@@ -2,7 +2,7 @@
 """Armed local-read LANE ADMISSION battery (P128.md).
 
 Usage: read_local_lane.py HOST PORT
-  boot: --thread-mode 1s --read-local 1 --enable-debug-command yes
+  boot: --thread-mode 1s|2s --overlap 0 --read-local 1 --enable-debug-command yes
 
 The fused thread's local-read lane holds kInboxSlots (1024) entries. A connection may pipeline up
 to kRobWindow (64) ops, so a thread that has accepted more than 16 deep-pipelining connections can
@@ -105,11 +105,12 @@ def drive(conns, shared, values, first_round, rounds):
 def main():
     host, port = _lib.host_port()
     ctl = _lib.Conn(host, port)
-    if _lib.thread_mode(ctl) != "1s":
-        _lib.skip_all("lane admission exists only in fused (1s) mode")
     cfg = ctl.cmd("CONFIG", "GET", "read-local")
     if not (isinstance(cfg, list) and len(cfg) == 2 and cfg[1] == b"1"):
         _lib.skip_all("needs --read-local 1 (CONFIG GET read-local -> %r)" % (cfg,))
+    server = _lib.info(ctl, "server")
+    if server.get("read_local") != "1" or int(server["read_local_active_threads"]) == 0:
+        raise AssertionError("read-local was requested but no reader lane is active: %r" % server)
     probe = ctl.cmd("DEBUG", "READ-LOCAL-LANE-CAP", "0")
     if isinstance(probe, Exception) or probe != b"OK":
         _lib.skip_all("needs DEBUG READ-LOCAL-LANE-CAP (--enable-debug-command yes) -> %r"

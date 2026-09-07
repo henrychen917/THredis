@@ -180,10 +180,9 @@ int main(int argc, char** argv) {
     if (cfg.overlap == 2)
         std::fprintf(stderr,
                      "WARNING: --overlap 2 selects an experimental research schedule\n");
-    if (cfg.read_local &&
-        (cfg.thread_mode != ThreadMode::Fused || cfg.overlap != 0))
+    if (cfg.read_local && cfg.overlap != 0)
         std::fprintf(stderr,
-                     "NOTICE: --read-local 1 requires --thread-mode 1s --overlap 0 "
+                     "NOTICE: --read-local 1 requires --overlap 0 "
                      "in this version; using the ordinary owner-task path\n");
     // THE ENGINE IS LATCHED HERE, once, before anything that reads it exists. Every Ring in the
     // process must agree (a uring ring cannot receive an eventfd doorbell and vice versa), and no
@@ -314,6 +313,11 @@ int main(int argc, char** argv) {
         srv.topo().dump(stdout);
         return run_fused_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
                                 tls_context.get(), unix_listener, final_shutdown_line);
+    }
+    if (srv.read_local_enabled()) {
+        srv.topo().dump(stdout);
+        return run_split_read_local_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
+                                           tls_context.get(), unix_listener, final_shutdown_line);
     }
 
     srv.topo().dump(stdout);

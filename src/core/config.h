@@ -317,7 +317,7 @@ struct Config {
     PersistIoEngine persist_io = PersistIoEngine::Uring;
     ThreadMode thread_mode = ThreadMode::Split;
     // Occupies the pre-existing padding before appendfilename, preserving Config and Server layout.
-    uint32_t read_local = 0;            // boot-only 0|1; 1s overlap-0 GET/MGET local-read lane
+    uint32_t read_local = 0;            // boot-only 0|1; overlap-0 GET/MGET lane in 1s or 2s IO
     const char* appendfilename = "appendonly.aof";
     const char* appenddirname = "appendonlydir";
     uint32_t auto_aof_rewrite_percentage = 100;
@@ -1139,7 +1139,7 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                         "             --read-local-atomic-filter 0|1 (boot-only; default 1)\n"
                         "             (--thread-pipeline is an overlap alias)\n"
                         "             (split/fused are mode aliases)\n"
-                        "             (read-local is active only with 1s overlap 0)\n"
+                        "             (read-local requires overlap 0; 2s IO owns no shards)\n"
                         "  placement (2s; default = even io/ex split over all allowed cpus):\n"
                         "    --ratio io:ex               GLOBAL counts, spread evenly over L3 domains\n"
                         "    --place role@cpu,...        explicit per-thread; roles are ifid, ex\n"
@@ -1210,6 +1210,10 @@ inline int validate_config(const Config& cfg) {
     if (cfg.thread_mode == ThreadMode::Split && cfg.overlap == 2) {
         std::fprintf(stderr,
                      "--overlap 2 is only available with --thread-mode 1s; 2s has no deep unified-stream schedule\n");
+        return kConfigError;
+    }
+    if (cfg.thread_mode == ThreadMode::Split && cfg.read_local && cfg.overlap != 0) {
+        std::fprintf(stderr, "--thread-mode 2s --read-local 1 requires --overlap 0\n");
         return kConfigError;
     }
     if (cfg.thread_mode == ThreadMode::Fused && cfg.overlap != 0 &&

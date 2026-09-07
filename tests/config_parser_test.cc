@@ -345,7 +345,10 @@ int main() {
         tomo::validate_config(read_local_split) != tomo::kConfigParsed ||
         read_local_split.thread_mode != tomo::ThreadMode::Split ||
         read_local_split.read_local != 1)
-        fail("read-local split-mode inert setting was rejected");
+        fail("read-local split-mode lane was rejected");
+    if (rejection_text({"--thread-mode", "2s", "--read-local", "1", "--overlap", "1"}, true) !=
+        "--thread-mode 2s --read-local 1 requires --overlap 0\n")
+        fail("split read-local silently accepted an unreachable overlap lane");
     auto parses_read_local_fallback_cell = [](const char* overlap, uint32_t expected) {
         tomo::Config cfg;
         tomo::ConfigParseState state;

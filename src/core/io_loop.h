@@ -538,6 +538,16 @@ private:
             return;
         }
         constexpr bool IoPipe = !Fused && Pipeline == 1;
+        if constexpr (Fused) {
+            if (srv_->read_local_enabled()) {
+                // A split EX tenure is permanently parked: it never probes the local lane.
+                // Resume BEFORE sampling the epoch, as at the existing network-wait boundary.
+                if (ThreadCtx::read_local_publication_parked(self_->read_local_publication()))
+                    self_->resume_read_local_tick();
+                self_->publish_read_local_tick(srv_->read_local_epoch());
+                self_->set_read_local_lane_active(true);
+            }
+        }
         if constexpr (!kEp) {
             if (listen_fd_ >= 0) arm_accept(UrKind::Accept);
             if constexpr (HasTls) arm_accept(UrKind::TlsAccept);
@@ -754,10 +764,12 @@ private:
             self_->clear_blocked();
         }
         if constexpr (Fused) {
-            // The read loop is over permanently. Teardown below may take longer than another
+            // The read loop is over for this tenure. Teardown may take longer than another
             // owner's bounded retire queue can tolerate, but it performs no foreign store probe.
-            if (srv_->read_local_enabled())
+            if (srv_->read_local_enabled()) {
+                self_->set_read_local_lane_active(false);
                 self_->publish_read_local_parked(srv_->read_local_epoch());
+            }
         }
         // A close requested by the last pass's read/send path has no later flush_ready to drain it,
         // and an undrained entry would show up as a live connection in the shutdown accounting.

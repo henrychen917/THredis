@@ -134,7 +134,7 @@ struct FlipReport {
     bool moving = false;
 };
 
-// Allocated only for the boot-armed fused read-local lane. The Server keeps only one pointer at its
+// Allocated only for the boot-armed read-local lane. The Server keeps only one pointer at its
 // true tail, so baseline member offsets and cache-line sharing remain unchanged.
 struct ReadLocalServerState {
     std::atomic<uint64_t> epoch{1};
@@ -580,7 +580,7 @@ public:
     }
 
     static bool read_local_enabled(const Config& cfg) {
-        return cfg.thread_mode == ThreadMode::Fused && cfg.overlap == 0 && cfg.read_local != 0;
+        return cfg.overlap == 0 && cfg.read_local != 0;
     }
     bool read_local_enabled() const { return read_local_enabled(cfg_); }
     uint64_t read_local_epoch() const {

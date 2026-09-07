@@ -14,6 +14,7 @@
 #include "server_tail.h"
 #include "slowlog.h"
 #include "../base/alloc.h"
+#include "../core/genthread.h"
 #include "../core/server.h"
 #include "../core/lbsignals.h"
 #include "../core/pubsub_event.h"
@@ -1977,8 +1978,8 @@ void cmd_info(Shard&, Op& op) {
         // stale -- and tooling depends on them. The NIC bench harness identifies the server it just
         // booted by reading process_id out of INFO, so its absence made every NIC cell fail with an
         // opaque "boot/cell FAIL" long before any measurement was taken.
-        // read_local is the EFFECTIVE lane state (fused, overlap 0, knob on) -- what a gate row
-        // must assert. CONFIG GET read-local echoes the knob even on a split boot where it is inert.
+        // read_local is the effective boot state. Actual loop entry and successful completions
+        // are separate observations: a configured but unreachable lane must be visible in INFO.
         appendf(body, "# Server\r\nredis_version:%s\r\ntomokv_version:%s\r\nredis_mode:standalone\r\n"
                       "thread_mode:%s\r\noverlap:%u\r\nthread_pipeline:%u\r\nread_local:%u\r\n"
                       "arch_bits:%zu\r\nmultiplexing_api:io_uring\r\nprocess_id:%lld\r\n"
@@ -1992,6 +1993,10 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned>(g_server ? g_server->cfg().port : 0),
                 static_cast<unsigned long long>(uptime),
                 static_cast<unsigned long long>(uptime / 86400));
+        // Guard the CALL, including all argument evaluation. The cold non-inlined helper owns
+        // its scratch buffers so the disabled INFO path keeps its old output without those arrays.
+        if (g_server && g_server->read_local_enabled())
+            append_read_local_thread_info(body, *g_server);
         if (g_server && g_server->thread_mode() == ThreadMode::Fused) {
             appendf(body,
                     "fused_threads:%u\r\nclient_threads:%u\r\nowner_threads:%u\r\n"

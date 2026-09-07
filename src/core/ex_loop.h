@@ -394,6 +394,7 @@ public:
 
     uint32_t fused_baseline_pass() {
         static_assert(Fused);
+        if (srv_->thread_mode() == ThreadMode::Split) return split_read_local_pass();
         if (read_local_interleave_enabled())
             return fused_pass_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_pass_impl<kGenthreadExBatchOps, true, false>();
@@ -636,6 +637,7 @@ public:
 
     uint32_t fused_baseline_sweep() {
         static_assert(Fused);
+        if (srv_->thread_mode() == ThreadMode::Split) return split_read_local_pass();
         if (read_local_interleave_enabled())
             return fused_sweep_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_sweep_impl<kGenthreadExBatchOps, true, false>();
@@ -698,12 +700,29 @@ public:
 
     Ring& ring() { return ring_; }
 
+    // Defined with the split read-local runtime in rl2s.cc. The IO role never services owner
+    // tasks or shard housekeeping, even while FLIP installs its future EX shard vector.
+    uint32_t split_read_local_pass();
+
     void run() {
+        if constexpr (Fused) {
+            // Only RL2S instantiates the owner loop with the fused-capable executor. Its lane
+            // was drained before role conversion; owner commands use no local-read captures.
+            if (!read_local_enabled() || read_local_impl().lane_count != 0) std::abort();
+            self_->publish_read_local_parked(srv_->read_local_epoch());
+            // A preceding shard-less IO tenure may have consumed this CONFIG version without
+            // applying it to shards. Reapply once ownership is installed and dispatch resumes.
+            live_config_version_ = UINT64_MAX;
+        }
         LoopSignals& sig = self_->sig();
         uint32_t idle_spins = 0;
 
         while (!self_->stop_flag().load(std::memory_order_relaxed) &&
                self_->role() == Role::Ex) {
+#ifdef TOMO_RL_CACHE_DEBUG
+            if constexpr (Fused)
+                srv_->debug_assert_read_local_sinks_follow_ownership(self_->id());
+#endif
             cached_now_ms_ = realtime_ms();
             const bool flip_frozen = srv_->flip_stage() >= FlipStage::ExDrain;
             const bool lb_frozen = lb_controller_armed_ && srv_->lb_dispatch_paused();
@@ -778,6 +797,8 @@ public:
                     did += lb_control_pass();
                     lb_bucket_bytes_pass();
                 }
+                if constexpr (Fused)
+                    did += read_local_impl().deferred.drain_ready();
             }
             // A pass that found nothing -- every drain and control pass came back empty -- is
             // polling, not work. Book it as idle so busy_ns means WORK: the FLIP placement model
@@ -1889,22 +1910,25 @@ private:
         return wake_coordinator();
     }
 
+    template <bool OwnsShards = true>
     void refresh_live_config() {
         LiveConfigSnapshot snapshot;
         if (!srv_->live_config_snapshot_if_changed(live_config_version_, snapshot)) return;
         const bool enabled = snapshot.maxmemory != 0;
-        const uint64_t shard_limit = snapshot.maxmemory / srv_->nshards();
-        for (Shard* sh : self_->shards()) {
-            sh->configure_maxmemory(enabled, shard_limit, snapshot.policy, snapshot.samples);
-            // CLIENT TRACKING and periodic SAVE need the same per-write observation points as
-            // keyspace notifications, so they ride the shard mask as synthetic observer bits.
-            // notify_record expands those observers over NOTIFY_ALL without adding those class
-            // bits here: the operator's configured pub/sub classes therefore remain independent.
-            // NOTIFY_NEW and NOTIFY_KEY_MISS stay outside the observer surface: `new` would count
-            // or invalidate a mutation twice, and a key miss is not a value change.
-            sh->set_notify_mask(snapshot.notify_events |
-                                (snapshot.tracking_armed ? NOTIFY_TRACKING : 0u) |
-                                (snapshot.save_armed ? NOTIFY_SAVE : 0u));
+        if constexpr (OwnsShards) {
+            const uint64_t shard_limit = snapshot.maxmemory / srv_->nshards();
+            for (Shard* sh : self_->shards()) {
+                sh->configure_maxmemory(enabled, shard_limit, snapshot.policy, snapshot.samples);
+                // CLIENT TRACKING and periodic SAVE need the same per-write observation points as
+                // keyspace notifications, so they ride the shard mask as synthetic observer bits.
+                // notify_record expands those observers over NOTIFY_ALL without adding those class
+                // bits here: the operator's configured pub/sub classes therefore remain independent.
+                // NOTIFY_NEW and NOTIFY_KEY_MISS stay outside the observer surface: `new` would count
+                // or invalidate a mutation twice, and a key miss is not a value change.
+                sh->set_notify_mask(snapshot.notify_events |
+                                    (snapshot.tracking_armed ? NOTIFY_TRACKING : 0u) |
+                                    (snapshot.save_armed ? NOTIFY_SAVE : 0u));
+            }
         }
         maxmemory_enabled_ = enabled;
         foreign_touch_policy_ =
@@ -3413,6 +3437,7 @@ private:
 };
 
 using ExLoop = ExLoopT<false>;
+template <> uint32_t ExLoopT<true>::split_read_local_pass();
 using FusedExLoop = ExLoopT<true>;
 
 // Disabled split executors retain the exact pre-read-local allocation stride plus the 264-byte
