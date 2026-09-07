@@ -134,14 +134,13 @@ struct ReadLocalExState<true> {
         bool lane_has_tombstones = false;
         bool point_writes_precise = true;
         bool keymiss_notify_armed = false;
-        bool interleave_owner_tasks = true;
-        bool prefetch_capture = true;
+        uint8_t reserved_schedule[2] = {}; // preserve the demotion-state offsets
         // EFFECTIVE lane capacity for ADMISSION. The physical ring is always kInboxSlots entries
         // and its index arithmetic still masks with kInboxSlots - 1; this only decides when the
         // parser stops admitting, so lowering it can never overrun the ring. It derives to
         // kInboxSlots and stays there unless DEBUG READ-LOCAL-LANE-CAP sets a test value, which
         // fused_pass_impl copies here once per rotation. It occupies the two padding bytes that
-        // already sat at offset 38 between prefetch_capture and demote_context, on the same first
+        // already sat at offset 38 between reserved_schedule and demote_context, on the same first
         // cache line as lane_head/lane_tail/lane_count that every admission test already reads, so
         // the struct does not grow, nothing moves, and reading it costs no line the caller did not
         // already own. See P128.md section 8.
@@ -181,9 +180,8 @@ public:
     bool init(Server* srv, ThreadCtx* self, bool dormant = false) {
         srv_ = srv; self_ = self;
         aof_manager_ = srv->aof().configured() ? &srv->aof() : nullptr;
-        lru_clock_shift_ = static_cast<uint8_t>(srv->cfg().lru_clock_shift);
         foreign_touch_random_ ^= (static_cast<uint64_t>(self->id()) + 1) * 0x9e3779b97f4a7c15ULL;
-        lb_sample_rate_ = srv->key_lb_signals_enabled() ? srv->cfg().lb_sample_rate : 0;
+        lb_sample_rate_ = srv->key_lb_signals_enabled() ? srv->lb_sample_rate() : 0;
         lb_sample_countdown_ = lb_sample_rate_;
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
@@ -205,8 +203,6 @@ public:
                 impl->point_writes_precise =
                     srv->cfg().maxmemory == 0 ||
                     srv->cfg().maxmemory_policy == MaxmemoryPolicy::NoEviction;
-                impl->interleave_owner_tasks = srv->cfg().read_local_interleave != 0;
-                impl->prefetch_capture = srv->cfg().read_local_prefetch_capture != 0;
                 read_local_.impl = std::move(impl);
             }
         }
@@ -244,8 +240,7 @@ public:
             shard->bind_notify_pending(&notify_keyless_pending_);
             if (read_local_enabled())
                 shard->store().configure_read_local(
-                    true, *read_local_impl().deferred.sink(),
-                    srv_->cfg().read_local_atomic_filter != 0);
+                    true, *read_local_impl().deferred.sink());
         }
     }
 
@@ -470,7 +465,7 @@ public:
         if (!lb_frozen) refresh_live_config();
         if (maxmemory_enabled_)
             cached_lru_clock_ = static_cast<uint8_t>(
-                (static_cast<uint64_t>(cached_now_ms_ / 1000) >> lru_clock_shift_) & 0x1f);
+                (static_cast<uint64_t>(cached_now_ms_ / 1000) >> kLruClockShift) & 0x1f);
 
         // The WB batch captured its AOF gate before entering this call. Only a clean fresh-task
         // turn may put that WB work into an EX prefetch gap: executing older retry/deferred debt
@@ -714,7 +709,7 @@ public:
             if (!placement_frozen) refresh_live_config();
             if (maxmemory_enabled_)
                 cached_lru_clock_ = static_cast<uint8_t>(
-                    (static_cast<uint64_t>(cached_now_ms_ / 1000) >> lru_clock_shift_) & 0x1f);
+                    (static_cast<uint64_t>(cached_now_ms_ / 1000) >> kLruClockShift) & 0x1f);
             sig.iterations++;
 
             uint32_t did = 0;
@@ -842,7 +837,7 @@ private:
 
     bool read_local_interleave_enabled() const {
         if constexpr (Fused)
-            return read_local_.impl && read_local_.impl->interleave_owner_tasks;
+            return read_local_.impl != nullptr;
         return false;
     }
 
@@ -1010,7 +1005,7 @@ private:
     // reply is private. Atomic exchanges still bracket the table word for point GET, but an exchange
     // of an unrelated key cannot move this key's epoch. Each probe retains its stable-topology
     // handshake; immutable replacement plus rotation QSBR then makes a second per-key table-word
-    // validation redundant. With the filter OFF (the A/B control), or above the bounded route cache,
+    // validation redundant. Above the bounded route cache,
     // every shard keeps the legacy generation rule and per-key validation.
     struct LocalMgetWindow {
         static constexpr uint32_t kMaxShards = 256;
@@ -1028,7 +1023,7 @@ private:
     ReadLocalFallbackReason local_mget_window_open(
             LocalMgetWindow& window, const uint64_t* touched, const uint64_t* hashes,
             const int32_t* shards, uint32_t key_count, bool cached_routes) const {
-        window.use_epochs = cached_routes && srv_->cfg().read_local_atomic_filter != 0;
+        window.use_epochs = cached_routes;
         for (uint32_t sid = 0; sid < srv_->nshards(); sid++) {
             if (!local_mget_touched(touched, sid)) continue;
             const uint64_t state = srv_->shard(static_cast<int32_t>(sid))
@@ -1126,7 +1121,7 @@ private:
     // (KvObj::touch_eviction_meta_foreign) rather than the owner's load/store pair, so a lost race
     // costs one approximate touch -- which LRU and LFU tolerate by construction -- and can never
     // corrupt a layout bit. Store-rare by construction: LRU writes only when the key's bucket is
-    // stale (once per 1<<lru-clock-shift seconds per key, 256 s by default) and LFU only when the
+    // stale (once per 256 seconds per key) and LFU only when the
     // increment actually fires, so the foreign RFO into the owner's line is the exception rather
     // than the per-read rule.
     __attribute__((noinline, cold))
@@ -1565,9 +1560,7 @@ private:
             return 0;
         } else {
             if (!read_local_enabled() || !op_budget) return 0;
-            return read_local_impl().prefetch_capture
-                ? drain_local_reads_bounded_impl<true, YieldToOwner>(op_budget)
-                : drain_local_reads_bounded_impl<false, YieldToOwner>(op_budget);
+            return drain_local_reads_bounded_impl<true, YieldToOwner>(op_budget);
         }
     }
 
@@ -3010,12 +3003,17 @@ private:
         if (!lb_sample_rate_) return;
         if (--lb_sample_countdown_ != 0) return;
         lb_sample_countdown_ = lb_sample_rate_;
-        shard.note_lb_sample(hash);
+        shard.note_lb_sample(hash, lb_sample_rate_);
     }
 
     void lb_bucket_bytes_pass() {
         if (!lb_sample_rate_ || cached_now_ms_ < lb_bytes_next_ms_) return;
         lb_bytes_next_ms_ = cached_now_ms_ + 10;
+        const uint32_t rate = srv_->lb_sample_rate();
+        if (rate != lb_sample_rate_) {
+            lb_sample_rate_ = rate;
+            lb_sample_countdown_ = rate;
+        }
         auto& owned = self_->shards();
         if (owned.empty()) return;
         if (lb_bytes_shard_cursor_ >= owned.size()) lb_bytes_shard_cursor_ = 0;
@@ -3337,7 +3335,6 @@ private:
     bool       maxmemory_enabled_ = false;
     bool       ex_sched_enabled_ = false;
     uint8_t    cached_lru_clock_ = 0;
-    uint8_t    lru_clock_shift_ = 8;   // latched from cfg at loop start; 1<<N seconds per bucket
     uint32_t   lb_sample_rate_ = 0;
     uint32_t   lb_sample_countdown_ = 0;
     uint32_t   age_sample_rate_cached_ = 0;

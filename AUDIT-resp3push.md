@@ -1,5 +1,10 @@
 # AUDIT — RESP3 push frames vs. the zero-copy (borrowed) reply path
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Tree: `/home/user/Projects/tomokv-cpp-perthread` @ `t-merge14` (`2e794c3bc`). Static reading only —
 nothing was built, started, or benched. No file in that tree was modified.
 

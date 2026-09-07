@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # One boot per battery, port 8079, cores 48-55. 1s runs ARMED (read-local + atomic filter).
 set -u
 cd /home/user/Projects/wt-replycode
@@ -15,7 +16,7 @@ run(){ # MODE TEST
      echo "  GUARD-REFUSE $MODE/$T (port busy)"; FAIL=$((FAIL+1)); FAILED="$FAILED $MODE/$T:guard"; return; fi
   if [ "$MODE" = 1s ]; then
     taskset -c $CORES $BIN --port $PORT --bind 127.0.0.1 --thread-mode 1s \
-      --read-local 1 --read-local-atomic-filter 1 --atomic 1 --enable-debug-command yes \
+      --read-local 1 --atomic 1 --enable-debug-command yes \
       --dir "$DIR" >"$LOG" 2>&1 &
   else
     taskset -c $CORES $BIN --port $PORT --bind 127.0.0.1 --thread-mode 2s --ratio 6:2 \

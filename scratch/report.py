@@ -248,7 +248,7 @@ def simple_table(caption, headers, rows, classes=None):
 
 _ctl = ctl_rows()
 ctl_table = simple_table(
-    "tests/flipctl.py (the gate's own invocation: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 "
+    "tests/flipctl.py (the historical gate invocation: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 "
     "--lb-age-sample-rate 1024, 8 server threads on cpus 52-55 + siblings)",
     ["run", "verdict", "rc", "what the row said"],
     [(f"<code>{html.escape(t)}</code>", v, rc, html.escape(d or a or "")) for t, v, rc, d, a in _ctl],
@@ -341,7 +341,7 @@ doc = f"""<title>Flip Thrash Fix</title>
 <pre>origin_rate=4898.601   anchor_rate=6000.916   model_last_decision=moved-delivered
 boot_rate_slope=0.022869547   boot_rate_slope_threshold=0.029664539</pre>
 <p>The load was still trending — just under the controller's own deferral threshold — so the "+22.5% delivered" that confirmed the flip was the driver's ramp, not the flip's doing. Base does not rail here because it random-walks with halving steps and settles on the best of several readings; the verify-or-revert seek takes one probe and compares it with one pre-flip reading, which is only as good as the baseline's own stillness.</p>
-<p><b>Fix:</b> the Measuring phase never moves the split, so the readings the model already takes while deciding <i>are</i> readings of the origin. Bracket them and floor every band of the maneuver at twice that spread — the same 2× observed-jitter convention as the signature band, the rate band and <code>band_</code>. On the gate's ramping driver the floor becomes 40%, the ramp's 22.5% confirms nothing, the seek reverts to 6:2 and anchors off-rail. On a still baseline the floor is ≈0 and nothing changes. The floor applies under an explicit <code>--flip-auto-band</code> too: that knob says how small a gain is worth chasing, not how still the workload is holding.</p>
+<p><b>Fix:</b> the Measuring phase never moves the split, so the readings the model already takes while deciding <i>are</i> readings of the origin. Bracket them and floor every band of the maneuver at twice that spread — the same 2× observed-jitter convention as the signature band, the rate band and <code>band_</code>. On the gate's ramping driver the floor becomes 40%, the ramp's 22.5% confirms nothing, the seek reverts to 6:2 and anchors off-rail. On a still baseline the floor is ≈0 and nothing changes. In the measured historical build, the floor also applied under the now-removed <code>--flip-auto-band</code>: that knob says how small a gain is worth chasing, not how still the workload is holding.</p>
 {ctl_table}
 
 <h2>6. Non-vacuity: the guard must not be a silent <code>--flip-auto 0</code></h2>
@@ -363,8 +363,8 @@ B  BREADTH          single-key SET:GET 1:1 and 9:1, and pure GET, same geometry:
 C  NON-VACUITY      boot the SAME load at a deliberately wrong split (e.g. --ratio 28:4) with --flip-auto 1:
                     the controller MUST move (1 flip, anchor at its target, live == anchor) and MUST beat
                     the --flip-auto 0 control at 28:4. A zero-flip result here is a FAIL, not a pass
-D  GATE ROW         tests/gate.sh (or just: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2
-                    --lb-age-sample-rate 1024 + tests/flipctl.py --stable-seconds 30) -- this is the row the
+D  HISTORICAL GATE ROW         tests/gate.sh (or just: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2
+                    --lb-age-sample-rate 1024 + tests/flipctl.py --stable-seconds 30) -- this was the row the
                     branch broke and the baseline-band floor fixes; it must anchor OFF-RAIL
 E  ALWAYS-ON COST   the A cell at a matched offered rate (memtier --rate-limiting) with perf stat on the
                     server: --flip-auto 1 against --flip-auto 0, same binary. Budget 3%</pre>

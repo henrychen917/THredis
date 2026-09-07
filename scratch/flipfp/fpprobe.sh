@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # fpprobe.sh -- VACUITY-PROOF liveness + detection test for the sampled fingerprint.
 #
 # The accuracy cells left a question the perf numbers cannot answer: a detector that never
@@ -20,7 +21,7 @@ OUT=$FP/fp-$TAG.txt
 SRV_CPUS=$SRV4; LG_CPUS=$LG4
 extra=""; [ -n "$W" ] && extra="--flip-work-window $W"
 pid=$(SRV_CPUS=$SRV4 boot "$BIN" "$PORT" "fp-$TAG" --ratio 2:2 --shards 64 --atomic 0 \
-        --flip-auto 1 --flip-auto-band -1 $extra) || exit 1
+        --flip-auto 1 $extra) || exit 1
 LG_CPUS=$LG4 preload "$PORT" 4
 
 # ---- Leg A: stationary load until anchored, then read the detector's learned state -------------

@@ -6,10 +6,9 @@
 # Sections: off noev lru vlru vttl lfu lruclock growth config
 #   lfu       hot-set survival under pressure PLUS the mechanism: OBJECT FREQ rises for ordinary
 #             reads and stays put for CLIENT NO-TOUCH reads, whoever serves the read.
-#   lruclock  the LRU twin on a 1 s bucket (boot with --lru-clock-shift 0): OBJECT IDLETIME
-#             resets on a read, keeps aging under NO-TOUCH, and re-touched old keys outlive
-#             untouched ones under pressure. The default 256 s bucket makes every key in a short
-#             test the same age, which is why the lru section above cannot see a touch at all.
+#   lruclock  the LRU twin on the fixed 256 s clock: seed every old cohort before one bucket
+#             boundary, then prove ordinary reads reset age, NO-TOUCH retains age, and touched
+#             keys outlive untouched ones. The bounded clock wait can take 260 s per boot.
 # On a fused boot with the read-local lane armed (INFO server read_local:1) both sections also
 # assert the reads they measure were LANE-served: before the lane learned to touch, a key kept hot
 # only by such reads was never counted as accessed and was evicted FIRST -- the policy inverted.
@@ -238,7 +237,7 @@ elif SECTION == "lfu":
     nt.close()
 
 elif SECTION == "lruclock":
-    # Boot with --lru-clock-shift 0: one-second buckets, so a 1.6 s dwell is a visible age.
+    # The production clock is fixed at 256 seconds per bucket.
     must("CONFIG", "SET", "maxmemory", MM); must("CONFIG", "SET", "maxmemory-policy", "allkeys-lru")
     # 64 samples, and here -- unlike the lfu section -- that is a pure gain, which is the whole
     # difference between the two policies in this tree. Sampling a candidate under LRU only READS
@@ -251,14 +250,20 @@ elif SECTION == "lruclock":
     must("CONFIG", "SET", "maxmemory-samples", "64")
     lane_armed = info_num("read_local") == 1
     must("SET", "lruc:probe", "v")
-    time.sleep(1.6)
-    idle = as_int(cmd("OBJECT", "IDLETIME", "lruc:probe"))
-    check("lruclock: bucket advanced over a 1.6 s dwell (needs --lru-clock-shift 0)",
-          idle is not None and idle >= 1, idle)
-    # Read then probe, twice if need be: on a 1 s bucket a second boundary falling between the
-    # GET and the OBJECT IDLETIME reports 1 for a read that did reset the clock, and a gate row
-    # must not be decided by which side of a tick it landed on. Three reads per attempt also give
-    # the lane more than one chance to admit the command on a freshly opened connection.
+    must("SET", "lruc:no-touch", "v")
+    fill("lruold", 3000)
+    # Age all three cohorts together. Poll the last-created key without touching it, so the
+    # whole cohort must cross a real production bucket; an unchanged clock must fail this arm.
+    deadline = time.monotonic() + 260
+    aged = None
+    while time.monotonic() < deadline:
+        aged = as_int(cmd("OBJECT", "IDLETIME", "lruold:2999"))
+        if aged is not None and aged >= 256:
+            break
+        time.sleep(0.1)
+    check("lruclock: production clock advanced for the full old cohort",
+          aged is not None and aged >= 256, aged)
+    # Retry the read/probe pair only if a clock boundary fell between its two commands.
     def read_then_idle(key):
         for _ in range(3):
             cmd("GET", key)
@@ -269,35 +274,23 @@ elif SECTION == "lruclock":
         idle = read_then_idle("lruc:probe")
     lane_probe = (info_num("read_local_keyspace_hits") or 0) - lane0
     check("lruclock: one ordinary read resets OBJECT IDLETIME to 0", idle == 0, idle)
-    time.sleep(1.6)
     nt, ntf = open_conn()
     check("lruclock: CLIENT NO-TOUCH ON", cmd_on(nt, ntf, "CLIENT", "NO-TOUCH", "ON") == b"+OK")
     lane1 = info_num("read_local_keyspace_hits") or 0
     for _ in range(20):
-        cmd_on(nt, ntf, "GET", "lruc:probe")
+        cmd_on(nt, ntf, "GET", "lruc:no-touch")
     lane_nt = (info_num("read_local_keyspace_hits") or 0) - lane1
-    idle = as_int(cmd("OBJECT", "IDLETIME", "lruc:probe"))
-    check("lruclock: 20 NO-TOUCH reads leave IDLETIME aging", idle is not None and idle >= 1, idle)
+    idle = as_int(cmd("OBJECT", "IDLETIME", "lruc:no-touch"))
+    check("lruclock: 20 NO-TOUCH reads preserve an old bucket", idle is not None and idle >= 256, idle)
     nt.close()
     if lane_armed:
         check("lruclock: the probe reads were lane-served", lane_probe >= 3 and lane_nt >= 15,
               "plain %d/3+ no-touch %d/20" % (lane_probe, lane_nt))
-    # Discrimination under pressure: 3000 old keys age one bucket, 50 of them are re-read, then
-    # 6800 new keys push past the ceiling. The pressure is deliberately sized so that the eviction
-    # it forces (~1.4k) is roughly HALF the untouched old bucket (2950) rather than nearly all of
-    # it: the ceiling is per SHARD, and a run that has to consume ~90% of the average shard's old
-    # keys will exhaust the unlucky shards and start spending re-read ones for reasons that have
-    # nothing to do with the policy. At half, the re-read 50 survive on their bucket alone and the
-    # untouched sample halves -- and on a server whose lane does not touch, the re-read 50 are just
-    # 50 more untouched keys and "mostly survive" fails, which is the whole point of the row.
-    fill("lruold", 3000)
-    time.sleep(1.6)
+    # Discrimination under pressure uses the same aged cohort. Heating 50 old keys leaves
+    # untouched old keys available to the eviction sampler throughout the following fill.
     lane2 = info_num("read_local_keyspace_hits") or 0
-    # Re-read THROUGH the fill, for the same reason the lfu section does (see there). On a 1 s
-    # bucket the fill itself takes several buckets, so 50 keys read once BEFORE it age right back
-    # into the band this row needs them to beat, and a few get spent for reasons that have nothing
-    # to do with the policy. Read during it and they carry the current bucket the whole way, which
-    # is what "kept hot" means and is the only version of the claim that is deterministic.
+    # Keep re-reading through the fill so the hot cohort stays in the current bucket even if
+    # another production clock boundary occurs while the pressure arm runs.
     # 6000 new keys, not 8000: with 64-sample selection the victim choice is EXACT, so the
     # untouched old bucket is spent almost in order, and pressure sized to consume ~85% of it
     # leaves the unlucky shards with nothing old left and they start on the re-read keys -- one

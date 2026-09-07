@@ -1,5 +1,10 @@
 # NOTES-SNAPCUT — SAVE/BGSAVE wrote half-applied cross-shard atomic groups
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Branch `t-snapcut`. Lane resources: cores 64-79, ports 7210-7219, redis 7.4 oracle on 7212.
 Every server was resolved from its listening socket (`ss -lntpH "sport = :<port>"`) and stopped by
 that exact pid; no process was ever selected by name or pattern.

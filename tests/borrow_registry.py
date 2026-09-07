@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Zero-copy borrow registry scaling battery.
-#   python3 tests/borrow_registry.py <host> <port>
+#   python3 tests/borrow_registry.py <host> <port> [--release-build]
 # Boot: --shards 1 --zc-min 64 --client-output-buffer-limit normal 0 0 0 --enable-debug-command yes
 #   one shard  -> every borrow lands in ONE registry, which is the quantity under test
 #   zc-min 64  -> a small value still takes the borrow path, so the probe pays registry cost and
@@ -18,7 +18,9 @@
 #     zero again after holder teardown;
 #   - the plain-GET arm is a NEGATIVE CONTROL measured in the same loop on the same connection. It
 #     never enters the registry, so it is what "no growth" reads like on this machine;
-#   - the assertion is a RATIO of two per-op costs measured seconds apart, never an absolute time.
+#   - measured send/release counters distinguish the two paths independently of speed;
+#   - per-operation cost ratios require --release-build and a stable plain-GET control. ASAN
+#     still exercises both paths, parks holders, verifies exact replies, and requires teardown.
 #
 # Drift (AUDIT-TESTS F7). The two arms are INTERLEAVED per round (borrow, plain, borrow, plain ...)
 # so a CPU-state shift lands on both, not on whichever arm happened to be measured second (the
@@ -35,7 +37,12 @@ import time
 
 import _lib
 
-HOST, PORT = sys.argv[1], int(sys.argv[2])
+ARGS = sys.argv[1:]
+RELEASE_BUILD = "--release-build" in ARGS
+ARGS = [arg for arg in ARGS if arg != "--release-build"]
+if len(ARGS) != 2:
+    raise SystemExit("usage: borrow_registry.py HOST PORT [--release-build]")
+HOST, PORT = ARGS[0], int(ARGS[1])
 
 HOLD_BYTES = 8192
 # One unread connection gets ~75 MiB of replies.  Unlike its receive-window setting, that volume
@@ -138,6 +145,11 @@ class C:
     def live_borrows(self):
         return self.cmd("DEBUG", "BORROWCOUNT")
 
+    def zc_counts(self):
+        rows = dict(line.split(b":", 1) for line in self.cmd("INFO", "STATS").splitlines()
+                    if b":" in line)
+        return int(rows[b"zc_sends"]), int(rows[b"zc_releases"])
+
 
 def wait_borrows(admin, predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
@@ -184,6 +196,26 @@ def main():
     rp = b"$%d\r\n" % PLAIN_BYTES + b"P" * PLAIN_BYTES + b"\r\n"
     probe.rate(fb, rb, DEPTH * 40, DEPTH)
     probe.rate(fp, rp, DEPTH * 40, DEPTH)
+
+    # Prove path identity with completed send/release counters, not a 1.5x latency ratio. There
+    # are no holders yet. First drain preceding borrows so they cannot move the plain control.
+    # Induce by disabling GET borrowing (positive arm fails), or borrowing below zc-min (plain
+    # arm fails). The byte-exact rate() reader still checks every response on every build.
+    check("probe borrows initially drained", wait_borrows(admin, lambda n: n == 0) == 0)
+    plain_before = admin.zc_counts()
+    probe.rate(fp, rp, OPS, DEPTH)
+    plain_after = admin.zc_counts()
+    check("plain GET never enters the borrow send path", plain_after == plain_before,
+          "before=%r after=%r" % (plain_before, plain_after))
+    borrow_before = admin.zc_counts()
+    probe.rate(fb, rb, OPS, DEPTH)
+    probe_drained = wait_borrows(admin, lambda n: n == 0)
+    borrow_after = admin.zc_counts()
+    check("the two arms really took different paths",
+          plain_after == plain_before and probe_drained == 0 and
+          all(after > before for before, after in zip(borrow_before, borrow_after)),
+          "plain=%r->%r borrow=%r->%r live=%d" %
+          (plain_before, plain_after, borrow_before, borrow_after, probe_drained))
 
     def measure():
         # Best (lowest ns/op) of ROUNDS per arm, arms interleaved so drift hits both equally.
@@ -244,7 +276,11 @@ def main():
 
     growth = borrow_busy / borrow_ref
     control = plain_busy / plain_ref
-    if control > MAX_GROWTH:
+    if not RELEASE_BUILD:
+        print("  SKIP borrowed GET per-op cost growth / control flatness -- requires "
+              "--release-build; borrow %.0f -> %.0f ns (%.3f), plain %.0f -> %.0f ns (%.3f)"
+              % (borrow_ref, borrow_busy, growth, plain_ref, plain_busy, control))
+    elif control > MAX_GROWTH:
         # A BROKEN INSTRUMENT DOES NOT GET A VERDICT. The plain arm never enters the registry, so
         # nothing this row is looking for can move it. When it moves anyway -- against the pre
         # baseline, against the post baseline, and after three re-rolls -- the box shifted under
@@ -262,8 +298,8 @@ def main():
               "%.0f -> %.0f ns  ratio=%.3f (%s)" % (borrow_ref, borrow_busy, growth, reference))
         check("control (non-borrowed GET) stayed flat", control <= MAX_GROWTH,
               "%.0f -> %.0f ns  ratio=%.3f (%s)" % (plain_ref, plain_busy, control, reference))
-    check("the two arms really took different paths", borrow_ref > plain_ref * 1.5,
-          "borrow %.0f ns vs plain %.0f ns (%s)" % (borrow_ref, plain_ref, reference))
+    # Restore the linear borrow_find() scan to induce the release-only growth failure while
+    # leaving the plain control flat. Sanitizer slowdown cannot be a verdict on this 5% budget.
     admin.cmd("FLUSHALL")
     admin.close()
     print("BORROW-REGISTRY %s" % ("PASS" if FAIL == 0 else "FAIL %d" % FAIL))

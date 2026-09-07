@@ -343,12 +343,12 @@ def full_battery(host, tls_port, plain_port, cert_dir, mode, expect_ktls):
     suppressed_before_get = int(parse_stats(admin).get("tls_zc_suppressed", "0"))
 
     config_reply = admin.command("CONFIG", "GET", "tls-*")
-    if not isinstance(config_reply, list) or len(config_reply) != 22:
+    if not isinstance(config_reply, list) or len(config_reply) != 20:
         raise AssertionError("CONFIG GET tls-* omitted a TLS knob: %r" % (config_reply,))
     config_values = dict(zip(config_reply[0::2], config_reply[1::2]))
     if (config_values.get(b"tls-port") != str(tls_port).encode() or
             config_values.get(b"tls-auth-clients") != mode.encode() or
-            config_values.get(b"tls-ktls") != (b"yes" if expect_ktls else b"no")):
+            b"tls-ktls" in config_values):
         raise AssertionError("CONFIG GET did not preserve TLS listener/auth values")
     immutable = admin.command("CONFIG", "SET", "tls-port", str(tls_port))
     if not isinstance(immutable, RuntimeError) or "immutable" not in str(immutable):

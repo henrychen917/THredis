@@ -1,5 +1,10 @@
 # Lane xperf2 — efficiency findings E4–E7
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Four audit claims. Each was tested on a live server BEFORE any code was touched; only the ones that
 reproduced were fixed, and only the ones that reproduced got a test. One came back empty and is
 recorded as such.
@@ -8,7 +13,7 @@ recorded as such.
 |---|---|---|---|---|
 | E4 | ExpireIndex never shrinks; memsets the whole sidecar on live→0; single-pass rehash | **REPRODUCED** (both halves) | yes | `tests/expireindex.py` |
 | E5 | zero-copy borrow registry is a linear vector scanned per borrow/release/retire | **REPRODUCED** | yes | `tests/borrow_registry.py` |
-| E6 | non-atomic scatter dispatch zeroes 512 B and scans all `nthreads()` per cross-shard op | **REPRODUCED** | yes | `tests/xshard_dispatch_scale.sh` |
+| E6 | non-atomic scatter dispatch zeroes 512 B and scans all `nthreads()` per cross-shard op | **REPRODUCED** | yes, historically | retired manual-map dispatch instrument; see `MERGE.md` |
 | E7 | segment mode is absorbing: once triggered every later reply is a malloc + iovec slot | **NOT REPRODUCED** | no | none |
 
 Rig: EPYC 9754, cores 48–63 only, ports 7200–7209 only, loopback. Oracle = vanilla redis 7.4 at
@@ -292,18 +297,20 @@ pre-fix binary to prove it can actually fail.
 |---|---|---|---|---|
 | `tests/expireindex.py <host> <port>` | `--shards 1 --ratio 1:1 --enable-debug-command yes` | growth-trigger cost ratio over a 16× population ≤ 8.0; live→0 DEL ≤ 1.25× a neighbouring DEL | FAIL 2 (16.30×, 2.00×) | PASS (1.65×, 1.00×) |
 | `tests/borrow_registry.py <host> <port>` | `--shards 1 --zc-min 64 --client-output-buffer-limit normal 0 0 0 --enable-debug-command yes` | borrowed-GET per-op cost growth over 0 → ~2000 live borrows ≤ 1.05 | FAIL (1.078, 1.079) | PASS (1.008, 1.008, 1.009) |
-| `tests/xshard_dispatch_scale.sh` (+ `.py`) | boots its own 4-thread and 128-thread arms | dispatch-excess ratio 128t/4t ≤ 1.20 | FAIL (1.297) | PASS (1.110) |
+| Retired `tests/xshard_dispatch_scale.sh` (+ `.py`) | historically booted fixed-owner 4-thread and 128-thread arms | historical dispatch-excess ratio 128t/4t ≤ 1.20 | FAIL (1.297) | PASS (1.110) |
 
 Each also carries its own non-vacuity checks: `expireindex.py` asserts INFO `expires` really
 reached the population under test and that INFO `expired_keys` MOVED (so the sampler is proven to
 still visit deadlines parked mid-migration), plus a no-TTL negative control on both timing legs;
 `borrow_registry.py` asserts `CLIENT LIST oll` grew (the borrow path is proven live, not assumed),
 carries a non-borrowed control arm, and refuses to run unless the zc gate straddles its two probe
-sizes; `xshard_dispatch_scale.py` refuses to report unless `DEBUG SHARD` + `DEBUG LBSIGNALS` prove
+sizes; the retired `xshard_dispatch_scale.py` refused to report unless `DEBUG SHARD` + `DEBUG LBSIGNALS` proved
 the cross pair really fanned out to two owner threads and the control stayed on one.
 
-None of the three is wired into `tests/gate.sh`: they each need their own boot geometry and the
-gate's port/cores belong to the mainline operator. Run them as above.
+These were standalone instruments when measured. The merged gate runs the expiry and borrow
+batteries with `--release-build`. The dispatch wrapper and helper are retired because their manual
+ownership geometry is unavailable; the historical measurements above do not validate default
+round-robin ownership. See [MERGE.md](MERGE.md).
 
 ## Evidence
 

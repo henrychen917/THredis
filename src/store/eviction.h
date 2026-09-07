@@ -6,6 +6,9 @@
 
 namespace tomo {
 
+// Fixed five-bit LRU clock: 256-second buckets, wrapping after 8192 seconds.
+inline constexpr uint32_t kLruClockShift = 8;
+
 enum class MaxmemoryPolicy : uint8_t {
     NoEviction,
     AllKeysRandom,

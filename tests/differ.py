@@ -2806,13 +2806,19 @@ def run_blocking_differ(rng):
          ["ZADD", "cbd:forever:bzmpop", "1", "v"]),
     ]
     for command, wake in forever_arms:
-        tbase, obase = info_blocked(ts, tf), info_blocked(os_, of)
+        # The preceding reply can precede its gauge decrement too. Arm against a settled
+        # baseline, so that delayed decrement cannot cancel this arm's observed increment.
+        tbase, obase = await_blocked(ts, tf, 0), await_blocked(os_, of, 0)
         tw, twf = conn_mode(TH, TP, RESP3); ow, owf = conn_mode(OH, OP, RESP3)
         tw.sendall(enc(command)); ow.sendall(enc(command)); logical_ops += 1
         tarmed = await_blocked(ts, tf, tbase + 1)
         oarmed = await_blocked(os_, of, obase + 1)
         property_check("%s timeout-zero armed" % command[0], tarmed == tbase + 1,
                        oarmed == obase + 1)
+        # A gauge stuck at zero must fail even if both servers miss the arm. Induce by
+        # suppressing blocked_clients increments; parity alone would pass False == False.
+        property_check("target %s blocking gauge moved" % command[0], tarmed, tbase + 1)
+        property_check("oracle %s blocking gauge moved" % command[0], oarmed, obase + 1)
         tready = bool(select.select([tw], [], [], 0.05)[0])
         oready = bool(select.select([ow], [], [], 0.05)[0])
         property_check("%s timeout-zero silence" % command[0], tready, oready)
@@ -2921,7 +2927,11 @@ def run_blocking_differ(rng):
             property_check("WAIT finite deadline fired", time.monotonic() - started >= 0.15, True)
         tw.close(); ow.close(); twf.close(); owf.close()
 
-    final_t, final_o = info_blocked(ts, tf), info_blocked(os_, of)
+    # Closing a WAIT socket does not synchronously retire its blocked-client registration on
+    # either server. Compare settled values, never two independently moving gauges. The bounded
+    # poll retains the last value on timeout: suppress disconnect's decrement to make the zero
+    # control fail, even if both servers leak the same count and the parity row agrees.
+    final_t, final_o = await_blocked(ts, tf, 0), await_blocked(os_, of, 0)
     property_check("blocking gauges drain", final_t, final_o)
     property_check("target blocking gauge zero control", final_t, 0)
     property_check("oracle blocking gauge zero control", final_o, 0)
@@ -5964,28 +5974,50 @@ if SUITE == "infofix":
         property_fail("target peak reset", repr(reset_memory))
     print("  infofix peak points: %r" % memory_points)
 
-    # Sampled-rate controls: RESETSTAT+idle is zero, a byte-compared PING burst is positive, and a
-    # second RESETSTAT returns the detector to zero.
+    # The same sampled-rate contract as infofix.py: INFO-only polls let residual samples drain,
+    # and work is fed until a sample sees it. No arbitrary instant is compared to the oracle's
+    # live gauge. Pin published_rate at zero/nonzero to fail the positive/idle controls.
+    def sampled_rate(sock, file):
+        return int(fields(sock, file, "stats").get("instantaneous_ops_per_sec", "-1"))
+
+    def idle_rate(sock, file):
+        deadline = time.monotonic() + 5.0
+        while True:
+            value = sampled_rate(sock, file)
+            if value <= 0 or time.monotonic() >= deadline:
+                return value
+            time.sleep(.11)
+
     for sock, file in ((ts, tf), (os_, of)):
         issue(sock, file, ["CONFIG", "RESETSTAT"])
-    time.sleep(.15)
-    target_control = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "-1"))
+    target_control = idle_rate(ts, tf)
     if target_control != 0: property_fail("target rate control", str(target_control))
     payload = enc(["PING"]) * 1000
-    ts.sendall(payload); os_.sendall(payload)
-    for iteration in range(1000):
-        target_reply, oracle_reply = read_reply(tf), read_reply(of)
-        if target_reply != oracle_reply:
-            property_fail("rate burst byte compare", "iteration=%d" % iteration)
+    deadline = time.monotonic() + 5.0
+    while True:
+        ts.sendall(payload); os_.sendall(payload)
+        replies_ok = True
+        for iteration in range(1000):
+            target_reply, oracle_reply = read_reply(tf), read_reply(of)
+            if target_reply != oracle_reply:
+                property_fail("rate burst byte compare", "iteration=%d" % iteration)
+                replies_ok = False
+        target_rate = sampled_rate(ts, tf)
+        oracle_rate = sampled_rate(os_, of)
+        if (not replies_ok or (target_rate > 0 and oracle_rate > 0) or
+                target_rate < 0 or oracle_rate < 0 or time.monotonic() >= deadline):
             break
-    time.sleep(.12)
-    target_rate = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "0"))
-    oracle_rate = int(fields(os_, of, "stats").get("instantaneous_ops_per_sec", "0"))
+        time.sleep(.11)
     if target_rate <= 0: property_fail("target rate fired", str(target_rate))
     if oracle_rate <= 0: property_fail("oracle rate fired", str(oracle_rate))
     issue(ts, tf, ["CONFIG", "RESETSTAT"])
-    time.sleep(.15)
-    reset_rate = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "-1"))
+    # Natural sampler aging must not hide an omitted RESETSTAT baseline (leave PING calls
+    # untouched to induce this independent reset failure).
+    ping = fields(ts, tf, "commandstats").get("cmdstat_ping", "calls=0")
+    ping_calls = dict(item.split("=", 1) for item in ping.split(",") if "=" in item)
+    if int(ping_calls["calls"]) != 0:
+        property_fail("target commandstats reset", ping)
+    reset_rate = idle_rate(ts, tf)
     if reset_rate != 0: property_fail("target rate reset", str(reset_rate))
     print("  infofix sampled rates: control=%d target=%d oracle=%d reset=%d" %
           (target_control, target_rate, oracle_rate, reset_rate))

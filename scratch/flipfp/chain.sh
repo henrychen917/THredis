@@ -1,8 +1,9 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # chain.sh -- t-flipfp proof chain. Resumable (every cell skips when its output file exists),
 # gate-pausing (quiet.done age + intruders before every cell). Re-run to resume.
 #   S0 digests            S1 slope cells PRE / POST / PRE-null (flip-auto 0) on 1T, 2T, 2s
-#   S1b slope 2s with --flip-auto 1 (anchored controller, band 0) PRE vs POST: the always-on cost
+#   S1b retired: the fixed-band controller cost experiment has no equivalent automatic-band arm.
 #   S2 accuracy: anchored band + false triggers, homogeneous MK and heterogeneous SET|GET, PRE vs POST
 #   S3 wrong-split boots 3:1 (4 thr) and 5:1 (6 thr): PRE-auto, POST-auto, flipguard, POST off
 #   S4 flipctl.py gate row (POST x2, PRE x1)   S5 batteries 1s + 2s   S6 differ   S7 gate quick
@@ -51,10 +52,7 @@ if want S1; then
     slope "prenull-$geom" "$PRE_BIN"  "$geom"
   done
 fi
-if want S1b; then
-  slope "pre1-2s"  "$PRE_BIN"  2s "--flip-auto 1 --flip-auto-band 0" 75
-  slope "post1-2s" "$POST_BIN" 2s "--flip-auto 1 --flip-auto-band 0" 75
-fi
+# S1b deliberately emits no measurements; its historical tables remain readable in S8.
 
 # ---- S2 accuracy: anchored band + false triggers on a stationary mix ---------------------------
 acc(){ # acc TAG BIN KIND(mk|hetero)
@@ -125,7 +123,7 @@ ctl(){ # ctl TAG BIN
   if [ -z "$tag" ] || [ "${out#*$tag}" = "$out" ]; then LG "HARNESS BUG: tag='$tag' out='$out'"; return 1; fi
   [ -s "$out" ] && { LG "CTL $tag on file :: $(grep -E '^ok:|AssertionError|anchored off-rail|Error' "$out" | head -1 | cut -c1-200)"; return 0; }
   wait_gate
-  local pid; pid=$(SRV_CPUS=$MY_MASK boot "$bin" "$PORT_CTL" "ctl-$tag" --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) || return 1
+  local pid; pid=$(SRV_CPUS=$MY_MASK boot "$bin" "$PORT_CTL" "ctl-$tag" --ratio 6:2 --atomic 0 --flip-auto 1) || return 1
   taskset -c "$MY_MASK" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_CTL" --stable-seconds 30 >"$out.part" 2>&1; local rc=$?
   echo "RC=$rc" >>"$out.part"; flipinfo "$PORT_CTL" >>"$out.part"; $CLI -p "$PORT_CTL" debug flipctl >>"$out.part" 2>&1
   mv "$out.part" "$out"; LG "CTL $tag rc=$rc :: $(grep -E '^ok:|AssertionError|anchored off-rail|Error' "$out" | head -1 | cut -c1-200)"

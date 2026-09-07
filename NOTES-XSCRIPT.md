@@ -1,5 +1,10 @@
 # Cross-shard script lane (`t-xscript`)
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 ## Status
 
 | | |

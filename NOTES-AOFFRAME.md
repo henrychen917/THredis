@@ -1,5 +1,10 @@
 # t-aofframe: the AOF writer produced a file its own loader refuses
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 **Verdict: the WRITER is wrong.** The loader's invariant is load-bearing, not over-strict. The fix
 is one guard at the writer's single control-frame choke point.
 

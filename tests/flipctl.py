@@ -3,7 +3,7 @@
 
 Boot separately on the requested lane:
   taskset -c 48-55 ./build/tomokv --port 7845 --save '' --flip-auto 1 \
-      --flip-auto-band 2 --enable-debug-command yes
+      --enable-debug-command yes
 
 The driver ramps to a low-load anchor, raises the issue rate on those same connections, and then
 changes the command mix. It deliberately uses no memtier and makes no performance claim; command
@@ -22,14 +22,10 @@ BOOT_JITTER_FACTORS = (0.8, 0.95, 1.1, 1.2, 1.05, 0.9)
 # stays inside the band it derives"), so the load has to be MEASURED, not assumed. Each attempt
 # spends PRE_HOLD_SECONDS proving the driver's own command rate is stationary by the controller's
 # own rule before the hold's assertion window opens; an attempt whose load leaves that band is
-# re-rolled, up to STABLE_HOLD_ATTEMPTS, and then the hold is SKIPPED with its numbers. A move
+# re-rolled, up to STABLE_HOLD_ATTEMPTS, and then the hold FAILS with its numbers. A move
 # while the load is provably stationary is a real move and still fails.
 STABLE_HOLD_ATTEMPTS = 3
 PRE_HOLD_SECONDS = 8
-# The controller's fallback band when INFO reports none (it always reports the live one while
-# anchored). Matches the gate's own --flip-auto-band 2: a zero band is not a licence to call any
-# load stationary.
-FALLBACK_RATE_BAND = 0.02
 
 
 def encode(*parts):
@@ -323,6 +319,9 @@ def main():
                             lambda row: row.get("flipctl_state") == "anchored", 90)
         if int(anchored["flipctl_boot_triggers"]) != 1:
             raise AssertionError("boot did not produce exactly one boot trigger: %r" % anchored)
+        sampled = info(control, "LB")
+        if int(sampled["lb_ex_queue_delay_samples"]) <= 0:
+            raise AssertionError("boot maneuver never armed queue-age sampling")
         anchor_split = (anchored["flipctl_anchor_io"], anchored["flipctl_anchor_ex"])
         if int(anchor_split[0]) <= 1 or int(anchor_split[1]) <= 1:
             raise AssertionError("ramping load produced a rail anchor: %r" % anchored)
@@ -342,8 +341,8 @@ def main():
         #     controller's own DEBUG dump and the per-second split/rate trace, so a real move is
         #     distinguishable from a driver artefact in the log.
         #   * load left the band                           -> RE-ROLL (up to STABLE_HOLD_ATTEMPTS,
-        #     inside a wall budget), then SKIP with the numbers. A row must not turn red for
-        #     something the driver did on a box that was busy elsewhere -- this row failed about
+        #     inside a wall budget), then FAIL with the numbers. A move can be judged only during
+        #     stationary load; this row failed about
         #     one full-gate run in five that way, always straight after the torture/ASAN phase,
         #     while passing 6 of 6 interleaved in a quiet window on the same binary.
         def stable_hold_attempt(seconds):
@@ -353,7 +352,9 @@ def main():
                 lambda row: row.get("flipctl_state") == "anchored", 60)
             base_triggers = int(anchored_row["flipctl_triggers"])
             base_split = (anchored_row["flipctl_anchor_io"], anchored_row["flipctl_anchor_ex"])
-            band = float(anchored_row.get("flipctl_rate_band", "0") or 0) or FALLBACK_RATE_BAND
+            band = float(anchored_row["flipctl_rate_band"])
+            if band < 0:
+                raise AssertionError("controller reported a negative derived rate band")
             rates = []
             trace = []
             hold_started = None
@@ -422,7 +423,7 @@ def main():
                         # The signature also counts PASS DEPTH -- how many frames an io thread
                         # happened to batch into one parse pass -- which is a property of how the
                         # box scheduled this load, not of the load. The driver cannot hold that
-                        # still and this row cannot adjudicate it: re-roll, and if it recurs, skip
+                        # still and this row cannot adjudicate it: re-roll, and if it recurs, fail
                         # with these numbers, which is exactly the report the controller lane
                         # needs. Every other trigger on a stationary load still fails below.
                         return ("reroll",
@@ -478,18 +479,11 @@ def main():
                 rerolls.append("wall budget for re-rolls exhausted")
                 break
         if held_row is None:
-            # Visible, reasoned, and NOT a failure: the row could not be judged because the load
-            # never held still, which is a statement about this box, not about the controller.
-            print("  %-52s SKIP no stationary load window in %d attempts; the hold asserts a "
-                  "property of the CONTROLLER and cannot be judged on a load the driver could not "
-                  "hold steady on this box.\n  %s" %
-                  ("controller holds through a stable load", len(rerolls),
-                   "\n  ".join(rerolls)), flush=True)
-            held_row = wait_for(control, "controller to re-anchor after the skipped hold",
-                                lambda row: row.get("flipctl_state") == "anchored", 90)
+            raise AssertionError("stable hold never opened and completed after bounded re-arms: " +
+                                 "\n".join(rerolls))
 
         # Every counter the surge phase compares against is re-read HERE rather than assumed to be
-        # at its boot value: a re-rolled or skipped hold may legitimately have spent a rate
+        # at its boot value: a re-rolled hold may legitimately have spent a rate
         # trigger on the driver's own wobble, and the surge phase's claim is about the DELTA the
         # surge produces, not about an absolute count.
         trigger_count = int(held_row["flipctl_triggers"])

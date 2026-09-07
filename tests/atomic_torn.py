@@ -10,9 +10,17 @@ import time
 import _lib
 
 
-HOST, PORT = sys.argv[1], int(sys.argv[2])
+# Build identity comes from the caller. Counter movement, exact values, and safety bounds are
+# mandatory on every build; only the time spent reaching them is a release-build assertion.
+ARGS = sys.argv[1:]
+RELEASE_BUILD = "--release-build" in ARGS
+ARGS = [arg for arg in ARGS if arg != "--release-build"]
+if len(ARGS) != 2:
+    raise SystemExit("usage: atomic_torn.py HOST PORT [--release-build]")
+HOST, PORT = ARGS[0], int(ARGS[1])
 FAIL = 0
 BARRIER_TIMEOUT = 10
+MECHANISM_TIMEOUT = 30.0  # liveness watchdog, never a successful/skip outcome on exhaustion
 
 
 def note(name, ok, extra=""):
@@ -24,6 +32,13 @@ def note(name, ok, extra=""):
 
 def skip(name, extra=""):
     print("  SKIP " + name + (" " + extra if extra else ""), flush=True)
+
+
+def release_note(name, ok, measured):
+    if RELEASE_BUILD:
+        note(name, ok, measured)
+    else:
+        skip(name, "requires --release-build; " + measured)
 
 
 def abort_barriers(*barriers):
@@ -669,6 +684,7 @@ note("OFF control exposes torn MSET-8",
 before = stats()
 required_stat(before, "atomic_predecessor_reads")
 required_stat(before, "atomic_commit_holds")
+required_stat(before, "atomic_promotions")
 debug("ATOMIC-COMMIT-DELAY", 2000)
 try:
     on_torn, on_reads, on_errors, _, _, on_threads_still_alive = hammer(
@@ -680,21 +696,32 @@ pred_delta = (required_stat(after, "atomic_predecessor_reads") -
               required_stat(before, "atomic_predecessor_reads"))
 hold_delta = (required_stat(after, "atomic_commit_holds") -
               required_stat(before, "atomic_commit_holds"))
-promo_delta = after.get("atomic_promotions", 0) - before.get("atomic_promotions", 0)
+promo_delta = required_stat(after, "atomic_promotions") - required_stat(before, "atomic_promotions")
 # V2 batches reclamation on owner passes and the 50ms low-frequency sweep instead of posting a
-# cleanup task for every retired group. Give that deliberately cold path one bounded tick to fire.
-deadline = time.time() + 1.5
-while promo_delta == 0 and time.time() < deadline:
+# cleanup task for every retired group. Poll completed work's cleanup with a watchdog; only the
+# original 1.5s completion budget is release-specific. This does not re-arm any race window.
+promotion_started = time.monotonic()
+deadline = promotion_started + MECHANISM_TIMEOUT
+while promo_delta == 0 and time.monotonic() < deadline and not on_errors and not on_torn:
     time.sleep(0.05)
     after = stats()
-    promo_delta = after.get("atomic_promotions", 0) - before.get("atomic_promotions", 0)
+    promo_delta = required_stat(after, "atomic_promotions") - required_stat(before, "atomic_promotions")
+promotion_elapsed = time.monotonic() - promotion_started
 note("ON MSET-8/MGET-8 torn-free",
      on_torn == 0 and on_reads > 0 and not on_errors and not on_threads_still_alive,
      "torn=%d reads=%d errors=%r threads_still_alive=%r" %
      (on_torn, on_reads, on_errors, on_threads_still_alive))
+# These are window-hit claims, NEVER release-only or skip-on-miss. Induce respectively by
+# removing safe-cut holds, bypassing predecessor lookup, or disabling promotion. Each still
+# fails on ASAN with a zero delta. Fresh-connection retry bounds for the first two need their own
+# measured hit rates; the RENAME control's 5/6 measurement cannot calibrate a different window.
 note("ON commit-delay window held a read cut", hold_delta > 0, "delta=%d" % hold_delta)
 note("ON exercised predecessor resolution", pred_delta > 0, "delta=%d" % pred_delta)
 note("ON exercised promotion", promo_delta > 0, "delta=%d" % promo_delta)
+release_note("ON promotion drains within release budget",
+             promo_delta > 0 and promotion_elapsed <= 1.5,
+             "promotion-drain=%.3fs holds=%d predecessors=%d promotions=%d" %
+             (promotion_elapsed, hold_delta, pred_delta, promo_delta))
 note("atomic_inflight returns to idle", after.get("atomic_inflight", -1) == 0,
      "value=%d" % after.get("atomic_inflight", -1))
 
@@ -865,104 +892,23 @@ else:
          copy_on[0] == 0 and not copy_on[1] and not copy_on[2],
          "anomalies=%d errors=%r threads_still_alive=%r" % copy_on)
 
-# Admission liveness: with a one-group window, the second frame in one received pipeline reaches
-# admission before owner notifications for the first are flushed. This makes the fired assertion
-# deterministic instead of depending on Python threads winning a scheduling race.
+# Separate admission liveness from live credit reconfiguration/accounting. Both use the
+# production bound and must actually enter their window; a clean miss is re-armed, never skipped.
+from atomicwindow import held_burst
 config("atomic", 1)
-config("atomic-window", 1)
-window_before = stats().get("atomic_window_stalls", 0)
-window_run = format(time.time_ns() & 0xfffffff, "x")
-window_errors = []
-window_client = Resp()
-window_frames = []
-for sequence in range(64):
-    args = ["MSET"]
-    for key_index in range(8):
-        args.extend(("aw%s:%x:%x" % (window_run, sequence, key_index),
-                     "window:%x" % sequence))
-    window_frames.append(frame(*args))
 try:
-    window_client.sock.sendall(b"".join(window_frames))
-    for _ in window_frames:
-        if window_client.read() != b"OK":
-            raise AssertionError("bad window reply")
+    witness = held_burst(HOST, PORT, whole_window=True)
+    note("derived atomic window stalls and resumes", True, witness)
 except Exception as exc:
-    window_errors.append(str(exc))
-finally:
-    window_client.close()
-window_after = stats().get("atomic_window_stalls", 0)
-note("atomic-window stalls and resumes",
-     not window_errors and window_after > window_before,
-     "stalls=%d errors=%r" % (window_after - window_before, window_errors))
-config("atomic-window", 256)
+    note("derived atomic window stalls and resumes", False, str(exc))
 
-# Credit leases must preserve the exact configured bound while CONFIG changes it under load. A
-# shrink may inherit more already-admitted groups than the new limit; wait for that unavoidable
-# debt to retire, then prove no subsequent sample exceeds the bound. Finally, an idle system must
-# have returned every leased credit to the pool so a skewed next IO can consume the whole window.
-lease_stop = threading.Event()
-lease_errors = []
-
-
-def lease_writer(wid):
-    client = None
-    keys = ["at:lease:%d:k%d" % (wid, key) for key in range(8)]
-    seq = 0
-    try:
-        client = Resp()
-        while not lease_stop.is_set():
-            if mset(client, keys, "lease:%d:%d" % (wid, seq)) != b"OK":
-                raise AssertionError("bad lease reply")
-            seq += 1
-    except Exception as exc:
-        lease_errors.append("writer%d:%s" % (wid, exc))
-    finally:
-        if client is not None:
-            client.close()
-
-
-lease_threads = [threading.Thread(target=lease_writer, args=(i,), daemon=True) for i in range(8)]
-for thread in lease_threads:
-    thread.start()
-for value in (31, 7, 19, 3):
-    if not config("atomic-window", value):
-        lease_errors.append("CONFIG atomic-window %d failed" % value)
-deadline = time.time() + 3
-bounded = False
-max_inflight = 0
-while time.time() < deadline:
-    sample = stats()
-    live = sample.get("atomic_inflight", 1000000)
-    debt = sample.get("atomic_credit_debt", 1000000)
-    if live <= 3 and debt == 0:
-        bounded = True
-        break
-    time.sleep(0.01)
-if bounded:
-    deadline = time.time() + 0.4
-    while time.time() < deadline:
-        live = stats().get("atomic_inflight", 1000000)
-        max_inflight = max(max_inflight, live)
-        if live > 3:
-            bounded = False
-            break
-lease_stop.set()
-for thread in lease_threads:
-    thread.join(timeout=10)
-deadline = time.time() + 3
-lease_after = stats()
-while lease_after.get("atomic_inflight", -1) != 0 and time.time() < deadline:
-    time.sleep(0.01)
-    lease_after = stats()
-note("atomic-window reconfiguration preserves bound and reclaims leases",
-     bounded and not any(thread.is_alive() for thread in lease_threads) and not lease_errors and
-     lease_after.get("atomic_inflight", -1) == 0 and
-     lease_after.get("atomic_credit_debt", -1) == 0 and
-     lease_after.get("atomic_credit_pool", -1) == 3,
-     "max=%d pool=%d debt=%d errors=%r" %
-     (max_inflight, lease_after.get("atomic_credit_pool", -1),
-      lease_after.get("atomic_credit_debt", -1), lease_errors))
-config("atomic-window", 256)
+# Resizing was removed with atomic-window. CONFIG SET atomic 1 still rebuilds credit generations;
+# require surviving old-generation groups before asserting the fixed bound and reclaimed leases.
+try:
+    witness = held_burst(HOST, PORT, whole_window=True, reconfigure=True)
+    note("atomic reconfiguration preserves derived bound and reclaims leases", True, witness)
+except Exception as exc:
+    note("atomic reconfiguration preserves derived bound and reclaims leases", False, str(exc))
 
 # Live CONFIG flips under active traffic are a liveness/safety arm. OFF intervals deliberately do
 # not promise atomicity; after ending ON, one final group must be read intact.

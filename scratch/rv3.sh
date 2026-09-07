@@ -1,6 +1,7 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # rv3.sh -- build + verify the fingerprint-band floor: STABLE HOLD (tests/flipctl.py, whose stable
-# phase is the row that was failing) x3 with the typed --flip-auto-band 2 the gate uses, the directed
+# phase is the row that was failing) x3 with the derived band, the directed
 # battery, and the two wrong-split boots + the stationary cell (must still move / must not move).
 source /home/user/Projects/wt-flipdamp/scratch/lib.sh; cd "$WT"
 LG(){ echo "$(date +%T) $*"; }
@@ -15,7 +16,7 @@ taskset -c 52-57,180-185 make unit >"$SP/fd-r6-unit.txt" 2>&1; LG "UNIT rc=$?"
 # STABLE HOLD x3 -- the failing row. Report band, distance and ratio whatever the verdict.
 for r in 1 2 3; do
   out=$SP/fd-r6-ctl-$r.txt; wait_gate
-  pid=$(boot8 "$FIX_BIN" "$PORT_BAT" "r6ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) || continue
+  pid=$(boot8 "$FIX_BIN" "$PORT_BAT" "r6ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1) || continue
   taskset -c "$LG8" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" --stable-seconds 30 >"$out" 2>&1; rc=$?
   echo "RC=$rc" >>"$out"; redis-cli -p "$PORT_BAT" debug flipctl >>"$out" 2>&1
   LG "CTL $r rc=$rc :: $(grep -E 'stable hold|anchored off-rail|^ok:|AssertionError' "$out" | head -2 | tr '\n' ' ' | cut -c1-200) :: $(grep -E '^signature_(band|distance|noise_bound)|^last_trigger' "$out" | tr '\n' ' ')"

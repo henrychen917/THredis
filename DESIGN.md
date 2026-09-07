@@ -1,6 +1,6 @@
 # Thread amortization study surface
 
-`thread-mode` and `overlap` are one boot-latched measurement surface. The documented mode
+`thread-mode` and the study-only `x-overlap` are one boot-latched measurement surface. The mode
 names are `2s` (separate IO and executor threads, the default) and `1s` (one generalized thread owns
 both roles). `split` and `fused` remain parser aliases so old invocations keep working.
 
@@ -9,11 +9,11 @@ both roles). `split` and `fused` remain parser aliases so old invocations keep w
 | `2s` | ordinary split IO/ex loops | exact `t-iopipe` WB/IFID batch schedule | rejected at config validation |
 | `1s` | coarse IFID → EX → WB rotation | exact `t-genthread` `iofused` schedule | gated `iofused` three-way schedule |
 
-The compatibility options `thread-pipeline` and `genthread-schedule` remain accepted: the former
-is a numeric alias for `overlap`, while the latter maps `coarse`, `iofused`, and the legacy
-`streams` name to `1s` plus overlap 0, 1, and 2 respectively. The legacy name is only a parser
-alias; overlap 2 no longer runs the streams implementation. Overlap 2 emits a boot warning because
-it is an experimental research schedule. Unified overlap 1 and 2 require `net-io uring`; the split
+Use `--x-overlap 0|1|2` for these study schedules and `--x-ex-sched 0|1` for the executor study.
+The old public schedule spellings and compatibility aliases are removed; see
+[DESIGN-KNOBS.md](DESIGN-KNOBS.md). Below, "overlap" names the internal schedule value.
+Overlap 2 emits a boot warning because it is an experimental research schedule.
+Unified overlap 1 and 2 require `net-io uring`; the split
 iopipe schedule retains its explicit epoll specialization. No schedule constant is runtime-tunable.
 
 Overlap 1 is deliberately the measured implementation, not a family resemblance. In `2s`, its

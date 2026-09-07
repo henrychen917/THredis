@@ -1,7 +1,7 @@
 // placement.h — per-thread role/cpu placement and the shard migration contract.
 //
-// A LOGICAL THREAD IS THE DEFAULT LOCALITY UNIT. With smt-mode=1, Linux's reported sibling pair is
-// the scheduling unit instead: both dense thread ids always have one role and FLIP moves them
+// A LOGICAL THREAD IS THE DEFAULT LOCALITY UNIT. When the allowed CPU set contains sibling pairs,
+// Linux's reported pair is the scheduling unit: both dense thread ids have one role and FLIP moves them
 // together. There is deliberately no node layer between a thread and its cpu/L3 facts.
 
 #pragma once
@@ -172,56 +172,12 @@ public:
         return true;
     }
 
-    // Shard ownership is a flat shard->EX tid table. A manual map must be complete because mixing
-    // an accidental omission with defaults would make a supposedly controlled placement measure a
-    // different layout. Runtime dispatch still reads Router's bucket owner exactly once.
-    bool assign_shard_homes(uint32_t nshards, const char* spec) {
-        shard_home_.assign(nshards, kNoThread);
-        if (!spec) {
-            for (uint32_t sid = 0; sid < nshards; sid++)
-                shard_home_[sid] = ex_[sid % ex_.size()];
-            return true;
-        }
-        if (!*spec) {
-            std::fprintf(stderr, "--shard-home must contain shard:thread pairs\n");
-            return false;
-        }
-
-        std::vector<bool> seen(nshards, false);
-        const char* p = spec;
-        while (*p) {
-            uint32_t sid = 0, tid = 0;
-            if (!parse_pair(p, sid, tid)) {
-                std::fprintf(stderr, "--shard-home: expected shard:thread pairs near '%s'\n", p);
-                return false;
-            }
-            if (sid >= nshards) {
-                std::fprintf(stderr, "--shard-home: shard %u is outside 0..%u\n", sid, nshards - 1);
-                return false;
-            }
-            if (tid >= threads_.size() || !is_executor(tid)) {
-                std::fprintf(stderr, "--shard-home: thread %u is not an ex thread\n", tid);
-                return false;
-            }
-            if (seen[sid]) {
-                std::fprintf(stderr, "--shard-home: shard %u is assigned more than once\n", sid);
-                return false;
-            }
-            seen[sid] = true;
-            shard_home_[sid] = tid;
-            if (*p == '\0') break;
-            p++;
-            if (!*p) {
-                std::fprintf(stderr, "--shard-home: trailing comma\n");
-                return false;
-            }
-        }
-        for (uint32_t sid = 0; sid < nshards; sid++) {
-            if (!seen[sid]) {
-                std::fprintf(stderr, "--shard-home: shard %u has no owner (manual maps must be complete)\n", sid);
-                return false;
-            }
-        }
+    // Boot ownership is always round-robin over the resolved executor set.
+    bool assign_shard_homes(uint32_t nshards) {
+        if (ex_.empty()) return false;
+        shard_home_.resize(nshards);
+        for (uint32_t sid = 0; sid < nshards; sid++)
+            shard_home_[sid] = ex_[sid % ex_.size()];
         return true;
     }
 
@@ -247,7 +203,7 @@ public:
             const int cpu = threads_[tid].cpu;
             if (cpu < 0 || cpu >= CPU_SETSIZE || cpu_to_tid[cpu] != kNoThread) {
                 std::fprintf(stderr,
-                             "--smt-mode: cpu %d is not a unique provisioned logical cpu\n", cpu);
+                             "SMT placement: cpu %d is not a unique provisioned logical cpu\n", cpu);
                 return false;
             }
             cpu_to_tid[cpu] = tid;
@@ -258,7 +214,7 @@ public:
             if (siblings.size() != 2 ||
                 std::find(siblings.begin(), siblings.end(), cpu) == siblings.end()) {
                 std::fprintf(stderr,
-                             "--smt-mode: cpu %d does not have one sysfs sibling\n", cpu);
+                             "SMT placement: cpu %d does not have one sysfs sibling\n", cpu);
                 return false;
             }
             const int peer_cpu = siblings[0] == cpu ? siblings[1] : siblings[0];
@@ -266,7 +222,7 @@ public:
                 ? cpu_to_tid[peer_cpu] : kNoThread;
             if (peer == kNoThread) {
                 std::fprintf(stderr,
-                             "--smt-mode: cpu %d requires sibling cpu %d in the placement\n",
+                             "SMT placement: cpu %d requires sibling cpu %d in the placement\n",
                              cpu, peer_cpu);
                 return false;
             }
@@ -274,13 +230,13 @@ public:
             if (reverse.size() != 2 ||
                 std::find(reverse.begin(), reverse.end(), cpu) == reverse.end()) {
                 std::fprintf(stderr,
-                             "--smt-mode: cpu %d and cpu %d are not a reciprocal sysfs pair\n",
+                             "SMT placement: cpu %d and cpu %d are not a reciprocal sysfs pair\n",
                              cpu, peer_cpu);
                 return false;
             }
             if (threads_[peer].role != threads_[tid].role) {
                 std::fprintf(stderr,
-                             "--smt-mode: sibling cpus %d and %d have different roles\n",
+                             "SMT placement: sibling cpus %d and %d have different roles\n",
                              cpu, peer_cpu);
                 return false;
             }
@@ -330,7 +286,7 @@ private:
     bool build_even_smt(const Topology& topo, uint32_t n_ifid, uint32_t n_ex) {
         if ((n_ifid & 1u) || (n_ex & 1u)) {
             std::fprintf(stderr,
-                         "--ratio: --smt-mode requires even logical io and ex counts\n");
+                         "--ratio: SMT placement requires even logical io and ex counts\n");
             return false;
         }
         const uint32_t nd = topo.ndomains() ? topo.ndomains() : 1;
@@ -344,7 +300,7 @@ private:
                 if (siblings.size() != 2 ||
                     std::find(siblings.begin(), siblings.end(), cpu) == siblings.end()) {
                     std::fprintf(stderr,
-                                 "--smt-mode: cpu %d does not have one sysfs sibling\n", cpu);
+                                 "SMT placement: cpu %d does not have one sysfs sibling\n", cpu);
                     return false;
                 }
                 const int peer = siblings[0] == cpu ? siblings[1] : siblings[0];
@@ -352,7 +308,7 @@ private:
                 if (peer_domain == kNoDomain) continue; // incomplete affinity unit is unavailable
                 if (peer_domain != d) {
                     std::fprintf(stderr,
-                                 "--smt-mode: sibling cpus %d and %d span L3 domains\n",
+                                 "SMT placement: sibling cpus %d and %d span L3 domains\n",
                                  cpu, peer);
                     return false;
                 }
@@ -360,12 +316,12 @@ private:
                 if (reverse.size() != 2 ||
                     std::find(reverse.begin(), reverse.end(), cpu) == reverse.end()) {
                     std::fprintf(stderr,
-                                 "--smt-mode: cpu %d and cpu %d are not a reciprocal sysfs pair\n",
+                                 "SMT placement: cpu %d and cpu %d are not a reciprocal sysfs pair\n",
                                  cpu, peer);
                     return false;
                 }
                 if (used[peer]) {
-                    std::fprintf(stderr, "--smt-mode: cpu %d belongs to two sibling units\n", peer);
+                    std::fprintf(stderr, "SMT placement: cpu %d belongs to two sibling units\n", peer);
                     return false;
                 }
                 used[cpu] = used[peer] = true;

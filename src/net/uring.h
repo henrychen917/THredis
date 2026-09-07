@@ -176,7 +176,7 @@ public:
     // every caller would otherwise have to invent the same retry and one of them would get it
     // wrong. In epoll mode there is no submission queue and this returns nullptr -- every caller
     // already handles that (it is the sqe-starved path), and no caller reaches it: network
-    // submission is engine-selected in IoLoop, and persistence is forced to --persist-io normal.
+    // submission is engine-selected in IoLoop, and persistence derives the syscall engine.
     io_uring_sqe* sqe() {
         if (__builtin_expect(wake_fd_ >= 0, false)) return nullptr;
         io_uring_sqe* s = io_uring_get_sqe(&r_);

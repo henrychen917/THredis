@@ -150,10 +150,10 @@ else:
     ok("io busy advanced under load", roll_b["io"]["busy_ns"] > roll_a["io"]["busy_ns"])
     ok("ex busy advanced under load", roll_b["ex"]["busy_ns"] > roll_a["ex"]["busy_ns"])
     ok("ex depth sampled", roll_b["ex"]["avg_depth"] >= 0.0)
-    ok("sampled queue delay fired",
-       roll_b["ex"]["queue_delay_samples"] > roll_a["ex"]["queue_delay_samples"])
+    ok("idle controller allocates no age-sampling work",
+       roll_b["ex"]["queue_delay_samples"] == roll_a["ex"]["queue_delay_samples"] == 0)
     ok("sampled queue delay EWMA valid", roll_b["ex"]["queue_delay_ewma_us"] >= 0.0)
-    ok("sampled oldest-entry age fired", roll_b["ex"]["oldest_age_max_us"] > 0)
+    ok("idle controller leaves age observations off", roll_b["ex"]["oldest_age_max_us"] == 0)
     ok("sampled age exports stay bounded",
        all(0 <= roll_b[role][field] <= SANE_AGE_US for role in ("io", "ex")
            for field in ROLLUP_AGE_FIELDS))

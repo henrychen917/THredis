@@ -1,5 +1,10 @@
 # AUDIT-CLEANUP — night lane t-night-cleanup (2026-09-03)
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Base: mainline `775aeea48`. Scope: stability + code cleanliness, implementation level only, ZERO
 performance risk. No server was booted, no memtier/perf ran; the only binaries executed were the
 pinned release build (`taskset -c 48-55,176-183 make -j8`) and the server-less unit binaries

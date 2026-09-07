@@ -871,7 +871,7 @@ void AofManager::init(Server& server, const Config& config, uint32_t nthreads, u
                       uint32_t writer_tid, const AofReplayPlan* replay) {
     server_ = &server;
     configured_ = config.appendonly;
-    engine_ = config.persist_io;
+    engine_ = persistence_engine(config);
     fsync_policy_.store(config.appendfsync, std::memory_order_relaxed);
     auto_rewrite_percentage_.store(config.auto_aof_rewrite_percentage,
                                    std::memory_order_relaxed);

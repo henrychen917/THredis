@@ -7,6 +7,7 @@
 // only break exact ties. This is deterministic, allocation-only code and never runs on a request
 // path.
 #pragma once
+#include <atomic>
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +15,84 @@
 #include <vector>
 
 namespace tomo {
+
+// Internal LB policy, allocated only by --lb 1. One decision spans the three sustained
+// controller ticks; sampling targets a fixed number of key visits over that whole window.
+// Executors latch the rate on their existing census beat and weight each sample by that rate,
+// so a rate change or owner migration cannot reinterpret counters collected at another rate.
+struct LbAutotune {
+    static constexpr uint32_t kTickMs = 1000;
+    static constexpr uint32_t kDecisionTicks = 3;
+    static constexpr uint32_t kWindowMs = kTickMs * kDecisionTicks;
+    static constexpr uint32_t kSamplesPerDecision = 4096;
+    static constexpr uint64_t kMoveTimeoutNs = 5ull * 1000 * 1000 * 1000;
+
+    std::atomic<uint32_t> sample_rate{1}; // bootstrap until the first completed traffic window
+    uint64_t last_fold_ns = 0;           // protected by Server::lb_signal_mu_
+
+    static uint32_t sample_every(double visits, double elapsed_ms, uint32_t window_ms) {
+        if (!(elapsed_ms > 0)) return 1;
+        const double rate = std::ceil(visits * window_ms / elapsed_ms / kSamplesPerDecision);
+        return static_cast<uint32_t>(std::clamp(rate, 1.0, double(UINT32_MAX)));
+    }
+
+    void observe_visits(uint64_t visits, uint64_t now) {
+        if (last_fold_ns && now > last_fold_ns) {
+            sample_rate.store(sample_every(visits, double(now - last_fold_ns) / 1000000.0,
+                                           kWindowMs),
+                              std::memory_order_relaxed);
+        }
+        last_fold_ns = now;
+    }
+
+    struct QuietJitter {
+        double previous = 0;
+        double jitter = 0;
+        uint32_t windows = 0;
+
+        bool observe(double value) {
+            const double delta = std::abs(value - previous);
+            // Learn adjacent-window jitter before making a decision. Once learned, excursions
+            // cannot widen their own admission band: only quiet, in-band changes update it.
+            if (windows && (windows <= kDecisionTicks || delta <= 2 * jitter))
+                jitter = windows == 1 ? delta : 0.25 * delta + 0.75 * jitter;
+            previous = value;
+            windows = std::min(windows + 1, kDecisionTicks + 1);
+            return windows > kDecisionTicks;
+        }
+        double band() const { return 2 * jitter; }
+    };
+    QuietJitter key_jitter, client_jitter; // controller writer only
+
+    // Completion records include drain and install, not just the pointer exchange. These two
+    // atomics are cold: one writer per completed movement, never an operation-path timestamp.
+    std::atomic<uint64_t> transfer_ns{0};
+    std::atomic<uint64_t> transfers{0};
+    void note_transfer(uint64_t elapsed_ns, uint32_t count) {
+        if (!count) return;
+        transfer_ns.fetch_add(std::max<uint64_t>(elapsed_ns, 1), std::memory_order_relaxed);
+        transfers.fetch_add(count, std::memory_order_release);
+    }
+    uint64_t move_cost_ns() const {
+        const uint64_t count = transfers.load(std::memory_order_acquire);
+        return count ? std::max<uint64_t>(1, transfer_ns.load(std::memory_order_relaxed) / count)
+                     : 0;
+    }
+    uint32_t move_cap(uint32_t candidates) const {
+        const uint64_t cost = move_cost_ns();
+        // Bootstrap with one move. Thereafter admit at most one decision tick's share of the
+        // measured transfer capacity, amortized across the sustained decision window.
+        const uint64_t cap = cost ? (uint64_t{kTickMs} * 1000000 / cost) / kDecisionTicks : 1;
+        return static_cast<uint32_t>(std::min<uint64_t>(candidates, std::max<uint64_t>(1, cap)));
+    }
+    uint64_t cooldown_ms() const {
+        // Round up to the observation cadence; zero measured cost never disables movement.
+        const uint64_t cost = move_cost_ns();
+        const uint64_t ticks = (cost * kDecisionTicks + uint64_t{kTickMs} * 1000000 - 1) /
+                               (uint64_t{kTickMs} * 1000000);
+        return std::max<uint64_t>(1, ticks) * kTickMs;
+    }
+};
 
 struct WeightedLbItem {
     uint64_t id = 0;

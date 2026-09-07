@@ -339,10 +339,10 @@ public:
             return false;
         }
     }
-    void note_lb_sample(uint64_t hash) {
+    void note_lb_sample(uint64_t hash, uint32_t rate) {
         const uint32_t bucket = bucket_of(hash);
         if (!lb_bucket_samples_ || !owns(bucket)) return;
-        lb_bucket_samples_[bucket - bucket_begin_]++;
+        lb_bucket_samples_[bucket - bucket_begin_] += rate;
     }
     uint32_t lb_bucket_samples(uint32_t bucket) const {
         if (!lb_bucket_samples_ || !owns(bucket)) return 0;
@@ -503,7 +503,7 @@ private:
     Op* notify_source_ = nullptr;
     bool* notify_pending_ = nullptr;
     std::unique_ptr<NotifyShardState> notify_state_;
-    // Allocated only when lb-sample-rate is nonzero. Appended in the cold tail so the hot shard
+    // Allocated only when lb is enabled. Appended in the cold tail so the hot shard
     // header and FlatStore offsets remain unchanged when weighted placement is compiled in.
     std::unique_ptr<uint32_t[]> lb_bucket_samples_;
     std::unique_ptr<uint64_t[]> lb_bucket_bytes_;

@@ -40,10 +40,8 @@ public:
     // Discovers L3 domains for the CPUs this process is ALLOWED to run on. Respecting the affinity
     // mask matters: under taskset the machine's full topology is not what we get, and assuming
     // otherwise is how threads end up "placed" onto cpus they can never run on.
-    // OPERATOR-DECLARED TOPOLOGY (--l3-domains). "0-7,8-15" builds two declared domains and
-    // bypasses discovery, so deliberate off-hardware shapes can still build
-    // shapes discovery would never produce. The declaration is intersected with the affinity mask:
-    // a cpu the process cannot run on is a config error worth failing loudly, not silently pinning.
+    // TOMOKV_L3_DOMAINS overrides broken sysfs: comma-separated domains, '+' joins CPU ranges.
+    // Every declared CPU must belong to the allowed affinity mask.
     bool declare(const char* spec) {
         cpu_set_t allowed;
         CPU_ZERO(&allowed);
@@ -51,6 +49,7 @@ public:
         domain_of_.assign(CPU_SETSIZE, kNoDomain);
         domains_.clear();
 
+        if (!spec || !*spec) return false;
         const char* p = spec;
         while (*p) {
             std::vector<int> cpus;
@@ -60,8 +59,11 @@ public:
                 if (end == p) return false;
                 long b = a;
                 if (*end == '-') { p = end + 1; b = std::strtol(p, &end, 10); if (end == p) return false; }
+                if (a < 0 || b < a || b >= CPU_SETSIZE ||
+                    (*end && *end != '+' && *end != ',')) return false;
                 for (long c = a; c <= b; c++) {
-                    if (c < 0 || c >= CPU_SETSIZE) return false;
+                    if (domain_of_[c] != kNoDomain ||
+                        std::find(cpus.begin(), cpus.end(), c) != cpus.end()) return false;
                     if (!CPU_ISSET(c, &allowed)) {
                         std::fprintf(stderr, "topology: declared cpu %ld is outside the affinity mask\n", c);
                         return false;
@@ -69,14 +71,21 @@ public:
                     cpus.push_back(static_cast<int>(c));
                 }
                 p = end;
-                if (*p == '+') p++;                      // "0-3+8-11" glues ranges into one node
+                if (*p == '+') {
+                    p++;
+                    if (!*p || *p == ',') return false;
+                }
             }
-            if (!cpus.empty()) {
+            if (cpus.empty()) return false;
+            {
                 const uint32_t id = static_cast<uint32_t>(domains_.size());
                 for (int c : cpus) domain_of_[c] = id;
                 domains_.push_back(std::move(cpus));
             }
-            if (*p == ',') p++;
+            if (*p == ',') {
+                p++;
+                if (!*p || *p == ',') return false;
+            }
         }
         return !domains_.empty();
     }
@@ -106,7 +115,7 @@ public:
     // Read Linux's authoritative SMT relationship for every CPU in the selected topology. Keep
     // the full sysfs list (rather than deriving an offset or intersecting it with affinity): the
     // placement validator must be able to distinguish a complete pair from a taskset which made
-    // only one sibling available. This is boot-only and is called only when smt-mode is enabled.
+    // only one sibling available. This is boot-only and is always read before deriving SMT placement.
     bool discover_thread_siblings() {
         thread_siblings_.assign(CPU_SETSIZE, {});
         for (const std::vector<int>& domain : domains_) {
@@ -117,6 +126,19 @@ public:
             }
         }
         return true;
+    }
+
+    uint32_t allowed_sibling_pairs() const {
+        uint32_t pairs = 0;
+        for (const auto& domain : domains_) {
+            for (int cpu : domain) {
+                const auto& siblings = thread_siblings(cpu);
+                if (siblings.size() != 2) continue;
+                const int peer = siblings[0] == cpu ? siblings[1] : siblings[0];
+                if (cpu < peer && domain_of(peer) != kNoDomain) pairs++;
+            }
+        }
+        return pairs;
     }
 
     uint32_t ndomains() const { return static_cast<uint32_t>(domains_.size()); }
@@ -198,7 +220,7 @@ private:
     }
 
     // Sysfs topology parsing intentionally does not intersect the process affinity mask. A
-    // sibling outside that mask is still the sibling, and smt-mode must reject the incomplete unit.
+    // sibling outside that mask is still the sibling, and pair placement must reject an incomplete unit.
     static void parse_cpu_list(const char* s, std::vector<int>& out) {
         while (*s) {
             while (*s == ',' || *s == ' ' || *s == '\n') s++;

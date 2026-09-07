@@ -59,7 +59,7 @@ HOT_SHARE = 4                                    # 3 of every 4 ops land in the 
 
 
 # THE LOAD BALANCER MUST HAVE SOMETHING TO BALANCE. A uniform key distribution over one small key
-# space keeps every shard at the same op rate, the imbalance never crosses lb-imbalance-pct, and no
+# space keeps every shard at the same op rate, the imbalance never crosses the learned band, and no
 # shard ever changes owner -- which is the precondition for the defect this battery exists for
 # (measured: 7.8M ops, 0 migrations). A hot window that ROTATES makes a few shards hot, then makes
 # different ones hot, so the balancer moves shards continuously and in both directions, which is
@@ -226,18 +226,11 @@ def main():
                   "read_local_hits delta %d" % (after_hits - before_hits))
         rep.check("block cache held blocks (non-vacuity)", peak_cache > 0,
                   "peak mem_block_cache %d bytes" % peak_cache)
-        # THE PRECONDITION, NOT A SIDE OBSERVATION. The defect lives at the shard-ownership edge,
-        # so a run in which the balancer moved nothing proves nothing about it. The LB thresholds
-        # are BOOT-ONLY, so this battery cannot arm them itself: the caller must boot with values
-        # that actually move shards. The default band (one tick per second, 25% imbalance, one
-        # move per 5 s) moves nothing under this load -- measured 0 moves in the gate's 16-thread
-        # geometry -- which is why the gate row names them explicitly.
+        # Ownership movement is the required precondition, including with automatic LB policy.
         after_moves = _lib.info_int(ctl, "all", "tomokv_keylb_bucket_moves")
         rep.check("load balancer moved shards (non-vacuity)", after_moves > before_moves,
-                  "tomokv_keylb_bucket_moves delta %d -- boot with MORE SHARDS THAN THREADS (a "
-                  "thread owning exactly one shard has nothing the balancer can move) and "
-                  "--lb-tick-ms 100. Do NOT add --lb-cooldown-ms 0: measured, it moves ZERO "
-                  "shards, not more" % (after_moves - before_moves))
+                  "tomokv_keylb_bucket_moves delta %d -- the automatic balancer must move "
+                  "shards; retain more shards than workers" % (after_moves - before_moves))
     print("  churn: ops=%d workers=%d flushes=%d peak_block_cache=%d"
           % (ops, workers, flushes, peak_cache))
     return rep.finish()

@@ -179,26 +179,18 @@ int main(int argc, char** argv) {
     if (validate_config(cfg) != kConfigParsed) return 1;
     if (cfg.overlap == 2)
         std::fprintf(stderr,
-                     "WARNING: --overlap 2 selects an experimental research schedule\n");
+                     "WARNING: --x-overlap 2 selects an experimental research schedule\n");
     if (cfg.read_local &&
         (cfg.thread_mode != ThreadMode::Fused || cfg.overlap != 0))
         std::fprintf(stderr,
-                     "NOTICE: --read-local 1 requires --thread-mode 1s --overlap 0 "
+                     "NOTICE: --read-local 1 requires --thread-mode 1s --x-overlap 0 "
                      "in this version; using the ordinary owner-task path\n");
     // THE ENGINE IS LATCHED HERE, once, before anything that reads it exists. Every Ring in the
     // process must agree (a uring ring cannot receive an eventfd doorbell and vice versa), and no
     // thread has been spawned yet, so this store needs no synchronisation.
     if (cfg.net_io == NetIoEngine::Epoll) {
         g_ring_epoll_mode = true;
-        // --persist-io uring submits its writes and fsyncs as SQEs on the writer io thread's ring,
-        // and under this engine that ring does not exist. Rather than half-support it, the network
-        // choice implies the persistence one: same kernel interface, one decision. Announced, not
-        // silent -- a run whose durability path changed under it must say so.
-        if (cfg.persist_io != PersistIoEngine::Normal) {
-            cfg.persist_io = PersistIoEngine::Normal;
-            std::fprintf(stderr, "--net-io epoll: persist-io forced to normal "
-                                 "(the uring persistence engine needs a ring)\n");
-        }
+        std::fprintf(stderr, "--net-io epoll: using syscall persistence (no io_uring ring)\n");
     }
     std::unique_ptr<TlsContext> tls_context;
     if (cfg.tls_port) {
@@ -216,6 +208,12 @@ int main(int argc, char** argv) {
     if (!command_registry_init(cfg.tls_port != 0, cfg.thread_mode == ThreadMode::Fused,
                                Server::read_local_enabled(cfg))) {
         std::fprintf(stderr, "command registry init failed\n");
+        return 1;
+    }
+
+    Server srv;
+    if (!srv.prepare_boot(cfg)) {
+        std::fprintf(stderr, "placement/geometry resolution failed\n");
         return 1;
     }
 
@@ -271,7 +269,6 @@ int main(int argc, char** argv) {
                      "this virtual-address layout is unsupported\n");
         return 1;
     }
-    Server srv;
     const AofReplayPlan* active_aof_plan = aof_plans.empty() ? nullptr : aof_plans.back().get();
     try {
         if (!srv.init(cfg, active_aof_plan)) {

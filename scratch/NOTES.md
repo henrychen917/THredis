@@ -1,5 +1,10 @@
 # t-flipdamp lane notes (THIS FILE IS MY MEMORY -- keep current)
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](../DESIGN-KNOBS.md) and [MERGE.md](../MERGE.md).
+
 ## Assignment (owner, 2026-09-05 relaunch after 19:20 usage-limit kill)
 Defect: `--flip-auto 1` (2s) lost 19.5% on multi-key 18:14 (MSET8+MGET8 1:1 p32, 512 conns) with
 3 flips, 993 clients moved, target 18:14 unchanged. Do: (1) A/B matrix 3 regimes + pure-GET null,

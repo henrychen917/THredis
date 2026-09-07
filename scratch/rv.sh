@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # rv.sh -- re-verification of the long-window-noise fix on the FINAL binary: gate row x2, directed
 # cost-gate x1, and the three 120 s cells that exposed the defects (red-22 stationary: no spurious
 # re-maneuver; red-31 / red8-71: one bounded move). Tags r3-*. Gate-pausing.
@@ -11,7 +12,7 @@ boot8(){ local SRV_CPUS=$SRV8; boot "$@"; }
 LG "BIN $(sha256sum "$FIX_BIN" | cut -c1-16)"
 for r in 1 2; do
   out=$SP/fd-r3-ctl-$r.txt; wait_gate
-  pid=$(boot8 "$FIX_BIN" "$PORT_BAT" "r3ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) || continue
+  pid=$(boot8 "$FIX_BIN" "$PORT_BAT" "r3ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1) || continue
   taskset -c "$LG8" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" --stable-seconds 30 >"$out" 2>&1; rc=$?
   echo "RC=$rc" >>"$out"; redis-cli -p "$PORT_BAT" debug flipctl >>"$out" 2>&1
   LG "CTL $r rc=$rc :: $(grep -E 'anchored off-rail|^ok:|AssertionError' "$out" | head -2 | tr '\n' ' ' | cut -c1-260)"

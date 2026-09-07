@@ -1,5 +1,10 @@
 # Persistence IO engines
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 `persist-io normal|uring` is one boot-only choice for both the AOF writer and the snapshot writer.
 The default is `uring`. The option is accepted on the command line and in a configuration file,
 `CONFIG GET persist-io` reports the latched value, and `CONFIG SET persist-io ...` rejects the

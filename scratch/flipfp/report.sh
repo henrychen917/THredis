@@ -20,7 +20,7 @@ for geom in 1t 2t 2s; do
 done
 if [ -s table-on-2s.md ]; then
   for shape in set_over get_hit; do
-    echo; echo "### flip-auto 1 (anchored, band 0) 2s $shape: PRE vs POST"; echo
+    echo; echo "### Historical retired fixed-band experiment: flip-auto 1 (anchored, band 0) 2s $shape: PRE vs POST"; echo
     echo "| metric | PRE | POST | delta | delta % |"; echo "|---|---:|---:|---:|---:|"
     pick table-on-2s.md "$shape"
   done
@@ -30,7 +30,7 @@ echo; echo "### accuracy (2:2, auto band, stationary load: triggers after boot =
 for f in acc-pre-mk.txt acc-post-mk.txt acc-pre-hetero.txt acc-post-hetero.txt; do [ -s "$f" ] && echo "- $(head -1 "$f")"; done
 echo; echo "### wrong-split boots (MK8 1:1, atomic 1, 120 s)"; echo
 for f in tm-pre-31.txt tm-post-31.txt tm-off-31.txt tm-pre6-51.txt tm-post6-51.txt; do [ -s "$f" ] && { echo "- $(head -1 "$f")"; echo "  $(sed -n 2p "$f")"; }; done
-echo; echo "### gate row tests/flipctl.py (6:2, band 2, age 1024, --stable-seconds 30)"; echo
+echo; echo "### tests/flipctl.py (6:2, --stable-seconds 30; band and sampling from each recorded boot)"; echo
 pass=0; runs=0
 for f in ctl-post-1.txt ctl-post-2.txt ctl-post-3.txt ctl-pre-1.txt ctl-pre-2.txt ctl-pre-3.txt; do
   [ -s "$f" ] || continue

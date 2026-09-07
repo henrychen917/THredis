@@ -184,11 +184,11 @@ int main() {
 
     // THE TYPED BAND IS A FLOOR, NOT A CEILING. The gate-hygiene lane's instrumented failure: a
     // driver holding its rate to 0.07% across 34 samples, a fingerprint distance of 0.2518 against
-    // a flat --flip-auto-band 2 (0.0200) -- 12.6x its band -- fired a maneuver on a stationary load.
+    // a flat explicit band of 2% (0.0200) -- 12.6x its band -- fired a maneuver on a stationary load.
     // A detector whose signature genuinely moves between adjacent quiet windows must end up with a
     // band above that movement whatever the operator typed, and must still fire on a real change.
     {
-        FlipShiftDetector typed(2, 4);   // --flip-auto-band 2
+        FlipShiftDetector typed(2, 4);   // internal explicit-band control: 2%
         // Stationary but NOISY: the read/write split alternates 35:65 / 65:35 window to window.
         // The detector smooths the signature, so the anchored distance this produces is ~0.09.
         const auto noisy = [](int k) { return quiet(k % 2 ? 65 : 35, k % 2 ? 35 : 65); };
@@ -250,8 +250,8 @@ int main() {
         if (fires) fail("the learned band fired on quiet-state movement");
     }
     // A TYPED BAND UNDER THE REAL SAMPLER. The shipped configuration cannot reach this -- the
-    // controller runs the learned band -- but an operator who sets --flip-auto-band AND the sampler
-    // can, and on a tree where the typed path bypasses the floor the fingerprint lane measured 73
+    // controller runs the learned band. This internal explicit-band control preserves the earlier
+    // regression: where the typed path bypassed the floor the fingerprint lane measured 73
     // two-consecutive exceedances in 600 stationary windows at K=100 and 208 at K=60: a spurious
     // maneuver every few seconds on a load that never changed. Driven here through THEIR writer, a
     // stationary 50/50 stream at depth 32, with the floor in place: none, and a real mix change
@@ -259,7 +259,7 @@ int main() {
     {
         for (uint32_t window : {60u, 100u}) {
             XorShift rng;
-            FlipShiftDetector typed(2, 8);   // --flip-auto-band 2, the operator's knob
+            FlipShiftDetector typed(2, 8);   // internal explicit-band control: 2%
             int fires = 0, confirmed = 0, streak = 0;
             for (int w = 0; w < 60; w++) {
                 FlipFingerprintWriter writer;

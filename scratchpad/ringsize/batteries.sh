@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # One boot per battery on port 8300, cores 58-61,186-189 (the half of this lane's allocation no other
 # lane's process can reach -- a
 # correctness battery is not a timing measurement, so the server may use every core it owns).
@@ -66,7 +67,7 @@ if [ "$MODE" = 1s ]; then
     boot "${ARM[@]}" || exit 1; run "$t"; halt
   done
   boot "${ARM[@]}" || exit 1; run session_monotonic CONFIG SET atomic 1; halt
-  boot --thread-mode fused --atomic 1 --read-local 1 --read-local-atomic-filter 1 \
+  boot --thread-mode fused --atomic 1 --read-local 1 \
        --enable-debug-command yes || exit 1
   run bplus; halt
 else

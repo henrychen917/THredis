@@ -1,5 +1,10 @@
 # NOTES-SERVERTAIL — the server/introspection tail
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Lane H. Everything below shipped on branch `t-servertail`, built from mainline `d177ea9cf`.
 
 Semantics came from the documented RESP protocol plus byte-probing a vanilla redis 7.4 binary at

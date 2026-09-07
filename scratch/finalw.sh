@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # finalw.sh -- RESUMABLE continuation of final.sh: runs only what is missing, pauses (never exits)
 # while the box marker is held, then builds the report. Safe to run after final.sh ended any way.
 source /home/user/Projects/wt-flipdamp/scratch/lib.sh
@@ -35,7 +36,7 @@ if [ ! -s "$SP/fd-bat-flipttl.txt" ]; then
 else echo "batteries flip/flip_under_load/flip_ttl: on file"; fi
 if [ ! -s "$SP/fd-bat-flipctl.txt" ]; then
   wait_gate
-  PID=$(boot "$FIX_BIN" "$PORT_BAT" batctl --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) && {
+  PID=$(boot "$FIX_BIN" "$PORT_BAT" batctl --ratio 6:2 --atomic 0 --flip-auto 1) && {
     taskset -c "$LG_CPUS" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" --stable-seconds 30 >"$SP/fd-bat-flipctl.txt" 2>&1; echo "flipctl.py rc=$? :: $(grep -vE '^\s*$' "$SP/fd-bat-flipctl.txt" | tail -2 | tr '\n' ' ' | cut -c1-300)"
     redis-cli -p "$PORT_BAT" debug flipctl >"$SP/fd-bat-flipctl-dbg.txt" 2>&1; stop "$PID" "$PORT_BAT"; }
 else echo "flipctl.py: on file :: $(grep -vE '^\s*$' "$SP/fd-bat-flipctl.txt" | tail -1 | cut -c1-200)"; fi

@@ -1,5 +1,10 @@
 # Read-local coherence follow-ups (`w-rlideas`)
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Base: `b5b4d397d`.  This lane keeps single-owner stores, immutable replacement, QSBR lifetime,
 unobstructed readers, and the existing retry-once local-MGET bound.  It adds no runtime knob and
 does not change the owner/scatter fallback, which remains the semantic authority.

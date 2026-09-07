@@ -283,7 +283,7 @@ std::string client_info_line_impl(const Client& client, const ClientMeta& meta, 
 enum class ConfigKind : uint8_t {
     String, Bool, Unsigned, Bytes, Enum, Policy, ClientOutputBufferLimit, NotifyFlags, Save,
     // slowlog-log-slower-than is the tree's first genuinely signed knob: redis's grammar accepts
-    // and reports -1, so the unsigned sentinel that --atomic-window uses would not round-trip.
+    // and reports -1, so an unsigned representation would not round-trip.
     Signed
 };
 struct ConfigValue {
@@ -312,50 +312,21 @@ void init_config(const Config& cfg) {
     const char* appendfsync = cfg.appendfsync == AppendFsyncPolicy::Always ? "always" :
                               cfg.appendfsync == AppendFsyncPolicy::No ? "no" : "everysec";
     g_config.push_back({"appendfsync", ConfigKind::Enum, appendfsync});
-    g_config.push_back({"persist-io", ConfigKind::Enum,
-                        cfg.persist_io == PersistIoEngine::Normal ? "normal" : "uring", true});
-    // Boot-only, like persist-io: reported so an operator can confirm which engine a running
+    // Boot-only: reported so an operator can confirm which engine a running
     // server actually chose, and refused by CONFIG SET rather than silently accepted.
     g_config.push_back({"net-io", ConfigKind::Enum,
                         cfg.net_io == NetIoEngine::Epoll ? "epoll" : "uring", true});
     g_config.push_back({"thread-mode", ConfigKind::Enum,
                         cfg.thread_mode == ThreadMode::Fused ? "1s" : "2s", true});
-    g_config.push_back({"overlap", ConfigKind::Unsigned,
+    g_config.push_back({"x-overlap", ConfigKind::Unsigned,
                         std::to_string(cfg.overlap), true});
     g_config.push_back({"read-local", ConfigKind::Unsigned,
                         std::to_string(cfg.read_local), true});
-    g_config.push_back({"read-local-interleave", ConfigKind::Unsigned,
-                        std::to_string(cfg.read_local_interleave), true});
-    g_config.push_back({"read-local-prefetch-capture", ConfigKind::Unsigned,
-                        std::to_string(static_cast<uint32_t>(
-                            cfg.read_local_prefetch_capture)), true});
-    g_config.push_back({"read-local-atomic-filter", ConfigKind::Unsigned,
-                        std::to_string(static_cast<uint32_t>(
-                            cfg.read_local_atomic_filter)), true});
-    g_config.push_back({"smt-mode", ConfigKind::Unsigned,
-                        std::to_string(cfg.smt_mode), true});
-    g_config.push_back({"ex-sched", ConfigKind::Unsigned,
+    g_config.push_back({"x-ex-sched", ConfigKind::Unsigned,
                         std::to_string(cfg.ex_sched), true});
-    g_config.push_back({"key-lb", ConfigKind::Unsigned,
-                        std::to_string(cfg.key_lb), true});
-    g_config.push_back({"client-lb", ConfigKind::Unsigned,
-                        std::to_string(cfg.client_lb), true});
-    g_config.push_back({"lb-sample-rate", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_sample_rate), true});
-    g_config.push_back({"lb-age-sample-rate", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_age_sample_rate), true});
-    g_config.push_back({"lb-tick-ms", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_tick_ms), true});
-    g_config.push_back({"lb-imbalance-pct", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_imbalance_pct), true});
-    g_config.push_back({"lb-move-cap", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_move_cap), true});
-    g_config.push_back({"lb-cooldown-ms", ConfigKind::Unsigned,
-                        std::to_string(cfg.lb_cooldown_ms), true});
+    g_config.push_back({"lb", ConfigKind::Unsigned, std::to_string(cfg.lb), true});
     g_config.push_back({"flip-auto", ConfigKind::Unsigned,
                         std::to_string(cfg.flip_auto), true});
-    g_config.push_back({"flip-auto-band", ConfigKind::Signed,
-                        std::to_string(cfg.flip_auto_band), true});
     g_config.push_back({"flip-work-window", ConfigKind::Unsigned,
                         std::to_string(cfg.flip_work_window), true});
     g_config.push_back({"appendfilename", ConfigKind::String, cfg.appendfilename, true});
@@ -373,14 +344,6 @@ void init_config(const Config& cfg) {
     add_config("maxmemory-samples", ConfigKind::Unsigned, cfg.maxmemory_samples);
     g_config.push_back({"script-instruction-limit", ConfigKind::Unsigned,
                         std::to_string(cfg.script_instruction_limit), true});
-    g_config.push_back({"script-crossshard-max-bytes", ConfigKind::Signed,
-                        std::to_string(cfg.script_crossshard_max_bytes), true});
-    g_config.push_back({"script-crossshard-workbench-bytes", ConfigKind::Signed,
-                        std::to_string(cfg.script_crossshard_workbench_bytes), true});
-    g_config.push_back({"script-crossshard-conflict-retries", ConfigKind::Signed,
-                        std::to_string(cfg.script_crossshard_conflict_retries), true});
-    g_config.push_back({"script-crossshard-cut-slots", ConfigKind::Signed,
-                        std::to_string(cfg.script_crossshard_cut_slots), true});
     add_config("maxclients", ConfigKind::Unsigned, cfg.maxclients);
     add_config("timeout", ConfigKind::Unsigned, cfg.timeout);
     add_config("tcp-keepalive", ConfigKind::Unsigned, cfg.tcp_keepalive);
@@ -405,7 +368,6 @@ void init_config(const Config& cfg) {
                         cfg.tls_ciphersuites ? cfg.tls_ciphersuites : "", true});
     g_config.push_back({"tls-prefer-server-ciphers", ConfigKind::Bool,
                         cfg.tls_prefer_server_ciphers ? "yes" : "no", true});
-    g_config.push_back({"tls-ktls", ConfigKind::Bool, cfg.tls_ktls ? "yes" : "no", true});
     g_client_obuf_limits = cfg.client_output_buffer_limits;
     g_config.push_back({"client-output-buffer-limit", ConfigKind::ClientOutputBufferLimit,
                         cfg_client_output_buffer_limit_string(g_client_obuf_limits)});
@@ -419,7 +381,6 @@ void init_config(const Config& cfg) {
     add_config("proto-max-bulk-len", ConfigKind::Bytes, cfg.proto_max_bulk_len);
     add_config("zc-min", ConfigKind::Unsigned, cfg.zc_min);
     add_config("atomic", ConfigKind::Unsigned, cfg.atomic);
-    add_config("atomic-window", ConfigKind::Unsigned, cfg.atomic_window);
     add_config("hash-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.hash.max_entries);
     add_config("hash-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.hash.max_value);
     add_config("list-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.list.max_entries);
@@ -524,7 +485,6 @@ bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
             if (!std::strcmp(entry.name, "maxmemory-samples") && (value == 0 || value > 64))
                 return false;
             if (!std::strcmp(entry.name, "atomic") && value > 1) return false;
-            if (!std::strcmp(entry.name, "atomic-window") && value > UINT32_MAX) return false;
             if (!std::strcmp(entry.name, "databases") && value != 1) return false;
             if (!std::strcmp(entry.name, "auto-aof-rewrite-percentage") &&
                 value > UINT32_MAX) return false;
@@ -1479,8 +1439,6 @@ void cmd_config(Shard& sh, Op& op) {
                     set_auto_rewrite = true;
                 } else if (!std::strcmp(update.first->name, "atomic"))
                     g_server->set_atomic_enabled(value != 0);
-                else if (!std::strcmp(update.first->name, "atomic-window"))
-                    g_server->set_atomic_window(static_cast<uint32_t>(value));
                 else if (!std::strcmp(update.first->name, "maxclients"))
                     g_server->set_maxclients(static_cast<uint32_t>(value));
                 else if (!std::strcmp(update.first->name, "timeout"))
@@ -1980,13 +1938,14 @@ void cmd_info(Shard&, Op& op) {
         // read_local is the EFFECTIVE lane state (fused, overlap 0, knob on) -- what a gate row
         // must assert. CONFIG GET read-local echoes the knob even on a split boot where it is inert.
         appendf(body, "# Server\r\nredis_version:%s\r\ntomokv_version:%s\r\nredis_mode:standalone\r\n"
-                      "thread_mode:%s\r\noverlap:%u\r\nthread_pipeline:%u\r\nread_local:%u\r\n"
+                      "thread_mode:%s\r\nshards:%u\r\nx_overlap:%u\r\nread_local:%u\r\natomic:%u\r\n"
                       "arch_bits:%zu\r\nmultiplexing_api:io_uring\r\nprocess_id:%lld\r\n"
                       "tcp_port:%u\r\nuptime_in_seconds:%llu\r\nuptime_in_days:%llu\r\n",
                 kVersion, kVersion, g_server ? g_server->thread_mode_name() : "2s",
-                g_server ? g_server->cfg().overlap : 0u,
+                g_server ? g_server->nshards() : 0u,
                 g_server ? g_server->cfg().overlap : 0u,
                 g_server && g_server->read_local_enabled() ? 1u : 0u,
+                g_server && g_server->atomic_enabled() ? 1u : 0u,
                 sizeof(void*) * 8,
                 static_cast<long long>(::getpid()),
                 static_cast<unsigned>(g_server ? g_server->cfg().port : 0),
@@ -2002,12 +1961,12 @@ void cmd_info(Shard&, Op& op) {
             const FlipReport flip = g_server ? g_server->flip_report() : FlipReport{};
             appendf(body,
                     "io_threads:%u\r\nex_threads:%u\r\nflip_target_io:%u\r\n"
-                    "flip_target_ex:%u\r\nflip_smt_mode:%u\r\n"
+                    "flip_target_ex:%u\r\n"
                     "flip_unit_threads:%u\r\nflip_bucket_min:%u\r\nflip_bucket_max:%u\r\n"
                     "flip_client_min:%u\r\nflip_client_max:%u\r\n"
                     "flip_last_transfers:%llu\r\nflip_in_progress:%u\r\n",
                     flip.live_io, flip.live_ex, flip.target_io, flip.target_ex,
-                    flip.smt_mode, flip.unit_threads, flip.bucket_min, flip.bucket_max,
+                    flip.unit_threads, flip.bucket_min, flip.bucket_max,
                     flip.client_min, flip.client_max,
                     static_cast<unsigned long long>(flip.last_transfers),
                     flip.moving ? 1u : 0u);

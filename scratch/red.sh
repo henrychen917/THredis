@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # red.sh -- the REDESIGN chain (t-flipdamp, 2026-09-06): cost gate + variance window + outcome loop.
 # Resumable and gate-pausing: every step is skipped when its output is on file and WAITS while the
 # owner holds the box marker. Re-run `scratch/red.sh` after any kill.
@@ -152,7 +153,7 @@ ctlrun(){ # ctlrun TAG BIN
   [ -s "$out" ] && { LG "CTL $tag: on file :: $(grep -E '^ok:|AssertionError|^RC=' "$out" | tail -2 | tr '\n' ' ' | cut -c1-200)"; return 0; }
   wait_gate
   pid=$(boot8 "$bin" "$PORT_BAT" "ctl4-$tag" --ratio 6:2 --atomic 0 --flip-auto 1 \
-        --flip-auto-band 2 --lb-age-sample-rate 1024) || return 1
+       ) || return 1
   taskset -c "$LG8" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" \
         --stable-seconds 30 >"$out" 2>&1
   rc=$?

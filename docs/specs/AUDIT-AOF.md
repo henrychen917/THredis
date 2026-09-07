@@ -520,8 +520,8 @@ Do *not* implement this by force-flushing a chunk per group (that destroys batch
 - `GCMT(G)` records land in a small `pending_commits` table keyed by ticket, holding the participant
   vector. After each drain pass, every entry whose participants are all `<= appended_seq[sid]` is
   appended and erased.
-- The table is bounded by the in-flight atomic window: `--atomic-window`, AUTO = `min(16*shards,1024)`
-  (`config.h:80-87`, resolved at `server.h:63-65`). So the table is at most ~1024 entries.
+- The table is bounded by the in-flight atomic window: always derived as `min(16*shards,1024)`
+  in `Server::init`, after boot geometry is resolved. So the table is at most ~1024 entries.
 - **Abandoned groups must reap.** A group that aborts never publishes a ticket, so it never produces
   a `GCMT`; its fragments are already in the file and are correctly skipped at replay. The leak risk
   runs the other way: a `GCMT` whose fragment never arrives (impossible if the participant
@@ -944,9 +944,9 @@ it lives in a place with no natural test: a table inside a single-threaded write
 - Chunk-granularity batching means a fragment can sit unposted in a producer chunk indefinitely on
   an idle shard, holding its `GCMT` hostage and stalling every later group behind it. Needs a
   bounded flush deadline on producer chunks, which interacts with the `everysec` timer.
-- The `pending_commits` table is bounded by `--atomic-window` (AUTO = `min(16*shards,1024)`), but
-  that window is a *credit* system with generation-based reconfiguration (`server.h:236-311, 486`).
-  A window resize while commits are pending must not lose an entry.
+- The `pending_commits` table is bounded by the automatic credit limit (`min(16*shards,1024)`), but
+  live atomic-mode changes still reconfigure its credit generation (`Server::set_atomic_enabled`).
+  An atomic-mode change while commits are pending must not lose an entry.
 - Aborted groups never produce a `GCMT`, so they cannot leak the table — but a `GCMT` whose fragment
   never arrives would, and would also be a silent correctness hole. This must be an assertion with a
   bounded age-out that **fails the AOF loudly**, not a best-effort skip.

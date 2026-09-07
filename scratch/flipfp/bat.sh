@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # bat.sh BIN MODE OUT -- one boot per battery on this lane's cores, port 8244. Kills by PID and
 # guards the port before every boot (a leaked co-binding server would split traffic through
 # SO_REUSEPORT and quietly turn a real defect into a pass). Adapted from cyclemap batteries_my.sh.
@@ -45,7 +46,7 @@ if [ "$MODE" = 1s ]; then
     boot "${ARM[@]}" || exit 1; run "$t"; halt
   done
   boot "${ARM[@]}" || exit 1; run session_monotonic CONFIG SET atomic 1; halt
-  boot --thread-mode fused --atomic 1 --read-local 1 --read-local-atomic-filter 1 \
+  boot --thread-mode fused --atomic 1 --read-local 1 \
        --enable-debug-command yes || exit 1
   run bplus; halt
 else

@@ -1,47 +1,17 @@
-# Thread modes and overlap schedules
+# Thread modes
 
-`--thread-mode 2s|1s` and `--overlap 0|1|2` select TomoKV's thread architecture and fixed
-amortization schedule at boot. The defaults are `2s` and `0`, so an existing command line or
-configuration keeps the ordinary separated-loop behavior. `split` and `fused` remain accepted as
-aliases for `2s` and `1s`; the new names are the values reported by `INFO Server` and immutable
-`CONFIG GET` entries. `CONFIG GET overlap` is canonical. For one compatibility release,
-`INFO Server` also emits the old `thread_pipeline` field beside `overlap`.
+`--thread-mode 2s|1s` selects TomoKV's thread architecture at boot. The default is `2s`;
+`split` and `fused` remain accepted aliases. `INFO Server` reports the actual `thread_mode`,
+`shards`, thread counts, effective `read_local`, and live `atomic` state. These observations
+let a run assert its resolved geometry. `CONFIG GET` reports the retained configuration;
+thread mode, shards, and local-read admission are immutable after boot.
 
-`--read-local 0|1` is also boot-only and defaults to `0`. A value of `1` arms the local read lane
-described below only for `1s` overlap 0. Every other legal mode/overlap cell accepts the setting but
-keeps reads on the ordinary owner-task path and logs one notice at boot. The setting is exposed by
-`CONFIG GET` and refused by `CONFIG SET`.
+`--read-local 0|1` defaults to `0`. In `1s`, enabling it arms the local read lane described
+below. In `2s` it is accepted but remains inactive and logs a notice at boot.
 
-`--read-local-interleave 0|1` is the boot-only internal scheduling selector for that armed cell and
-defaults to `1`. It serves bounded local-read chunks before and between owner-task chunks. Each
-captured owner producer gets one bounded quantum per rotation and is re-notified if work remains,
-so no producer can be stranded behind the local lane and queued depth cannot stretch the rotation
-without bound. `0` retains the original single positional local drain for A/B. The selector is
-inert when read-local is not active, is exposed by `CONFIG GET`, and is refused by `CONFIG SET`.
-Snapshot, placement, and pre-existing retry/deferred turns retain the legacy total ordering.
-
-`--read-local-prefetch-capture 0|1` is the boot-only A/B selector for an armed lane and defaults to
-`1`. At `1`, a prefetch walk captures the exact slot and immutable object it found and execute serves
-that object without reloading the slot. At `0`, the legacy path only hints the table home slots and
-performs a fresh lookup at execute. The selector is accepted but inert when read-local is inactive.
-
-`--read-local-atomic-filter 0|1` is the boot-only pending-atomic selector and defaults to `1`. At
-`1`, each shard publishes a fail-closed 4096-cell counting-fingerprint filter: a read falls back only
-when its key might belong to an unsafe atomic group. At `0`, any pending atomic work retains the old
-whole-shard refusal for A/B. The selector is accepted but inert when read-local is inactive, is
-exposed by `CONFIG GET`, and is refused by `CONFIG SET`.
-
-| mode | overlap 0 | overlap 1 | overlap 2 |
-| --- | --- | --- | --- |
-| `2s` | ordinary separated IO/executor loops | `t-iopipe` interwoven WB/IFID schedule | rejected |
-| `1s` | coarse generalized-thread rotation | `t-genthread` `iofused` schedule | gated `iofused` three-way schedule |
-
-Overlap 2 prints a boot warning identifying it as an experimental research schedule. Unified
-overlap 1 and 2 require `--net-io uring` because their measured schedules share a single explicit
-submission boundary. The shipped `--thread-pipeline` spelling remains a numeric alias for
-`--overlap`. The compatibility knob `--genthread-schedule` accepts only `coarse`, `iofused`, or
-`streams` and selects the corresponding `1s` overlap value. `streams` is now only the legacy name
-for overlap 2; it does not select the retained streams implementation.
+The armed lane serves bounded local-read chunks between bounded owner-task quanta, captures
+immutable objects at prefetch, and filters unsafe atomic keys individually. These behaviors
+are fixed. Snapshot, placement, and pre-existing retry/deferred turns preserve their ordering.
 
 ## 2s: separated threads
 
@@ -49,20 +19,13 @@ Mode `2s` assigns each physical thread one live role. IO (`ifid`) threads receiv
 retire, and send; executor (`ex`) threads own shards and execute commands. With no placement knob,
 TomoKV makes the same even IO/ex split across the allowed CPUs as before.
 
-Overlap 0 is the unchanged plain-loop baseline. Overlap 1 is the exact measured `t-iopipe`
-schedule: it interweaves bounded WB and IFID batches inside each IO thread while retaining separate
-executor threads. Its shallow order, depth-selected natural order, prefetch walks, and submission
-boundary are fixed rather than tunable. Overlap 2 is rejected because the three-way schedule
-requires unified ownership.
-
-Use `2s` when you need `--ratio`, explicit IO/ex role placement, manual `FLIP`, or the automatic
-flip controller. It also remains the conservative choice outside the unified architecture bench's
-tested core-count and overlap regimes.
+Use `2s` for separate IO/executor placement, `--ratio`, manual `FLIP`, or `--flip-auto`.
+Complete sibling pairs in the allowed CPU set become placement and FLIP units automatically.
 
 ## 1s: unified generalized threads
 
 Mode `1s` gives every selected physical thread both an IO loop object and an executor loop object.
-Overlap 0 rotates three coarse streams in this order:
+Each thread rotates through these phases:
 
 1. maintain connections and parse/route at most 32 operations per connection pass;
 2. consume an executor batch of at most 32 operations;
@@ -70,10 +33,9 @@ Overlap 0 rotates three coarse streams in this order:
 
 With `--read-local 0`, local commands take the same self SPSC task lane as remote commands and are
 consumed during the executor phase; they are not executed inline. With `--read-local 1`, eligible
-plain GETs and MGETs instead enter a parsing-thread-local queue. With the default interleave
-selector, the overlap-0 executor phase drains one bounded chunk immediately after parsing and more
-bounded chunks between owner-task chunks. The selector's `0` control retains the original single
-drain slot. In both cases replies still retire through one connection ROB slot and the normal
+plain GETs and MGETs instead enter a parsing-thread-local queue. The executor phase drains one
+bounded chunk immediately after parsing and more bounded chunks between owner-task chunks.
+Replies retire through one connection ROB slot and the normal
 write-back path. Parsing never waits for that local queue to retire: a later hash-precise write
 first moves the unresolved reads in its transitive key-overlap component to ordinary owner queues,
 then publishes behind them; a conservative write moves the whole unresolved set. An unfinished
@@ -107,7 +69,7 @@ clears poison the filter for their duration so every epoch moves. One-key GET ne
 its filter check stays inside the existing before/after point-probe sequence validation. Plain
 writes publish nothing beyond their slot store when read-local is armed.
 
-With prefetch capture enabled, a point-only batch first hints all home words, then performs complete
+A point-only batch first hints all home words, then performs complete
 key-verified probes in program order. Each probe retains the observed slot address and decoded
 immutable `KvObj` pointer on the stack, and execute copies directly from that object. Mixed GET/MGET
 batches capture and consume one command at a time to preserve connection order; MGET handles any key
@@ -122,34 +84,12 @@ key-miss notification gate, respectively. The `foreign_read_*` gauges expose cur
 references, occupied/wildcard/saturated cells, and poisoned shards. MGET separately reports local
 hits, generation retries, and pending-filter or generation fallback counts.
 
-Overlap 1 selects the fork's exact `iofused` schedule, which overlaps its WB dependency stream and
-network work around a 128-operation coarse executor turn. Overlap 2 reuses the same ready lists,
-fixed private task lanes, whole batches, and SEND-sensitive outer submission boundary. On a deep
-pass it freezes and prefetches the ready WB batch, runs the targeted IFID batch, then gathers,
-schedules, and prefetches one whole EX batch. The existing WB prepare/pump work fills that EX load
-gap; the prefetched EX batch executes afterward, followed by ordinary whole EX batches. No kernel
-submit/reap occurs inside the gap. A single gate bit, recomputed from work actually completed in the
-pass, returns the next rotation to coarse IFID → EX → WB after thin work. There is no residual
-carry, unpublished IFID state, reservation credit, or delayed EX retirement in this path. The old
-streams loop remains in source for branch comparison but is unreachable from overlap-2 dispatch.
-
-Read-local is not woven into either interwoven schedule in this version, so enabling its knob there
-retains the task path. Overlap 2 is exposed for research rather than as a production recommendation.
-
 With no `--place`, `1s` uses every CPU in the process affinity mask. `--place` can select a subset;
 its `ifid@CPU` and `ex@CPU` labels are treated only as CPU selectors because every selected thread
 has both responsibilities. `--ratio` is rejected because there are no separate role counts.
 `--flip-auto` is also rejected, the flip controller does not start, and `FLIP` returns a clear
 mode-unavailable error. Existing key load-balancing bucket movers remain available.
 
-## Choosing a cell
-
-The architecture bench found unified mode strongest through 16 cores: it led tuned separated mode
-by 9–21% at 8 cores, and at 16 cores with a client request-pipeline depth of 128 it led by 2.4% for
-GET and 10% for SET. Those results should not be extrapolated to larger core counts or different
-workloads without a separate measurement.
-
-Use overlap 0 when the purpose is ordinary operation or a study baseline. Overlaps 1 and 2 are
-fixed measurement cells: select them only when the schedule itself is the variable under study.
-Choose `2s` when runtime role reshaping or ratio tuning matters, or when deploying beyond the
-measured unified envelope.
+The default shard count derives as `min(8 * executor threads, 256)` in both modes, before
+persistence recovery. An explicit `--shards 1..256` overrides it; `--shards -1` restores auto.
+Key and client balancing share `--lb 0|1`, default `1`; disabling it allocates no LB state.

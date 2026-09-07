@@ -405,13 +405,10 @@ void cmd_object_impl(Shard& shard, Op& op) {
     // maxmemory is enabled. With eviction off the bits are meaningless, so report a fresh key.
     if (!shard.store().maxmemory_enabled()) { reply_int(op.sink(), 0); return; }
     if (freq) { reply_int(op.sink(), object->eviction_meta()); return; }
-    // Age is quantised to 1<<lru-clock-shift seconds and wraps after 32 buckets (~8192s at the
-    // default shift of 8) because the clock is five bits wide. Documented, not hidden.
-    const Server* server = command_server();
-    const uint32_t shift = server ? server->cfg().lru_clock_shift : 8;
+    // The fixed five-bit clock quantises age to 256 seconds and wraps after 8192 seconds.
     const uint8_t age = static_cast<uint8_t>(
         (shard.store().published_lru_clock() - object->eviction_meta()) & 0x1f);
-    reply_int(op.sink(), static_cast<long long>(age) << shift);
+    reply_int(op.sink(), static_cast<long long>(age) << kLruClockShift);
 }
 
 void cmd_object(Shard& shard, Op& op) { cmd_object_impl<false>(shard, op); }

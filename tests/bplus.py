@@ -2,7 +2,7 @@
 """Directed B+ per-key atomic-filter gate. Usage: tests/bplus.py HOST PORT
 
 Boot requirement:
-  --thread-mode 1s --overlap 0 --read-local 1 --read-local-atomic-filter 1
+  --thread-mode 1s --x-overlap 0 --read-local 1
   --atomic 1 --enable-debug-command yes
 
 The test does not infer routing from key names. DEBUG SHARD/LBSIGNALS select a real cross-owner
@@ -527,9 +527,8 @@ def main():
     try:
         expected_config = {
             "thread-mode": b"1s",
-            "overlap": b"0",
+            "x-overlap": b"0",
             "read-local": b"1",
-            "read-local-atomic-filter": b"1",
             "atomic": b"1",
         }
         for name, wanted in expected_config.items():
@@ -538,10 +537,8 @@ def main():
                 raise AssertionError(
                     "B+ test needs CONFIG %s=%s, got %r" %
                     (name, wanted.decode(), got))
-        immutable = discovery.command("CONFIG", "SET", "read-local-atomic-filter", "0")
-        if not isinstance(immutable, RespError) or b"immutable" not in immutable.message:
-            raise AssertionError(
-                "read-local-atomic-filter is not boot-latched: CONFIG SET returned %r" % immutable)
+        if discovery.command("CONFIG", "GET", "read-local-atomic-filter") != []:
+            raise AssertionError("removed read-local atomic-filter knob is still exposed")
 
         geometry = select_geometry(discovery)
         if (geometry["a_shard"] != debug_shard(discovery, geometry["b"]) or

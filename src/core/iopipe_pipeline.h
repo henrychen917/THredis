@@ -1,7 +1,7 @@
 // iopipe_pipeline.h -- fixed geometry for the split-IO micro-pipeline experiment.
 //
 // Keep every batch size, buffer count, prefetch window, and schedule entry in this one block.  The
-// `--overlap 1` selects this one static loop shape; the geometry itself is not tunable. A
+// `--x-overlap 1` selects this one static loop shape; the geometry itself is not tunable. A
 // stage is batch-granular and returns immediately when its stream buffer is empty; there are no
 // fibers, request schedulers, or per-request stage machines.
 #pragma once

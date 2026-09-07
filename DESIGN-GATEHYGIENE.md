@@ -1,5 +1,10 @@
 # Gate hygiene: the rows that assert a timing or statistical property
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Branch `t-gatehygiene`, from `ceb6b02f8` (train 13).
 
 Three full-gate rows reddened intermittently on a correct build. None of them had a wrong
@@ -456,3 +461,74 @@ stable hold: 30s on a measured-stationary load, no trigger or split movement (at
 
 `flip.py` needed no in-flight re-roll in any post-fix run (0 re-roll lines), so the budget is
 headroom rather than a routine cost. The flipctl row costs 120 s, unchanged from before this lane.
+
+---
+
+## 10. Incoming timing lane on `78c3e5391` — 2026-09-07
+
+**Merged disposition:** the maintainer reports the incoming timing lane gated 344/344 with no
+SKIP rows. The account below records that lane's original implementation and offline validation;
+it is not a validation claim for the merged tree. Its dispatch wrapper/helper and timing evaluator
+are retired: repeatability checks did not replace the deleted manual ownership instrument. The
+configurable-window shrink samples and shrink/reclaim budgets are superseded by the derived-window
+held-burst liveness and old-generation reconfiguration witnesses in `tests/atomicwindow.py`.
+All those mechanism, exact-reply, bound, and credit-reclamation checks remain mandatory on every
+build. The original OFF RENAME four-roll hard-failure control is unchanged, and the 1.5-second
+promotion budget still requires `--release-build`. The merged ledger requires quick 325/full 342;
+the constants remain untouched. [MERGE.md](MERGE.md) records the complete conflict and row accounting.
+
+The rest of this section is historical lane evidence, including its now-superseded dispatch,
+shrink, admission-calibration, and ledger statements.
+
+This is a test-only diff in `cx-timing`. No server, benchmark, gate, or compiler was run. The
+earlier acceptance results above describe earlier changes, **not this diff**. The worked fixes
+in `multirace.py` and the RENAME OFF control are unchanged.
+
+| area | change | failure induction (also documented beside the checks) |
+| --- | --- | --- |
+| `differ.py`, blocking | Wait for both blocked-client gauges to reach zero before final comparison. Assert each server's gauge increment independently, against a settled baseline. | Suppress registration increments to fail movement; suppress disconnect decrements to fail the bounded zero control. |
+| `atomic_torn.py`, promotion/leases | Keep promotion movement and credit safety mandatory. Separate the original 1.5s promotion and 3s shrink/reclaim budgets behind `--release-build`. Sample the credit bound across at least 32 observations with completed writer traffic, and require zero inflight/debt plus the exact final credit pool. | Disable promotion or lease returns; over-issue credits after shrink. An observed excess or exhausted mechanism watchdog fails on every build. |
+| `slowlog.py` | Derive recording-thread capacity from INFO (`fused_threads`, or `io_threads + ex_threads`), and issue more writes than its aggregate capacity. | Disable ring eviction or max-len trimming. |
+| `xshard_dispatch_scale.sh` / `.py` | Disable balancing during the fixed-owner experiment; verify ownership remained fixed. Use distinct reply payloads, check every pair's topology, alternate boot order, and retain every ratio. Only score release timings when repeated arms and same-shard controls agree within the supplied 2% box contract. Every qualified pair must meet the unchanged 1.20 bound; no best-pair selection. | Misroute a key or change a second pair's fan-out to fail mechanism checks; restore the all-thread scan to fail a stable release measurement. Unqualified timings say SKIP with all numbers, not that scaling passed. |
+| `pubsub.py` | Drain old pattern registrations before checking the next NUMPAT population; keep exact live-pattern assertions. | Leak the disconnected RESP3 subscriber's pattern; a constant-zero NUMPAT still fails the live arms. |
+| `borrow_registry.py` | Replace the 1.5x timing proxy for different paths with `zc_sends`/`zc_releases` deltas and a plain-GET negative control before holders exist. Keep parked-borrow/drain and byte-exact reply checks on every build; cost budgets require `--release-build`. | Disable borrowing, borrow below the cutover, or omit releases to fail mechanisms; restore the linear lookup to fail the qualified release growth budget. |
+| `expireindex.py` | Assert exact 2 -> 1 -> 0 TTL accounting, DEL replies, and the surviving value on every repetition. Keep INFO outside both timed DEL intervals. Cost ratios require `--release-build`. | Break expiry unregistration or delete accounting to fail mechanisms; restore the historical-capacity memset to fail the release timing bound. |
+| `infofix.py` and its differential counterpart | Poll INFO-only idle samples until zero; feed verified PINGs until the sampler reports work. Also require RESETSTAT to clear those PING counters, so natural rate decay cannot substitute for a reset. | Pin the rate at zero/nonzero, or omit the command-counter reset baseline. |
+| `stream.py` | Check exact retained entries through trimming, first-entry creation and embedded-to-macro growth on every build. Report all footprint measurements; score the original byte ceilings only with `--release-build`. Require positive measured allocation instead of clamping negative deltas to zero. | Drop/wrongly trim entries or omit memory accounting to fail mechanisms; inflate first-entry/node allocations to fail release footprint bounds. |
+
+The release gate explicitly passes `--release-build` to the affected batteries. The ASAN atomic
+row omits it. Standalone runs against an instrumented binary should likewise omit it; all
+mechanism assertions remain active and performance measurements still appear in the log.
+
+### Outstanding atomic window calibration — not claimed fixed
+
+Three window-hit checks remain strict at their existing arming geometry:
+
+* `atomic_torn.py:718`, commit-delay held a read cut;
+* `atomic_torn.py:719`, predecessor resolution;
+* `atomic_torn.py:923`, admission stalls and resumes.
+
+Their own per-attempt hit/miss measurements were not supplied. The RENAME control's measured
+5/6 hit rate does not establish a bound for these different mechanisms. No fresh-connection
+retry count was guessed, no window-hit assertion was made release-only, and their observation
+windows were not widened. Fresh-state retry hygiene for these three checks still needs the
+maintainer's measurements at `--shards 16 --ratio 6:2`, cores `0-7`, separately for release and
+ASAN. Record each attempt's counter deltas and any real value/worker failure; such failures must
+stop retrying immediately. This is the unfinished part of item 1, not an acceptance claim.
+
+### Static and offline checks
+
+Python AST parsing, `bash -n` and `git diff --check` passed. Source-extracted helper checks with
+synthetic inputs covered successful and exhausted gauge/pattern polls, 8/16-thread INFO
+geometries, release-flag behavior, exact TTL transitions, stuck sampled rates, and excess/no-work
+lease samples. The dispatch result evaluator rejected a synthetic stable 1.30 ratio, incorrect
+second-pair geometry, negative excess and a missing pair, while explicitly skipping unstable
+timings. These are harness checks, **not** server fault-injection or PRE/POST measurements.
+
+### Ledger
+
+No top-level row was added or retired; the `ok`/`bad` label sequence is unchanged. In this diff
+the quick exit is at `gate.sh:1262`. The release atomic row (`:434`), stream feature-loop calls
+(`:457`, `:516`), expiry (`:674`), borrow (`:682`) and dispatch (`:688`) rows are before it; the
+ASAN atomic row (`:1275`) is after it. Internal assertions do not add ledger rows.
+`EXPECT_QUICK=327` and `EXPECT_FULL=344` remain unchanged, and no count adjustment is needed.

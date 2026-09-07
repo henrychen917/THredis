@@ -1,5 +1,10 @@
 # NOTES-BARRIERTEST — the barrier owner mask now has a discriminator
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Lane `t-barriertest`. The mechanism in `t-barrier` was already merged; this lane adds only the
 directed battery it described. No engine source, gate script, ledger constant, build output or
 runtime result is changed here.

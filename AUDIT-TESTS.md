@@ -1,5 +1,10 @@
 # AUDIT-TESTS — stability of the test/gate instrument (night lane `t-night-tests`)
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Base: mainline `775aeea48`. Scope: `tests/` (99 Python batteries, 10 shell drivers, 3 C++ unit
 tests) and `tests/gate.sh` (the merge instrument, 239 quick / 250 full rows). Nothing here was RUN:
 the box's cores and the server binary were off limits for this lane, so every finding is static
@@ -122,7 +127,7 @@ the per-row elapsed column in the ledger file. Static lower bounds that no serve
 | MM floor (memtier 20 s, sampled 8+6) | 1 | 14 | measurement, keep |
 | saturated-flip memtier | 1 | 25+3 | measurement, keep |
 | `flipctl.py --stable-seconds 30` (+ramp/idle/surge, timeout 300) | 1 | 60-120 est. | measurement, keep |
-| `xshard_dispatch_scale.sh` (2 pairs x 2 boots x 7 rounds x 2 x 400k ops) | 1 | 90-150 est. | measurement, keep |
+| Retired `xshard_dispatch_scale.sh` (historical 2 pairs x 2 boots x 7 rounds x 2 x 400k ops) | 1 historically, 0 now | 90-150 est. historically | manual ownership instrument removed; see `MERGE.md` |
 | `atomic_torn.py` hammers (3+2.5+2+2.5 s) + OFF re-rolls (up to 14 s) + RENAMENX/COPY parks (2 x 64 x 100 ms = 12.8 s) + window/lease/churn (~6 s) | 1 quick, +1 ASAN | ~45-60 each | re-rolls are dead time on this kernel (F6) |
 | `spinprobe.py` (6 s baseline + 6 s probe) | 3 | 37.5 | measurement, keep |
 | Python batteries' literal sleeps (census: flipctl 17 s, limits 5.8, edgetime 4.5, atomic_ryow 4, hexpire 3.4 — most run x2) | | ~60 | keep |

@@ -13,7 +13,7 @@ namespace {
 // A real workload must not wait forever merely because its stationary noise never presents a
 // quiet absolute-rate band. Thirty seconds is long enough to reject ordinary connection ramps but
 // short enough to make automatic placement useful during a container/cell warm-up. The gate below
-// converts this duration to controller ticks, so --lb-tick-ms keeps the same wall-clock bound.
+// converts this duration to controller ticks, so the internal tick preserves the same wall-clock bound.
 constexpr uint64_t kBootMaxDeferralMs = 30'000;
 
 // Anchored drift is deliberately much slower than both the half-weight maneuver EWMA and the
@@ -131,7 +131,8 @@ void FlipShiftDetector::update_band() {
     const double quantum =
         1.0 / std::sqrt(static_cast<double>(std::max<uint64_t>(smoothed_.commands, 1)));
     // A TYPED BAND IS A FLOOR, NOT A CEILING, AND IT CANNOT BUY RESOLUTION THE SIGNAL HAS NOT GOT.
-    // --flip-auto-band says how large a mix change is worth a maneuver; it says nothing about how
+    // The internal detector's explicit-band unit-test control sets the mix change worth a maneuver;
+    // it says nothing about how
     // still the signature holds, and it used to return here consulting neither the estimator's
     // resolution nor the signal's measured movement. Measured by the gate-hygiene lane on a driver
     // whose rate held to 0.07% across 34 samples: a fingerprint distance of 0.2518 against a flat
@@ -356,6 +357,12 @@ bool FlipController::sample_rate(Server& server, uint64_t now_ms, double& rate) 
     rate_window_ms_ = now_ms;
     rate_window_commands_ = commands;
     rate_window_movement_ = movement;
+    // The maneuver alone arms stamps. Derive their rate over the same three-tick decision
+    // window; keep this computation behind the armed check, including its clock/window inputs.
+    if (signal_sample_rate_.load(std::memory_order_relaxed))
+        signal_sample_rate_.store(LbAutotune::sample_every(
+            completed, elapsed_ms, server.flipctl_tick_ms() * kSettleTicks),
+            std::memory_order_release);
     // Every rate sample, selected or not, feeds the long-window noise estimate; a tick at the
     // near-idle floor (one command per thread per tick, the boot gate's own idle line) is not load.
     {
@@ -571,11 +578,11 @@ void FlipController::start_maneuver(Server& server, FlipctlTriggerReason reason,
     anchor_learning_rate_samples_ = 0;
     retrigger_after_flip_ = false;
     pending_retrigger_ = FlipctlTriggerReason::None;
-    // An explicit age rate remains the maneuver rate. Zero means automatic here, derived from the
-    // provisioned pool rather than a machine constant. Every owner applies this value to itself.
+    // Derive the initial maneuver rate from the last traffic observation, then adapt it on
+    // each completed rate window. Idle and anchored states leave stamping off entirely.
     signal_sample_rate_.store(
-        server.cfg().lb_age_sample_rate ? server.cfg().lb_age_sample_rate
-                                        : std::max<uint32_t>(1, server.nthreads()),
+        LbAutotune::sample_every(rate_ew_.prev1 > 0 ? rate_ew_.prev1 : boot_rate_ewma_,
+                                1000, server.flipctl_tick_ms() * kSettleTicks),
         std::memory_order_release);
     for (uint32_t tid = 0; tid < server.nthreads(); tid++) {
         const LoopSignals& signal = server.thread(tid).sig();
@@ -735,7 +742,7 @@ bool FlipController::sample_role_demand(Server& server, uint64_t now_ms, double&
 
 // The spread the ORIGIN split's own stabilized readings showed while the model was deciding: the
 // baseline's movement between the two windows the outcome loop compares. It is a floor under every
-// band this maneuver uses, an operator-typed --flip-auto-band included, because that knob says how
+// band this maneuver uses, the detector's explicit-band unit-test control included: it says how
 // small a gain is worth chasing, not how still the workload is holding.
 double FlipController::baseline_band() const {
     return origin_window_.samples >= 2 ? origin_window_.bracket_band() : 0;
@@ -743,7 +750,8 @@ double FlipController::baseline_band() const {
 
 // The throughput noise a projected gain has to beat before a flip could be VERIFIED: the band the
 // last anchor learned, if any, or the maneuver's own stabilized-pair jitter, and never below what
-// the baseline itself moved. A typed --flip-auto-band replaces the learned pair, not the floor.
+// the baseline itself moved. The internal explicit-band unit-test control replaces the learned pair,
+// not the floor.
 double FlipController::verification_band(double rate) const {
     const double floor = std::max(baseline_band(), 2.0 * rate_ew_.sigma());
     if (configured_band_ > 0)
@@ -769,7 +777,7 @@ bool FlipController::decide_placement(Server& server, uint32_t coordinator, uint
     model_io_headroom_ = io_headroom;
     model_ex_headroom_ = ex_headroom;
 
-    const uint32_t unit = server.cfg().smt_mode ? 2u : 1u;
+    const uint32_t unit = server.smt_units_enabled() ? 2u : 1u;
     const uint32_t total_units = server.nthreads() / unit;
     const uint32_t now_units = server.role_count(Role::Ifid) / unit;
     const double band = verification_band(rate);
@@ -1036,7 +1044,7 @@ void FlipController::anchor(Server& server, double rate) {
     // The rejected alternative was widening that detector's band by twice the excursion it just
     // proved uninformative. Measured: a paced 8-key -> single-key change scores distance 0.630 on
     // a metric whose maximum is 1.0, so one null result set a floor of 1.26 and the fingerprint
-    // detector could never fire again at any workload -- a self-inflicted `--flip-auto-band 0`.
+    // detector could never fire again at any workload -- an accidentally disabled trigger.
     // A threshold learned from an excursion can exceed every excursion; a window cannot.
     const bool null_maneuver = current == maneuver_origin_io_ &&
         (last_trigger_ == FlipctlTriggerReason::FingerprintShift ||

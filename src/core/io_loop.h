@@ -665,7 +665,7 @@ private:
                 did += lb_control_pass();
                 if (__builtin_expect(lb_controller_armed &&
                                      cached_now_ms_ >= lb_controller_beat_ms_, false)) {
-                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->cfg().lb_tick_ms;
+                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->lb_tick_ms();
                     if (srv_->lb_cron_writer(self_->id()) &&
                         srv_->lb_controller_tick(self_->id(), cached_now_ms_))
                         lb_schedule_wake_all();
@@ -890,7 +890,7 @@ private:
                 did += lb_control_pass();
                 if (__builtin_expect(lb_controller_armed &&
                                      cached_now_ms_ >= lb_controller_beat_ms_, false)) {
-                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->cfg().lb_tick_ms;
+                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->lb_tick_ms();
                     if (srv_->lb_cron_writer(self_->id()) &&
                         srv_->lb_controller_tick(self_->id(), cached_now_ms_))
                         lb_schedule_wake_all();
@@ -1827,7 +1827,7 @@ private:
                 did += lb_control_pass();
                 if (__builtin_expect(lb_controller_armed &&
                                      cached_now_ms_ >= lb_controller_beat_ms_, false)) {
-                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->cfg().lb_tick_ms;
+                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->lb_tick_ms();
                     if (srv_->lb_cron_writer(self_->id()) &&
                         srv_->lb_controller_tick(self_->id(), cached_now_ms_))
                         lb_schedule_wake_all();
@@ -2486,7 +2486,7 @@ private:
             auto conn = std::make_unique<TlsConn>();
             std::string error;
             if (!conn->init(*tls_context_, srv_->cfg().tls_auth_clients, c->fd(),
-                            srv_->cfg().tls_ktls, error)) {
+                            true, error)) {
                 std::fprintf(stderr, "TLS connection init failed: %s\n", error.c_str());
                 return false;
             }
@@ -7287,7 +7287,7 @@ ordinary_dispatch:
         uint64_t head_since_us = 0;
         uint64_t seen_generation = 0;
     };
-    // Empty and allocation-free when --lb-age-sample-rate=0.
+    // Empty and allocation-free while controller age sampling is disarmed.
     std::unordered_map<Client*, RobHeadAge> rob_head_ages_;
     uint64_t rob_age_generation_ = 0;
     bool touched_[kMaxThreads] = {};      // dedupe flags for the current parse pass

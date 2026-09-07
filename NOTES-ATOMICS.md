@@ -1,5 +1,10 @@
 # Opt-in epoch-MVCC atomics
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 `--atomic 1` makes the write groups for `MSET`, `MSETNX`, multi-key `DEL`, `UNLINK`, the STORE
 family, and the cross-shard mover family atomic. `LMPOP` and `ZMPOP` also revalidate their selected
 owner before mutating it. `MGET`, `EXISTS`, `TOUCH`, `KEYS`, and exact `DBSIZE` resolve one committed

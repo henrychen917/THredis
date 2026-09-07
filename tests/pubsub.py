@@ -127,6 +127,21 @@ def info_stats(conn):
     return result
 
 
+def patterns_drained(admin, label, timeout=5.0):
+    # NUMPAT is global, including registrations whose sockets have closed but whose IO cleanup
+    # has not run. No pattern clients are live at these boundaries. Retain the exact zero
+    # assertion on timeout; suppress disconnect's pattern unregister to induce failure. The
+    # live-pattern rows still require 2, so returning constant zero cannot pass the battery.
+    deadline = time.monotonic() + timeout
+    while True:
+        count = admin.command("PUBSUB", "NUMPAT")
+        if count == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{label}: NUMPAT did not drain, last={count!r}")
+        time.sleep(0.01)
+
+
 def main():
     if len(sys.argv) != 3:
         raise SystemExit(f"usage: {sys.argv[0]} HOST PORT")
@@ -365,6 +380,7 @@ def main():
     multi.close()
 
     # Exact and both pattern arms, including subscriber-mode framing/restrictions.
+    patterns_drained(admin, "before exact/pattern arms")
     arms = Conn(host, port)
     arm_channel = f"{token}:news:42"
     expect(arms.command("SUBSCRIBE", arm_channel), [b"subscribe", arm_channel.encode(), 1],
@@ -616,6 +632,7 @@ def main():
            [b"pmessage", f"{token}:mix*".encode(), mixed.encode(), b"again"], "resp3 pmessage body")
     resp2_sub.close()
     resp3_sub.close()
+    patterns_drained(admin, "mixed RESP3 pattern disconnect")
 
     # D. Subscriber disconnect mid-fanout. Half the subscribers are reset while a pipelined burst
     #    is in flight, so batches already queued name connections that no longer exist. The survivors
@@ -677,6 +694,7 @@ def main():
            b"OK", "restore obuf limits")
 
     # F. Introspection aggregates against a Python-side model of the same population.
+    patterns_drained(admin, "before NUMPAT model")
     model_exact, model_patterns, model_shard = {}, {}, {}
     model_conns = []
     for index in range(10):

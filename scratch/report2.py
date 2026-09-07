@@ -278,7 +278,7 @@ trail_table = simple_table(
     [(f"<code>{wl} r{r}</code>", fr, hio, hex_, tgt, gm, bar, pays, pb, hz, html.escape(dec), fl) for (wl, r, fr, hio, hex_, tgt, gm, bar, pays, pb, hz, dec, fl) in trail]) if trail else "<p class=muted>(trail not on file)</p>"
 
 ctl_table = simple_table(
-    "tests/flipctl.py (the gate's invocation: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024, 8 server threads on cpus 52-55 + siblings)",
+    "tests/flipctl.py (the historical gate invocation: --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024, 8 server threads on cpus 52-55 + siblings)",
     ["run", "verdict", "rc", "what the row said"],
     [(f"<code>{html.escape(t)}</code>", v, rc, html.escape(said)) for t, v, rc, said in ctl],
     ["post" if v == "PASS" else "pre" for _, v, _, _ in ctl]) if ctl else "<p class=muted>(flipctl.py rows not on file)</p>"
@@ -382,7 +382,7 @@ C  NON-VACUITY      boot the SAME load at --ratio 28:4 (and 3:1 on 4 threads) wi
                     rate above the --flip-auto 0 control at the wrong split. Zero flips here is a FAIL
 D  DIRECTED         tests/flip_cost_gate.py against --ratio 3:1 --flip-auto 1 (cost gate refuses / pays / induced miss reverts and doubles the bar)
                     tests/flip_multikey_hold.py against --ratio 18:14 --flip-auto 1
-E  GATE ROW         --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024 + tests/flipctl.py --stable-seconds 30
+E  HISTORICAL GATE ROW         --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024 + tests/flipctl.py --stable-seconds 30
 F  ALWAYS-ON COST   the A cell at a matched offered rate (memtier --rate-limiting) with perf stat on the server:
                     --flip-auto 1 against --flip-auto 0, same binary. Budget 3%
 G  UNIT             make unit (build/flipctl-unit carries the signal, cost-gate, window and outcome rows on the measured numbers)</pre>

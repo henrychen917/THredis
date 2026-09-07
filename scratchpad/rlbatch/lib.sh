@@ -17,7 +17,7 @@ guard_port(){ # a leaked co-binding server silently splits traffic via SO_REUSEP
 boot_srv(){ # boot_srv <binary> <logfile> [extra args...] -> SRV pid
   local bin="$1" log="$2"; shift 2
   guard_port "$PORT" || return 1
-  # EXTRA_ARGS lets a caller add boot flags (e.g. --read-local-interleave 0) without a second copy
+  # EXTRA_ARGS lets a caller add boot flags (e.g. --lb 0) without a second copy
   # of this function; word splitting is intentional.
   # shellcheck disable=SC2086
   taskset -c "$SRVCORE" "$bin" --port "$PORT" --bind 127.0.0.1 --shards 16 \

@@ -1,5 +1,10 @@
 # Armed local GET: pass-by-pass redundancy audit
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Baseline: `775aeea48` (mainline). Configuration audited: `--thread-mode 1s --read-local 1`,
 defaults `--read-local-interleave 1 --read-local-prefetch-capture 1`, `TOMO_READ_LOCAL_SET_TAX_VARIANT=0`.
 

@@ -8,8 +8,7 @@ dark (`flip-auto 0`).
 ## Ownership and footprint
 
 - `src/main.cc` is the controller cron owner. When `flip-auto=1`, the main/monitor thread calls
-  `Server::flipctl_tick()` once per existing LB tick (`lb-tick-ms`; if that mechanism is disabled,
-  the period derives from the provisioned thread count). No IO or EX loop runs controller policy.
+  `Server::flipctl_tick()` on its internal observation cadence. No IO or EX loop runs controller policy.
 - `src/core/flipctl.{h,cc}` contains the fingerprint representation, shift detector, and controller
   state machine. Controller vectors allocate only when `flip-auto=1`.
 - Each `ThreadCtx` embeds one `FlipFingerprintWriter`. It has no dynamic storage. Only the physical
@@ -46,10 +45,10 @@ distance gives equal weight to the four feature families. Scalar distances use o
 measurement quantum, avoiding the zero-anchor discontinuity where one rare admin argument would
 otherwise have distance one.
 
-With `flip-auto-band=-1`, the band is twice the maximum quiet adjacent/drift distance learned at
-the final split, floored by the four-family sampling quantum divided by observed commands. A
-numeric value is a percent. Zero disables fingerprint and collapse re-triggers. Final anchor
-learning consumes a number of closed aggregates derived from the provisioned thread count. It is
+The automatic band is twice the maximum quiet adjacent/drift distance learned at
+the final split, floored by the four-family sampling quantum divided by observed commands.
+It has no public override. Final anchor learning consumes a number of closed aggregates derived
+from the provisioned thread count. It is
 done after maneuver-only age sampling is disarmed, so the controller cannot detect its own signal
 cost transition as a workload change.
 
@@ -64,14 +63,15 @@ The boot maneuver remains pending until the command-rate EWMA's relative slope a
 falls below a threshold derived from its own change jitter and measurement quantum. Directional
 connection ramp-up therefore remains drift, while jittery stationary traffic can qualify even when
 its absolute rate never enters a quiet band. A 30-second ceiling, converted to ticks from
-`lb-tick-ms`, caps deferral under non-idle traffic. Traffic at or below one command per provisioned
-thread per tick resets the learning/cap state, so an idle server remains in
+the internal observation cadence, caps deferral under non-idle traffic. Traffic at or below one
+command per provisioned thread per tick resets the learning/cap state, so an idle server remains in
 `awaiting-load-stability` and never pays for a maneuver it cannot use.
 
-`FlipController::start_maneuver()` arms the existing enqueue-age machinery at runtime. An explicit
-`lb-age-sample-rate` is used when nonzero; otherwise the rate derives from the provisioned thread
-count. IO and EX loops apply the published rate to their own `LoopSignals`, preserving single-owner
-writes. IO releases its ROB-head age map when the rate returns to zero.
+`FlipController::start_maneuver()` arms the existing enqueue-age machinery at runtime. Its rate
+derives from observed command volume and the three-tick decision window, and adapts on completed
+traffic windows; see [DESIGN-KNOBS.md](../DESIGN-KNOBS.md). IO and EX loops apply the published
+rate to their own `LoopSignals`, preserving single-owner writes. IO releases its ROB-head age
+map when the rate returns to zero.
 
 After a stabilized baseline rate, `issue_initial_jump()` subtracts the per-thread maneuver window.
 For each role it computes:
@@ -88,9 +88,10 @@ Both role-constraint guards use the role's busiest corrected-busy thread. Thus a
 not vetoed by idle peers. If either role has no measured work/busy quantity, measurement continues;
 the controller does not invent a workload prior.
 
-The calculation is performed in placement units (one logical CPU normally, one sibling pair under
-`smt-mode=1`) and then reported/committed in threads. The target passes `nio_eq` in the measured
-direction by `max(1, abs(nio_eq-nio_now)/2)`, clamped to one live unit of each role. Even when the
+The calculation is performed in placement units (one logical CPU normally, one sibling pair when
+the allowed topology contains complete pairs) and then reported/committed in threads. The target
+passes `nio_eq` in the measured direction by `max(1, abs(nio_eq-nio_now)/2)`, clamped to one live
+unit of each role. Even when the
 equalized split rounds to the current split, the direction of greater measured demand supplies the
 deliberate one-unit overshoot.
 
@@ -143,7 +144,7 @@ fingerprint, rate surge, rate collapse, and forced causes independently observab
 
 ## Integration and observability
 
-- `src/core/config.h` is the sole parser/default source for `flip-auto`, `flip-auto-band`, and
+- `src/core/config.h` is the sole parser/default source for `flip-auto` and
   `flip-work-window`; `src/cmd/t_server.cc` exposes them as immutable CONFIG values.
 - `tomokv.conf` documents the numeric grammar and off/auto semantics.
 - `INFO FLIPCTL` reports state/phase, anchor split/rate, bands, total/per-reason trigger counts, and

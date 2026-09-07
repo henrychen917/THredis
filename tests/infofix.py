@@ -267,22 +267,49 @@ def wire_bytes_and_rate():
     check("input counter exact after PING", as_int(second, "total_net_input_bytes"), expected_input)
     check("output counter exact after PING", as_int(second, "total_net_output_bytes"), expected_output)
 
+    def idle_rate():
+        # INFO is excluded from sampled_ops. Polling only INFO advances the eight 100ms sample
+        # slots without feeding the meter. A RESETSTAT command can itself finish after the
+        # reset baseline; wait for that residual sample to age out instead of sleeping once.
+        # Induce failure by retaining a nonzero published rate when the idle window has drained.
+        deadline = time.monotonic() + 5.0
+        trace = []
+        while True:
+            value = as_int(info(c, "stats"), "instantaneous_ops_per_sec")
+            trace.append(value)
+            if value == 0 or value < 0 or time.monotonic() >= deadline:
+                print("  idle sampled rates: %r" % trace)
+                return value
+            time.sleep(0.11)
+
     c.cmd("CONFIG", "RESETSTAT")
-    time.sleep(0.15)
-    control = as_int(info(c, "stats"), "instantaneous_ops_per_sec")
+    control = idle_rate()
     check("ops/sec idle control", control, 0)
     payload = encode("PING") * 5000
-    c.sock.sendall(payload)
-    for _ in range(5000):
-        _, reply = c.read()
-        if reply != "PONG":
-            raise AssertionError("pipeline PING returned %r" % reply)
-    time.sleep(0.12)
-    loaded = as_int(info(c, "stats"), "instantaneous_ops_per_sec")
+    deadline = time.monotonic() + 5.0
+    loaded_trace = []
+    while True:
+        c.sock.sendall(payload)
+        for _ in range(5000):
+            _, reply = c.read()
+            if reply != "PONG":
+                raise AssertionError("pipeline PING returned %r" % reply)
+        loaded = as_int(info(c, "stats"), "instantaneous_ops_per_sec")
+        loaded_trace.append(loaded)
+        if loaded != 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(0.11)
+    # Feed work until the sampler observes it. Pin the sampler at zero to induce failure;
+    # neither the positive-value check nor the exact idle checks degrade to SKIP on timeout.
+    print("  loaded sampled rates: %r" % loaded_trace)
     check("ops/sec sampler fired", loaded, lambda value: value > 0)
     c.cmd("CONFIG", "RESETSTAT")
-    time.sleep(0.15)
-    check("ops/sec RESETSTAT control", as_int(info(c, "stats"), "instantaneous_ops_per_sec"), 0)
+    # Also prove RESETSTAT executed: natural aging alone cannot satisfy a broken reset. Removing
+    # its command-counter baseline leaves this run's PINGs visible and fails this companion.
+    ping = info(c, "commandstats").get("cmdstat_ping", "calls=0")
+    ping_fields = dict(item.split("=", 1) for item in ping.split(",") if "=" in item)
+    check("RESETSTAT cleared the measured PINGs", int(ping_fields["calls"]), 0)
+    check("ops/sec RESETSTAT control", idle_rate(), 0)
     c.close()
 
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # fpshift.sh -- RATE-NEUTRAL workload shift: does the fingerprint still detect a mix change?
 #
 # fpprobe's leg B swapped single-key 1:1 for 8-key MGET/MSET, which collapses the command rate ~9x;
@@ -20,7 +21,7 @@ lim_load(){ # lim_load PORT SECS RATIO OUTFILE
     --rate-limiting=$RL --distinct-client-seed --hide-histogram >"$4" 2>&1
 }
 pid=$(SRV_CPUS=$SRV4 boot "$BIN" "$PORT" "fps-$TAG" --ratio 2:2 --shards 64 --atomic 0 \
-        --flip-auto 1 --flip-auto-band -1) || exit 1
+        --flip-auto 1) || exit 1
 LG_CPUS=$LG4 preload "$PORT" 4
 
 # ---- phase A: GET only, rate pinned, until anchored -------------------------------------------

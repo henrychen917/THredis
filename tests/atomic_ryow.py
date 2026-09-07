@@ -215,11 +215,16 @@ note("abandoned MSETNX candidates are never observable",
      not thread.is_alive() and leak_reads > 0 and not leak_errors,
      "reads=%d errors=%r" % (leak_reads, leak_errors))
 
-# Cross-key atomics on one connection must be admitted concurrently. A tiny window makes overlap
-# directly observable (the third frame stalls admission), and the rate comparison guards against a
-# future accidental return of the full connection barrier.
-admin.cmd("CONFIG", "SET", "atomic-window", "2")
-stall_before = int(admin.cmd("INFO", "STATS").split(b"atomic_window_stalls:", 1)[1].split(b"\r\n", 1)[0])
+# Observe multiple disjoint groups in flight on exactly one fresh connection. A connection
+# barrier cannot satisfy this witness, even though the production credit limit exceeds its ROB.
+from atomicwindow import held_burst
+try:
+    witness = held_burst(HOST, PORT, whole_window=False)
+    note("cross-key atomics on one connection overlap", True, witness)
+except Exception as exc:
+    note("cross-key atomics on one connection overlap", False, str(exc))
+
+# Rate comparison uses a separate, unheld burst after the witness has fully drained.
 c = Resp()
 burst_count = 24
 burst = bytearray()
@@ -230,8 +235,6 @@ c.sock.sendall(burst)
 overlap_ok = all(c.read() == b"OK" for _ in range(burst_count))
 pipelined_elapsed = time.perf_counter() - started
 c.close()
-stall_after = int(admin.cmd("INFO", "STATS").split(b"atomic_window_stalls:", 1)[1].split(b"\r\n", 1)[0])
-admin.cmd("CONFIG", "SET", "atomic-window", "256")
 
 c = Resp()
 started = time.perf_counter()
@@ -241,14 +244,9 @@ serial_elapsed = time.perf_counter() - started
 c.close()
 pipe_rate = burst_count / max(pipelined_elapsed, 1e-9)
 serial_rate = burst_count / max(serial_elapsed, 1e-9)
-rates = "stalls=%d pipe=%.0f/s serial=%.0f/s ratio=%.2f" % (
-    stall_after - stall_before, pipe_rate, serial_rate, pipe_rate / max(serial_rate, 1e-9))
-# The MECHANISM half, asserted on every tier: the 24 groups were all admitted and answered OK, and
-# the two-deep window actually stalled admission, which is only possible if a younger cross-key
-# group was in flight while an older one was still deciding. A connection barrier -- the regression
-# this section exists for -- makes stall_after == stall_before, on any build, at any speed.
-note("cross-key atomics on one connection overlap",
-     overlap_ok and stall_after > stall_before, rates)
+rates = "pipe=%.0f/s serial=%.0f/s ratio=%.2f" % (
+    pipe_rate, serial_rate, pipe_rate / max(serial_rate, 1e-9))
+note("unheld pipelined groups completed", overlap_ok, rates)
 # The RATE half: with the barrier gone, pipelining 24 groups must also beat 24 serial round trips.
 # It is a performance claim -- true only on a machine that is not being slowed unevenly -- so it is
 # made on the release tier and skipped, with its numbers, everywhere else.

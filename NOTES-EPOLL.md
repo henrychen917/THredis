@@ -1,5 +1,10 @@
 # NOTES-EPOLL — a second network event engine
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Branch `t-epoll`. Adds `--net-io uring|epoll`: a selectable epoll backend beside io_uring, so the
 same binary runs on kernels and in environments where io_uring is unavailable or unwanted.
 **The default is unchanged (`uring`), and the uring build contains no epoll code.**

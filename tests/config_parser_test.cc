@@ -8,6 +8,13 @@
 #include <vector>
 
 #include "src/core/config.h"
+#include "src/core/weighted_lb.h"
+
+static_assert(tomo::cfg_default_shards(1) == 8);
+static_assert(tomo::cfg_default_shards(2) == 16);
+static_assert(tomo::cfg_default_shards(16) == 128);
+static_assert(tomo::cfg_default_shards(32) == 256);
+static_assert(tomo::cfg_default_shards(UINT32_MAX) == 256);
 
 namespace {
 
@@ -160,22 +167,16 @@ int main() {
         !rejects({"--shards", "16x"}) ||
         !rejects({"--shards", ""}))
         fail("shards boot grammar differs");
-    if (rejection_text({"--shards", "16x"}) != "--shards must be between 1 and 256\n")
+    if (rejection_text({"--shards", "16x"}) != "--shards wants -1 (auto) or 1..256\n")
         fail("shards rejection text is not canonical");
     tomo::Config shards_default;
-    if (shards_default.shards != 16) fail("shards default is not 16");
+    if (shards_default.shards != tomo::Config::kShardsAuto)
+        fail("shards default is not auto");
+    if (tomo::parse_config_args({"--shards", "-1"}, shards, shards_state, 2, "test") !=
+            tomo::kConfigParsed || shards.shards != tomo::Config::kShardsAuto)
+        fail("explicit auto shards rejected");
 
-    tomo::Config persistence;
-    tomo::ConfigParseState persistence_state;
-    const std::vector<const char*> persistence_args = {"--persist-io", "NoRmAl"};
-    if (tomo::parse_config_args(persistence_args, persistence, persistence_state, 2, "test") !=
-            tomo::kConfigParsed ||
-        persistence.persist_io != tomo::PersistIoEngine::Normal ||
-        !rejects({"--persist-io", "hybrid"}))
-        fail("persist-io boot grammar differs");
-
-    // --net-io mirrors --persist-io exactly: named enum, case insensitive, boot-only, and a
-    // NEGATIVE CONTROL so "it parsed" cannot pass for a parser that accepts anything.
+    // The retained network engine also determines persistence; there is no separate selector.
     tomo::Config network;
     tomo::ConfigParseState network_state;
     const std::vector<const char*> network_args = {"--net-io", "EpOlL"};
@@ -192,7 +193,7 @@ int main() {
     tomo::Config threads;
     tomo::ConfigParseState threads_state;
     const std::vector<const char*> threads_args = {
-        "--thread-mode", "1s", "--overlap", "2",
+        "--thread-mode", "1s", "--x-overlap", "2",
     };
     if (tomo::parse_config_args(threads_args, threads, threads_state, 2, "test") !=
             tomo::kConfigParsed ||
@@ -213,36 +214,24 @@ int main() {
                tomo::validate_config(cfg) == tomo::kConfigParsed &&
                cfg.thread_mode == mode && cfg.overlap == pipeline;
     };
-    if (!parses_threads({"--thread-mode", "2s", "--overlap", "1"},
+    if (!parses_threads({"--thread-mode", "2s", "--x-overlap", "1"},
                         tomo::ThreadMode::Split, 1) ||
-        !parses_threads({"--thread-mode", "1s", "--thread-pipeline", "1"},
+        !parses_threads({"--thread-mode", "1s", "--x-overlap", "1"},
                         tomo::ThreadMode::Fused, 1) ||
         !parses_threads({"--thread-mode", "split"}, tomo::ThreadMode::Split, 0) ||
-        !parses_threads({"--thread-mode", "fused"}, tomo::ThreadMode::Fused, 0) ||
-        !parses_threads({"--genthread-schedule", "coarse"},
-                        tomo::ThreadMode::Fused, 0) ||
-        !parses_threads({"--genthread-schedule", "IoFuSeD"},
-                        tomo::ThreadMode::Fused, 1) ||
-        !parses_threads({"--genthread-schedule", "streams"},
-                        tomo::ThreadMode::Fused, 2))
-        fail("thread-mode or genthread compatibility aliases differ");
+        !parses_threads({"--thread-mode", "fused"}, tomo::ThreadMode::Fused, 0))
+        fail("thread-mode compatibility aliases differ");
     if (!rejects({"--thread-mode", "two-stage"}) ||
-        !rejects({"--overlap", "3"}) ||
-        !rejects({"--overlap", "-1"}) ||
-        !rejects({"--thread-pipeline", "3"}) ||
-        !rejects({"--thread-pipeline", "-1"}) ||
+        !rejects({"--x-overlap", "3"}) ||
+        !rejects({"--x-overlap", "-1"}) ||
         !rejects({"--genthread-schedule", "streams0"}))
         fail("invalid thread study grammar was accepted");
-    if (rejection_text({"--overlap", "3"}) != "--overlap wants 0, 1 or 2\n" ||
-        rejection_text({"--thread-pipeline", "-1"}) !=
-            "--overlap wants 0, 1 or 2\n" ||
-        rejection_text({"--genthread-schedule", "streams0"}) !=
-            "--genthread-schedule wants coarse, iofused or streams\n")
+    if (rejection_text({"--x-overlap", "3"}) != "--x-overlap wants 0, 1 or 2\n")
         fail("thread-study parser rejection text is not canonical");
     tomo::Config invalid_split_deep;
     tomo::ConfigParseState invalid_split_deep_state;
     const std::vector<const char*> invalid_split_deep_args = {
-        "--overlap", "2", "--thread-mode", "2s",
+        "--x-overlap", "2", "--thread-mode", "2s",
     };
     {
         StderrSilencer quiet;
@@ -251,18 +240,18 @@ int main() {
             tomo::validate_config(invalid_split_deep) != tomo::kConfigError)
             fail("2s plus overlap 2 was not rejected after order-independent parsing");
     }
-    if (rejection_text({"--overlap", "2", "--thread-mode", "2s"}, true) !=
-            "--overlap 2 is only available with --thread-mode 1s; "
+    if (rejection_text({"--x-overlap", "2", "--thread-mode", "2s"}, true) !=
+            "--x-overlap 2 is only available with --thread-mode 1s; "
             "2s has no deep unified-stream schedule\n" ||
-        rejection_text({"--thread-mode", "1s", "--overlap", "1",
+        rejection_text({"--thread-mode", "1s", "--x-overlap", "1",
                         "--net-io", "epoll"}, true) !=
-            "--thread-mode 1s with --overlap 1 requires --net-io uring "
+            "--thread-mode 1s with --x-overlap 1 requires --net-io uring "
             "for its single submit boundary\n")
         fail("thread-study validation rejection text is not canonical");
     tomo::Config read_local;
     tomo::ConfigParseState read_local_state;
     const std::vector<const char*> read_local_args = {
-        "--thread-mode", "1s", "--overlap", "0", "--read-local", "1",
+        "--thread-mode", "1s", "--x-overlap", "0", "--read-local", "1",
     };
     if (tomo::parse_config_args(read_local_args, read_local, read_local_state, 2, "test") !=
             tomo::kConfigParsed ||
@@ -274,69 +263,7 @@ int main() {
         !rejects({"--read-local", ""}))
         fail("read-local boot grammar differs");
     tomo::Config read_local_default;
-    if (read_local_default.read_local != 0 ||
-        read_local_default.read_local_interleave != 1 ||
-        read_local_default.read_local_atomic_filter != 1)
-        fail("read-local defaults differ");
-    auto parses_read_local_interleave = [](const char* value, uint32_t expected) {
-        tomo::Config cfg;
-        tomo::ConfigParseState state;
-        const std::vector<const char*> args = {"--read-local-interleave", value};
-        return tomo::parse_config_args(args, cfg, state, 2, "test") ==
-                   tomo::kConfigParsed &&
-               cfg.read_local_interleave == expected;
-    };
-    if (!parses_read_local_interleave("0", 0) ||
-        !parses_read_local_interleave("1", 1) ||
-        !rejects({"--read-local-interleave", "2"}) ||
-        !rejects({"--read-local-interleave", "yes"}) ||
-        !rejects({"--read-local-interleave", "-1"}) ||
-        !rejects({"--read-local-interleave", ""}))
-        fail("read-local-interleave boot grammar differs");
-    tomo::Config prefetch_capture_off;
-    tomo::ConfigParseState prefetch_capture_off_state;
-    const std::vector<const char*> prefetch_capture_off_args = {
-        "--read-local-prefetch-capture", "0",
-    };
-    if (tomo::parse_config_args(prefetch_capture_off_args, prefetch_capture_off,
-                                prefetch_capture_off_state, 2, "test") !=
-            tomo::kConfigParsed ||
-        prefetch_capture_off.read_local_prefetch_capture != 0 ||
-        !rejects({"--read-local-prefetch-capture", "2"}) ||
-        !rejects({"--read-local-prefetch-capture", "yes"}) ||
-        !rejects({"--read-local-prefetch-capture", "-1"}) ||
-        !rejects({"--read-local-prefetch-capture", ""}))
-        fail("read-local-prefetch-capture boot grammar differs");
-    tomo::Config prefetch_capture_on;
-    tomo::ConfigParseState prefetch_capture_on_state;
-    const std::vector<const char*> prefetch_capture_on_args = {
-        "--read-local-prefetch-capture", "1",
-    };
-    if (tomo::parse_config_args(prefetch_capture_on_args, prefetch_capture_on,
-                                prefetch_capture_on_state, 2, "test") !=
-            tomo::kConfigParsed ||
-        tomo::validate_config(prefetch_capture_on) != tomo::kConfigParsed ||
-        prefetch_capture_on.read_local != 0 ||
-        prefetch_capture_on.read_local_prefetch_capture != 1)
-        fail("read-local-prefetch-capture inert on setting was rejected");
-    tomo::Config prefetch_capture_default;
-    if (prefetch_capture_default.read_local_prefetch_capture != 1)
-        fail("read-local-prefetch-capture default is not capture-at-prefetch");
-    auto parses_read_local_atomic_filter = [](const char* value, uint32_t expected) {
-        tomo::Config cfg;
-        tomo::ConfigParseState state;
-        const std::vector<const char*> args = {"--read-local-atomic-filter", value};
-        return tomo::parse_config_args(args, cfg, state, 2, "test") ==
-                   tomo::kConfigParsed &&
-               cfg.read_local == 0 && cfg.read_local_atomic_filter == expected;
-    };
-    if (!parses_read_local_atomic_filter("0", 0) ||
-        !parses_read_local_atomic_filter("1", 1) ||
-        !rejects({"--read-local-atomic-filter", "2"}) ||
-        !rejects({"--read-local-atomic-filter", "yes"}) ||
-        !rejects({"--read-local-atomic-filter", "-1"}) ||
-        !rejects({"--read-local-atomic-filter", ""}))
-        fail("read-local-atomic-filter boot grammar differs");
+    if (read_local_default.read_local != 0) fail("read-local default differs");
     tomo::Config read_local_split;
     tomo::ConfigParseState read_local_split_state;
     const std::vector<const char*> read_local_split_args = {"--read-local", "1"};
@@ -350,7 +277,7 @@ int main() {
         tomo::Config cfg;
         tomo::ConfigParseState state;
         const std::vector<const char*> args = {
-            "--thread-mode", "1s", "--overlap", overlap, "--read-local", "1",
+            "--thread-mode", "1s", "--x-overlap", overlap, "--read-local", "1",
         };
         return tomo::parse_config_args(args, cfg, state, 2, "test") ==
                    tomo::kConfigParsed &&
@@ -362,109 +289,98 @@ int main() {
         !parses_read_local_fallback_cell("2", 2))
         fail("read-local overlap fallback cells were rejected");
 
-    tomo::Config smt;
-    tomo::ConfigParseState smt_state;
-    const std::vector<const char*> smt_args = {"--smt-mode", "1"};
-    if (tomo::parse_config_args(smt_args, smt, smt_state, 2, "test") !=
-            tomo::kConfigParsed ||
-        smt.smt_mode != 1 ||
-        !rejects({"--smt-mode", "2"}) ||
-        !rejects({"--smt-mode", "yes"}) ||
-        !rejects({"--smt-mode", "-1"}))
-        fail("smt-mode boot grammar differs");
-    tomo::Config smt_default;
-    if (smt_default.smt_mode != 0)
-        fail("smt-mode default is not logical-CPU independent");
-
     tomo::Config ex_sched;
     tomo::ConfigParseState ex_sched_state;
-    const std::vector<const char*> ex_sched_args = {"--ex-sched", "1"};
+    const std::vector<const char*> ex_sched_args = {"--x-ex-sched", "1"};
     if (tomo::parse_config_args(ex_sched_args, ex_sched, ex_sched_state, 2, "test") !=
             tomo::kConfigParsed ||
         ex_sched.ex_sched != 1 ||
-        !rejects({"--ex-sched", "2"}) ||
-        !rejects({"--ex-sched", "yes"}) ||
-        !rejects({"--ex-sched", "-1"}))
+        !rejects({"--x-ex-sched", "2"}) ||
+        !rejects({"--x-ex-sched", "yes"}) ||
+        !rejects({"--x-ex-sched", "-1"}))
         fail("ex-sched boot grammar differs");
     tomo::Config ex_sched_default;
     if (ex_sched_default.ex_sched != 0)
         fail("ex-sched default is not FIFO");
 
+    // A longer observation interval with proportionally more traffic must preserve the
+    // samples-per-decision target; transfer pacing must respond to measured cost.
+    tomo::LbAutotune sampled_lb;
+    sampled_lb.last_fold_ns = 1;
+    sampled_lb.observe_visits(4096, 1000000001);
+    const uint32_t sampled_rate = sampled_lb.sample_rate.load();
+    sampled_lb.observe_visits(8192, 3000000001);
+    if (sampled_rate != 3 || sampled_lb.sample_rate.load() != sampled_rate)
+        fail("LB samples per decision depend on observation interval");
+    tomo::LbAutotune slow_lb, fast_lb;
+    if (slow_lb.move_cap(16) != 1 || slow_lb.cooldown_ms() == 0)
+        fail("LB bootstrap cannot move or has no observation cooldown");
+    slow_lb.note_transfer(600000000, 1);
+    fast_lb.note_transfer(1000000, 1);
+    if (slow_lb.move_cap(16) >= fast_lb.move_cap(16) ||
+        slow_lb.cooldown_ms() <= fast_lb.cooldown_ms())
+        fail("LB pacing does not track completed transfer cost");
+    tomo::LbAutotune::QuietJitter noise;
+    for (double sample : {10.0, 11.0, 10.0, 11.0}) noise.observe(sample);
+    if (noise.band() != 2.0) fail("LB band is not twice measured quiet jitter");
+    noise.observe(40.0);
+    if (noise.band() != 2.0) fail("an excursion widened its own LB band");
+
     tomo::Config lb;
     tomo::ConfigParseState lb_state;
-    const std::vector<const char*> lb_args = {
-        "--key-lb", "0", "--client-lb", "0",
-        "--lb-sample-rate", "0", "--lb-age-sample-rate", "0", "--lb-tick-ms", "250",
-        "--lb-imbalance-pct", "17", "--lb-move-cap", "3",
-        "--lb-cooldown-ms", "9000",
+    if (lb.lb != 1) fail("LB default is not enabled");
+    for (const char* value : {"0", "1"}) {
+        if (tomo::parse_config_args({"--lb", value}, lb, lb_state, 2, "test") !=
+                tomo::kConfigParsed || lb.lb != static_cast<uint32_t>(*value - '0'))
+            fail("LB boot grammar differs");
+    }
+    if (!rejects({"--lb", "2"}) || !rejects({"--lb", "-1"}) ||
+        !rejects({"--lb", "yes"}) || !rejects({"--lb", ""}))
+        fail("invalid LB grammar accepted");
+
+    // Each retired spelling must fail even with its formerly valid default. The same parser
+    // consumes conf-file tokens, so this also prevents CONFIG REWRITE from reviving old knobs.
+    const std::pair<const char*, const char*> retired[] = {
+        {"--read-local-prefetch-capture", "1"}, {"--read-local-atomic-filter", "1"},
+        {"--read-local-interleave", "1"}, {"--flip-auto-band", "-1"},
+        {"--shard-home", "0:1"}, {"--l3-domains", "0-7"}, {"--smt-mode", "0"},
+        {"--genthread-schedule", "coarse"}, {"--atomic-window", "-1"},
+        {"--persist-io", "uring"}, {"--lru-clock-shift", "8"},
+        {"--script-crossshard-max-bytes", "-1"},
+        {"--script-crossshard-workbench-bytes", "-1"},
+        {"--script-crossshard-conflict-retries", "-1"},
+        {"--script-crossshard-cut-slots", "-1"}, {"--tls-ktls", "yes"},
+        {"--key-lb", "1"}, {"--client-lb", "1"}, {"--lb-sample-rate", "64"},
+        {"--lb-age-sample-rate", "0"}, {"--lb-tick-ms", "1000"},
+        {"--lb-imbalance-pct", "25"}, {"--lb-move-cap", "1"},
+        {"--lb-cooldown-ms", "5000"}, {"--ex-sched", "0"},
+        {"--overlap", "0"}, {"--thread-pipeline", "0"},
     };
-    if (tomo::parse_config_args(lb_args, lb, lb_state, 2, "test") != tomo::kConfigParsed ||
-        lb.key_lb != 0 || lb.client_lb != 0 || lb.lb_sample_rate != 0 ||
-        lb.lb_age_sample_rate != 0 ||
-        lb.lb_tick_ms != 250 || lb.lb_imbalance_pct != 17 || lb.lb_move_cap != 3 ||
-        lb.lb_cooldown_ms != 9000)
-        fail("weighted-LB knob grammar or zero off posture differs");
-    tomo::Config lb_default;
-    if (lb_default.key_lb != 1 || lb_default.client_lb != 1 ||
-        lb_default.lb_sample_rate != 64 || lb_default.lb_age_sample_rate != 0 ||
-        lb_default.lb_tick_ms != 1000 ||
-        lb_default.lb_imbalance_pct != 25 || lb_default.lb_move_cap != 1 ||
-        lb_default.lb_cooldown_ms != 5000)
-        fail("weighted-LB defaults differ");
-    if (!rejects({"--key-lb", "2"}) ||
-        !rejects({"--key-lb", "-1"}) ||
-        !rejects({"--client-lb", "yes"}) ||
-        !rejects({"--client-lb", "2"}) ||
-        !rejects({"--lb-sample-rate", "-1"}) ||
-        !rejects({"--lb-age-sample-rate", "-1"}) ||
-        !rejects({"--lb-tick-ms", "later"}) ||
-        !rejects({"--lb-imbalance-pct", "-1"}) ||
-        !rejects({"--lb-move-cap", "-1"}) ||
-        !rejects({"--lb-cooldown-ms", "-1"}))
-        fail("invalid weighted-LB knob grammar was accepted");
+    for (const auto& [flag, value] : retired) {
+        if (!rejects({flag, value})) fail("retired knob was accepted");
+    }
+    if (tomo::persistence_engine(network_default) != tomo::PersistIoEngine::Uring ||
+        tomo::persistence_engine(network) != tomo::PersistIoEngine::Normal)
+        fail("persistence does not follow the network engine");
 
     tomo::Config flipctl;
     tomo::ConfigParseState flipctl_state;
     const std::vector<const char*> flipctl_args = {
-        "--flip-auto", "1", "--flip-auto-band", "7", "--flip-work-window", "0",
+        "--flip-auto", "1", "--flip-work-window", "0",
     };
     if (tomo::parse_config_args(flipctl_args, flipctl, flipctl_state, 2, "test") !=
             tomo::kConfigParsed ||
-        flipctl.flip_auto != 1 || flipctl.flip_auto_band != 7 ||
+        flipctl.flip_auto != 1 ||
         flipctl.flip_work_window != 0)
         fail("flip controller knob grammar or zero off posture differs");
     tomo::Config flipctl_default;
-    if (flipctl_default.flip_auto != 0 || flipctl_default.flip_auto_band != -1 ||
+    if (flipctl_default.flip_auto != 0 ||
         flipctl_default.flip_work_window != 100)
         fail("flip controller defaults differ");
     if (!rejects({"--flip-auto", "2"}) ||
         !rejects({"--flip-auto", "yes"}) ||
-        !rejects({"--flip-auto-band", "-2"}) ||
-        !rejects({"--flip-auto-band", "auto"}) ||
         !rejects({"--flip-work-window", "-1"}))
         fail("invalid flip controller knob grammar was accepted");
-
-    tomo::Config xscript;
-    tomo::ConfigParseState xscript_state;
-    const std::vector<const char*> xscript_args = {
-        "--script-crossshard-max-bytes", "0",
-        "--script-crossshard-workbench-bytes", "1048576",
-        "--script-crossshard-conflict-retries", "-1",
-        "--script-crossshard-cut-slots", "7",
-    };
-    if (tomo::parse_config_args(xscript_args, xscript, xscript_state, 2, "test") !=
-            tomo::kConfigParsed ||
-        xscript.script_crossshard_max_bytes != 0 ||
-        xscript.script_crossshard_workbench_bytes != 1048576 ||
-        xscript.script_crossshard_conflict_retries != -1 ||
-        xscript.script_crossshard_cut_slots != 7)
-        fail("cross-script knob grammar or values differ");
-    if (!rejects({"--script-crossshard-max-bytes", "-2"}) ||
-        !rejects({"--script-crossshard-max-bytes", "-9223372036854775808"}) ||
-        !rejects({"--script-crossshard-workbench-bytes", "wat"}) ||
-        !rejects({"--script-crossshard-conflict-retries", "9223372036854775808"}) ||
-        !rejects({"--script-crossshard-cut-slots", "-9"}))
-        fail("invalid cross-script knob grammar was accepted");
 
     tomo::Config missing_ca;
     tomo::ConfigParseState missing_ca_state;

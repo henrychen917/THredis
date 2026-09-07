@@ -1,5 +1,10 @@
 # DESIGN-flipfp -- the flip fingerprint leaves the per-op hot path
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 Lane t-flipfp, base e2ef7a155 (train 11). Lever I2 of CYCLEMAP.md: `flip_fingerprint_note` ran its
 full body on every dispatched frame -- 63 (1T) to 86 (2T) instr/op and 8.6% of the write path's
 store-queue-full stall -- for a detector whose only reader is off in the shipped config.
@@ -311,7 +316,9 @@ A real class change driven at a pinned command rate, so the fingerprint is not p
 detector. The signal and the floor cannot be read from one run -- with a learned band the trigger
 fires and `reset()` wipes the distance -- so each arm is run twice: `--flip-auto-band 90` holds the
 anchor and lets the distance converge (the signal), `--flip-auto-band -1` learns the floor.
-`scratch/flipfp/fpmargin.sh`.
+The former `scratch/flipfp/fpmargin.sh` implemented this two-band experiment. It is retired in the
+merged tree because neither pinning the band nor disabling its retriggers has a public control.
+These historical measurements remain evidence only for their recorded builds; see `MERGE.md`.
 
 **BITCOUNT -> INCR** (the redesign lane's reference change), 2:2 split, `--rate-limiting` pinned:
 

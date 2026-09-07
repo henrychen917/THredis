@@ -738,8 +738,7 @@ public:
 
     // Enabled is boot-latched. The sink may be rebound only at a quiesced fused ownership handoff;
     // false keeps the old store path and every installed writer hook predicted cold.
-    void configure_read_local(bool enabled, ReadLocalRetireSink sink,
-                              bool atomic_filter = true) {
+    void configure_read_local(bool enabled, ReadLocalRetireSink sink) {
         if (enabled && !sink.defer) std::abort();
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         if (enabled && !sink.diagnostics()) std::abort();
@@ -750,10 +749,6 @@ public:
         if (enabled && atomic_pending_entries() != 0) std::abort();
         ReadLocalStoreState* state = read_local_store_state();
         if (enabled && !state) std::abort();
-        if (enabled) {
-            if (read_local_enabled_ && read_local_atomic_filter_ != atomic_filter) std::abort();
-            read_local_atomic_filter_ = atomic_filter;
-        }
         if constexpr (kReadLocalSetTaxAtomicRaw) {
             // Persistence/bootstrap may have used the ordinary overwrite path before the boot latch
             // is exposed. Establish fixed atomic payload cells for that final image while no foreign
@@ -788,7 +783,6 @@ public:
         return read_local_store_state_required().retire_sink;
     }
 #endif
-    bool read_local_atomic_filter_enabled() const { return read_local_atomic_filter_; }
 
     uint64_t read_local_state_acquire() const {
         return read_local_store_state_required().probe_sequence.load(std::memory_order_acquire);
@@ -823,7 +817,6 @@ public:
         // permanently poisons, so short-circuiting here cannot turn that fail-closed state into a
         // false negative after the last enumerable entry drains.
         if (!read_local_pending(state)) return false;
-        if (!read_local_atomic_filter_) return true;
         return read_local_store_state_required().foreign_reads.might_contain(hash);
     }
     bool foreign_read_key_unsafe(uint64_t hash) const {
@@ -831,10 +824,8 @@ public:
         return foreign_read_key_unsafe(state, hash);
     }
     // Multi-key window validator. Load it only for a key whose shard word carries the pending bit,
-    // and only to compare against a later load of the same cell. With the filter OFF a pending
-    // shard sends every key to its owner before any comparison, so the constant is never compared.
+    // and only to compare against a later load of the same cell. Called only on the armed lane.
     uint32_t foreign_read_cell_epoch(uint64_t hash) const {
-        if (!read_local_atomic_filter_) return 0;
         return read_local_store_state_required().foreign_reads.cell_epoch(hash);
     }
     static uint32_t foreign_read_filter_index(uint64_t hash) {
@@ -880,8 +871,7 @@ public:
         // reader that already observed a negative cell cannot validate across the later handler.
         ReadLocalTableGuard publication(*this);
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_)
-            state.foreign_reads.add_span(count, std::forward<HashAt>(hash_at));
+        state.foreign_reads.add_span(count, std::forward<HashAt>(hash_at));
         foreign_read_pending_witness_open(state);
     }
 
@@ -889,8 +879,7 @@ public:
     void foreign_read_scope_close_span(uint32_t count, HashAt&& hash_at) {
         if (!read_local_enabled_) return;
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_)
-            state.foreign_reads.close_span(count, std::forward<HashAt>(hash_at));
+        state.foreign_reads.close_span(count, std::forward<HashAt>(hash_at));
         foreign_read_pending_witness_close(state);
     }
 
@@ -3527,10 +3516,9 @@ private:
         if (!read_local_enabled_) std::abort();
         if (entry.foreign_read_unsafe_published) std::abort();
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_)
-            state.foreign_reads.add_span(entry.capacity, [&](uint32_t index) {
-                return atomic_entry_hash(entry, index);
-            });
+        state.foreign_reads.add_span(entry.capacity, [&](uint32_t index) {
+            return atomic_entry_hash(entry, index);
+        });
         foreign_read_pending_witness_open(state);
         entry.foreign_read_unsafe_published = true;
     }
@@ -3538,10 +3526,9 @@ private:
     void read_local_pending_unpublish(AtomicEntry& entry) {
         if (__builtin_expect(!entry.foreign_read_unsafe_published, true)) return;
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_)
-            state.foreign_reads.close_span(entry.capacity, [&](uint32_t index) {
-                return atomic_entry_hash(entry, index);
-            });
+        state.foreign_reads.close_span(entry.capacity, [&](uint32_t index) {
+            return atomic_entry_hash(entry, index);
+        });
         foreign_read_pending_witness_close(state);
         entry.foreign_read_unsafe_published = false;
     }
@@ -3574,13 +3561,13 @@ private:
     void foreign_read_poison_open() {
         ReadLocalTableGuard publication(*this);
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_) state.foreign_reads.poison_open();
+        state.foreign_reads.poison_open();
         foreign_read_pending_witness_open(state);
     }
 
     void foreign_read_poison_close() {
         ReadLocalStoreState& state = read_local_store_state_required();
-        if (read_local_atomic_filter_) state.foreign_reads.poison_close();
+        state.foreign_reads.poison_close();
         foreign_read_pending_witness_close(state);
     }
 
@@ -3774,11 +3761,11 @@ private:
     // than a legitimate reason to widen these hot fields.
     uint32_t  cap_[2]   = {0, 0};
     uint32_t  mask_[2]  = {0, 0};
-    // Boot-latched, and the first two bytes a foreign probe tests before it touches anything else.
-    // They belong ON the topology line rather than 200 bytes past it: co-located, the whole foreign
+    // Boot-latched, and the first byte a foreign probe tests before it touches anything else.
+    // It belongs ON the topology line rather than 200 bytes past it: co-located, the whole foreign
     // read reduces to one line of FlatStore. Armed state itself stays sidecarred.
     bool      read_local_enabled_ = false;
-    bool      read_local_atomic_filter_ = false;
+    uint8_t   reader_reserved_ = 0; // retain the measured reader/owner line separation
 
     // ---- SEPARATOR. Read-mostly only: config, bind-once counter bindings, and the snapshot
     // scalars that are latched once when a capture is prepared. NOTHING here is written by an
@@ -3864,7 +3851,7 @@ struct FlatStoreLayoutLock {
     // atomic_pending_ is the FIRST of them: read_local_probe() cannot reach probe_sequence, the
     // read-local filter or the retire sink without loading it.
     static constexpr size_t reader_first = offsetof(FlatStore, atomic_pending_);
-    static constexpr size_t reader_last  = offsetof(FlatStore, read_local_atomic_filter_);
+    static constexpr size_t reader_last  = offsetof(FlatStore, read_local_enabled_);
     // Every byte the owner writes on the ordinary insert-a-new-key / DEL path.
     static constexpr size_t owner_first  = offsetof(FlatStore, live_);
     static constexpr size_t owner_last   = offsetof(FlatStore, borrow_tombs_) + 3;

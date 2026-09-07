@@ -9,7 +9,7 @@ NCORES=$(taskset -c "$CORES" nproc)
 if [ "$NCORES" -ge 8 ]; then RATIO=4:4
 else RATIO=$(((NCORES+1)/2)):$((NCORES-(NCORES+1)/2)); fi
 CLI=${REDIS_CLI:-redis-cli}
-PERSIST_IO=${PERSIST_IO:-uring}
+NET_IO=${NET_IO:-uring}
 ACTIVE_PID=
 
 cleanup() {
@@ -43,7 +43,7 @@ boot_server() {
   [ "$debug" = yes ] && debug_args=(--enable-debug-command yes)
   taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --atomic "$atomic" \
-    --persist-io "$PERSIST_IO" --appendonly yes --appendfsync everysec \
+    --net-io "$NET_IO" --appendonly yes --appendfsync everysec \
     --dir "$directory" "${debug_args[@]}" \
     >"$log" 2>&1 &
   boot_pid=$!
@@ -138,7 +138,7 @@ for kind in manifest base record-length group-vector; do
   python3 tests/aof_rewrite.py 127.0.0.1 "$PORT" corrupt "$directory" "$kind" >/dev/null
   if taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
       --shards 16 --ratio "$RATIO" --protected-mode no --appendonly yes \
-      --persist-io "$PERSIST_IO" --appendfsync everysec \
+      --net-io "$NET_IO" --appendfsync everysec \
       --dir "$directory" >"$directory/refusal.log" 2>&1; then
     exit 1
   fi
@@ -154,7 +154,7 @@ first_size=$(stat -c %s "$first_path")
 truncate -s $((first_size-7)) "$first_path"
 if taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --appendonly yes \
-    --persist-io "$PERSIST_IO" --appendfsync everysec \
+    --net-io "$NET_IO" --appendfsync everysec \
     --dir "$interior" >"$interior/refusal.log" 2>&1; then
   exit 1
 fi

@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # red2.sh -- REDESIGN chain v2 (t-flipdamp, 2026-09-06 pm), folding the coordinator's owner-box
 # correction: BASE-auto (t9final) is the bar to beat, cells are 120 s with a 1 Hz trace so
 # time-to-first-move / moves-after-stabilization / steady-state are three separate numbers, the
@@ -141,7 +142,7 @@ for r in 1 2; do
   out=$SP/fd-r2-ctl-$r.txt
   [ -s "$out" ] && { LG "CTL $r on file :: $(grep -E '^ok:|AssertionError|anchored off-rail' "$out" | head -1 | cut -c1-180)"; continue; }
   wait_gate
-  pid=$(boot8 "$RED_BIN" "$PORT_BAT" "r2ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) || continue
+  pid=$(boot8 "$RED_BIN" "$PORT_BAT" "r2ctl-$r" --ratio 6:2 --atomic 0 --flip-auto 1) || continue
   taskset -c "$LG8" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" --stable-seconds 30 >"$out" 2>&1; rc=$?
   echo "RC=$rc" >>"$out"; redis-cli -p "$PORT_BAT" debug flipctl >>"$out" 2>&1
   LG "CTL $r rc=$rc :: $(grep -E 'anchored off-rail|^ok:|AssertionError' "$out" | head -1 | cut -c1-200)"

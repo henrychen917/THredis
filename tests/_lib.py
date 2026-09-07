@@ -11,7 +11,7 @@ House rules this module encodes (they are rules, not preferences -- see AUDIT-TE
     timing arm in disguise).
   * A geometry claim is PROVED on this boot. `shard_of()` and `topology()` ask the server; nothing
     is inferred from key names or from the default shard-home map (the hash seed is drawn from the
-    kernel at every boot, and --shard-home can move shards).
+    kernel at every boot, and the balancer can move shards).
   * "Owner" means the thread that owns a shard -- the `shard <sid> <owner_tid>` rows of DEBUG
     LBSIGNALS -- never the `ex` role label. Under --thread-mode 1s every thread is labelled `fused`;
     ownership still comes from shard rows. Every helper here behaves identically in 1s and 2s.

@@ -10,7 +10,7 @@ if [ "$NCORES" -ge 8 ]; then RATIO=4:4
 else RATIO=$(((NCORES+1)/2)):$((NCORES-(NCORES+1)/2)); fi
 CLI=${REDIS_CLI:-redis-cli}
 BIN=${TOMO_BIN:-./build/tomokv}
-PERSIST_IO=${PERSIST_IO:-uring}
+NET_IO=${NET_IO:-uring}
 ACTIVE_PID=
 
 cleanup() {
@@ -39,7 +39,7 @@ boot_server() {
   local boot_pid socket_pid
   taskset -c "$CORES" "$BIN" --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --atomic "$atomic" \
-    --persist-io "$PERSIST_IO" --appendonly yes --appendfsync everysec \
+    --net-io "$NET_IO" --appendonly yes --appendfsync everysec \
     --auto-aof-rewrite-percentage 0 \
     --enable-debug-command yes --dir "$directory" >"$log" 2>&1 &
   boot_pid=$!

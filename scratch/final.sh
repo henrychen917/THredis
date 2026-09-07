@@ -1,4 +1,5 @@
 #!/bin/bash
+# Boot grammar updated for derived controls; historical PRE/POST results need fresh validation.
 # final.sh -- everything the report needs, in priority order, each step gate-checked:
 #   1 matrix2: pol0a pol0b pol1 base1 x mk sk1:1 sk9:1 get, 40s cells, 3 ABBA rounds
 #   2 directed hold test: policy x2 (expect pass), base x1 (expect fail)
@@ -30,7 +31,7 @@ taskset -c "$LG_CPUS" python3 tests/flip_under_load.py 127.0.0.1 "$PORT_BAT" 20 
 taskset -c "$LG_CPUS" python3 tests/flip_ttl.py 127.0.0.1 "$PORT_BAT" >"$SP/fd-bat-flipttl.txt" 2>&1; echo "flip_ttl.py rc=$? :: $(tail -1 "$SP/fd-bat-flipttl.txt" | cut -c1-120)"
 stop "$PID" "$PORT_BAT"
 require_gate || exit 3
-PID=$(boot "$FIX_BIN" "$PORT_BAT" batctl --ratio 6:2 --atomic 0 --flip-auto 1 --flip-auto-band 2 --lb-age-sample-rate 1024) || exit 2
+PID=$(boot "$FIX_BIN" "$PORT_BAT" batctl --ratio 6:2 --atomic 0 --flip-auto 1) || exit 2
 taskset -c "$LG_CPUS" timeout 300 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT_BAT" --stable-seconds 30 >"$SP/fd-bat-flipctl.txt" 2>&1; echo "flipctl.py rc=$? :: $(grep -vE '^\s*$' "$SP/fd-bat-flipctl.txt" | tail -2 | tr '\n' ' ' | cut -c1-300)"
 redis-cli -p "$PORT_BAT" debug flipctl >"$SP/fd-bat-flipctl-dbg.txt" 2>&1
 stop "$PID" "$PORT_BAT"

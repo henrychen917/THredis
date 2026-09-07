@@ -1,5 +1,10 @@
 # TomoKV-cpp hygiene audit
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 ## Findings
 
 | Finding | Category | Disposition | Evidence |
@@ -352,7 +357,8 @@ auth_failures before_reset=1 after_reset=1
 ## Test-file census
 
 The calibration examples expireindex.py, borrow_registry.py, and xshard_dispatch_scale.sh were
-already wired in the current parent. aof_frames.py is indirectly executed by aof_frame_order.py;
+already wired in this note's historical parent. The merged tree retires the dispatch instrument;
+the two surviving batteries use `--release-build`. aof_frames.py is indirectly executed by aof_frame_order.py;
 aof_rewrite.py and aof_rewrite_triggers.py are driven by matrix wrappers; differ.py is driven by
 differ_gate.sh; niclib.sh and gate_refs.txt support optional full-tier NIC rows.
 
@@ -456,7 +462,7 @@ XSHARD-DISPATCH-SCALE PASS (best 128t/4t excess ratio=0.960, limit=1.20)
 notify: ok (notify_events_fired=1608)
 ~~~
 
-Purpose-boot matrix commands:
+Historical purpose-boot matrix commands (superseded by the current gate's network-engine grammar):
 
 ~~~sh
 PERSIST_IO=normal GATE_PORT=7600 GATE_CORES=128-135 tests/aof_rewrite_matrix.sh
@@ -465,7 +471,8 @@ PERSIST_IO=uring  GATE_PORT=7600 GATE_CORES=128-135 tests/aof_rewrite_matrix.sh
 PERSIST_IO=uring  GATE_PORT=7600 GATE_CORES=128-135 tests/aof_rewrite_trigger_matrix.sh
 ~~~
 
-Other purpose-booted battery invocations (each boot used the knobs documented by gate.sh):
+Historical purpose-booted battery invocations (not recipes for the merged tree; the dispatch
+instrument and script OFF arm below are retired):
 
 ~~~sh
 python3 tests/xscript.py 127.0.0.1 7600 off|limit|window

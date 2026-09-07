@@ -1,5 +1,10 @@
 # P0: the armed-fused crash — attribution, real crash site, and the instrument
 
+> Historical research record: configuration recipes and measurements below describe earlier
+> revisions. Deleted controls are not accepted by the merged server, and the manual-map
+> dispatch-scaling instrument is retired. For current controls and merge dispositions, see
+> [DESIGN-KNOBS.md](DESIGN-KNOBS.md) and [MERGE.md](MERGE.md).
+
 ## 1. The reported evidence was two different failures, not one
 
 The gate-hygiene lane's third acceptance gate reported a segfault in the reply path
