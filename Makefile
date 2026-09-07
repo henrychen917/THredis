@@ -97,11 +97,15 @@ build/read-local-ring-unit: tests/read_local_ring_unit.cc $(wildcard src/*/*.h) 
 build/read-local-write-ring-unit: tests/read_local_write_ring_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/read_local_write_ring_unit.cc -o $@
-unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit
+build/waits-unit: tests/waits_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -I. tests/waits_unit.cc -o $@
+unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit build/waits-unit
 	./build/config-parser-test
 	./build/flipctl-unit
 	./build/read-local-ring-unit
 	./build/read-local-write-ring-unit
+	./build/waits-unit
 
 # Load drivers: not part of `all`, kept compiling here so they cannot rot unnoticed.
 build/benchtxn: tools/benchtxn.cc Makefile

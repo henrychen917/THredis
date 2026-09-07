@@ -1399,7 +1399,7 @@ void cmd_config(Shard& sh, Op& op) {
                                (save_armed ? NOTIFY_SAVE : 0u));
         }
 
-        // Eviction config is process-global (odd/even snapshot read by owners each pass); publish
+        // Eviction config is process-global (committed mailbox copies read each pass); publish
         // it once from shard 0's task rather than per shard.
         if (sh.id() == 0 && g_server) {
             for (const auto& update : updates) {
@@ -1415,7 +1415,8 @@ void cmd_config(Shard& sh, Op& op) {
                     g_server->set_proto_max_bulk_len(value);
                 }
             }
-            LiveConfigSnapshot desired = g_server->live_config_snapshot();
+            LiveConfigSnapshot desired =
+                g_server->live_config_snapshot(g_server->worker_of_shard(sh.id()));
             bool set_memory = false, set_policy = false, set_samples = false;
             for (const auto& update : updates) {
                 const Slice text(update.second.data(),
