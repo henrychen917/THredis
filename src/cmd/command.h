@@ -385,6 +385,7 @@ bool command_prepare_scan_route(Server& server, Op& op);
 bool command_prepare_subcmd_route(Server& server, Op& op);
 // Lets the server-tail translation unit reach the bound Server without duplicating the binding.
 Server* command_server();
+uint64_t command_proto_max_bulk_len();
 // The IO thread currently running a ConnLocal handler, for the few commands that must talk to
 // the loop itself (SHUTDOWN's ring pokes). Null outside a ConnLocal call.
 ThreadCtx* command_local_thread();

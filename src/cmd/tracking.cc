@@ -28,6 +28,7 @@
 // REDIRECT sends the invalidation to another connection, which may be owned by a different io
 // thread; that is one extra hop through the same transport (TrackingDeliver).
 
+#include "t_stream.h"
 #include "../core/io_loop.h"
 
 namespace tomo {
@@ -99,19 +100,28 @@ void IoLoop::tracking_register_read(Client* client, ClimonConn& state, Op& op) {
     if (!spec) return;
     // Only genuine reads register. A write from the tracking connection is not a subscription.
     if (!(spec->flags & CmdFlags::Readonly) || (spec->flags & CmdFlags::Write)) return;
-    if (spec->first_key <= 0) return;
     // OPTIN: register only when the previous command was CLIENT CACHING yes.
     // OPTOUT: register unless the previous command was CLIENT CACHING no.
     if (state.optin && !caching) return;
     if (state.optout && caching) return;
 
+    uint32_t first = spec->first_key > 0 ? static_cast<uint32_t>(spec->first_key) : 0;
+    uint32_t end = spec->last_key < 0 ? op.argc()
+        : std::min<uint32_t>(op.argc(), static_cast<uint32_t>(spec->last_key) + 1);
+    if (spec->flags & CmdFlags::StreamRoute) {
+        // Registration must not append a parser error to the real reply; dispatch owns that error.
+        Op probe;
+        for (uint32_t i = 0; i < op.argc(); ++i)
+            if (!probe.push_arg(op.arg(i))) return;
+        StreamXreadArgs parsed;
+        if (!stream_parse_xread(probe, parsed)) return;
+        first = parsed.first_key;
+        end = first + parsed.key_count;
+    }
+    if (!first) return;
     const uint64_t id = client->id();
-    const int32_t last = spec->last_key;
     const int32_t step = spec->key_step > 0 ? spec->key_step : 1;
-    const uint32_t end = last < 0 ? op.argc()
-                                  : std::min<uint32_t>(op.argc(),
-                                                       static_cast<uint32_t>(last) + 1);
-    for (uint32_t i = static_cast<uint32_t>(spec->first_key); i < end;
+    for (uint32_t i = first; i < end;
          i += static_cast<uint32_t>(step)) {
         const Slice key = op.arg(i);
         if (srv_->cfg().tracking_table_max_keys &&

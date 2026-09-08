@@ -184,6 +184,14 @@ public:
         return true;
     }
 
+    uint64_t deferred_output_bytes(const Client& c) const {
+        const auto found = oob_defer_.find(const_cast<Client*>(&c));
+        if (found == oob_defer_.end()) return 0;
+        uint64_t bytes = 0;
+        for (const auto& frame : found->second) bytes += frame.bytes.size();
+        return bytes;
+    }
+
     // THE WHOLE REPLY SIDE, in one call: retire completed ops IN ORDER, stage their bytes, and
     // write. All three belong together and all three belong to the sender -- if the io thread
     // retired and merely handed bytes over, only the send syscall would move between modes, and
@@ -793,6 +801,7 @@ private:
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
+        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if constexpr (TlsNoBorrow) {
@@ -887,6 +896,7 @@ private:
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
+        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if (op.no_borrow()) note_zc_suppressed_tls();

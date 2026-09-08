@@ -1428,10 +1428,9 @@ void cmd_zrem(Shard& shard, Op& op) {
     reply_int(op.sink(), static_cast<long long>(removed));
 }
 
-RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
+RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop,
+                                 const CompactItems& items) {
     RemovalResult result;
-    CompactItems items;
-    if (!items.load(value)) return result;
     const int64_t length = static_cast<int64_t>(items.entries.size());
     if (start < 0) start += length;
     if (stop < 0) stop += length;
@@ -1445,6 +1444,12 @@ RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t st
     result.count = static_cast<uint32_t>(stop - start + 1);
     if (!value.erase_range(value.compact().logical(first), end)) return {};
     return result;
+}
+
+RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
+    CompactItems items;
+    if (!items.load(value)) return {};
+    return compact_erase_rank(value, start, stop, items);
 }
 
 RemovalResult compact_erase_score(CollectionRef& value, const ScoreRange& range) {
@@ -1954,7 +1959,7 @@ void cmd_zpop_generic(Shard& shard, Op& op, bool maximum) {
         const int64_t first = maximum ? static_cast<int64_t>(items.entries.size() - take) : 0;
         const int64_t last = maximum ? static_cast<int64_t>(items.entries.size() - 1)
                                      : static_cast<int64_t>(take - 1);
-        removed = compact_erase_rank(value, first, last);
+        removed = compact_erase_rank(value, first, last, items);
     } else {
         const uint64_t start_rank = maximum ? value.entries() : 1;
         ZsetNode* node = zset_expanded(value)->by_rank(start_rank);

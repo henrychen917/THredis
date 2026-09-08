@@ -319,6 +319,14 @@ g++ -std=c++20 -O2 -march=native -pthread -I. tests/read_local_write_ring_unit.c
     && /tmp/tomokv-read-local-write-ring-unit >>/tmp/gate-ring-unit.txt 2>&1 \
     && ok "read-local write ring + arming transient unit" \
     || bad "read-local write ring + arming transient unit" "see /tmp/gate-ring-unit.txt"
+# Surviving networking/command audit: deterministic serverless failure states, both tiers.
+pausable make -j2 build/netcmd-unit >/tmp/gate-netcmd-build.txt 2>&1 \
+    && ok "netcmd regression build" || bad "netcmd regression build" "see /tmp/gate-netcmd-build.txt"
+for NETCMD_CASE in streams zpop notify-oom notify-retry flush output pubsub receive config; do
+  timeout 60 ./build/netcmd-unit "$NETCMD_CASE" >/tmp/gate-netcmd-$NETCMD_CASE.txt 2>&1 \
+      && ok "netcmd $NETCMD_CASE regression" \
+      || bad "netcmd $NETCMD_CASE regression" "see /tmp/gate-netcmd-$NETCMD_CASE.txt"
+done
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
       --check src/cmd/acl_categories_generated.h \
@@ -447,7 +455,7 @@ shutdown_clean \
 # asserts its own mechanisms fired; the boot covers multi/blocking/pubsub+sharded/lua/limits.
 # ONE list, shared with the fused+armed leg below, so the two legs cannot drift apart: a battery
 # added here runs on the armed lane too, and the ledger arithmetic counts it twice per atomic mode.
-FEATURE_BATTERIES="s6 multi_exec blocking blockmulti stream streamgroups pubsub lua_scripting scriptsurf limits resp3 bitfield dumprestore zsetops geo climon climon2 tracking hexpire servertail lcs concur edgeproto edgeenc edgetime arity contarity cmdgap aclsel expwide infofix pushtear"
+FEATURE_BATTERIES="s6 multi_exec blocking blockmulti stream streamgroups pubsub lua_scripting scriptsurf limits resp3 bitfield dumprestore zsetops geo climon climon2 tracking hexpire servertail lcs concur edgeproto edgeenc edgetime arity contarity cmdgap aclsel expwide infofix pushtear netcmd"
 for AT in 0 1; do
   boot ./build/tomokv --atomic $AT --enable-debug-command yes \
       || bad "feature battery boot (atomic $AT)"

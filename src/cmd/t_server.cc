@@ -296,6 +296,7 @@ struct ConfigValue {
 std::mutex g_config_mu;
 std::vector<ConfigValue> g_config;
 ClientOutputBufferLimits g_client_obuf_limits;
+std::atomic<uint64_t> g_proto_max_bulk_len{512ull * 1024 * 1024};
 
 void add_config(const char* name, ConfigKind kind, uint64_t value) {
     g_config.push_back(ConfigValue{name, kind, std::to_string(value)});
@@ -304,6 +305,7 @@ void add_config(const char* name, ConfigKind kind, uint64_t value) {
 void init_config(const Config& cfg) {
     std::lock_guard<std::mutex> lock(g_config_mu);
     g_config.clear();
+    g_proto_max_bulk_len.store(cfg.proto_max_bulk_len, std::memory_order_relaxed);
     g_config.push_back({"save", ConfigKind::Save, cfg_save_schedule_string(cfg.save)});
     g_config.push_back({"dir", ConfigKind::String, (cfg.dir && *cfg.dir) ? cfg.dir : "."});
     g_config.push_back({"dbfilename", ConfigKind::String,
@@ -1373,6 +1375,7 @@ void cmd_config(Shard& sh, Op& op) {
                     if (!parse_u64(Slice(update.second.data(), update.second.size()), value))
                         std::abort();
                     g_server->set_proto_max_bulk_len(value);
+                    g_proto_max_bulk_len.store(value, std::memory_order_relaxed);
                 }
             }
             LiveConfigSnapshot desired = g_server->live_config_snapshot();
@@ -2928,6 +2931,9 @@ bool command_parse_scan_cursor(Slice text, uint64_t& cursor) {
 }
 
 Server* command_server() { return g_server; }
+uint64_t command_proto_max_bulk_len() {
+    return g_proto_max_bulk_len.load(std::memory_order_relaxed);
+}
 ThreadCtx* command_local_thread() { return g_thread; }
 
 void command_config_snapshot(std::vector<std::pair<std::string, std::string>>& out) {

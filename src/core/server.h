@@ -156,6 +156,7 @@ public:
     static constexpr uint64_t kAtomicEnabledBit = uint64_t{1} << 63;
 
     Server() = default;
+    friend struct NetcmdRegression;
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 

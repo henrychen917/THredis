@@ -90,6 +90,8 @@
     void client_routing_forward_monitor(const PubSubEvent& event);
 
     // ---- CLIENT REPLY ---------------------------------------------------------------------------
+    void climon_flush_completed(Op& op);
+    void climon_mark_reply(Client* client, Op& op);
     bool climon_reply_suppressed(Client* client);
     uint32_t climon_serve_suppressed(Client* client);
     uint32_t climon_prepare_suppressed(Client* client, bool& submit_allowed);

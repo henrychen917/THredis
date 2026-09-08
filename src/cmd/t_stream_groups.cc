@@ -4,6 +4,7 @@
 // The stream and this cold state remain owned by one executor shard at all times.
 #include "command.h"
 #include "t_stream.h"
+#include "notify.h"
 #include "../core/shard.h"
 #include "../exec/op.h"
 #include "../net/resp.h"
@@ -224,9 +225,9 @@ void reply_nogroup(Op& op, Slice key, Slice group, bool xreadgroup = false) {
     auto sink = op.sink();
     sink.push_back('-');
     sink.append("NOGROUP No such key '", sizeof("NOGROUP No such key '") - 1);
-    sink.append(key.p, key.n);
+    reply_line_text(sink, key.p, key.n);
     sink.append("' or consumer group '", sizeof("' or consumer group '") - 1);
-    sink.append(group.p, group.n);
+    reply_line_text(sink, group.p, group.n);
     if (xreadgroup)
         sink.append("' in XREADGROUP with GROUP option\r\n",
                     sizeof("' in XREADGROUP with GROUP option\r\n") - 1);
@@ -238,9 +239,9 @@ void reply_nogroup_subcommand(Op& op, Slice key, Slice group) {
     sink.push_back('-');
     sink.append("NOGROUP No such consumer group '",
                 sizeof("NOGROUP No such consumer group '") - 1);
-    sink.append(group.p, group.n);
+    reply_line_text(sink, group.p, group.n);
     sink.append("' for key name '", sizeof("' for key name '") - 1);
-    sink.append(key.p, key.n);
+    reply_line_text(sink, key.p, key.n);
     sink.append("'\r\n", sizeof("'\r\n") - 1);
 }
 
@@ -296,17 +297,6 @@ void assign_pending_consumer(StreamGroups& groups, StreamPending& pending, Slice
     const uint64_t old_capacity = pending.consumer.capacity();
     pending.consumer.assign(consumer.p, consumer.n);
     groups.note_capacity_change(old_capacity, pending.consumer.capacity());
-}
-
-void upsert_pending(StreamGroups& groups, StreamGroup& group, const StreamID& id,
-                    StreamPending&& replacement) {
-    const auto old = group.pending.find(id);
-    const uint64_t old_bytes = old == group.pending.end()
-        ? 0 : pending_allocation_bytes(old->second);
-    const auto [it, inserted] = group.pending.insert_or_assign(id, std::move(replacement));
-    const uint64_t new_bytes = pending_allocation_bytes(it->second);
-    if (inserted) groups.note_insert(new_bytes);
-    else groups.note_capacity_change(old_bytes, new_bytes);
 }
 
 uint64_t pending_for(const StreamGroup& group, const std::string& consumer) {
@@ -463,6 +453,8 @@ void cmd_xgroup(Shard& shard, Op& op) {
             maybe_release_groups(*value);
             reply_err(op.sink(), "ERR out of memory"); return;
         }
+        if constexpr (kNotify)
+            notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::XgroupCreate, key);
         reply_ok(op.sink());
         return;
     }
@@ -485,6 +477,8 @@ void cmd_xgroup(Shard& shard, Op& op) {
         groups->note_delete(group_allocation_bytes(found->first, found->second));
         groups->groups.erase(found);
         maybe_release_groups(*stream_value(object));
+        if constexpr (kNotify)
+            notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::XgroupDestroy, key);
         reply_int(op.sink(), 1);
         return;
     }
@@ -498,6 +492,8 @@ void cmd_xgroup(Shard& shard, Op& op) {
         if (!create_consumer(*groups, *group, op.arg(4), shard.now_ms(), consumer, created)) {
             reply_err(op.sink(), "ERR out of memory"); return;
         }
+        if constexpr (kNotify) if (created)
+            notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::XgroupCreateconsumer, key);
         reply_int(op.sink(), created ? 1 : 0);
         return;
     }
@@ -519,6 +515,8 @@ void cmd_xgroup(Shard& shard, Op& op) {
         }
         groups->note_delete(consumer_allocation_bytes(consumer->first));
         group->consumers.erase(consumer);
+        if constexpr (kNotify)
+            notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::XgroupDelconsumer, key);
         reply_int(op.sink(), static_cast<long long>(removed));
         return;
     }
@@ -541,6 +539,8 @@ void cmd_xgroup(Shard& shard, Op& op) {
         ObjectSizeTracker tracker(shard.store(), object);
         group->last_delivered = id;
         group->entries_read = entries_read;
+        if constexpr (kNotify)
+            notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::XgroupSetid, key);
         reply_ok(op.sink());
         return;
     }
@@ -582,7 +582,6 @@ bool parse_pending_bound(Op& op, Slice input, bool start, StreamID& id, bool& ex
     exclusive = input.n && input.p[0] == '(';
     if (exclusive) { input.p++; input.n--; }
     if (!parse_id(input, id, start ? 0 : UINT64_MAX, true)) { invalid_id(op); return false; }
-    if (exclusive && start && !id_increment(id)) return false;
     return true;
 }
 
@@ -635,6 +634,10 @@ void cmd_xpending(Shard& shard, Op& op) {
     int64_t count = 0;
     if (!parse_i64_exact(op.arg(pos + 2), count)) {
         reply_err(op.sink(), "ERR value is not an integer or out of range"); return;
+    }
+    if (start_exclusive && !id_increment(start)) {
+        reply_array_header(op.sink(), 0);
+        return;
     }
     const Slice consumer = op.argc() == pos + 4 ? op.arg(pos + 3) : Slice{};
     const int64_t now = shard.now_ms();
@@ -844,7 +847,9 @@ void cmd_xautoclaim(Shard& shard, Op& op) {
     consumer->seen_time = now;
     std::vector<StreamOwnedEntry> claimed;
     std::vector<StreamID> deleted;
-    try { claimed.reserve(count); deleted.reserve(count); }
+    // COUNT bounds work; it is not a request to allocate that many entries on an empty PEL.
+    const size_t capacity = std::min<uint64_t>(count, group->pending.size());
+    try { claimed.reserve(capacity); deleted.reserve(capacity); }
     catch (const std::bad_alloc&) { reply_err(op.sink(), "ERR out of memory"); return; }
     const uint64_t max_scan = count > UINT64_MAX / 10 ? UINT64_MAX : count * 10;
     struct AutoClaimScan {
@@ -968,6 +973,8 @@ void cmd_xsetid(Shard& shard, Op& op) {
     if (!stream_object_update_header(object, header)) {
         reply_err(op.sink(), "ERR corrupt stream encoding"); return;
     }
+    if constexpr (kNotify)
+        notify_record(shard, op, NOTIFY_STREAM, NotifyEventId::Xsetid, op.arg(1));
     reply_ok(op.sink());
 }
 
@@ -1153,7 +1160,7 @@ void cmd_xinfo(Shard& shard, Op& op) {
 
 static const CommandSpec kTable[] = {
     {"XGROUP",      2, -1, CmdFlags::Write | CmdFlags::CursorShard | CmdFlags::SubcmdRoute,
-                              cmd_xgroup<false>, 2, 2, 1, cmd_xgroup<true>},
+                              cmd_xgroup<false>, 2, 2, 1, notify_handler<cmd_xgroup<true>>},
     {"XREADGROUP",  7, -1, CmdFlags::Write | CmdFlags::Blocking | CmdFlags::MultiShard |
                               CmdFlags::CursorShard | CmdFlags::StreamRoute,
                               cmd_xreadgroup<false>, 0, 0, 0, cmd_xreadgroup<true>},
@@ -1166,7 +1173,7 @@ static const CommandSpec kTable[] = {
     {"XAUTOCLAIM",  6,  9, CmdFlags::Write,
                               cmd_xautoclaim<false>, 1, 1, 1, cmd_xautoclaim<true>},
     {"XSETID",      3,  7, CmdFlags::Write,
-                              cmd_xsetid<false>, 1, 1, 1, cmd_xsetid<true>},
+                              cmd_xsetid<false>, 1, 1, 1, notify_handler<cmd_xsetid<true>>},
     {"XINFO",       2,  6, CmdFlags::Readonly | CmdFlags::CursorShard | CmdFlags::SubcmdRoute,
                               cmd_xinfo<false>, 2, 2, 1, cmd_xinfo<true>},
 };
@@ -1286,22 +1293,36 @@ bool stream_xreadgroup_execute(Shard& shard, Op& op) {
             reply_null_array(op.sink(), op.resp3());
             return true;
         }
-        group->last_delivered = entries.back().id;
-        group->entries_read = infer_entries_read(object, group->last_delivered);
         if (!parsed.noack) {
+            PendingMap prepared;
             try {
                 for (const StreamOwnedEntry& entry : entries) {
                     StreamPending pending;
                     pending.consumer = consumer_name;
                     pending.delivery_time = now;
                     pending.delivery_count = 1;
-                    upsert_pending(*groups, *group, entry.id, std::move(pending));
+                    prepared.emplace(entry.id, std::move(pending));
                 }
             } catch (const std::bad_alloc&) {
                 reply_err(op.sink(), "ERR out of memory"); return true;
             }
+            // Publish only after every PEL node and consumer string exists. Node transfer and
+            // swapping an existing PEL value cannot allocate; a failed preparation changes neither
+            // the cursor nor any previously pending delivery.
+            while (!prepared.empty()) {
+                auto node = prepared.extract(prepared.begin());
+                auto old = group->pending.find(node.key());
+                groups->note_insert(pending_allocation_bytes(node.mapped()));
+                if (old == group->pending.end()) group->pending.insert(std::move(node));
+                else {
+                    groups->note_delete(pending_allocation_bytes(old->second));
+                    std::swap(old->second, node.mapped());
+                }
+            }
             consumer->active_time = now;
         }
+        group->last_delivered = entries.back().id;
+        group->entries_read = infer_entries_read(object, group->last_delivered);
         reply_stream_entries(op, key, entries, false);
         return true;
     }

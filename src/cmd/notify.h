@@ -119,6 +119,7 @@ enum class NotifyEventId : uint8_t {
     Zpopmin, Zpopmax, Zrangestore, Zunionstore, Zinterstore, Zdiffstore,
     Geosearchstore, Georadiusstore,
     Xadd, Xdel, Xtrim,
+    XgroupCreate, XgroupDestroy, XgroupCreateconsumer, XgroupDelconsumer, XgroupSetid, Xsetid,
     Expired, Evicted, Keymiss, New,
 };
 

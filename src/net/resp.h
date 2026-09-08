@@ -19,7 +19,7 @@
 
 namespace tomo {
 
-enum class ParseResult { Ok, Incomplete, Error };
+enum class ParseResult { Ok, Incomplete, Error, Empty };
 
 // Read decimal digits terminated by CRLF, advancing `pos` past the CRLF.
 //
@@ -94,7 +94,7 @@ inline ParseResult resp_parse_t(const char* buf, uint32_t len, uint32_t& pos, Op
             }
         }
         pos = eol + 2;
-        return op.argc() ? ParseResult::Ok : ParseResult::Incomplete;  // bare CRLF: ignore
+        return op.argc() ? ParseResult::Ok : ParseResult::Empty;
     }
 
     uint32_t p = pos + 1;                      // past '*'
@@ -210,8 +210,19 @@ template <typename Buf> inline void reply_outofrange(Buf&& b) {
     b.append(kMsg, sizeof(kMsg) - 1);
 }
 
+// RESP simple strings/errors cannot carry line delimiters, even when the source is a bulk.
+template <typename Buf> inline void reply_line_text(Buf&& b, const char* text, size_t len) {
+    size_t start = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (text[i] != '\r' && text[i] != '\n') continue;
+        b.append(text + start, i - start);
+        b.push_back(' ');
+        start = i + 1;
+    }
+    if (start < len) b.append(text + start, len - start);
+}
 template <typename Buf> inline void reply_err(Buf&& b, const char* msg) {
-    b.push_back('-'); b.append(msg, std::strlen(msg)); b.append("\r\n", 2);
+    b.push_back('-'); reply_line_text(b, msg, std::strlen(msg)); b.append("\r\n", 2);
 }
 template <typename Buf> inline void reply_simple(Buf&& b, const char* msg) {
     b.push_back('+'); b.append(msg, std::strlen(msg)); b.append("\r\n", 2);
