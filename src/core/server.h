@@ -102,6 +102,7 @@ enum class LbStage : uint8_t {
     ExDrain,
     ClientDrain,
     ClientMoving,
+    IoDrain,
 };
 
 struct LbShardMove {
@@ -152,7 +153,35 @@ static_assert(sizeof(AtomicApplySlot) == 64);
 static_assert(alignof(AtomicApplySlot) == 64);
 
 class Server {
+    friend struct CoreConcurrencyTest;
 public:
+    // Done releases the ROB slot, but executor code may still be notifying its IO.
+    // Odd means an executor scope can hold Client pointers; an even value ends that
+    // scope. Nested calls retain the outer scope. Writers own separate cache lines.
+    class ClientWorkScope {
+    public:
+        ClientWorkScope(Server& server, uint32_t tid)
+            : epoch_(server.client_work_[tid].epoch) {
+            const uint64_t before = epoch_.load(std::memory_order_relaxed);
+            outer_ = !(before & 1);
+            if (outer_) {
+                end_ = before + 2;
+                epoch_.store(before + 1, std::memory_order_release);
+            }
+        }
+        ~ClientWorkScope() {
+            if (outer_) epoch_.store(end_, std::memory_order_release);
+        }
+        ClientWorkScope(const ClientWorkScope&) = delete;
+        ClientWorkScope& operator=(const ClientWorkScope&) = delete;
+    private:
+        std::atomic<uint64_t>& epoch_;
+        uint64_t end_ = 0;
+        bool outer_ = false;
+    };
+    uint64_t client_work_epoch(uint32_t tid) const {
+        return client_work_[tid].epoch.load(std::memory_order_acquire);
+    }
     static constexpr uint64_t kAtomicEnabledBit = uint64_t{1} << 63;
 
     Server() = default;
@@ -680,7 +709,10 @@ public:
     bool flip_dispatch_paused() const { return flip_stage() != FlipStage::Idle; }
     LbStage lb_stage() const { return lb_stage_.load(std::memory_order_acquire); }
     uint64_t lb_epoch() const { return lb_epoch_.load(std::memory_order_acquire); }
-    bool lb_dispatch_paused() const { return lb_stage() == LbStage::ExDrain; }
+    bool lb_dispatch_paused() const {
+        const LbStage stage = lb_stage();
+        return stage == LbStage::IoDrain || stage == LbStage::ExDrain;
+    }
     bool placement_transition_active() const {
         return flip_dispatch_paused() || lb_stage() != LbStage::Idle;
     }
@@ -697,7 +729,7 @@ public:
     LbClientMove lb_client_move() const { return lb_client_move_; }
     bool lb_should_pause(uint32_t owner, uint64_t id) const {
         const LbStage stage = lb_stage();
-        return stage == LbStage::ExDrain ||
+        return stage == LbStage::IoDrain || stage == LbStage::ExDrain ||
                (stage == LbStage::ClientDrain && lb_client_move_.source == owner &&
                 lb_client_move_.id == id);
     }
@@ -714,6 +746,21 @@ public:
         for (uint32_t tid = 0; tid < nthreads(); tid++)
             if (live_executor(tid) && !lb_acked(tid)) return false;
         return true;
+    }
+    bool lb_all_io_acked() const {
+        for (uint32_t tid : placement_.ifid_threads())
+            if (!lb_acked(tid)) return false;
+        return true;
+    }
+    bool lb_begin_ex_drain() {
+        if (lb_stage() != LbStage::IoDrain || !lb_all_io_acked()) return false;
+        // Every producer has left its parse/post pass. Only now may an empty executor
+        // inbox prove that no old-route task remains unpublished.
+        lb_stage_.store(LbStage::ExDrain, std::memory_order_release);
+        return true;
+    }
+    void lb_start_shard_drain() {
+        lb_stage_.store(LbStage::IoDrain, std::memory_order_release);
     }
     uint64_t lb_ticks() const { return lb_ticks_.load(std::memory_order_relaxed); }
     uint64_t lb_bucket_moves() const {
@@ -1365,7 +1412,7 @@ public:
                 lb_bucket_bytes_spread_after_.store(
                     static_cast<uint64_t>(bytes_after + 0.5), std::memory_order_relaxed);
                 lb_bucket_hot_streak_ = 0;
-                lb_stage_.store(LbStage::ExDrain, std::memory_order_release);
+                lb_start_shard_drain();
             }
             lb_prefer_client_ = !choose_client;
             return true;
@@ -1494,7 +1541,8 @@ public:
         }
         std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
         const LbStage live_lb_stage = lb_stage();
-        if (live_lb_stage == LbStage::ExDrain || live_lb_stage == LbStage::ClientDrain) {
+        if (live_lb_stage == LbStage::IoDrain || live_lb_stage == LbStage::ExDrain ||
+            live_lb_stage == LbStage::ClientDrain) {
             // An explicit shape change wins over an uncommitted cron candidate. No ownership edge
             // exists in either stage, so withdrawing it is exact. A ClientMoving request has
             // already crossed its reversible preflight; FLIP admits it and IoDrain waits for that
@@ -2067,7 +2115,7 @@ public:
         from.erase(std::remove_if(from.begin(), from.end(), [&](Shard* shard) {
             return std::find(moving.begin(), moving.end(), shard) != moving.end();
         }), from.end());
-        for (Shard* shard : moving) adopt_read_local_retire_sink(*shard, destination);
+        for (Shard* shard : moving) adopt_shard_owner_state(*shard, destination);
         router_.commit_transfer();
         for (Shard* shard : moving)
             shard_owner_[shard->id()].store(destination, std::memory_order_release);
@@ -2095,7 +2143,7 @@ public:
         to.push_back(&shard);                       // capacity was reserved before PREPARING
         *found = from.back();
         from.pop_back();
-        adopt_read_local_retire_sink(shard, destination);
+        adopt_shard_owner_state(shard, destination);
         router_.commit_transfer();                 // THE single bucket ownership edge
         shard_owner_[shard_id].store(destination, std::memory_order_release);
         router_.finish_transfer();
@@ -2111,6 +2159,27 @@ public:
         } catch (...) {
             return false;
         }
+    }
+
+    void bind_owner_notify_pending(uint32_t tid, bool* pending) {
+        owner_notify_pending_[tid] = pending;
+    }
+
+    void adopt_shard_owner_state(Shard& shard, uint32_t destination) {
+        adopt_read_local_retire_sink(shard, destination);
+        // A destination may already have cached this version while the source's last
+        // pass used the previous one. Configure the incoming store at the ownership
+        // edge; an unchanged destination version must never leave it on stale limits.
+        const LiveConfigSnapshot config = live_config_snapshot();
+        shard.configure_maxmemory(config.maxmemory != 0, config.maxmemory / nshards(),
+                                  config.policy, config.samples);
+        shard.set_notify_mask(config.notify_events |
+                              (config.tracking_armed ? NOTIFY_TRACKING : 0u) |
+                              (config.save_armed ? NOTIFY_SAVE : 0u));
+        bool* pending = owner_notify_pending_[destination];
+        if (!pending) std::abort();
+        shard.bind_notify_pending(pending);
+        *pending = true; // service any output carried with the shard on the first owner pass
     }
 
     bool live_executor(uint32_t tid) const {
@@ -3654,6 +3723,12 @@ private:
     std::unique_ptr<ReadLocalServerState> read_local_state_;
     // Appended at the true tail: this test-only knob must not move any production member.
     std::atomic<uint64_t> debug_atomic_conditional_deadline_{0};
+    // Registered at executor construction (including dormant FLIP roles), then read
+    // only while all executors are quiesced at an ownership transfer. Keep this state
+    // at the tail so existing members retain their offsets.
+    bool* owner_notify_pending_[kMaxThreads] = {};
+    struct alignas(64) ClientWorkEpoch { std::atomic<uint64_t> epoch{0}; };
+    ClientWorkEpoch client_work_[kMaxThreads];
 };
 
 }  // namespace tomo

@@ -66,6 +66,7 @@ inline constexpr uint32_t kRecvChunk = 16 * 1024;
 //   ex    ExLoop    execute+notify; never sends
 
 class IoLoop {
+    friend struct CoreConcurrencyTest;
 public:
     WbEngine& engine() { return wb_; }
     uint32_t reap_atomic_deferred() {
@@ -314,6 +315,10 @@ public:
         }
         if (!climon_migration_ready(client)) {
             error = "connection has transient CLIENT/MONITOR/TRACKING state";
+            return false;
+        }
+        if (!client_executor_quiesced(client) || !client->migration_protocol_idle()) {
+            error = "connection has an unfinished executor completion";
             return false;
         }
         return true;
@@ -2716,6 +2721,7 @@ private:
         // Last source-side touch before the owner store, so the moved connection's cold arm
         // counters land on the thread that will actually be doing the arming from here on.
         client->rob().set_read_local_arm_stats(target.read_local_arm_stats_or_null());
+        client_work_fences_.erase(client);
         client->set_ifid_thread(destination); // THE single connection ownership edge
         command_client_directory_move(client_id, destination);
         if (!target.post_client_transfer(self_->id(), transfer, ring_, self_->sig())) std::abort();
@@ -2903,6 +2909,26 @@ private:
         const LbStage stage = srv_->lb_stage();
         if (stage != LbStage::ClientDrain) lb_client_wake_pending_ = false;
         if (stage == LbStage::Idle || stage == LbStage::ClientMoving) return 0;
+        if (stage == LbStage::IoDrain) {
+            // This control tail is outside dispatch: all owner samples taken by this IO
+            // have either been posted (including quiet batches) or abandoned for reparse.
+            if (!srv_->lb_acked(self_->id())) {
+                srv_->lb_ack(self_->id());
+                lb_schedule_wake_all();
+            }
+            if (self_->id() == srv_->lb_coordinator()) {
+                if (srv_->lb_begin_ex_drain()) {
+                    lb_schedule_wake_all();
+                    return 1;
+                }
+                if (srv_->lb_timed_out()) {
+                    srv_->lb_stage_timed_out();
+                    lb_schedule_wake_all();
+                    return 1;
+                }
+            }
+            return 0;
+        }
         if (stage == LbStage::ExDrain) {
             if (self_->id() == srv_->lb_coordinator()) {
                 if (srv_->lb_all_ex_acked()) {
@@ -3947,9 +3973,8 @@ private:
         const bool notify_armed = notify_armed_;
         const uint64_t pass_max_bulk_len = proto_max_bulk_len_;
         const bool default_bulk_limit = pass_max_bulk_len == 512ull * 1024 * 1024;
-        // One continuous-placement epoch per parse pass. Work published concurrently with a new
-        // EX drain is included in that drain; reloading the stage for every operation would add a
-        // shared atomic to the request path without strengthening the ownership fence.
+        // IoDrain waits for this whole parse/post pass before opening ExDrain. A task whose
+        // owner was sampled here therefore reaches that owner before it can acknowledge.
         const bool lb_pause_this_pass = lb_controller_armed_ &&
             srv_->lb_should_pause(self_id, c->id());
         if (__builtin_expect(lb_pause_this_pass, false)) {
@@ -7194,7 +7219,9 @@ ordinary_dispatch:
         // went quiet, so nothing revisits it unless mark_active puts it back -- returning without
         // doing so leaked the entire client (~137KB) per disconnect once. Only a quiesced,
         // claim-free conn may release its slot and die.
-        if (!c->safe_to_release()) { mark_active(c); return; }
+        if (!c->safe_to_release() || !client_executor_quiesced(c) ||
+            !c->safe_to_release()) { mark_active(c); return; }
+        client_work_fences_.erase(c);
         climon_untrack_client(c);
         command_client_disconnected(c);
         self_->release_wb_slot(c->wb_slot());
@@ -7210,6 +7237,34 @@ ordinary_dispatch:
         // free it at the top of the one after; the drain lambda skips dead clients.
         c->mark_dead();
         dead_next_.push_back(c);
+    }
+
+    // Called only after the connection is ROB-quiescent and no longer dispatching. The
+    // acquire on Done precedes this snapshot, so every executor that could still hold
+    // this Client published its odd scope before we sample. Wait for EACH such scope
+    // to end, without requiring all executors to be idle at the same instant.
+    bool client_executor_quiesced(Client* client) const {
+        try {
+            auto [it, inserted] = client_work_fences_.try_emplace(client);
+            ClientWorkFence& fence = it->second;
+            const uint64_t dispatch = client->rob().dispatch_id();
+            if (inserted || fence.dispatch != dispatch) {
+                fence.dispatch = dispatch;
+                for (uint32_t tid = 0; tid < srv_->nthreads(); tid++)
+                    fence.epochs[tid] = srv_->client_work_epoch(tid);
+            }
+            bool ready = true;
+            for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
+                // This IO's synchronous fused stack cannot run concurrently with teardown;
+                // its existing pipeline/serve fences cover retained local handles.
+                if (tid == self_->id() || !(fence.epochs[tid] & 1)) continue;
+                if (srv_->client_work_epoch(tid) == fence.epochs[tid]) ready = false;
+                else fence.epochs[tid] = 0;
+            }
+            return ready;
+        } catch (const std::bad_alloc&) {
+            return false; // Keep the Client and retry; allocation failure cannot waive lifetime.
+        }
     }
 
     // Free everything that has been dead for a full iteration. Called once per loop pass, BEFORE
@@ -7239,6 +7294,10 @@ ordinary_dispatch:
     }
 
     Server*    srv_  = nullptr;
+    struct ClientWorkFence {
+        uint64_t dispatch = 0;
+        uint64_t epochs[kMaxThreads] = {};
+    };
     ThreadCtx* self_ = nullptr;
     IfidBatch ifid_batch_{};
     WbBatch wb_batch_{};
@@ -7411,6 +7470,8 @@ ordinary_dispatch:
     IfidPipelineBatch* active_ifid_context_ = nullptr;
     WbPipelineBatch* active_wb_context_ = nullptr;
     bool targeted_ifid_ = false;
+    // Cold teardown/migration state; leave all established hot member offsets intact.
+    mutable std::unordered_map<Client*, ClientWorkFence> client_work_fences_;
 };
 
 }  // namespace tomo
