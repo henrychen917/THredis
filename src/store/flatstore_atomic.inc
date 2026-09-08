@@ -357,6 +357,8 @@
         KvObj* old = atomic_exchange_physical(hash, key, value);
         entry->parked()[index] = old;
         entry->count = index + 1;
+        atomic_pending_->group_installing = true;
+        if (value) note_loaded_object(hash, value);
         return old;
     }
 
@@ -389,6 +391,7 @@
         auto* entry = static_cast<AtomicEntry*>(opaque);
         if (!entry || !entry->count || entry->linked) std::abort();
         atomic_link_entry(*entry);
+        atomic_pending_->group_installing = false;
     }
 
 
@@ -399,20 +402,22 @@
     // and DELETE passes attach nothing, so without a reclaiming trigger on every pass (this is
     // called for deletes too, unlike the old value-writes-only reserve) tombstones fill the table.
     // Once it returns true, the group's physical install pass cannot hit a capacity
-    // failure. Returns false only on real OOM (calloc) or a locked snapshot with no raw room.
+    // failure. A busy rehash can refuse a pass until bounded progress frees the old table.
     bool atomic_prepare_capacity(uint32_t additional) {
         if (__builtin_expect(read_local_enabled_, false))
             return atomic_prepare_capacity_read_local(additional);
         if (rehashing()) {
             if (!snapshot_active_) {
-                // Keep drain ahead of fill: advance at least `additional` keys' worth of slots so
-                // table 0 cannot fill before this rehash finishes (mirrors insert()'s 1-key : 8-slot
-                // ratio, generalised to a whole install pass).
-                uint32_t steps = additional / kRehashSlotsPerOp + 1;
+                // Match ordinary insert's eight old slots PER new key. Advancing only one slot
+                // per new key lets an empty old prefix consume the budget while table 0 fills.
+                uint64_t steps = static_cast<uint64_t>(additional) + 1;
                 while (steps-- && rehashing()) rehash_step();
             }
-            if (rehashing())
-                return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
+            if (rehashing()) {
+                const uint64_t need = static_cast<uint64_t>(live_[0]) + tombs_[0] +
+                                      live_[1] + additional;
+                return need < cap_[0];
+            }
             // fell through: rehash completed, re-evaluate against the merged table below.
         }
         if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + additional) * 100 <
@@ -452,6 +457,9 @@
         };
         if (fits()) { atomic_version_bytes_ += bytes; return true; }
         if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return false;
+        // Earlier candidates in this owner pass are absent from the pending list. Refuse further
+        // growth under pressure until the whole installed prefix is published (also on abort).
+        if (atomic_pending_ && atomic_pending_->group_installing) return false;
         uint32_t budget = kEvictionsPerOp;
         while (budget-- && !fits()) {
             KvObj* victim = choose_victim(protected_key);
@@ -461,6 +469,7 @@
             // A key an in-flight group or a staged cross-owner script depends on is not a legal
             // victim: evicting it would destroy the predecessor those readers resolve against.
             if (atomic_needs_version(hash, key)) continue;
+            (void)aof_.record_delete(key);
             const uint32_t before = size();
             const bool live = erase(hash, key);
             if (size() == before) return false;
@@ -777,11 +786,14 @@ private:
     bool atomic_prepare_capacity_read_local(uint32_t additional) {
         if (rehashing()) {
             if (!snapshot_active_) {
-                uint32_t steps = additional / kRehashSlotsPerOp + 1;
+                uint64_t steps = static_cast<uint64_t>(additional) + 1;
                 while (steps-- && rehashing()) rehash_step_read_local();
             }
-            if (rehashing())
-                return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
+            if (rehashing()) {
+                const uint64_t need = static_cast<uint64_t>(live_[0]) + tombs_[0] +
+                                      live_[1] + additional;
+                return need < cap_[0];
+            }
         }
         if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + additional) * 100 <
             static_cast<uint64_t>(cap_[0]) * kLoadPct)
@@ -1488,6 +1500,22 @@ private:
         kvobj_free(object);
     }
 
+    bool atomic_prepare_rollback_capacity(AtomicEntry* end) {
+        uint64_t restore = 0;
+        for (AtomicEntry* entry = atomic_pending_->head; entry != end; entry = entry->next) {
+            if (!entry->group_epoch || !entry->group_aborted ||
+                !entry->group_aborted->load(std::memory_order_acquire)) continue;
+            for (uint32_t i = 0; i < entry->count; i++) {
+                if (atomic_live_value(entry->parked()[i]) &&
+                    !atomic_find_physical(atomic_entry_hash(*entry, i), atomic_entry_key(*entry, i)))
+                    restore++;
+            }
+        }
+        // A later boundary may retain some predecessors in the chain. Reserving for those too
+        // is conservative; no record or predecessor is released if this preflight fails.
+        return restore == 0 || (restore <= UINT32_MAX && atomic_prepare_capacity(restore));
+    }
+
     bool atomic_collapse(uint64_t floor, uint64_t cleanup_cutoff) {
         if (__builtin_expect(read_local_enabled_, false))
             return atomic_collapse_read_local(floor, cleanup_cutoff);
@@ -1620,6 +1648,7 @@ private:
             }
         }
         if (!overlap) {
+            if (!atomic_prepare_rollback_capacity(first_unselected)) return false;
             atomic_pending_->cleanup_slow += occurrences;
             uint64_t promoted = 0;
             AtomicEntry* entry = atomic_pending_->head;
@@ -2006,6 +2035,7 @@ private:
             }
         }
         if (!overlap) {
+            if (!atomic_prepare_rollback_capacity(first_unselected)) return false;
             atomic_pending_->cleanup_slow += occurrences;
             uint64_t promoted = 0;
             AtomicEntry* entry = atomic_pending_->head;

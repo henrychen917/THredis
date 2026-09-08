@@ -97,6 +97,20 @@ build/read-local-ring-unit: tests/read_local_ring_unit.cc $(wildcard src/*/*.h) 
 build/read-local-write-ring-unit: tests/read_local_write_ring_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/read_local_write_ring_unit.cc -o $@
+STORE_REGRESSION_SRC := tests/store_regression.cc src/cmd/t_hash.cc src/cmd/t_hash_ttl.cc
+build/store-regression: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST -I. \
+	  $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
+build/store-regression-sidecar: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST \
+	  -DTOMO_TTL_DEADLINE_SIDECAR=1 -I. $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
+build/store-regression-tsan: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -O1 -fsanitize=thread -fno-omit-frame-pointer -no-pie \
+	  -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST -I. \
+	  $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
 unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit
 	./build/config-parser-test
 	./build/flipctl-unit

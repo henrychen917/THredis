@@ -251,7 +251,7 @@ trap 'exit 130' INT TERM
 
 # ---- 0. preflight: tools, oracle tree, strays ------------------------------------------------
 MISSING=
-for tool in g++ make python3 redis-cli memtier_benchmark ss taskset timeout awk; do
+for tool in g++ make python3 redis-cli memtier_benchmark ss taskset timeout awk setarch; do
   command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
 [ -z "$MISSING" ] || {
@@ -319,6 +319,35 @@ g++ -std=c++20 -O2 -march=native -pthread -I. tests/read_local_write_ring_unit.c
     && /tmp/tomokv-read-local-write-ring-unit >>/tmp/gate-ring-unit.txt 2>&1 \
     && ok "read-local write ring + arming transient unit" \
     || bad "read-local write ring + arming transient unit" "see /tmp/gate-ring-unit.txt"
+# Twelve storage regressions, all BEFORE the quick-tier exit. The hash reaper is production code;
+# store-boundary spies make held epochs, capture cursors, eviction and allocation failures exact.
+# No case skips. Build failure makes every dependent row red. EXPECT constants are maintainer-owned.
+STORE_REGRESSION_BUILT=0
+pausable make build/store-regression >/tmp/gate-store-build.txt 2>&1 && STORE_REGRESSION_BUILT=1
+for STORE_CASE in unlinked randomkey rehash rollback snapshot-eviction flags aof-eviction intents imported-hash field-index-failure hash-bytes; do
+  STORE_RUN=(./build/store-regression "$STORE_CASE")
+  STORE_CASE_BUILT=$STORE_REGRESSION_BUILT
+  if [ "$STORE_CASE" = flags ]; then
+    # Only this process disables address randomization: GCC TSan otherwise collides with the
+    # host's mappings before main. A runtime race report or unavailable TSan is a red row.
+    STORE_CASE_BUILT=0
+    pausable make build/store-regression-tsan >/tmp/gate-store-flags-build.txt 2>&1 && STORE_CASE_BUILT=1
+    STORE_RUN=(setarch x86_64 -R ./build/store-regression-tsan flags)
+  fi
+  quiet_wait
+  if [ "$STORE_CASE_BUILT" = 1 ] && \
+      timeout --foreground "$GATE_TEST_TIMEOUT" "${STORE_RUN[@]}" \
+          >/tmp/gate-store-$STORE_CASE.txt 2>&1; then
+    ok "storage $STORE_CASE regression"
+  else
+    bad "storage $STORE_CASE regression" "see /tmp/gate-store-build.txt, /tmp/gate-store-$STORE_CASE-build.txt and /tmp/gate-store-$STORE_CASE.txt"
+  fi
+done
+pausable make build/store-regression-sidecar >/tmp/gate-store-sidecar.txt 2>&1 \
+    && timeout --foreground "$GATE_TEST_TIMEOUT" ./build/store-regression-sidecar deadline-sidecar \
+        >>/tmp/gate-store-sidecar.txt 2>&1 \
+    && ok "storage deadline-sidecar regression" \
+    || bad "storage deadline-sidecar regression" "see /tmp/gate-store-sidecar.txt"
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
       --check src/cmd/acl_categories_generated.h \
