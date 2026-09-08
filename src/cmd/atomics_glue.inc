@@ -24,7 +24,8 @@ WorkError begin_plain_version(Server& server, Shard& shard, Slice key, uint64_t 
     }
     if (script_forced) server.note_script_forced_write();
 
-    if (snapshot == UINT64_MAX) snapshot = server.atomic_snapshot();
+    // Writers must clone the newest committed version, even while an unrelated reservation
+    // holds the safe read watermark behind a completed foreign write.
     store.atomic_set_read_context(snapshot, origin_conn_id);
     KvObj* visible = store.find(hash, key);
     KvObj* clone = nullptr;
@@ -124,6 +125,22 @@ ScatterTaskResult execute_atomic_apply(const Task& task, Shard& shard, Op& op,
     ScatterState& state = *task.scatter;
     ShardGroup& group = *group_for(state, shard.id());
     FlatStore& store = shard.store();
+
+    if (state.kind == Kind::Script && !state.aborted.load(std::memory_order_acquire)) {
+        // Validation and UNPIN are separate waves. Keep the write intents until this owner
+        // turn and validate again before any exchange; plain RMWs remain free to run between
+        // waves, but cannot make a saved script image overwrite their completed write.
+        for (uint32_t i = 0; i < group.count; i++) {
+            const uint32_t pos = state.key_order[group.begin + i];
+            const KeyRef& key = state.keys[pos];
+            if ((state.status[pos] & 1u) &&
+                store.atomic_script_changed(key.hash, op.arg(key.arg), state.script_cut)) {
+                state.script_conflict.store(true, std::memory_order_release);
+                state.aborted.store(true, std::memory_order_release);
+                return ScatterTaskResult::Complete;
+            }
+        }
+    }
 
     // The phase-one destination observation is sufficient for computing an unconditional image.
     // NX decisions are different: their precondition must still hold at the owner immediately
@@ -883,7 +900,7 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
                 plain_read_cut(server, op, cleanup_cutoff), origin_conn_id);
             return true;
         }
-        const uint64_t snapshot = server.atomic_snapshot();
+        const uint64_t snapshot = UINT64_MAX;
 
         struct PreparedLocal {
             RecordedKey key;
@@ -971,7 +988,7 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
             plain_read_cut(server, op, cleanup_cutoff), origin_conn_id);
         return true;
     }
-    const uint64_t snapshot = server.atomic_snapshot();
+    const uint64_t snapshot = UINT64_MAX;
     const WorkError result = begin_plain_version(
         server, shard, routed, op.hash, snapshot, origin_conn_id);
     if (result == WorkError::None) return true;

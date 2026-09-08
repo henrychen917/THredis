@@ -279,7 +279,8 @@ int register_error(lua_State* state, const char* message) {
 
 int fn_register(lua_State* state) {
     auto* sink = static_cast<RegisterSink*>(lua_touserdata(state, lua_upvalueindex(1)));
-    if (!sink) return register_error(state, "redis.register_function is not available here");
+    if (!sink || (!sink->defs && !sink->store_callbacks))
+        return register_error(state, "redis.register_function is not available here");
 
     std::string name;
     std::string description;
@@ -430,8 +431,12 @@ bool run_library_body(lua_State* state, Slice code, RegisterSink& sink,
 
     get_global_raw(state, "redis");                  // saved real table (or nil)
     const int saved = lua_gettop(state);
+    // The closure may escape into a callback. Lua owns this cell; revoke it before the
+    // stack-local metadata sink goes away, and keep it rooted during the protected call.
+    auto* registration = new (lua_newuserdata(state, sizeof(RegisterSink))) RegisterSink(sink);
+    const int registration_index = lua_gettop(state);
     lua_createtable(state, 0, 1);
-    lua_pushlightuserdata(state, &sink);
+    lua_pushvalue(state, registration_index);
     lua_pushcclosure(state, fn_register, 1);
     lua_setfield(state, -2, "register_function");
     lua_createtable(state, 0, 1);
@@ -441,7 +446,8 @@ bool run_library_body(lua_State* state, Slice code, RegisterSink& sink,
     set_global_raw(state, "redis");
 
     lua_pushvalue(state, chunk);
-    const int status = lua_pcall(state, 0, 0, 0);
+    const int status = script_pcall_library(state);
+    *registration = RegisterSink{};
 
     lua_pushvalue(state, saved);
     set_global_raw(state, "redis");
@@ -450,7 +456,8 @@ bool run_library_body(lua_State* state, Slice code, RegisterSink& sink,
         size_t length = 0;
         std::string message;
         if (lua_istable(state, -1)) {
-            lua_getfield(state, -1, "err");
+            lua_pushliteral(state, "err");
+            lua_rawget(state, -2);
             if (lua_isstring(state, -1)) {
                 const char* text = lua_tolstring(state, -1, &length);
                 message = script_clean_error(text, length);

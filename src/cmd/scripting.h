@@ -51,6 +51,10 @@ lua_State* script_thread_state();
 // caller owns it and must lua_close() it.
 lua_State* script_new_sandbox_state();
 
+// Consumes a library-body callable, applying the script instruction budget in either interpreter.
+// Returns Lua's pcall status with one error value on failure, including a caught budget error.
+int script_pcall_library(lua_State* state);
+
 // Runs the callable on top of `state` (consumed) under the shard-owner contract: instruction hook,
 // atomic undo/rollback, eviction suspension, notification source hooks and RESP conversion. Writes
 // the reply — or the Redis-shaped error — into `op`. The stack is left empty either way.

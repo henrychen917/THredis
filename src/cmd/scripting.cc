@@ -817,6 +817,13 @@ void bind_call_globals(lua_State* state, ScriptContext& context) {
     set_global_raw(state, "KEYS");
 }
 
+// Reply/error tables are data. Reading them must never execute a user __index outside pcall.
+void raw_result_field(lua_State* state, int index, const char* field) {
+    if (index < 0) index = lua_gettop(state) + index + 1;
+    lua_pushstring(state, field);
+    lua_rawget(state, index);
+}
+
 bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& output,
                        uint32_t depth, uint32_t& elements, std::string& error,
                        bool outer_resp3, uint8_t script_resp) {
@@ -852,28 +859,34 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     if (type != LUA_TTABLE) { reply_null(output, outer_resp3); return true; }
 
-    lua_getfield(state, index, "err");
+    raw_result_field(state, index, "err");
     if (!lua_isnil(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
         if (!value) { lua_pop(state, 1); error = "invalid redis error table"; return false; }
-        output.push_back('-'); output.append(value, length); output.append("\r\n", 2);
+        output.push_back('-');
+        for (size_t i = 0; i < length; i++)
+            output.push_back(value[i] == '\r' || value[i] == '\n' ? ' ' : value[i]);
+        output.append("\r\n", 2);
         lua_pop(state, 1);
         return true;
     }
     lua_pop(state, 1);
-    lua_getfield(state, index, "ok");
+    raw_result_field(state, index, "ok");
     if (!lua_isnil(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
         if (!value) { lua_pop(state, 1); error = "invalid redis status table"; return false; }
-        output.push_back('+'); output.append(value, length); output.append("\r\n", 2);
+        output.push_back('+');
+        for (size_t i = 0; i < length; i++)
+            output.push_back(value[i] == '\r' || value[i] == '\n' ? ' ' : value[i]);
+        output.append("\r\n", 2);
         lua_pop(state, 1);
         return true;
     }
     lua_pop(state, 1);
 
-    lua_getfield(state, index, "double");
+    raw_result_field(state, index, "double");
     if (lua_isnumber(state, -1)) {
         const double value = static_cast<double>(lua_tonumber(state, -1));
         lua_pop(state, 1);
@@ -882,7 +895,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    lua_getfield(state, index, "big_number");
+    raw_result_field(state, index, "big_number");
     if (lua_isstring(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
@@ -894,13 +907,13 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    lua_getfield(state, index, "verbatim_string");
+    raw_result_field(state, index, "verbatim_string");
     if (lua_istable(state, -1)) {
         const int verbatim = lua_gettop(state);
-        lua_getfield(state, verbatim, "format");
+        raw_result_field(state, verbatim, "format");
         size_t format_length = 0;
         const char* format = lua_tolstring(state, -1, &format_length);
-        lua_getfield(state, verbatim, "string");
+        raw_result_field(state, verbatim, "string");
         size_t value_length = 0;
         const char* value = lua_tolstring(state, -1, &value_length);
         if (format && format_length >= 3 && value && value_length <= UINT32_MAX) {
@@ -914,7 +927,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    lua_getfield(state, index, "map");
+    raw_result_field(state, index, "map");
     if (lua_istable(state, -1)) {
         const int map = lua_gettop(state);
         uint32_t count = 0;
@@ -942,7 +955,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    lua_getfield(state, index, "set");
+    raw_result_field(state, index, "set");
     if (lua_istable(state, -1)) {
         const int set = lua_gettop(state);
         uint32_t count = 0;
@@ -1000,7 +1013,7 @@ std::string script_runtime_error(lua_State* state, const ScriptContext& context,
     std::string message;
     bool from_table = false;
     if (lua_istable(state, -1)) {
-        lua_getfield(state, -1, "err");
+        raw_result_field(state, -1, "err");
         if (lua_isstring(state, -1)) {
             size_t length = 0;
             const char* text = lua_tolstring(state, -1, &length);
@@ -1058,6 +1071,33 @@ std::string script_clean_error(const char* text, size_t length) {
     return clean_error(text, length);
 }
 
+int script_pcall_library(lua_State* state) {
+    ScriptContext context;
+    ScriptContext* current = &context;
+    // Keep the previous context slot rooted below the callable while the library runs. This
+    // works for both the temporary LOAD interpreter and an executor's persistent interpreter.
+    lua_pushlightuserdata(state, &g_hook_context_key);
+    lua_rawget(state, LUA_REGISTRYINDEX);
+    lua_insert(state, -2);
+    const int saved = lua_gettop(state) - 1;
+    lua_pushlightuserdata(state, &g_hook_context_key);
+    lua_pushlightuserdata(state, &current);
+    lua_rawset(state, LUA_REGISTRYINDEX);
+    lua_sethook(state, instruction_hook, LUA_MASKCOUNT, kHookInterval);
+    int status = lua_pcall(state, 0, 0, 0);
+    lua_sethook(state, nullptr, 0, 0);
+    lua_pushlightuserdata(state, &g_hook_context_key);
+    lua_pushvalue(state, saved);
+    lua_rawset(state, LUA_REGISTRYINDEX);
+    lua_remove(state, saved);
+    if (context.timed_out) {
+        if (status != 0) lua_pop(state, 1);
+        lua_pushliteral(state, "ERR function library exceeded the instruction limit");
+        status = LUA_ERRRUN;
+    }
+    return status;
+}
+
 void script_execute(Shard& shard, Op& op, const ScriptInvocation& call) {
     LuaEngine& engine = t_lua_engine;
     lua_State* state = engine.state;
@@ -1087,8 +1127,9 @@ void script_execute(Shard& shard, Op& op, const ScriptInvocation& call) {
     lua_sethook(state, instruction_hook, LUA_MASKCOUNT, kHookInterval);
     const int status = lua_pcall(state, arguments, 1, handler_index);
     lua_sethook(state, nullptr, 0, 0);
-    if (status != 0) {
-        const std::string error = script_runtime_error(state, context, call);
+    if (status != 0 || context.timed_out) {
+        const std::string error = context.timed_out ? std::string{}
+            : script_runtime_error(state, context, call);
         lua_settop(state, 0);
         engine.current = nullptr;
         // Effects already applied STAND, and the notifications they fired stand with them. Both
