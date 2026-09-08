@@ -17,8 +17,8 @@ dark (`flip-auto 0`).
   build gates.
 - Cross-owner observation follows the existing exceptional INFO-counter rule: the monitor reads a
   completed monotonic cumulative window and subtracts its last snapshot. A writer stores
-  `closed_windows` last, so an unfinished partial window is never consumed. Closing is once per
-  `flip-work-window` commands, not per command.
+  `closed_windows` last, so an unfinished partial window is never consumed. Publication is at the
+  end of a sampled parse pass, as specified in [DESIGN-flipfp.md](../DESIGN-flipfp.md).
 
 ## 1. Workload fingerprint
 
@@ -34,10 +34,11 @@ The writer records:
 - multikey key sum/count, using the registry's existing `first_key/last_key/key_step` metadata;
 - approximate value bytes, the already-parsed argument slice sizes excluding metadata-named keys.
 
-`flip-work-window=100` is the default. Zero makes the helper return without recording and closes no
-windows. Windows are command-count based. A deep parse pass can carry a window just over N, but it
-pays one close comparison at the end of that already-completed pass; detection latency therefore
-continues to scale with work rather than elapsed time.
+The internal sampler records one whole parse pass in 100 on average, with uniform gaps of 1..199
+passes to avoid aliasing. `flip-auto` alone arms it; off records nothing and closes no windows.
+There is no `flip-work-window` knob. The first enabled pass is sampled, and detection latency
+continues to scale with work rather than elapsed time. The detector derives its band and resolution
+from actual samples; the sampling policy preserves the measured behavior in DESIGN-flipfp.md.
 
 `flip_signature()` turns pass and class counts into probability vectors and keys/value bytes into
 per-command means. `FlipShiftDetector` EWMA-smooths the signature by halves. Its normalized L1
@@ -144,8 +145,9 @@ fingerprint, rate surge, rate collapse, and forced causes independently observab
 
 ## Integration and observability
 
-- `src/core/config.h` is the sole parser/default source for `flip-auto` and
-  `flip-work-window`; `src/cmd/t_server.cc` exposes them as immutable CONFIG values.
+- `src/core/config.h` parses the single `flip-auto` switch (default 0), exposed as immutable
+  CONFIG. `flipctl.h` derives fingerprint arming from that latch; INFO server reports its
+  effective `flip_fingerprint_window` as 0 or 100, an observation rather than a control.
 - `tomokv.conf` documents the numeric grammar and off/auto semantics.
 - `INFO FLIPCTL` reports state/phase, anchor split/rate, bands, total/per-reason trigger counts, and
   the last trigger reason.

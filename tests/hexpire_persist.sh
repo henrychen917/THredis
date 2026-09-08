@@ -52,7 +52,7 @@ DEADLINE=$(python3 "$ROOT/tests/hexpire.py" 127.0.0.1 "$PORT" persistbuild | sed
 [ -n "$DEADLINE" ] || { echo "seed failed"; exit 1; }
 "$CLI" -p "$PORT" SAVE >/dev/null || { echo "SAVE failed"; exit 1; }
 stop
-boot --load "$WORK/hexpire.tomo"
+boot --dbfilename hexpire.tomo
 step python3 "$ROOT/tests/hexpire.py" 127.0.0.1 "$PORT" "persistcheck:$DEADLINE"
 stop
 

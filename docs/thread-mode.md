@@ -2,16 +2,29 @@
 
 `--thread-mode 2s|1s` selects TomoKV's thread architecture at boot. The default is `2s`;
 `split` and `fused` remain accepted aliases. `INFO Server` reports the actual `thread_mode`,
-`shards`, thread counts, effective `read_local`, and live `atomic` state. These observations
+`shards`, `overlap`, `reorder`, thread counts, effective `read_local`, and live `atomic` state. These observations
 let a run assert its resolved geometry. `CONFIG GET` reports the retained configuration;
-thread mode, shards, and local-read admission are immutable after boot.
+thread mode, shards, overlap, reorder, and local-read admission are immutable after boot.
+
+`--overlap 0|1` defaults to `0`. In `2s`, 1 overlaps IO writeback. In `1s`, 1 selects
+the gated three-way schedule formerly numbered 2, and requires `--net-io uring`.
+Both fused settings support local reads. See [OVERLAP.md](../OVERLAP.md) for the schedule
+mapping, its evidence, and the outstanding executor-scheduler geometry hazard.
+
+`--reorder 0|1` (default `0`) reorders across connections in an executor batch for latency; per-connection order is always preserved.
+It works in both modes and either overlap setting. Off keeps FIFO and allocates nothing;
+on uses head rank then static command cost, retaining FIFO for single-connection runs.
+Special tasks remain barriers. CONFIG exposes immutable `reorder`; [REORDER.md](../REORDER.md)
+documents the storage bounds, mechanism battery, and latency measurement plan.
 
 `--read-local 0|1` defaults to `0`. In `1s`, enabling it arms the local read lane described
 below. In `2s` it is accepted but remains inactive and logs a notice at boot.
 
-The armed lane serves bounded local-read chunks between bounded owner-task quanta, captures
-immutable objects at prefetch, and filters unsafe atomic keys individually. These behaviors
-are fixed. Snapshot, placement, and pre-existing retry/deferred turns preserve their ordering.
+The armed lane captures immutable objects at prefetch and filters unsafe atomic keys individually.
+With overlap 0 it serves bounded local-read chunks between bounded owner-task quanta. With
+overlap 1 it drains those same read chunks before the whole owner batches; ordinary deep turns
+then run the WB callback in the first batch's prefetch gap.
+Snapshot, placement, and pre-existing retry/deferred turns preserve their ordering.
 
 ## 2s: separated threads
 
@@ -25,7 +38,7 @@ Complete sibling pairs in the allowed CPU set become placement and FLIP units au
 ## 1s: unified generalized threads
 
 Mode `1s` gives every selected physical thread both an IO loop object and an executor loop object.
-Each thread rotates through these phases:
+With overlap 0, each thread rotates through these phases:
 
 1. maintain connections and parse/route at most 32 operations per connection pass;
 2. consume an executor batch of at most 32 operations;
@@ -33,8 +46,11 @@ Each thread rotates through these phases:
 
 With `--read-local 0`, local commands take the same self SPSC task lane as remote commands and are
 consumed during the executor phase; they are not executed inline. With `--read-local 1`, eligible
-plain GETs and MGETs instead enter a parsing-thread-local queue. The executor phase drains one
-bounded chunk immediately after parsing and more bounded chunks between owner-task chunks.
+plain GETs and MGETs instead enter a parsing-thread-local queue. At overlap 0 the executor phase
+drains one bounded chunk immediately after parsing and more between owner-task chunks. At overlap
+1 parsing uses the targeted ready list, owner batches hold up to 128 tasks, and the read lane
+drains before fresh owner execution. Its foreign pointers never span the WB callback: exceptional
+turns finish WB before local reads; ordinary deep turns finish local reads before WB.
 Replies retire through one connection ROB slot and the normal
 write-back path. Parsing never waits for that local queue to retire: a later hash-precise write
 first moves the unresolved reads in its transitive key-overlap component to ordinary owner queues,
@@ -92,4 +108,7 @@ mode-unavailable error. Existing key load-balancing bucket movers remain availab
 
 The default shard count derives as `min(8 * executor threads, 256)` in both modes, before
 persistence recovery. An explicit `--shards 1..256` overrides it; `--shards -1` restores auto.
-Key and client balancing share `--lb 0|1`, default `1`; disabling it allocates no LB state.
+Key and client balancing use independent `--key-lb 0|1` and `--client-lb 0|1` switches,
+both default `1`. Each off arm allocates none of its signals/windows; both off allocate no
+shared LB state. `--shard-home shard:tid,...` sets a complete initial ownership map in either
+mode and permits empty filler executors. See [DESIGN-KNOBS.md](../DESIGN-KNOBS.md) for the surface.

@@ -1,132 +1,319 @@
-# Configuration-surface reduction
+# TomoKV configuration: operator and researcher audit
 
-> Incoming knobs-lane record. The line references and validation history below describe that
-> lane before integration; [MERGE.md](MERGE.md) records the merged conflict dispositions and
-> verified gate-line arithmetic. The merged tree has not been built or gated.
+2026-09-08, `cx-overlap`, on `c8e61f646` plus the incoming worktree changes. This replaces the
+previous “currently swept” retention test. A control stays if an operator can make an observable
+production decision with it **or** its sweep answers a needed paper question. An existing harness
+loop is neither necessary nor sufficient evidence. No build, server, benchmark, or gate was run.
 
-Baseline: `78c3e5391`, 2026-09-07. This implements the maintainer's prescribed dispositions.
-No server, benchmark, or gate was run by Codex. This is an uncommitted implementation for review
-and maintainer-run validation, with no throughput or latency improvement claimed. The maintainer's
-first gate result and the atomic-window test repair are recorded below.
+The encoding deletion was wrong. Seven reference controls now replace the eight old compact
+controls; the two list axes become one signed setting. Boot, CONFIG GET/SET, aliases, REWRITE,
+collection mutations and recovery consume them. Defaults retain the incoming limits.
 
-## One-to-one knob accounting
+**Scripting remains unresolved, explicitly:** the deleted instruction control passes OPERATOR,
+but its reference-name replacement cannot preserve today's execution semantics. Redis's
+`busy-reply-threshold` (alias `lua-time-limit`) is a soft elapsed-time threshold, not an instruction
+abort limit. This diff does not install a misleading alias or silently change the default. The
+maintainer has been asked to choose between preserving the abort and implementing Redis's
+continuing-script/BUSY/KILL behavior. The exact incompatibility and remaining work are below.
 
-Defaults below describe the baseline unless the after column states otherwise. A deleted
-name is rejected by both the CLI and the shared conf-file parser, is absent from the Config
-fields and CONFIG table, and has no corresponding INFO configuration value. Operational
-counters such as atomic-window stalls and kTLS engagement remain observations of the retained
-mechanisms. No aliases preserve a deleted public control.
+## Inventory and verdicts
 
-| Before | Before default | After | Reason / retained behavior |
+The incoming parser has **64 controls**, excluding `--help`; all appear individually below.
+The seven restorations bring it to **71**, plus five Redis encoding aliases. The positional config
+path, conf-only `pin` spelling and the one accepted environment variable are accounted for
+separately. Prefix table names with `--` on the CLI; conf files omit that prefix. CONFIG support
+and mutability are stated independently of CLI acceptance.
+
+No remaining incoming control fails both lenses. In particular, production compatibility keeps
+controls whose performance sweep would be redundant. This is not a requirement to manufacture
+another deletion. The NEITHER ledger records the already removed implementation choices and
+duplicate spellings, with their fixed behavior. No speculative performance winner is selected.
+
+“Gap” means a question needs a completed, attributable paper experiment; a correctness battery
+or a list of planned cells does not fill it. Every RESEARCH/BOTH row names its question.
+
+| Control | Default / accepted values | Verdict | Operator decision and/or paper question | Observation / experiment status |
+| --- | --- | --- | --- | --- |
+| `thread-mode` | `2s`; `1s`, `2s`, aliases `fused`, `split` | BOTH | Operator chooses a worker architecture for their latency/load shape. **Question:** when does sharing parsing/execution/replies beat dedicated IO and executor roles? | Boot; INFO mode and role counts. Match total cores and offered load. |
+| `overlap` | `0`; `0\|1` | RESEARCH | **Question:** how much latency/throughput improvement comes from overlapping independent work at each pipeline depth in each architecture? | Boot; INFO `overlap`. **Gap:** complete [OVERLAP.md](OVERLAP.md)'s measured factorial cells. |
+| `read-local` | `0`; `0\|1` | BOTH | Operator trades read latency against immutable-write cost on read-heavy fused workloads. **Question:** when do avoided hand-offs repay the local-read lane's writer cost? | Boot; effective INFO `read_local`, lane/fallback counters. **Gap:** mixed workloads across both overlap arms. In 2s requested 1 is inert. |
+| `reorder` | `0`; `0\|1` | RESEARCH | **Question:** can cross-connection reordering improve short-request tails without unacceptable long-request delay or throughput loss? | Boot; INFO and permutation witnesses. **Gap:** [REORDER.md](REORDER.md)'s mixed-size latency study, including long-request tails. |
+| `atomic` | `0`; `0\|1` | BOTH | Operator selects cross-shard command atomicity. **Question:** what is the cost of group-scoped MVCC as fan-out and contention grow? | Live CONFIG; effective INFO and atomic counters. Compare competitors with equivalent semantics; OFF is only an explicitly labelled ablation. |
+| `key-lb` | `1`; `0\|1` | BOTH | Operator permits or stops autonomous shard movement. **Question:** when does key-skew correction repay migration/drain/cache-warmup cost? | Boot; INFO LB, current shard owners. **Gap:** independent key/client 2×2 skew and phase-change cells. |
+| `client-lb` | `1`; `0\|1` | BOTH | Operator permits or stops connection movement. **Question:** how much imbalance is caused by connection placement after key ownership is held fixed? | Boot; INFO LB and client transfers. **Gap:** same independent 2×2, including hot clients with uniform keys. |
+| `flip-auto` | `0`; `0\|1` | BOTH | Operator chooses adaptive IO/EX roles versus a stable manual split. **Question:** does adaptation outperform a fixed split on changing workloads after transition costs and false triggers are charged? | Boot, 2s; FLIPCTL/INFO. Include stationary controls and phase duration; a correctness flip is not a performance result. |
+| `shards` | `-1` auto or `1..256`; auto `min(8*initial_executors,256)` | BOTH | Operator chooses shard inventory/migration granularity. **Question:** where does finer partitioning stop helping balance and start costing memory or scatter overhead? | Boot; actual INFO `shards`. **Gap:** shard count independent of executor count, not just the automatic diagonal. |
+| `ratio` | Unset: even split of allowed CPUs; positive `io:ex` | BOTH | Operator allocates the CPU budget between network and execution. **Question:** how does the optimal split change with depth, value size and read/write mix? | Boot, 2s; INFO current roles and FLIPCTL. Hold placement rules and total CPUs constant. |
+| `place` | Unset; explicit `ifid@cpu,ex@cpu,...` | BOTH | Operator isolates CPUs and chooses locality. **Question:** how much of the observed scaling limit is cross-CCX traffic rather than additional worker count? | Boot; INFO `thread_cpus`, DEBUG roles. **Gap:** matched counts on one CCX versus multiple L3 domains/SMT. |
+| `shard-home` | Unset: round-robin; complete `shard:executor_tid,...` | RESEARCH | **Question:** does dispatch cost grow with idle executor inventory when the number of active owners stays fixed? | Boot; INFO initial/current maps and DEBUG inventory. Restored `xshard_dispatch_scale` guard; paper profile/rates still required. |
+| `no-pin` | Flag absent; valueless flag disables worker affinity | OPERATOR | Let the OS/cgroup scheduler place workers instead of pinning each worker to one CPU, e.g. when sharing a CPU quota. | Boot; INFO `pin_threads`. This cannot be expressed by a different pinned `place` list. |
+| `hash` | `mix64`; `mix64\|siphash` | OPERATOR | Choose hash-flood resistance for untrusted keys versus the measured benign-key cost. | Boot; INFO reports the active hash, including recovered hash material. Repeating a known two-hash point-rate comparison is not itself a paper question. |
+| `net-io` | `uring`; `uring\|epoll`, case-insensitive | BOTH | Operator can run on hosts where io_uring is unavailable/disallowed. **Question:** how much gain is attributable to the event engine versus the IO/EX architecture? | Boot; CONFIG/INFO and `multiplexing_api`. **Gap:** matched architecture/engine ablation with persistence disabled; this knob also selects persistence IO. Fused overlap requires uring. |
+| `zc-min` | `16384`; uint32 bytes, `0` off | BOTH | Operator chooses the copy/borrow crossover for reply sizes and outstanding memory. **Question:** where does zero-copy's fixed ownership cost amortize on the actual NIC path? | Live CONFIG and INFO, borrow counters. **Gap:** separate GET and multi-key cutovers; gather uses `min(zc-min,1024)`. Loopback cannot answer send-path questions. |
+
+These production controls pass without inventing a performance sweep for every TLS path, file
+name or monitoring bound. Known compatibility limits are not reasons to delete their useful
+surface; they are listed in the reverse audit.
+
+| Control | Current default / grammar | Verdict | Operator decision / observable effect |
 | --- | --- | --- | --- |
-| `--read-local-prefetch-capture` | `1` | Deleted; capture selected statically | Preserve the winning immutable-object capture at prefetch. |
-| `--read-local-atomic-filter` | `1` | Deleted; precise filter whenever read-local is armed | Preserve the winning per-key safety filter, including fail-closed poison and overflow handling. |
-| `--read-local-interleave` | `1` | Deleted; bounded interleave whenever read-local is armed | Preserve bounded local chunks and per-producer owner quanta. |
-| `--flip-auto-band` | `-1` | Deleted; controller initialized with automatic band | Preserve the existing learned jitter, resolution, and baseline floors. |
-| `--shard-home` | Unset | Deleted; round-robin over resolved executors | Preserve default ownership; remove manual map parsing. Runtime migration remains available. |
-| `--l3-domains` | Discovery | Deleted; discovery plus `TOMOKV_L3_DOMAINS` environment override | Keep hardware discovery and an escape hatch for broken L3 sysfs. Override grammar remains comma-separated domains, `-` ranges, `+` range joins; invalid/duplicate/out-of-mask CPUs fail. |
-| `--smt-mode` | `0` | Deleted; derive from complete sibling pairs in the allowed topology | Use existing sibling-unit placement and FLIP invariants when pairs are present. |
-| `--genthread-schedule` | No independent default; compatibility alias | Deleted | Remove the alias that assigned fused mode and an overlap value. See objection about the original “zero uses” premise. |
-| `--atomic-window` | `-1` | Deleted; `min(16 * resolved_shards, 1024)` | Preserve the measured automatic credit bound. No CONFIG override or live window setter remains. Live `atomic` still reconfigures credits safely. |
-| `--persist-io` | `uring` | Deleted; derive engine from retained `net-io` | Preserve native uring persistence and the existing syscall dependency under epoll, which owns no uring ring. |
-| `--lru-clock-shift` | `8` | Deleted; `kLruClockShift = 8` | Preserve 256-second buckets and the 8192-second wrap. Executor clocks and OBJECT IDLETIME share this constant. |
-| `--script-crossshard-max-bytes` | `-1` | Deleted; boot-derived staging budget | Preserve `max(4 MiB, min(boot_maxmemory / shards / 16, 64 MiB))`, or 4 MiB when boot maxmemory is zero. |
-| `--script-crossshard-workbench-bytes` | `-1` | Deleted; twice the staging budget | Preserve the original automatic workbench bound, still allocated on demand. |
-| `--script-crossshard-conflict-retries` | `-1` | Deleted; fixed `8` | Preserve the original automatic conflict-retry limit for scripts. |
-| `--script-crossshard-cut-slots` | `-1` | Deleted; fixed `4` | Preserve the original per-IO script snapshot reservation bound. |
-| `--tls-ktls` | `yes` | Deleted; always attempt kTLS when TLS is enabled | Preserve automatic userspace fallback. `tls-port 0` still creates no TLS context or connection state. |
-| `--key-lb` | `1` | Collapsed into `--lb` | One switch controls key and client balancing together. |
-| `--client-lb` | `1` | Collapsed into `--lb` | Same switch; no independently disabled half remains. |
-| `--lb-sample-rate` | `64` | Collapsed; rate derived from measured visits and decision duration | Target a constant number of samples per decision; details below. |
-| `--lb-age-sample-rate` | `0` | Collapsed; derived sampling only during a flip maneuver | Keep idle/anchor sampling dark; derive the armed rate from traffic and the controller's decision window. |
-| `--lb-tick-ms` | `1000` | Collapsed; internal 1000 ms observation tick | Retain the observation cadence; derive sampling over three sustained ticks. |
-| `--lb-imbalance-pct` | `25` | Collapsed; twice measured quiet jitter | Separate key/client learners; excursions cannot enlarge their own admission band. |
-| `--lb-move-cap` | `1` | Collapsed; derive from measured transfer duration | Bootstrap one move, then pace against measured per-move drain/install cost. |
-| `--lb-cooldown-ms` | `5000` | Collapsed; derive from measured transfer duration | Remove the old all-nonzero machinery gate: zero cooldown can no longer mean zero moves. |
-| No `--lb` | — | **`--lb 0\|1`, default `1`** | The sole public key/client balancing switch; `0` allocates no LB sidecar, bucket counters/census arrays, or controller windows. |
-| `--thread-mode` | `2s` | Kept, unchanged; `2s\|1s` and `split\|fused` aliases | Both architectures remain. |
-| `--ratio` | Unset; even split | Kept, split only | Global IO/EX counts, spread over locality domains; retain conf/CLI precedence with `place`. |
-| `--place` | Derived | Kept, derived by default | Explicit `role@cpu` selection remains; fused mode uses labels only as CPU selectors. |
-| `--shards` | Constant `16` | Kept; default `-1` resolves to `min(8 * executor_count, 256)` | Eight migration units per initial executor; preserves 16 shards at the gate's 6:2 split. Explicit `1..256` remains authoritative. |
-| `--read-local` | `0` | Kept, `0\|1` | Effective only in fused plain scheduling; inactive modes retain ordinary owner dispatch. |
-| `--atomic` | `0` | Kept, `0\|1`, live | Preserve enable/disable and group-scoped epoch-MVCC behavior. |
-| `--flip-auto` | `0` | Kept, `0\|1`, split only | Preserve explicit controller enablement and dark fingerprint/stamp writers when disabled. |
-| `--ex-sched` | `0` | **`--x-ex-sched 0\|1`**, default `0` | Study namespace only; omitted from public help, tomokv.conf, and user documentation. |
-| `--overlap` | `0` | **`--x-overlap 0\|1\|2`**, default `0` | Study namespace only; same schedules and mode/engine validation. |
-| `--zc-min` | `16384` | Held unchanged | Pending maintainer benchmarks. |
-| `--net-io` | `uring` | Held unchanged, `uring\|epoll` | Preserve both network engines and their existing persistence dependency. |
-| `--hash` | `mix64` | Held unchanged, `mix64\|siphash` | Pending maintainer benchmarks. |
+| `port` | `6379`; `0..65535`, 0 disables plaintext TCP | OPERATOR | Select the service endpoint or require TLS/Unix-only access; inspect listeners/INFO `tcp_port`. Boot. |
+| `bind` | `127.0.0.1`; one address | OPERATOR | Choose the listening interface; inspect sockets. Boot; multi-address/IPv6 compatibility remains a gap. |
+| `unixsocket` | Unset; socket path | OPERATOR | Enable a local filesystem endpoint; unset allocates no listener. Boot. |
+| `maxclients` | `10000`; positive uint32 | OPERATOR | Bound accepted connection demand; CONFIG and rejected-connection counters. Live; concurrent acceptors can overshoot by an IO-thread-scale burst. |
+| `timeout` | `0`; seconds `0..INT_MAX` | OPERATOR | Reclaim idle normal connections; 0 disables that timer. Live; blocked and RESP2 pub/sub clients are exempt. |
+| `tcp-keepalive` | `300`; seconds `0..INT_MAX` | OPERATOR | Detect dead TCP peers; 0 disables probes. Live for newly accepted connections. |
+| `tcp-backlog` | `511`; `0..INT_MAX` | OPERATOR | Size the kernel accept backlog for connection bursts. Boot; CONFIG SET refuses mutation. |
+| `client-output-buffer-limit` | `normal 0 0 0`, `replica 256mb 64mb 60`, `pubsub 32mb 8mb 60`; repeated class/hard/soft/seconds | OPERATOR | Bound slow-consumer memory by class; inspect clients and disconnects. Live. `slave`/`replica` share the reference slot; no replication service exists. |
+| `tls-port` | `0`; `0..65535` | OPERATOR | Enable/locate encrypted ingress. Boot; 0 creates no TLS context/BIO registry. |
+| `tls-cert-file` | Unset; path | OPERATOR | Install the server certificate chain; inspect the served certificate. Boot. |
+| `tls-key-file` | Unset; path | OPERATOR | Select the server private key matching that certificate. Boot. |
+| `tls-ca-cert-file` | Unset; path | OPERATOR | Choose a CA bundle for client verification. Boot. |
+| `tls-ca-cert-dir` | Unset; directory | OPERATOR | Use a managed CA directory instead of, or alongside, a bundle. Boot. |
+| `tls-auth-clients` | `yes`; `yes\|no\|optional` | OPERATOR | Require, omit or optionally verify client certificates. Boot; handshake outcomes are observable. |
+| `tls-protocols` | Unset selects TLSv1.2/TLSv1.3; space-separated versions | OPERATOR | Match protocol policy and client support. Boot; negotiated version is observable. |
+| `tls-ciphers` | Unset selects the existing AES-GCM-first list | OPERATOR | Choose suites for TLS ≤1.2. Boot; handshake inspection. |
+| `tls-ciphersuites` | Unset selects the existing TLS 1.3 suite list | OPERATOR | Choose TLS 1.3 suites; OpenSSL uses a separate API/protocol namespace. Boot. |
+| `tls-prefer-server-ciphers` | `no`; `yes\|no` | OPERATOR | Choose whose preference orders eligible suites. Boot. |
+| `requirepass` | Empty/unset | OPERATOR | Manage the default user's password using existing Redis runbooks. Live; AUTH and ACL default-user state. Existing sessions are not deauthenticated by rotation. |
+| `protected-mode` | `yes`; boot/live also accept `0\|1` | OPERATOR | Reject unauthenticated remote access when no password is configured. Live; CONFIG emits yes/no. |
+| `enable-debug-command` | `no`; `no\|yes\|local` | OPERATOR | Limit diagnostic commands to an explicit maintenance posture. Boot. |
+| `aclfile` | Unset; path | OPERATOR | Persist/load named-user policy separately from service configuration. Boot; ACL LOAD/SAVE. |
+| `user` | No inline definitions; repeatable `name rules...` | OPERATOR | Declare users and command/key/channel permissions in a config file. Boot parser; later ACL commands manage users. Mutually exclusive with aclfile. |
+| `acl-pubsub-default` | `resetchannels`; `allchannels\|resetchannels` | OPERATOR | Choose channel permission on new/reset ACL users. Live. |
+| `acllog-max-len` | `128`; unsigned count, 0 keeps no entries | OPERATOR | Budget ACL-denial history; inspect ACL LOG. Live; bound is per IO thread. |
+| `dir` | `.`; directory | OPERATOR | Select persistent storage/recovery location. Boot; CONFIG SET is immutable. |
+| `dbfilename` | `dump.tomo`; plain filename | OPERATOR | Name the snapshot/recovery artifact. Boot; no slash allowed. |
+| `save` | `3600 1`, `300 100`, `60 10000`; repeatable seconds/changes, empty disables | OPERATOR | Set snapshot cadence/recovery exposure; INFO persistence records saves/failures. Live; off removes mutation-observer work. |
+| `appendonly` | `no`; `yes\|no` | OPERATOR | Choose a write log for recovery. Boot-only here; live enablement is a compatibility gap. |
+| `appendfsync` | `everysec`; `always\|everysec\|no` | OPERATOR | Choose durability versus sync latency using existing runbooks. Live; AOF status/errors. |
+| `appendfilename` | `appendonly.aof`; plain filename | OPERATOR | Choose the AOF family basename. Boot; distinct from its containing directory. |
+| `appenddirname` | `appendonlydir`; plain directory name | OPERATOR | Place the multipart AOF family under dir. Boot. |
+| `auto-aof-rewrite-percentage` | `100`; uint32, 0 disables automatic trigger | OPERATOR | Choose tolerated log growth before compaction; INFO AOF sizes/rewrite state. Live. |
+| `auto-aof-rewrite-min-size` | `64mb`; bytes with Redis suffixes | OPERATOR | Avoid compaction churn on small logs even when percentage growth is high. Live. |
+| `aof-use-rdb-preamble` | Only `yes` | OPERATOR | Keep a runbook's format declaration and reject unsupported recovery expectations. A compatibility assertion, not an experimental dimension; TomoKV snapshot format is not Redis RDB. |
+| `aof-timestamp-enabled` | `no`; `yes\|no` | OPERATOR | Include timestamps in the log for inspection/recovery tooling. Live. |
+| `databases` | Only `1` | OPERATOR | Assert the required keyspace count and fail an incompatible config. Single-value compatibility assertion; no multi-DB implementation or sweep is proposed. |
+| `proto-max-bulk-len` | `512mb`; `1 MiB..4294901759` | OPERATOR | Bound individual request bulks; accepted/rejected requests and memory use. Live; locked uint32 Slice ABI prevents Redis's larger ceiling. |
+| `maxmemory` | `0`; bytes with Redis suffixes | OPERATOR | Set the dataset memory budget; inspect INFO memory/evictions/OOM. Live; 0 removes eviction work. |
+| `maxmemory-policy` | `noeviction`; eight existing Redis LRU/LFU/random/TTL policies | OPERATOR | Choose write rejection or the appropriate cache victim policy. Live; hit/miss/eviction/OOM observations. |
+| `maxmemory-samples` | `5`; `1..64` | OPERATOR | Trade eviction selection quality for eviction CPU cost. Live; the supported upper bound is narrower than Redis's. |
+| `notify-keyspace-events` | Empty; Redis flag string | OPERATOR | Enable the events consumed by application/monitoring subscribers. Live; empty arms no notification machinery. |
+| `tracking-table-max-keys` | `1000000`; unsigned count, 0 unlimited | OPERATOR | Budget client-side-cache remembering state; invalidations and table occupancy. Boot; per-owner bound and missing live SET are compatibility gaps. |
+| `slowlog-log-slower-than` | `10000`; microseconds ≥−1; −1 off, 0 all | OPERATOR | Choose which slow commands need investigation; SLOWLOG. Live. |
+| `slowlog-max-len` | `128`; unsigned count, 0 keeps no entries | OPERATOR | Budget diagnostic history/retention; SLOWLOG LEN. Live; per-recording-thread bound. |
+| `latency-monitor-threshold` | `0`; uint32 milliseconds, 0 off | OPERATOR | Choose the latency events worth recording; LATENCY commands. Live; differs from per-command slow-log records. |
+| `stream-node-max-bytes` | `4096`; current uint32 parser, 0 ignores this axis | OPERATOR | Trade stream-node memory against traversal/allocation work; CONFIG, MEMORY and workload latency. Live; reference MEMORY grammar/range repair remains missing. |
+| `stream-node-max-entries` | `100`; current uint32 boot parser, 0 ignores this axis | OPERATOR | Bound stream entries per macro-node independently of payload size. Live; reference 64-bit range is not correctly enforced. |
+| `hash-max-listpack-entries` | `512`; canonical integer `0..LONG_MAX` | OPERATOR | Choose the count at which small hashes become tables; OBJECT ENCODING/MEMORY USAGE. Restored, live. |
+| `hash-max-listpack-value` | `64`; bytes `0..LONG_MAX`, memory suffixes | OPERATOR | Bound field-name/value length in packed hashes; same observations. Restored, live. |
+| `list-max-listpack-size` | `-2`; signed int32; count or byte modes below | OPERATOR | Choose packing density/node size for lists; OBJECT ENCODING and MEMORY USAGE. Restored, live. |
+| `set-max-listpack-entries` | `128`; canonical integer `0..LONG_MAX` | OPERATOR | Choose the count crossover for string sets. Restored, live; independent of the fixed integer-set limit. |
+| `set-max-listpack-value` | `64`; canonical integer `0..LONG_MAX`, **no suffixes** | OPERATOR | Bound string-member length in packed sets. Restored, live. |
+| `zset-max-listpack-entries` | `128`; canonical integer `0..LONG_MAX` | OPERATOR | Choose the count crossover for packed sorted sets. Restored, live. |
+| `zset-max-listpack-value` | `64`; bytes `0..LONG_MAX`, memory suffixes | OPERATOR | Bound member length in packed sorted sets. Restored, live. |
 
-The additional `--thread-pipeline` alias of overlap is removed with the old public spelling;
-it cannot bypass the study namespace. Study CONFIG names are `x-ex-sched` and `x-overlap`;
-INFO uses `x_overlap`, with the obsolete `overlap`/`thread_pipeline` aliases removed.
+| Other accepted input / alias | Verdict | Meaning |
+| --- | --- | --- |
+| `TOMOKV_L3_DOMAINS` | OPERATOR | Correct missing/broken topology discovery using known CPU/L3 membership. Unset/empty uses sysfs; comma-separated domains, ranges and `+` joins. Invalid, duplicate and out-of-affinity CPUs fail. It changes topology facts used by placement, not individual worker placement. |
+| `pin yes\|no` (conf) | OPERATOR | Existing spelling for normal affinity / `--no-pin`; same production decision, no second feature. |
+| Positional conf path | OPERATOR | Boot an existing configuration and give CONFIG REWRITE a destination. CLI overrides file settings. |
+| `help` | OPERATOR | Invocation discovery; excluded from the knob count. |
+| `hash-max-ziplist-entries` | OPERATOR | Reference alias of hash-max-listpack-entries; same value, validation and live behavior. |
+| `hash-max-ziplist-value` | OPERATOR | Reference alias of hash-max-listpack-value. |
+| `list-max-ziplist-size` | OPERATOR | Reference alias of list-max-listpack-size. |
+| `zset-max-ziplist-entries` | OPERATOR | Reference alias of zset-max-listpack-entries. |
+| `zset-max-ziplist-value` | OPERATOR | Reference alias of zset-max-listpack-value. |
 
-Other TomoKV controls not assigned a change by the design stay unchanged:
-`--flip-work-window 100`, `--script-instruction-limit 100000`, `--no-pin` / conf `pin yes`,
-and persistence input `--load`. Redis-compatible parser arms, names, defaults, and runtime
-semantics are untouched. Documentation-only edits clarify the automatically selected engine.
+## Reference mapping and semantics
 
-## Derivation and lazy work
+Names and numeric kinds were checked against the official
+[Redis 8.8.1 registry](https://github.com/redis/redis/blob/8.8.1/src/config.c) and the
+[8.10.0 registry](https://github.com/redis/redis/blob/8.10.0/src/config.c), including their aliases,
+rather than inferred from old ziplist names. The memory-versus-integer distinction for set values
+is intentional. All three count limits and set value use canonical decimal; hash/zset byte limits
+use the reference memory parser. Values retain the full reference range in cold configuration;
+owner-local limits saturate at UINT32_MAX, the largest representable collection/element size.
+CONFIG GET/REWRITE retain the original full-range value, not the saturated implementation bound.
 
-`LbAutotune` lives beside the existing weighted placement policy in
-[`src/core/weighted_lb.h`](src/core/weighted_lb.h). Only `lb=1` allocates it. Its observation
-tick is 1000 ms and a sustained decision covers three ticks, preserving existing hysteresis.
-The sampling target is 4096 observations per decision. For measured visits `V` over elapsed
-time `E`, the one-in-N rate is `max(1, ceil(V * decision_ms / E / 4096))`, capped at uint32.
-Low traffic samples every visit. Before the first completed window, sampling bootstraps at 1.
+| Removed TomoKV name | Reference name / status | Default-preserving translation |
+| --- | --- | --- |
+| `hash-max-compact-entries` | `hash-max-listpack-entries` | 512 entries |
+| `hash-max-compact-value` | `hash-max-listpack-value` | 64 bytes; restore MEMORY grammar |
+| `list-max-compact-entries` | `list-max-listpack-size` | The default −2 retains UINT32_MAX entries; nonnegative settings select count mode |
+| `list-max-compact-value` | `list-max-listpack-size` | −2 maps to the existing 8192-byte small-list payload budget and expanded-node budget |
+| `set-max-compact-entries` | `set-max-listpack-entries` | 128 string members; integer sets retain their independent fixed 128-entry bound |
+| `set-max-compact-value` | `set-max-listpack-value` | 64 bytes; integer grammar, not MEMORY grammar |
+| `zset-max-compact-entries` | `zset-max-listpack-entries` | 128 entries |
+| `zset-max-compact-value` | `zset-max-listpack-value` | 64 bytes; restore MEMORY grammar |
+| `script-instruction-limit` | **No equivalent reference alias.** Expected control is `busy-reply-threshold`, alias `lua-time-limit`; implementation pending | No elapsed-time value reproduces an instruction-count abort |
 
-Each successful key sample contributes its **latched rate** to the physical shard counter.
-The fold therefore consumes estimated visits directly instead of multiplying historical counts
-by a newer rate. Each executor refreshes its private rate on the existing census beat. Counters
-and their census state remain on the physical shard; immutable bucket IDs retain controller
-history across migration. No ownership or retirement handoff was moved out of its critical section.
+No active consumer in this worktree needs the old TomoKV compact spellings. They stay rejected.
+The five reference aliases are accepted at boot and by live CONFIG, share canonical storage,
+and REWRITE emits canonical names only. Canonical+alias duplicates in one CONFIG SET fail before
+fan-out rather than giving one control two independent values.
 
-Age sampling uses the same duration/traffic rule over three flip-controller ticks. It is armed
-at maneuver start, updated on completed traffic windows, and set to zero at anchor/disable.
-Its traffic estimate is completed commands; fanout can generate multiple stamped tasks per
-command. It adds no eager computation while sampling is off. This controller remains independent
-of the continuous key/client LB enable switch.
+For lists, −1, −2, −3, −4, −5 select 4, 8, 16, 32, 64 KiB; values below −5 clamp to 64 KiB.
+Positive values bound elements per node, subject to the 8 KiB safety limit; 0 allows one element.
+The full signed-int32 grammar is accepted, including INT_MIN without negation overflow.
+These are reference exceptions to the project's usual 0=off/−1=auto convention. See the
+[reference node-limit implementation](https://github.com/redis/redis/blob/8.8.1/src/quicklist.c).
 
-Key and client imbalance bands learn adjacent-window jitter before admission, using the
-existing 0.25 EWMA weighting. After learning, only changes inside twice the learned jitter
-update the estimate. The fire band is twice jitter; the existing 80% Schmitt release and
-three-tick sustain remain. A zero measured band is a legitimate observation, never an off switch;
-a zero-imbalance window clears the streak even when the learned release band is also zero.
+TomoKV still has its own compact serialization. To obey the unchanged-default requirement, its
+small-list crossover counts aggregate payload bytes as before; expanded nodes count encoded bytes
+as before. Thus this is not a claim of byte-identical Redis listpack occupancy or automatic
+Redis-style demotion. The restored control selects the count/size policy for both representations.
+This retained representation difference is explicit, not hidden behind a reference spelling.
+Existing nodes are not eagerly repacked on CONFIG SET; subsequent builders/inserts apply the
+current limits, including LSET/LINSERT, list moves, deletion rebuilds, snapshot/AOF and RESTORE.
 
-Transfer timing brackets the existing drain-through-commit transaction using its already
-published deadline. Completed duration divided by moved items gives mean cost `C` in ns.
-The shard move cap is `min(shards, max(1, floor(tick_ns / C / 3)))`; before a measurement it
-is one. Cooldown is `max(1, ceil(3 * C / tick_ns)) * tick_ms`, with one tick before a cost
-sample. Client transfers remain one candidate per existing connection-drain transaction.
-Only completed transfers contribute cost; refused or abandoned plans do not. Timing and policy
-updates are cold, and the existing quiesced ownership transfer/rebinding functions are unchanged.
+The default EncodingConfig translates field-for-field to the prior TypeLimits. CONFIG fan-out
+updates each shard only on that shard's executor, before the existing barrier completes.
+Limits remain inside Shard and move with it. The script workbench receives the executing shard's
+live limits at each activation, including same-coordinator reuse; two stale references to the
+removed Config::type_limits were also repaired. No new per-owner sidecar or migration hand-off is
+introduced, and no unused interpreter or encoding-specific allocation is created by parsing.
 
-The read-local selectors are replaced by their winning branches inside the existing armed
-paths. Immutable capture, filter publication, retirement, and QSBR retain their existing
-arming checks. Scoped hash callbacks are still invoked only after read-local admission, and
-scatter hash enumeration remains behind the local LB-enabled check. TLS setup still begins
-only after the listener's `tls-port` check. No removed flag is replaced by an eager argument
-whose callee merely returns early.
+### The scripting conflict
 
-## Boot geometry, INFO, and layout
+The [reference scripting contract](https://redis.io/docs/latest/develop/programmability/eval-intro/)
+keeps an over-threshold script running, rejects most other clients with BUSY, and permits selected
+administrative commands. SCRIPT KILL/FUNCTION KILL can kill only an activation that has not
+issued a write. `busy-reply-threshold` is live, in milliseconds, default 5000, range 0..LONG_MAX;
+0 disables this soft threshold. Its old name is `lua-time-limit`. Although redis.conf prose also
+mentions negative values, the checked current configuration registries reject them.
 
-`Server::prepare_boot` resolves topology, sibling units, placement, and the shard default
-before AOF/snapshot recovery reads a shard count. `Server::init` consumes that same prepared
-placement, with no second discovery. Fused executor count is the number of selected fused
-threads; split executor count is the resolved EX role count. A later FLIP changes roles without
-changing the boot-latched shard count.
+Today TomoKV executes Lua synchronously inside one owner task and aborts after **more than
+100000 instructions**, checked every 1000 instructions, replying BUSY to the invoking client.
+Prior writes stand. KILL commands always reply NOTBUSY. There is no mapping from 100000 VM
+instructions to milliseconds that preserves that behavior for every script and load. Replacing
+100000 with 5000 ms, keeping an abort under the new name, or accepting a soft threshold that can
+never be serviced would each violate a stated requirement.
 
-`INFO server` adds `shards` from the real shard inventory and `atomic` from the live enable
-bit. The existing `read_local` already reports the effective lane state and remains intact.
-These fields are read-only, computed on INFO, with no operation-path writes. The thread counts
-already reported by each mode remain. No new CONFIG shard entry is added, so CONFIG REWRITE
-does not turn an automatic default into an explicit fixed count. The old separate key/client
-enable observations become `tomokv_lb_enabled`; movement counters remain available. The
-deleted SMT flag's INFO value is removed; the derived FLIP unit size remains observable.
+The instruction control therefore earns **OPERATOR**, not NEITHER. Restoring it as an explicitly
+TomoKV instruction bound would preserve the default and restore the production decision, but
+would not satisfy the requested reference-only repair. A complete reference implementation needs
+a responsive script-control path in **both** modes, timeout visibility to other connections,
+correct KILL versus UNKILLABLE behavior after writes, and continued execution without breaking
+owner exclusivity, connection ordering or QSBR. That necessarily changes the default behavior of
+scripts that currently reach the instruction bound. This decision is pending; no script restoration
+is claimed in this diff and no infinite-script runtime test is added to the existing default mode.
 
-| Layout lock | Before | After |
+## Near-duplicates and redundant experiments
+
+- **ratio/place/no-pin/L3 environment/shard-home:** ratio specifies counts and lets placement derive;
+  place specifies concrete CPUs; no-pin controls whether workers obey those CPU targets; L3 input
+  corrects discovered domain membership; shard-home sets initial key ownership. Place subsumes the
+  ability to spell ratio's resulting layout, but does not replace its stable operator intent across
+  hosts. A sweep varying all of these at once is confounded. Hold ownership and role counts fixed
+  when testing locality; disable movement when testing filler executors.
+- **key-lb/client-lb/flip-auto:** move different objects (shards, connections, roles). They are not
+  three spellings for balancing. Their interaction needs independent arms; the old merged `lb`
+  switch concealed that question and remains deleted.
+- **overlap/read-local/reorder:** respectively schedule overlap, locality of clean reads, and
+  ordering across connections. Their OFF arms answer different latency/amortization questions.
+  Shallow/deep implementation-selector sweeps do not deserve separate public controls.
+- **zc-min's two thresholds:** this is an actual coupled control. Above 1024, a sweep changes GET
+  while leaving the multi-key gather cutoff at 1024. Below 1024 it changes both. Keep one knob,
+  but label effective cutovers and include separate command families; do not claim it independently
+  measures both mechanisms.
+- **hash:** the known benign point-operation cost is not a forward-looking paper question by
+  itself. Keep it for the operational trust decision; omit repetitive benign-key sweep cells.
+- **net-io/persist-io:** one current selector controls both engines. AOF-on engine comparisons
+  cannot attribute their difference solely to networking. Keep the useful operational fallback
+  and test the networking question with AOF/save work disabled; do not resurrect persist-io.
+- **requirepass/user/aclfile:** a default-user password, inline users, and an external policy file
+  overlap in what policy they can express. Existing runbooks and ACL LOAD/SAVE require all three;
+  use canonical ACL state to interpret them, not independent authentication systems.
+- **tls-ciphers/tls-ciphersuites** cover different TLS protocol generations; **CA file/directory**
+  cover different certificate deployment formats. Similar names are not redundant decisions.
+- **timeout/tcp-keepalive/output-buffer limits/maxclients** address idle sessions, dead peers,
+  slow consumers and admission respectively. **maxmemory/proto-max-bulk-len** bound different
+  resources. Do not delete one because another is also a memory number.
+- **slowlog threshold/length/latency threshold:** event selection, record retention and aggregate
+  latency history differ. **AOF percentage/minimum size** are an AND policy that prevents small-log
+  churn; **stream bytes/entries** independently bound variable-size nodes.
+
+## Retired implementation controls: NEITHER ledger
+
+These remain absent from CLI/conf/CONFIG. Fixed or derived behavior is inherited, not newly
+benchmarked here. None earns a new paper cell merely because a historical harness mentioned it.
+Restored encoding functionality and the unresolved instruction control are excluded from this
+NEITHER classification.
+
+| Retired control / spelling | Verdict | Fixed / derived behavior and reason |
+| --- | --- | --- |
+| `read-local-prefetch-capture` | NEITHER | Capture enabled inside armed read-local; the established winner, not an operator policy. |
+| `read-local-atomic-filter` | NEITHER | Precise fail-closed safety filter enabled; weakening safety is not a production choice or defensible arm. |
+| `read-local-interleave` | NEITHER | Bounded local chunks and owner quanta enabled; no independent policy question established. |
+| `flip-auto-band` | NEITHER | Automatic learned jitter/resolution/baseline floors; exposes internal detector tuning otherwise. |
+| `flip-work-window` | NEITHER | Mean one-in-100 whole-pass sampler when flip-auto=1, zero work when off; repeated sampler implementation cells do not answer the adaptation question. |
+| `lb` | NEITHER | Removed merged alias; independent key/client controls each default 1. |
+| `lb-sample-rate` | NEITHER | Derive from visits/duration, target 4096 observations per sustained decision. |
+| `lb-age-sample-rate` | NEITHER | Derive only during a flip maneuver; anchor/idle stays dark. |
+| `lb-tick-ms` | NEITHER | Fixed 1000 ms observation beat, three-tick sustain. |
+| `lb-imbalance-pct` | NEITHER | Separate key/client learners; band twice observed quiet jitter. |
+| `lb-move-cap` | NEITHER | Start at one shard, derive pacing from completed drain/install cost. |
+| `lb-cooldown-ms` | NEITHER | Derive from completed transfer cost. |
+| `l3-domains` | NEITHER | Redundant CLI spelling removed; discovery plus documented environment correction remains. |
+| `smt-mode` | NEITHER | Derive sibling placement/FLIP units from the allowed topology. |
+| `genthread-schedule` | NEITHER | Duplicate schedule selector; thread-mode plus overlap selects the retained behavior. |
+| `ex-sched`, `x-ex-sched` | NEITHER | Old names rejected; public reorder defaults to FIFO/0. |
+| `x-overlap`, `thread-pipeline` | NEITHER | Old names rejected; public overlap defaults to 0. |
+| `atomic-window` | NEITHER | `min(16*resolved_shards,1024)`; safe live atomic reconfiguration retained. A second credit number adds no named paper question. |
+| `persist-io` | NEITHER | Uring with net-io uring, syscall IO with epoll; the old selector duplicated a dependency. |
+| `lru-clock-shift` | NEITHER | Fixed 8: 256-second buckets, 8192-second wrap; public eviction policy/sample controls remain. |
+| `script-crossshard-max-bytes` | NEITHER | `max(4 MiB,min(boot_maxmemory/shards/16,64 MiB))`, 4 MiB without a ceiling; internal staging partition. Aggregate transient-memory control is a separate missing operator capability. |
+| `script-crossshard-workbench-bytes` | NEITHER | Twice staging budget, lazy allocation; duplicate internal partition. |
+| `script-crossshard-conflict-retries` | NEITHER | Fixed 8 in the existing explicit-conflict path. |
+| `script-crossshard-cut-slots` | NEITHER | Fixed 4 snapshot reservations per IO owner. |
+| `tls-ktls` | NEITHER | Attempt kTLS when TLS is enabled, with userspace fallback; TLS off creates no context. A losing implementation arm alone is not a useful knob. |
+| `load` | NEITHER | Recover `<dir>/<dbfilename>` with existing AOF precedence; duplicate recovery-path selection. |
+| `conf` | NEITHER | Redundant flag spelling removed; positional conf path remains. |
+
+The earlier removal of `load` changed recovery: an existing configured snapshot is now loaded
+without an explicit load flag. That change predates this review and is preserved. Missing files
+boot empty; present corrupt/unreadable files fail. Gate launches already isolate persistence
+folders. This review does not present that earlier behavior change as an unchanged default.
+
+## Reverse audit: expected controls still missing or incomplete
+
+These are **OPERATOR compatibility gaps**, not NEITHER deletions. A setting should be accepted
+only when its behavior exists. Replication, cluster, sentinel, modules and multi-DB controls remain
+outside the project's target; this list does not propose reopening them.
+
+| Missing/incomplete control | Operator decision / concrete gap |
+| --- | --- |
+| `busy-reply-threshold`, `lua-time-limit` | Script responsiveness and intervention; unresolved semantics/default conflict above. The deleted instruction control is useful and should not have been classified NEITHER. |
+| `set-max-intset-entries` | Integer-set memory/CPU crossover. Still fixed at 128 (Redis defaults to 512); restored listpack settings do not masquerade as this control. |
+| `list-compress-depth` | Compress interior list nodes while keeping ends cheap. No compression machinery; do not accept an inert setting. |
+| `hll-sparse-max-bytes` | Tune HLL sparse/dense crossover; `hll.cc` fixes 3000. |
+| `unixsocketperm` | Set socket access using the expected octal grammar; no corresponding config entry exists. |
+| Multi-address `bind`, IPv6 listener support | A single address is not full Redis bind grammar/behavior. |
+| `include` | Compose shared/base/secret configuration using existing config-file organization. The current loader treats it as an unknown directive. |
+| `logfile`, `loglevel`, syslog controls | Choose log destination/volume through standard service configuration; current stdout/stderr redirection is an external workaround. |
+| `daemonize`, `supervised`, `pidfile` | Integrate existing service-manager runbooks. Foreground operation is useful but does not provide the reference directives. |
+| `client-query-buffer-limit`, `maxmemory-clients` | Bound aggregate query buffers / evict clients for process memory pressure. proto-max-bulk-len limits a single bulk, and output limits are per client/class. CLIENT NO-EVICT currently has no maxmemory-clients enforcement to exempt. |
+| `stop-writes-on-bgsave-error` | Select write availability after snapshot failure. Current behavior is fixed; no reference control. |
+| `aof-load-truncated`, `no-appendfsync-on-rewrite` | Select incomplete-tail recovery and rewrite-time sync policy instead of fixed behavior. |
+| `rdbcompression`, `rdbchecksum`, `aof-use-rdb-preamble no` | Reference-format/policy expectations are not fulfilled by the custom TomoKV snapshot. Do not add parser-only acceptance. |
+| `lfu-log-factor`, `lfu-decay-time` | Tune reference LFU aging/probabilistic frequency behavior; current eviction metadata is a separate implementation. |
+| `active-expire-effort`, `hz`, `dynamic-hz`, `lazyfree-*`, `activedefrag` | Choose background CPU/reclamation policy. Several require implementation work, not just exposing an internal number. |
+| Live `appendonly`, `dir`, `dbfilename`, TLS settings, `tracking-table-max-keys` | Useful accepted boot controls still cannot be changed as Redis runbooks expect. Live TLS rotation particularly needs lifecycle work. |
+| Process-wide `tracking-table-max-keys`, `slowlog-max-len`, `acllog-max-len` | Present names currently bound owner/thread-local state, so process totals can exceed the configured count. |
+| `stream-node-max-bytes` grammar; stream ranges | Redis accepts MEMORY suffixes/full reference ranges. Current boot parsing is uint32 decimal; live setters can truncate larger values. A large positive value can become zero and disable a rollover axis. |
+| Existing numeric ceilings/grammar | maxmemory-samples is capped at 64; proto-max-bulk-len is ABI-bounded; latency threshold stores uint32. Other old unsigned parsers accept noncanonical leading zeros. These are retained limitations, not proof of exact Redis parity. |
+| Complete CONFIG GET/REWRITE for boot geometry | CLI-only hash/port/bind/topology are not all in the CONFIG registry; REWRITE drops explicit geometry. `pin yes` in a later conf line also cannot undo an earlier `pin no`. Operator runbooks need a complete round trip, not a claim that the file already captures everything. |
+
+An accepted compatibility declaration (`databases 1`, preamble yes, replica buffer class) is useful
+when it states the sole supported contract honestly. A configurable value with no implementing
+mechanism would be a different, misleading surface.
+
+## Default, layout and lazy-work accounting
+
+| Layout | Incoming worktree | This diff |
 | --- | ---: | ---: |
-| Config | 624 | **528** |
+| Config | 488 (original baseline 624) | **544** |
 | Op | 336 | 336 |
 | Client | 1984 | 1984 |
 | ThreadCtx | 1408 | 1408 |
@@ -135,14 +322,86 @@ deleted SMT flag's INFO value is removed; the derived FLIP unit size remains obs
 | Rob<64> | 192 | 192 |
 | AtomicEntry | 144 | 144 |
 
-The Config assertion explicitly becomes **528**, with the same accounting comment beside it:
-104 declared field bytes removed, 4 bytes added for `lb`, and 4 bytes of additional alignment
-padding: `624 - 104 + 4 + 4 = 528`. No surviving Config fields were reordered. This changes
-their offsets and Server's embedded Config footprint, intentionally and visibly. Other locks
-remain unchanged. The former FlatStore filter byte and the two ReadLocalExImpl selector bytes
-are reserved padding to preserve the measured reader/owner separation and demotion-state offsets.
+Only the Config assertion changes: **488 + 7×8 = 544**. Restoring full reference ranges requires
+seven int64 values, instead of the former eight uint32 implementation thresholds. Config's
+embedded Server footprint changes; every hot structure size and Shard's store/stats offsets stay
+locked. A host-ABI ctypes model agrees for the incoming and new Config; the maintainer's build
+must prove the C++ assertion. No assertion for a hot object was relaxed.
 
-## Atomic-window gate repair: verdict (a), test witness
+Default list node checks are still 8192 bytes / UINT16_MAX entries. Small-list limits still map to
+UINT32_MAX / 8192; hash to 512 / 64; set/zset to 128 / 64. Integer-set default decisions stay at
+128 independently. These restored settings add no hot global CONFIG lookups. Values are parsed
+at boot or on the existing CONFIG control path, then copied to owner-local limits. List node
+operations now read those limits instead of constants, so unchanged decisions are not a claim
+of unchanged cycles; the PRE/POST comparison remains required.
+
+No hot argument enumeration was moved ahead of key/client/flip/read-local checks. Off still
+removes feature-specific allocations: key-lb leaves sample rate zero and owns no census arrays;
+client-lb collects no observations; both off allocate no shared LB policy/windows; flip-auto off
+has no fingerprint work; atomic off has no MVCC allocation; overlap/reorder/read-local retain their
+incoming guards. Encoding CONFIG SET does not walk or eagerly rebuild existing objects.
+
+## Validation and maintainer hand-off
+
+Performed: source/reference inspection, Python AST parsing (without imports/execution),
+changed-file whitespace checks, parser/table inventory comparison, and the Config ABI model.
+**Not performed:** C++ compilation/parsing, runtime tests, server boots, the gate, benchmarks,
+performance measurement or negative-control binaries.
+
+Existing tests now cover boot defaults, all seven controls/five aliases, file/CLI precedence,
+reference numeric types/ranges, negative/zero/positive list modes, canonical rewrites/reboot,
+live count/value promotion on every shard, RESTORE using live limits, separate integer sets,
+and expanded list-node budget effects. Existing boundary tests read live reference names.
+`tests/knobs.py` remains in its existing gate row and restores settings/cleans its keys.
+
+Maintainer negative controls: ignore EncodingConfig when initializing shards (boot/rewrite
+behavior checks must fail); skip owner-local CONFIG application (all-shard promotion checks must
+fail); leave expanded_push's budget fixed at 8192 (the expanded-node memory witness must fail);
+keep aliases in independent storage (alias readback/duplicate/rewrite checks must fail). No such
+binary was built or run here. The node-memory witness uses equal-length keys and identical list
+contents, both necessarily expanded, so the small-list promotion alone cannot satisfy it.
+
+**This review adds/retires no gate rows.** The inherited working diff still requires quick **327**,
+full **344** (345 with optional NIC), versus untouched constants 325/342. Count by emitting line:
+reorder mechanism at line **329** and dispatch scaling at **694**, both before the quick exit at
+**1264**; each contributes +1 to quick and full. The existing knobs result emits at **987**, also
+before that exit; changing its checks contributes zero rows. The parser, encoding and server-tail
+batteries likewise keep their existing emitting rows. EXPECT_QUICK/EXPECT_FULL were not edited.
+
+| Required matched-load PRE/POST comparison | PRE | POST |
+| --- | --- | --- |
+| Default GET/SET and collection commands, both modes, same explicit geometry | Incoming binary/rate/cycles/instructions/IPC | Pending; default decisions preserved, rates unmeasured |
+| Default list promotion, expanded pushes/rebuilds, integer/generic sets | Incoming fixed limits | Pending; restored defaults, including node behavior |
+| Nondefault encodings and scripts using collection workbenches | Prior knob-enabled/reference-aligned control, labelled separately | Pending; new controls are functionality, not a claimed optimization |
+| Paper research questions in the inventory | Recorded/predeclared baseline arms | Complete gaps at matched offered load, plus separately labelled saturation sweeps |
+
+Use the gate's actual 16 shards, 6:2 split, cores 0–7 when reproducing gate rows, and test 1s as
+well. Use the NIC rig for zero-copy/send-path claims; rate is the verdict and instructions/IPC
+explain it. No “winner” or PRE/POST number is inferred from this source-only review.
+
+## Retained correctness finding and evidence limits
+
+The captured and uncaptured local MGET paths in `src/core/ex_loop.h` still contain
+`kAttempts=2` retry loops and increment `mget_generation_retries`. The original reduction already
+reported these as an inherited violation of the supplied **no reader retries** law. This surface
+change preserves those paths; it does not silently weaken the law or claim to resolve the issue.
+
+The prior overlap/reorder audit also found compile-time SET-tax variants 1 and 3 in
+`src/store/read_local_settax.h` that permit sequence-protected in-place writes while read-local
+is armed. Those optional builds conflict with the immutable-write law; the shipped variant 0
+is unchanged. These compile-time experiments are not runtime surface controls.
+
+The earlier shard-count/LB derivations are implementation policy, not newly measured optima.
+Transfer duration does not include subsequent cache warmup; the maintainer's rate/cycles/IPC
+comparison remains necessary. Derived SMT placement retains the earlier complete-pair/same-role
+restrictions, including rejection of odd logical ratios when pair mode is active. The fixed LRU
+clock keeps the earlier real age-witness waits. None of these prior findings is hidden by the
+restored feature surface.
+
+The following evidence and line numbers describe the original reduction, before this final
+surface update. They are retained as the witness-repair record, not as current line references.
+
+## Historical atomic-window repair record (retained from the original reduction)
 
 The reported failure is **(a)**: the test never separated release of its artificial hold from
 its resume assertion. It is not evidence of a newly broken derived window. This verdict was
@@ -220,109 +479,3 @@ TomoKV. No build, server, benchmark, or gate was run for the repair. For maintai
 server controls: disabling admission-backpressure release must fail the resume deadline; dropping
 old-generation credit returns must fail pool reclamation; suppressing the stall witness must
 exhaust discovery. None of those server mutations was applied or run here.
-
-## Gate accounting and review checks
-
-**Required expected counts: quick 325, full 342** (343 with the optional NIC row).
-`EXPECT_QUICK=327` and `EXPECT_FULL=344` at lines 141–142 of `tests/gate.sh` are deliberately
-unchanged for the maintainer to edit. Counted by emitting line, not battery name or file location:
-
-| Row change | Baseline emitting line | Position relative to quick exit | Quick delta | Full delta |
-| --- | --- | --- | ---: | ---: |
-| Retire `xscript off control`; keep limit/window with automatic bounds | 658, inside the former three-arm loop | Before old exit 1260; surviving two-arm row now emits at 649, before exit 1245 | -1 | -1 |
-| Retire manual-map dispatch scaling guard and its shell wrapper | 686 | Before old exit 1260; retirement note now at 673, before exit 1245 | -1 | -1 |
-| Replace persistence CONFIG surface check with removed-knob/actual-geometry checks | 981 | Four iterations before the exit; replacement emits at 966 | 0 | 0 |
-| Restore separate atomic liveness and reconfiguration checks inside `atomic_torn.py` | Internal base lines 894 and 957 | Outer release row still emits at 435, before quick exit 1245; ASAN row still emits at 1255, after it | 0 | 0 |
-| All other battery rows | Existing lines, retaining multiplicity | Same side of the quick exit | 0 | 0 |
-
-Restoring the internal check adds one separately reported assertion per battery invocation, not
-another `gate.sh` ledger entry. Expected counts therefore **remain quick 325 / full 342**, or 343
-with the optional NIC row; the known PROGRAM-STATE mismatch is unchanged. No outer battery row
-was added. New helper files are consumed by existing rows. Parser coverage
-rejects every removed spelling even with its formerly valid default, checks the study grammar,
-and checks sample-budget invariance, jitter excursion rejection, and transfer-cost pacing.
-Compile-time assertions cover the shard-default scaling and cap. `tests/knobs.py` checks the
-CONFIG removals and compares INFO geometry with DEBUG's actual thread/shard inventory on the
-four existing persistence/atomic boots. Normal persistence coverage now boots `net-io epoll`;
-uring coverage still boots `net-io uring`.
-
-Atomic admission tests use fresh disjoint cross-owner keys and held groups at the production
-credit limit. The global arm must observe stalls and multiple live groups, maintain the bound,
-and reclaim all credits. The one-connection arm must observe simultaneous groups on that one
-connection. Each has four bounded fresh attempts and fails if its witness never appears, with
-the DEBUG hold cleared before the resume deadline. The independent reconfiguration row uses
-live `atomic` with old-generation groups still present; resizing itself is retired with the knob.
-Live ON/OFF toggle coverage also remains. The separate rate comparison uses an unheld burst.
-
-The script staging control exceeds the default 4 MiB budget and still requires refusal before
-RUN with untouched values. The cut-slot arm uses more than four connections per serving thread,
-retains its serial negative control, and re-arms fresh connections up to three times before
-failing. LRU rows age all old cohorts across one real 256-second bucket before probing ordinary
-reads, NO-TOUCH, and eviction survival; no clock override remains. The four rows and their
-positive lane-hit witnesses remain. Their individual clock wait is bounded at 260 seconds.
-
-The TLS fallback battery uses the retained cipher grammar (TLS 1.2 CBC; TLS 1.3 AES-256 outside
-the current custom AES-128 RX installer) and retains its live fallback/zero-copy-suppression
-assertions. Default kTLS engagement retains its separate positive witness. Idle LB signal tests
-now require zero age samples; the maneuver test must observe positive age sampling. The stable
-flip hold uses the reported derived band and fails after bounded unsuccessful re-arms.
-
-Initial reduction validation: serial C++20 syntax checks with warnings enabled for the parser,
-main, fused loop, scatter, server/INFO, LB reporting, flip controller, TLS, persistence, snapshot,
-and OBJECT implementations; Python AST parsing; shell syntax checks; diff/removed-reference
-and layout-assertion inspection. No executable was linked or run by Codex. The maintainer then
-reported the failure documented above. The repaired runtime witnesses and their broken-server
-controls, and performance, remain unverified; the repair's server-free checks are listed above.
-
-| Matched geometry/load comparison | PRE `78c3e5391` | POST working diff |
-| --- | --- | --- |
-| GET/SET rates, cycles/op, instructions/op, IPC in both modes | Not measured in this worktree | Not measured |
-| Enabled LB under stationary/skewed/changing load | Existing fixed controller | New derivations; benchmark pending |
-| `lb=0` / flip sampling dark | Source baseline | Arming/allocation paths inspected; benchmark pending |
-| Full gate | 344/344 supplied by maintainer | Maintainer's pre-repair run: 340 ok, 3 FAIL (including the expected ledger mismatch); repair not run, expected count still 342 |
-
-## OBJECTIONS
-
-1. **`--read-local-prefetch-capture` / `--read-local-atomic-filter`: inherited reader retry.**
-   The winning captured MGET path already violates the supplied “no reader retries” law:
-   `prepare_captured_local_mget` in `src/core/ex_loop.h` sets `kAttempts=2` at line 1295,
-   loops at 1317, and increments `mget_generation_retries` before repeating at 1431–1432.
-   The same loop exists in the baseline, and this diff still selects that winning path.
-   It was not redesigned or silently removed. The default GET capture arm breaks on table
-   churn; the confirmed normal-path objection is MGET. Resolving the inherited law conflict
-   requires a separate correctness decision, not a covert change in this surface reduction.
-
-2. **`--genthread-schedule`: “zero uses” was not literal.** Baseline
-   `src/core/config.h:702–716` actively lowered `coarse/iofused/streams` into fused mode and
-   overlap 0/1/2, with parser tests for the aliases. There was no independent Config field.
-   The alias is deleted as prescribed; former callers now fail explicitly.
-
-3. **`--lb` and derived `--shards`: measurement still required.** The specified derivation
-   scheme is implemented, but the 4096-sample target, eight shards per executor, initial
-   all-visit sampling, and transfer pacing have no PRE/POST rate evidence in this task.
-   Age sampling estimates command volume, so fanout affects actual stamped-task counts.
-   A pointer transfer's timed drain/install duration also does not measure subsequent cache
-   warmup or commands lost. These limitations matter to a paper and to the instruction/IPC
-   verdict; the formulae are implementation choices within the specified derivations, not
-   claims of measured optima. No runtime tuning knobs were retained to defer this decision.
-
-4. **`--smt-mode` / `--l3-domains`: stricter boot geometry.** Automatic pair mode invokes
-   the existing complete-pair and same-role validation. Odd logical ratios, incomplete explicit
-   pairs, or a split restricted to one available pair can now be rejected. L3 override repairs
-   L3 discovery; sibling sysfs still must be readable to derive and validate pair mode.
-   These consequences are recorded rather than adding an unrequested SMT override.
-
-5. **`--shard-home`: one regression instrument is lost.** The retired scaling wrapper kept
-   all 16 shards on two real executors and added empty filler executors using the manual map.
-   Default round-robin changes that ownership with thread count. Keeping its former measured
-   ratio threshold on a different geometry would assert an unvalidated claim, so its one row
-   is explicitly retired rather than reporting a misleading pass.
-
-6. **`--lru-clock-shift`: gate duration increases.** Keeping the winning 256-second clock
-   and preserving a real positive age witness costs up to 260 seconds on each of four boots.
-   No debug clock selector or artificial tolerance was introduced. The maintainer should budget
-   for those waits when running either tier.
-
-All prescribed knob dispositions are implemented. No item was left undone for a newly
-introduced compile failure or correctness-law violation; the inherited MGET conflict above
-is explicitly retained for maintainer review.

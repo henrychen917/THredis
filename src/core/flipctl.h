@@ -19,6 +19,13 @@ namespace tomo {
 
 class Server;
 
+// Preserve the measured sampler (DESIGN-flipfp.md): one whole parse pass in 100 on average.
+// Arming derives solely from the controller latch. No runtime sampling knob or adaptive
+// per-operation work is needed; the detector already derives its bands from actual samples.
+inline constexpr uint32_t flip_fingerprint_window(bool controller_enabled) {
+    return controller_enabled ? 100u : 0u;
+}
+
 enum class FlipFingerprintClass : uint8_t {
     Read = 0,
     Write,
@@ -50,7 +57,7 @@ struct FlipFingerprintWindow {
 // and one predicted-false branch; no store. Inside a sampled pass the full fingerprint body runs
 // for every frame and note_command accumulates exactly what the exhaustive writer accumulated for
 // that pass; at the pass end finish_parse_pass() publishes it and the caller draws the gap to the
-// next sampled pass. `work_window_` keeps the knob's documented meaning, commands per fingerprint
+// next sampled pass. `work_window_` is the mean commands per fingerprint
 // sample: one pass in W is sampled, so one frame in W is fingerprinted at every pipeline depth (a
 // sampled pass contributes all of its d frames and costs the body d times, once per W passes).
 // Gaps are uniform over [1, 2W-1] passes (mean W). A stride of exactly W would alias with any

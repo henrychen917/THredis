@@ -1,26 +1,26 @@
 # Thread amortization study surface
 
-`thread-mode` and the study-only `x-overlap` are one boot-latched measurement surface. The mode
+`thread-mode` and the public `overlap` are one boot-latched measurement surface. The mode
 names are `2s` (separate IO and executor threads, the default) and `1s` (one generalized thread owns
 both roles). `split` and `fused` remain parser aliases so old invocations keep working.
 
-| mode | overlap 0 | overlap 1 | overlap 2 |
-| --- | --- | --- | --- |
-| `2s` | ordinary split IO/ex loops | exact `t-iopipe` WB/IFID batch schedule | rejected at config validation |
-| `1s` | coarse IFID → EX → WB rotation | exact `t-genthread` `iofused` schedule | gated `iofused` three-way schedule |
+| mode | overlap 0 | overlap 1 |
+| --- | --- | --- |
+| `2s` | ordinary split IO/ex loops | `t-iopipe` WB/IFID batch schedule |
+| `1s` | coarse IFID → EX → WB rotation | gated `iofused` three-way schedule (formerly 2) |
 
-Use `--x-overlap 0|1|2` for these study schedules and `--x-ex-sched 0|1` for the executor study.
-The old public schedule spellings and compatibility aliases are removed; see
-[DESIGN-KNOBS.md](DESIGN-KNOBS.md). Below, "overlap" names the internal schedule value.
-Overlap 2 emits a boot warning because it is an experimental research schedule.
-Unified overlap 1 and 2 require `net-io uring`; the split
-iopipe schedule retains its explicit epoll specialization. No schedule constant is runtime-tunable.
+Use `--overlap 0|1`; CONFIG and INFO also call it `overlap`. The former `x-overlap` spelling,
+value 2, and old schedule aliases are rejected. `--reorder 0|1` enables cross-connection
+reordering in an executor batch for latency, with per-connection order always preserved.
+It defaults to 0; [REORDER.md](REORDER.md) records the restored public surface and the
+32/128-task storage fix, including the deterministic mechanism battery. Fused overlap requires
+`net-io uring`; split overlap retains its epoll specialization. No schedule geometry is tunable.
 
-Overlap 1 is deliberately the measured implementation, not a family resemblance. In `2s`, its
+In `2s`, overlap 1 retains the measured implementation. Its
 shallow rotation is WB observe, IFID receive, WB prefetch, IFID parse/hash, WB retire/prepare, IFID
 post, and WB submit/reclaim; its existing depth gate selects the measured natural-order path. In
-`1s`, `iofused` retains the fork's targeted IFID work, WB dependency prefetch, coarse executor turn,
-and SEND-sensitive submission boundary. Overlap 2 builds on those same mechanics. Its deep path
+`1s`, the gated three-way schedule retains targeted IFID work, WB dependency prefetch, the
+coarse executor turn, and the SEND-sensitive submission boundary. Its deep path
 freezes and prefetches a ready-list WB batch, performs the targeted IFID batch, gathers/schedules and
 prefetches one whole EX batch, uses WB prepare/pump as the EX load-gap filler, then executes that EX
 batch and drains any remaining EX batches normally. Kernel submission remains at the single outer
@@ -28,14 +28,14 @@ boundary. A one-bit depth gate returns the next rotation to the unchanged coarse
 order after a thin pass. These shapes are fixed so results can be compared against overlap 0's
 plain-loop baseline.
 
-The `1s` overlap-1 implementation remains unchanged. Both unified overlap schedules use its pending
-IFID/WB ready lists and the fused inbox's lifetime-fixed geometry directly (1,024 slots per
-producer), including blocking, transaction, scatter/script follow-up, and stale-owner paths. The
-overlap-2 deep path adds only one gate bit and a stack-local whole EX batch to overlap 1's WB batch;
-it has no IFID reservations, residual ages, A/D executor contexts, delayed lane retirement, or
-unpublished operations. The old streams source is retained for branch comparison but is unreachable
-from overlap-2 dispatch. Reservation-capable queue operations remain because overlap-0 read-local
-demotion uses them; neither overlap 1 nor overlap 2 enters them.
+Fused overlap uses pending IFID/WB ready lists and the inbox's lifetime-fixed geometry directly
+(1,024 slots per producer), including blocking, transaction, scatter/script follow-up, and
+stale-owner paths. Its extra schedule state is one gate bit and a stack-local EX batch beside
+the WB batch. It has no buffered IFID reservations, residual ages, A/D executor contexts, or
+delayed lane retirement. The old shallow and streams bodies remain for source comparison with
+no boot dispatch. Local-read demotion uses synchronous reservation-capable operations on the
+same physical inbox in either fused schedule. [OVERLAP.md](OVERLAP.md) records the coexistence
+audit, historical comparison evidence, and the measurements still required for this mapping.
 
 # Masked-monolith executor inbox
 

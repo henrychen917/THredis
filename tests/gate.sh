@@ -319,6 +319,15 @@ g++ -std=c++20 -O2 -march=native -pthread -I. tests/read_local_write_ring_unit.c
     && /tmp/tomokv-read-local-write-ring-unit >>/tmp/gate-ring-unit.txt 2>&1 \
     && ok "read-local write ring + arming transient unit" \
     || bad "read-local write ring + arming transient unit" "see /tmp/gate-ring-unit.txt"
+# REORDER.md: one row in BOTH tiers (before the quick exit). Real published ROB tasks drive the
+# production scheduler at 32/128 capacity. Exact non-identity permutations prove it fired; ASAN
+# and UBSAN make undersized scratch and an invalid occupancy shift fail, never skip or time out green.
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -fno-omit-frame-pointer -pthread -I. tests/reorder_unit.cc \
+    -o /tmp/tomokv-reorder-unit 2>/tmp/gate-reorder-unit.txt \
+    && timeout 60 /tmp/tomokv-reorder-unit >>/tmp/gate-reorder-unit.txt 2>&1 \
+    && ok "reorder mechanism + 32/128-task geometry battery" \
+    || bad "reorder mechanism + 32/128-task geometry battery" "see /tmp/gate-reorder-unit.txt"
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
       --check src/cmd/acl_categories_generated.h \
@@ -332,7 +341,7 @@ fi
 ./build/tomokv --spread 4:4   2>&1 | grep -q "unknown"  && ok "reject --spread"    || bad "reject --spread"
 ./build/tomokv --nodes 2      2>&1 | grep -q "unknown"  && ok "reject --nodes"     || bad "reject --nodes"
 ./build/tomokv --ratio 4:4:2  2>&1 | grep -q "deleted"  && ok "reject 3-part ratio"|| bad "reject 3-part ratio"
-./build/tomokv --conf /nonexistent-conf 2>&1 | grep -q "cannot open" && ok "reject missing conf" || bad "reject missing conf"
+./build/tomokv /nonexistent-conf 2>&1 | grep -q "cannot open" && ok "reject missing conf" || bad "reject missing conf"
 printf 'florb 1\n' > /tmp/gate-bad.conf
 ./build/tomokv /tmp/gate-bad.conf 2>&1 | grep -q "unknown argument" && ok "reject bad conf key" || bad "reject bad conf key"
 printf 'aclfile /tmp/gate-users.acl\nuser alice on nopass ~* &* +@all\n' > /tmp/gate-acl-mixed.conf
@@ -367,7 +376,11 @@ launch(){ # logtag binary args... -> pid in $SRV, log in $SRVLOG; waits up to 30
   guard_port "$PORT"
   [ -x "$bin" ] || { say "boot ($tag)" "FAIL ($bin is not an executable)"; return 1; }
   SRVLOG=$(mktemp "/tmp/gate-srv-$tag.XXXXXX")
-  taskset -c $CORES "$bin" --port $PORT --bind 127.0.0.1 --shards 16 "$@" > "$SRVLOG" 2>&1 &
+  # Every ordinary boot gets an empty persistence directory. Explicit recovery arms override it
+  # through their later --dir argument; a previous battery's SAVE must not become this one's input.
+  local boot_dir
+  boot_dir=$(mktemp -d "/tmp/gate-data-$tag.XXXXXX") || return 1
+  taskset -c $CORES "$bin" --port $PORT --bind 127.0.0.1 --shards 16 --dir "$boot_dir" "$@" > "$SRVLOG" 2>&1 &
   SRV=$!
   # 30s, not 10s: the AOF replay boot replays its file BEFORE it listens, and on a box shared
   # with other lanes that overran a 10s deadline and turned six AOF rows red with no defect behind
@@ -467,7 +480,7 @@ for AT in 0 1; do
   if boot_fused ./build/tomokv --atomic "$AT" --enable-debug-command yes; then
     FUSED_INFO=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO server 2>/dev/null | tr -d '\r')
     FUSED_MODE=$(printf '%s\n' "$FUSED_INFO" | sed -n 's/^thread_mode://p')
-    FUSED_OVERLAP=$(printf '%s\n' "$FUSED_INFO" | sed -n 's/^x_overlap://p')
+    FUSED_OVERLAP=$(printf '%s\n' "$FUSED_INFO" | sed -n 's/^overlap://p')
     [ "$FUSED_MODE" = 1s ] && [ "$FUSED_OVERLAP" = 0 ] \
         && ok "fused boot line (atomic $AT)" \
         || bad "fused boot line (atomic $AT)" "wire mode=$FUSED_MODE overlap=$FUSED_OVERLAP"
@@ -673,7 +686,12 @@ py tests/borrow_registry.py 127.0.0.1 $PORT --release-build >/tmp/gate-borrow.tx
     && ok "borrow-registry growth bound" || bad "borrow-registry growth bound" "see /tmp/gate-borrow.txt"
 stop
 
-# Dispatch scaling's manual ownership geometry is retired; see MERGE.md and DESIGN-KNOBS.md.
+# This row restores the original manual ownership geometry: two real owners plus empty fillers.
+# It boots its own arms; the maintainer runs it on the quiet box with the rest of the gate.
+quiet_wait
+XDS_PORT=$PORT XDS_CPUS=$CORES XDS_BIN=./build/tomokv bash tests/xshard_dispatch_scale.sh \
+    >/tmp/gate-xds.txt 2>&1 \
+    && ok "cross-shard dispatch scaling" || bad "cross-shard dispatch scaling" "see /tmp/gate-xds.txt"
 
 # ---- Redis-wire DUMP/RESTORE survives the native snapshot/restart boundary -------------------
 DUMPRESTORE_DIR=$(mktemp -d /tmp/gate-dumprestore.XXXXXX)
@@ -685,7 +703,7 @@ py tests/dumprestore.py 127.0.0.1 $PORT prepare_restart \
     || bad "DUMP/RESTORE restart preparation" "see /tmp/gate-dumprestore-restart.txt"
 stop
 boot ./build/tomokv --atomic 1 --dir "$DUMPRESTORE_DIR" \
-    --load "$DUMPRESTORE_DIR/dumprestore.tomo" \
+    --dbfilename dumprestore.tomo \
     || bad "DUMP/RESTORE snapshot reload boot"
 py tests/dumprestore.py 127.0.0.1 $PORT verify_restart \
     >>/tmp/gate-dumprestore-restart.txt 2>&1 \
@@ -745,7 +763,7 @@ for NET_IO in epoll uring; do
              "see /tmp/gate-snapshot-cut-${NET_IO}.txt"
   stop
   boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
-      --dir "$SNAP_DIR" --load "$SNAP_DIR/cut.tomo" \
+      --dir "$SNAP_DIR" --dbfilename cut.tomo \
       || bad "snapshot cut reload boot ($NET_IO)"
   py tests/snap_cut_battery.py "$PORT" verify_cut \
       >>"/tmp/gate-snapshot-cut-${NET_IO}.txt" 2>&1 \
@@ -794,7 +812,7 @@ for NET_IO in epoll uring; do
              "see /tmp/gate-snapshot-typed-${NET_IO}.txt"
   stop
   boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
-      --dir "$TYPED_DIR" --load "$TYPED_DIR/typed.tomo" \
+      --dir "$TYPED_DIR" --dbfilename typed.tomo \
       || bad "typed snapshot reload boot ($NET_IO)"
   py tests/snap_typed_roundtrip.py "$PORT" verify \
       >>"/tmp/gate-snapshot-typed-${NET_IO}.txt" 2>&1 \
@@ -816,7 +834,7 @@ for NET_IO in epoll uring; do
              "see /tmp/gate-snapshot-race-${NET_IO}.txt"
   stop
   boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
-      --dir "$RACE_DIR" --load "$RACE_DIR/race.tomo.cut" \
+      --dir "$RACE_DIR" --dbfilename race.tomo.cut \
       || bad "typed snapshot race reload boot ($NET_IO)"
   py tests/snap_typed_race.py "$PORT" verify "$RACE_DIR/race.tomo.oracle.json" \
       >>"/tmp/gate-snapshot-race-${NET_IO}.txt" 2>&1 \

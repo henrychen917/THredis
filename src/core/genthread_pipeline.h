@@ -12,7 +12,7 @@ inline constexpr uint32_t kGenthreadIfidBatchOps = 32;
 inline constexpr uint32_t kGenthreadExBatchOps = 32;
 inline constexpr uint32_t kGenthreadWbBatchConns = 16;
 
-// Pipelines 1 and 2 share the measured generalized-thread batch geometry. These names are
+// Fused overlap and the retained legacy schedules share this generalized-thread geometry. Names are
 // deliberately separate from the coarse constants above so selecting the study baseline cannot
 // silently inherit the larger experimental batches.
 inline constexpr uint32_t kGenthreadPipelineIfidBatchOps = 128;
@@ -33,7 +33,7 @@ inline constexpr uint32_t kGenthreadIoFusedCoalesceRotations = 4;
 // rotations.
 inline constexpr uint32_t kGenthreadThreeWayMinBatchOccupancy = 8;
 
-// Legacy streams implementation retained below the overlap-2 dispatch for branch comparison.  It
+// Legacy streams implementation retained without a boot dispatch for source comparison. It
 // keeps one IFID context, exactly two EX contexts (A/D), and one WB context. The contexts are loop
 // locals; streams may carry only a pre-I1 IFID batch or pre-E1 EX batch across one rotation. WB is
 // empty at every outer boundary, and triple-buffered EX is forbidden.

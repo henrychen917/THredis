@@ -528,12 +528,8 @@ private:
     void run_loop() {
         static_assert(Pipeline <= 2);
         if constexpr (Fused && Pipeline == 1) {
-            run_fused_iofused_loop<HasUnix, HasTls, kEp, false>();
-            return;
-        }
-        if constexpr (Fused && Pipeline == 2) {
-            // Overlap 2 is the gated three-way extension of iofused.  The old streams loop remains
-            // below for branch comparison, but no boot-time dispatch can reach it.
+            // Fused "on" is the former overlap-2 gated three-way schedule. The shallower
+            // iofused and legacy streams bodies have no boot dispatch; see OVERLAP.md.
             run_fused_iofused_loop<HasUnix, HasTls, kEp, true>();
             return;
         }
@@ -780,8 +776,8 @@ private:
 
     // The iofused family is a private boot-time instantiation. Neither arm owns streams' unpublished
     // IFID reservations, A/D executor contexts, residual-age gates, or buffered retirement state.
-    // Overlap 1 retains the source WB-prefetch -> targeted IFID -> WB -> coarse EX rotation.
-    // Overlap 2 selects the gated whole-batch three-way pass below. Both retain the measured
+    // The retained ThreeWay=false body is the former overlap 1 for source comparison only.
+    // Fused overlap 1 now selects ThreeWay=true (formerly 2), with the same measured
     // SEND-immediate / four-non-SEND N2 handling.
     template <bool HasUnix, bool HasTls, bool kEp, bool ThreeWay>
     void run_fused_iofused_loop() {
@@ -937,6 +933,10 @@ private:
             }
 
             Span idle(sig.idle_ns);
+            // All local captures were consumed by the pass/sweep above. An idle fused thread
+            // must stop holding back another owner's bounded retire ring, just as in overlap 0.
+            if (__builtin_expect(srv_->read_local_enabled(), false))
+                self_->publish_read_local_parked(srv_->read_local_epoch());
             self_->arm_blocked();
             if constexpr (kEp) {
                 if (!self_->any_fused_inbound())
@@ -946,9 +946,17 @@ private:
                 else                            ring_.submit_and_reap<true>();
             }
             non_send_rotations = 0;
+            // Clear the parked bit BEFORE sampling the epoch, in the same seq-cst order as
+            // the grace scan. The next pass may then capture foreign objects safely.
+            if (__builtin_expect(srv_->read_local_enabled(), false)) {
+                self_->resume_read_local_tick();
+                self_->publish_read_local_tick(srv_->read_local_epoch());
+            }
             self_->clear_blocked();
         }
 
+        if (srv_->read_local_enabled())
+            self_->publish_read_local_parked(srv_->read_local_epoch());
         if constexpr (kEp) {
             while (!epoll_closes_.empty()) {
                 Client* victim = epoll_closes_.back();
@@ -3782,8 +3790,14 @@ private:
                         storage_->reasons[i], read_local_mget(rob.at(storage_->ids[i])));
                 }
             }
-            if (completed_locally)
-                loop_->fused_executor_completion<false>(client_);
+            if (completed_locally) {
+                // Error lowering can finish an MGET locally. Overlap's targeted parser needs
+                // the same wake as ordinary local completion, including release of its fence.
+                if (loop_->targeted_ifid_)
+                    loop_->fused_executor_completion<true>(client_);
+                else
+                    loop_->fused_executor_completion<false>(client_);
+            }
             count_ = 0;  // every prepared scatter/marker is now owned by its published Op
             if (reserved_current_worker_ < 0) {
                 for (uint32_t i = 0; i < nowners_; i++)
@@ -3905,10 +3919,13 @@ private:
               bool IofusedPrivateQueue = false>
     DispatchResult parse_and_dispatch(
         Client* c, IfidPipelineBatch* pipeline_batch = nullptr) {
-        static constexpr bool Fused =
+        // The non-buffered overlap parser is fused too: geometry/active-list optimizations
+        // must not compile out its ROB hazards, MGET fence, admission, or demotion protocol.
+        // Buffered legacy streams stay outside the local-read protocol and have no boot caller.
+        static constexpr bool Fused = IofusedPrivateQueue || (
             BatchOps == kGenthreadIfidBatchOps &&
             !IoPipe && !BufferedIfid && !TargetedIfid &&
-            !SuppressOrdinaryActiveMark && !IofusedPrivateQueue;
+            !SuppressOrdinaryActiveMark);
         [[maybe_unused]] const bool read_local_enabled =
             Fused && __builtin_expect(srv_->read_local_enabled(), false);
         Client& conn = *c;
@@ -4001,7 +4018,9 @@ private:
             if constexpr (Fused) {
                 op = read_local_enabled
                     ? rob.acquire_read_local(conn.op_route_flags())
-                    : rob.acquire<true>(conn.op_route_flags());   // coded replies: fused only
+                    : rob.acquire<!IofusedPrivateQueue>(conn.op_route_flags());
+                // Preserve the old unarmed overlap parser's byte replies. acquire_read_local
+                // above uses the existing coded fused arm; overlap WB already handles codes.
             } else {
                 op = rob.acquire<false>(conn.op_route_flags());   // 2s keeps the byte path
             }
@@ -5957,8 +5976,8 @@ ordinary_dispatch:
         return work;
     }
 
-    // OVERLAP 2: iofused's ready lists and whole batches, with the first ordinary EX batch split at
-    // its existing prefetch seam.  The gate starts closed and samples only work completed by this
+    // FUSED OVERLAP ON (formerly 2): iofused's ready lists and whole batches, with the first EX
+    // batch split at its existing prefetch seam. The gate samples only work completed by this
     // pass. Closed rotations use the literal coarse IFID -> EX -> WB owner order; an open rotation
     // freezes and warms WB first, then runs IFID -> EX loads -> WB stores -> EX consumption. The WB
     // callback is synchronous, so neither its client batch nor EX's stack task batch crosses an

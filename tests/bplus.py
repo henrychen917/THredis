@@ -2,7 +2,7 @@
 """Directed B+ per-key atomic-filter gate. Usage: tests/bplus.py HOST PORT
 
 Boot requirement:
-  --thread-mode 1s --x-overlap 0 --read-local 1
+  --thread-mode 1s --overlap 0|1 --read-local 1
   --atomic 1 --enable-debug-command yes
 
 The test does not infer routing from key names. DEBUG SHARD/LBSIGNALS select a real cross-owner
@@ -527,7 +527,6 @@ def main():
     try:
         expected_config = {
             "thread-mode": b"1s",
-            "x-overlap": b"0",
             "read-local": b"1",
             "atomic": b"1",
         }
@@ -537,6 +536,8 @@ def main():
                 raise AssertionError(
                     "B+ test needs CONFIG %s=%s, got %r" %
                     (name, wanted.decode(), got))
+        if config_value(discovery, "overlap") not in (b"0", b"1"):
+            raise AssertionError("B+ test needs a supported overlap schedule")
         if discovery.command("CONFIG", "GET", "read-local-atomic-filter") != []:
             raise AssertionError("removed read-local atomic-filter knob is still exposed")
 

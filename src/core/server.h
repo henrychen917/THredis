@@ -260,7 +260,7 @@ public:
         if (!adjust_open_files_limit()) return false;
         check_tcp_backlog_settings();
         // Shard maps are resolved exactly once at boot; parsing never leaks onto a request path.
-        if (!placement_.assign_shard_homes(cfg.shards)) return false;
+        if (!placement_.assign_shard_homes(cfg.shards, cfg.shard_home)) return false;
 
         // ---- shards: bucket ranges, fixed for the life of the process ----------------------------
         shards_.resize(cfg.shards);
@@ -269,7 +269,7 @@ public:
             const uint32_t b0 = i * per;
             const uint32_t b1 = (i + 1 == cfg.shards) ? kNumBuckets : (i + 1) * per;
             shards_[i] = std::make_unique<Shard>();
-            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.type_limits,
+            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.encodings.type_limits(),
                              cfg.stream_limits);
             if (key_lb_signals_enabled() && !shards_[i]->enable_lb_signals()) {
                 std::fprintf(stderr, "fatal: could not allocate weighted-placement signals\n");
@@ -303,10 +303,10 @@ public:
             threads_[i] = std::make_unique<ThreadCtx>();
             // The fingerprint writer is armed only when its one reader, the flip controller, is
             // enabled (DESIGN-flipfp.md): with --flip-auto 0 and in 1s mode it is dark and costs
-            // one predicted branch per op. flip_work_window keeps its CONFIG value either way.
+            // one predicted branch per op. The enabled sampler keeps its measured 1-in-100 policy.
             threads_[i]->init(i, placement_.role_of(i), nthreads,
                               0,
-                              flipctl_.enabled() ? cfg.flip_work_window : 0);
+                              flip_fingerprint_window(flipctl_.enabled()));
             threads_[i]->init_command_counts(command_registry_size());
         }
         if (read_local_enabled()) {
@@ -393,14 +393,11 @@ public:
         return cfg_.thread_mode == ThreadMode::Fused ? "1s" : "2s";
     }
 
-    bool lb_machinery_enabled() const {
-        return cfg_.lb != 0;
-    }
     bool key_lb_signals_enabled() const {
-        return lb_machinery_enabled();
+        return cfg_.key_lb != 0;
     }
     bool client_lb_signals_enabled() const {
-        return lb_machinery_enabled();
+        return cfg_.client_lb != 0;
     }
     bool lb_controller_enabled() const {
         return key_lb_signals_enabled() || client_lb_signals_enabled();
@@ -589,7 +586,9 @@ public:
     }
 
     static bool read_local_enabled(const Config& cfg) {
-        return cfg.thread_mode == ThreadMode::Fused && cfg.overlap == 0 && cfg.read_local != 0;
+        // Both fused schedules consume local captures before the executor pass publishes QSBR.
+        // Their IO loops also publish park/resume edges; see OVERLAP.md for the lifetime audit.
+        return cfg.thread_mode == ThreadMode::Fused && cfg.read_local != 0;
     }
     bool read_local_enabled() const { return read_local_enabled(cfg_); }
     uint64_t read_local_epoch() const {
@@ -3485,8 +3484,8 @@ private:
     std::atomic<uint64_t> lb_bucket_bytes_spread_before_{0};
     std::atomic<uint64_t> lb_bucket_bytes_spread_after_{0};
 
-    // Weighted-placement state is absent when lb=0. Bucket arrays are indexed by the
-    // immutable routing id; client state is keyed by the immutable connection id. The mutex is a
+    // Weighted-placement state is absent when both key-lb and client-lb are 0. Bucket arrays
+    // are indexed by the immutable routing id; client state is keyed by the immutable connection id. The mutex is a
     // once-per-controller-beat/read-side lock and is never acquired on an operation path.
     std::unique_ptr<LbAutotune> lb_policy_;
     mutable std::mutex lb_signal_mu_;
