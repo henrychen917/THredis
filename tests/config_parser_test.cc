@@ -349,7 +349,7 @@ int main() {
         tomo::validate_config(read_local_split) != tomo::kConfigParsed ||
         read_local_split.thread_mode != tomo::ThreadMode::Split ||
         read_local_split.read_local != 1)
-        fail("read-local split-mode inert setting was rejected");
+        fail("read-local split-mode lane was rejected");
     auto parses_read_local_cell = [](const char* mode, const char* overlap,
                                      const char* lane, const char* reorder, const char* engine) {
         tomo::Config cfg;

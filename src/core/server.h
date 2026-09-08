@@ -26,7 +26,8 @@
 #include "flipctl.h"
 #include "weighted_lb.h"
 #include "placement.h"
-#include "config.h"        // struct Config: every runtime knob, one home
+#include "config.h"
+#include "orthog.h"        // struct Config: every runtime knob, one home
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -134,7 +135,7 @@ struct FlipReport {
     bool moving = false;
 };
 
-// Allocated only for the boot-armed fused read-local lane. The Server keeps only one pointer at its
+// Allocated only for the boot-armed read-local lane. The Server keeps only one pointer at its
 // true tail, so baseline member offsets and cache-line sharing remain unchanged.
 struct ReadLocalServerState {
     std::atomic<uint64_t> epoch{1};
@@ -326,6 +327,13 @@ public:
                     std::fprintf(stderr, "fatal: could not allocate read-local store state\n");
                     return false;
                 }
+            }
+        }
+        if (cfg_.overlap || cfg_.reorder) {
+            mode_schedule_stats_.reset(new (std::nothrow) ModeScheduleStats[nthreads]);
+            if (!mode_schedule_stats_) {
+                std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");
+                return false;
             }
         }
         if (lb_controller_enabled()) {
@@ -585,10 +593,14 @@ public:
         return count;
     }
 
+    ModeScheduleStats& mode_schedule_stats(uint32_t tid) {
+        return mode_schedule_stats_[tid];
+    }
+    const ModeScheduleStats* mode_schedule_stats() const { return mode_schedule_stats_.get(); }
+
     static bool read_local_enabled(const Config& cfg) {
-        // Both fused schedules consume local captures before the executor pass publishes QSBR.
-        // Their IO loops also publish park/resume edges; see OVERLAP.md for the lifetime audit.
-        return cfg.thread_mode == ThreadMode::Fused && cfg.read_local != 0;
+        // Both modes and both schedules consume local captures before publishing QSBR.
+        return cfg.read_local != 0;
     }
     bool read_local_enabled() const { return read_local_enabled(cfg_); }
     uint64_t read_local_epoch() const {
@@ -3662,6 +3674,7 @@ private:
     // Appended cold state: disabled servers allocate no epoch state and no established offset
     // moves. Later test-only knobs stay behind this pointer for the same reason.
     std::unique_ptr<ReadLocalServerState> read_local_state_;
+    std::unique_ptr<ModeScheduleStats[]> mode_schedule_stats_;
     // Appended at the true tail: this test-only knob must not move any production member.
     std::atomic<uint64_t> debug_atomic_conditional_deadline_{0};
 };

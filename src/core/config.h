@@ -329,7 +329,7 @@ struct Config {
     AppendFsyncPolicy appendfsync = AppendFsyncPolicy::Everysec;
     ThreadMode thread_mode = ThreadMode::Split;
     // Boot-only local-read lane; its internal winners are fixed.
-    uint32_t read_local = 0;            // boot-only 0|1; 1s GET/MGET local-read lane
+    uint32_t read_local = 0;            // boot-only 0|1; GET/MGET lane in 1s or shard-less 2s IO
     const char* appendfilename = "appendonly.aof";
     const char* appenddirname = "appendonlydir";
     uint32_t auto_aof_rewrite_percentage = 100;
@@ -400,9 +400,10 @@ struct Config {
     // Null means "started without a config file", which is exactly the
     // condition CONFIG REWRITE reports as an error.
     const char* conf_path = nullptr;
+    // The knob collapse leaves 80 bytes spare; retain the project's 624-byte layout lock.
+    uint8_t layout_reserved[80]{};
 };
-// DESIGN-KNOBS.md: incoming 488 + seven full-range encoding settings (56) = 544.
-static_assert(sizeof(Config) == 544, "Config footprint changed; update the documented accounting");
+static_assert(sizeof(Config) == 624, "Config footprint changed; update the documented accounting");
 
 inline constexpr uint32_t cfg_default_shards(uint32_t executors) {
     return executors >= 32 ? 256 : 8 * executors;

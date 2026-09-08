@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check one externally booted overlap/read-local cell; never starts a server.
 
-Usage: overlap.py HOST PORT 1s|2s 0|1 0|1
+Usage: overlap.py HOST PORT 1s|2s OVERLAP READ_LOCAL [REORDER]
 Boot with the requested mode/overlap/read-local, --key-lb 0 --client-lb 0, --enable-debug-command yes,
 and two shard owners foreign to the reader. Repeat for all eight cells and atomic 0/1.
 This is a correctness/engagement battery, not a throughput measurement. Existing
@@ -34,11 +34,12 @@ def burst(conn, commands, replies):
 
 
 def main():
-    if (len(sys.argv) != 6 or sys.argv[3] not in ("1s", "2s") or
+    if (len(sys.argv) not in (6, 7) or sys.argv[3] not in ("1s", "2s") or
             any(value not in ("0", "1") for value in sys.argv[4:])):
         raise SystemExit(__doc__)
-    host, port, mode, overlap, lane = sys.argv[1:]
-    armed = mode == "1s" and lane == "1"
+    host, port, mode, overlap, lane = sys.argv[1:6]
+    reorder = sys.argv[6] if len(sys.argv) == 7 else "0"
+    armed = lane == "1"
     control = _lib.Conn(host, port, timeout=10)
     reader = _lib.Conn(host, port, timeout=10)
     keys = []
@@ -47,7 +48,7 @@ def main():
         config = dict(zip(config[::2], config[1::2]))
         for name, wanted in (("thread-mode", mode), ("overlap", overlap),
                              ("read-local", lane), ("key-lb", "0"), ("client-lb", "0"),
-                             ("reorder", "0")):
+                             ("reorder", reorder)):
             expect(config.get(name.encode()), wanted.encode(), "CONFIG " + name)
         expect(control.must("CONFIG", "GET", "x-overlap"), [], "retired spelling")
         result = control.cmd("CONFIG", "SET", "overlap", overlap)

@@ -1,5 +1,10 @@
 # TomoKV configuration: operator and researcher audit
 
+> Integration update (2026-09-08): [ORTHOG.md](ORTHOG.md) supersedes this branch report
+> for combined-mode support, INFO activation evidence, layout accounting, and validation.
+> Both modes now support both local-read settings with either overlap/reorder setting;
+> `Config` retains the required 624-byte stride. Historical branch findings below remain intact.
+
 2026-09-08, `cx-overlap`, on `c8e61f646` plus the incoming worktree changes. This replaces the
 previous “currently swept” retention test. A control stays if an operator can make an observable
 production decision with it **or** its sweep answers a needed paper question. An existing harness

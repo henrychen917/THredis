@@ -8,8 +8,8 @@ thread mode, shards, overlap, reorder, and local-read admission are immutable af
 
 `--overlap 0|1` defaults to `0`. In `2s`, 1 overlaps IO writeback. In `1s`, 1 selects
 the gated three-way schedule formerly numbered 2, and requires `--net-io uring`.
-Both fused settings support local reads. See [OVERLAP.md](../OVERLAP.md) for the schedule
-mapping, its evidence, and the outstanding executor-scheduler geometry hazard.
+Both settings in both modes support local reads. [ORTHOG.md](../ORTHOG.md) records the
+integration evidence; [REORDER.md](../REORDER.md) records the repaired scheduler bounds.
 
 `--reorder 0|1` (default `0`) reorders across connections in an executor batch for latency; per-connection order is always preserved.
 It works in both modes and either overlap setting. Off keeps FIFO and allocates nothing;
@@ -17,8 +17,9 @@ on uses head rank then static command cost, retaining FIFO for single-connection
 Special tasks remain barriers. CONFIG exposes immutable `reorder`; [REORDER.md](../REORDER.md)
 documents the storage bounds, mechanism battery, and latency measurement plan.
 
-`--read-local 0|1` defaults to `0`. In `1s`, enabling it arms the local read lane described
-below. In `2s` it is accepted but remains inactive and logs a notice at boot.
+`--read-local 0|1` defaults to `0`. Enabling it arms the local read lane in either mode.
+In `2s`, IO threads remain shard-less and use the fused-capable reader machinery; every write
+still goes to its shard owner. Both overlap schedules retain their split IO writeback order.
 
 The armed lane captures immutable objects at prefetch and filters unsafe atomic keys individually.
 With overlap 0 it serves bounded local-read chunks between bounded owner-task quanta. With
@@ -34,6 +35,20 @@ TomoKV makes the same even IO/ex split across the allowed CPUs as before.
 
 Use `2s` for separate IO/executor placement, `--ratio`, manual `FLIP`, or `--flip-auto`.
 Complete sibling pairs in the allowed CPU set become placement and FLIP units automatically.
+
+With local reads enabled, all physical threads bind permanent QSBR retirement sinks before
+serving. Only the IO tier enters a reader loop. Executor tenure remains parked as a reader,
+performs immutable replacement, and drains its retirement queue. FLIP retains those sinks
+across both directions of role conversion. INFO SERVER reports `read_local_thread_N` with
+role, published shard count, actual lane activation, and lifetime GET/MGET completion counts.
+
+INFO SERVER also reports `overlap_schedule`, `overlap_passes`, and
+`overlap_interleaved_passes` from the loops that actually execute, plus `reorder_batches`,
+`reorder_multi_client_runs`, `reorder_permuted_runs`, and `reorder_max_batch`. A nonzero
+permutation count proves the scheduler changed a real multi-client batch. These lifetime
+witnesses survive RESETSTAT. Their optional array is allocated only when overlap or reorder
+is enabled. The whole witness field family is absent when both knobs are off, preserving
+the disabled INFO path. Armed boots report the allocated count as `schedule_stats_threads`.
 
 ## 1s: unified generalized threads
 

@@ -1,5 +1,5 @@
-// Unified generalized-thread runtime. This translation unit is the boot-time architecture wall:
-// only it instantiates ExLoopT<true> and IoLoop's Fused=true loop methods for overlap 0 and 1.
+// Unified generalized-thread runtime for overlap 0 and 1. rl2s.cc separately instantiates
+// the shard-less local-read IO schedules and fused-capable split owners.
 #include "genthread.h"
 
 #include <algorithm>

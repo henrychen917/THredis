@@ -1,5 +1,10 @@
 # Reorder: public latency scheduling and safe batch storage
 
+> Integration update (2026-09-08): [ORTHOG.md](ORTHOG.md) supersedes this branch report
+> for combined-mode support, INFO activation evidence, layout accounting, and validation.
+> Both modes now support both local-read settings with either overlap/reorder setting;
+> `Config` retains the required 624-byte stride. Historical branch findings below remain intact.
+
 Source-only change, 2026-09-08, in `cx-overlap` on `c8e61f646`. The existing
 overlap restoration is retained, including fused overlap with read-local armed.
 No compiler, server, benchmark, gate, or C++ battery was run. All runtime and

@@ -1,5 +1,10 @@
 # Overlap and local reads
 
+> Integration update (2026-09-08): [ORTHOG.md](ORTHOG.md) supersedes this branch report
+> for combined-mode support, INFO activation evidence, layout accounting, and validation.
+> Both modes now support both local-read settings with either overlap/reorder setting;
+> `Config` retains the required 624-byte stride. Historical branch findings below remain intact.
+
 Source audit and diff, 2026-09-08. The input checkout is `c8e61f646`, the configuration
 reduction merge after the supplied `78c3e5391` baseline. No build, server, benchmark,
 or gate was run. References below retain the overlap-only diff's line numbers unless marked **PRE**,

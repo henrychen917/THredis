@@ -72,7 +72,7 @@ template <size_t Capacity>
 void verify(Task (&tasks)[Capacity], const std::vector<Task>& expected, bool must_move) {
     require(expected.size() <= Capacity, "oracle exceeds its input capacity");
     const std::vector<Task> before(tasks, tasks + Capacity);
-    ex_schedule_batch(tasks, static_cast<uint32_t>(expected.size()));
+    const ReorderResult witness = ex_schedule_batch(tasks, static_cast<uint32_t>(expected.size()));
     bool moved = false;
     for (size_t i = 0; i < expected.size(); i++) {
         require(same(tasks[i], expected[i]), "actual permutation differs from exact oracle");
@@ -89,6 +89,8 @@ void verify(Task (&tasks)[Capacity], const std::vector<Task>& expected, bool mus
     for (size_t i = expected.size(); i < Capacity; i++)
         require(same(tasks[i], before[i]), "scheduler touched the unused batch suffix");
     require(moved == must_move, "required reordering did not fire (or FIFO control moved)");
+    require((witness.permuted_runs != 0) == moved, "permutation telemetry differs from actual tasks");
+    require(witness.permuted_runs <= witness.multi_client_runs, "permutation without a multi-client run");
     permutations += moved;
 }
 

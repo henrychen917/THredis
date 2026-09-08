@@ -25,6 +25,7 @@ SRC      += src/cmd/server_tail.cc src/cmd/slowlog.cc src/cmd/lcs.cc src/cmd/inf
 SRC      += src/cmd/lbsignals.cc
 SRC      += src/core/flipctl.cc
 SRC      += src/core/genthread.cc
+SRC      += src/core/rl2s.cc
 SRC      += src/cmd/cmdgap.cc
 SRC      += src/cmd/pfdebug.cc
 SRC      += src/cmd/cmdmeta.cc

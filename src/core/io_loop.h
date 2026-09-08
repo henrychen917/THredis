@@ -443,6 +443,7 @@ public:
     }
 
     void run_fused();
+    void run_split_read_local();
 
 private:
     void refresh_age_sampling() {
@@ -524,16 +525,27 @@ private:
 #include "pubsub.inc"
 
     template <bool HasUnix, bool HasTls, bool kEp, bool Fused = false,
-              uint8_t Pipeline = 0>
+              uint8_t Pipeline = 0, bool SplitLocal = false>
     void run_loop() {
         static_assert(Pipeline <= 2);
-        if constexpr (Fused && Pipeline == 1) {
+        if constexpr (Fused && Pipeline == 1 && !SplitLocal) {
             // Fused "on" is the former overlap-2 gated three-way schedule. The shallower
             // iofused and legacy streams bodies have no boot dispatch; see OVERLAP.md.
             run_fused_iofused_loop<HasUnix, HasTls, kEp, true>();
             return;
         }
-        constexpr bool IoPipe = !Fused && Pipeline == 1;
+        static_assert(!SplitLocal || Fused);
+        constexpr bool IoPipe = (!Fused || SplitLocal) && Pipeline == 1;
+        if constexpr (Fused) {
+            if (srv_->read_local_enabled()) {
+                // A split EX tenure is permanently parked: it never probes the local lane.
+                // Resume BEFORE sampling the epoch, as at the existing network-wait boundary.
+                if (ThreadCtx::read_local_publication_parked(self_->read_local_publication()))
+                    self_->resume_read_local_tick();
+                self_->publish_read_local_tick(srv_->read_local_epoch());
+                self_->set_read_local_lane_active(true);
+            }
+        }
         if constexpr (!kEp) {
             if (listen_fd_ >= 0) arm_accept(UrKind::Accept);
             if constexpr (HasTls) arm_accept(UrKind::TlsAccept);
@@ -640,7 +652,7 @@ private:
                 if constexpr (IoPipe) {
                     if (__builtin_expect(!routing_forward_.empty(), false))
                         client_routing_cleanup_pass();
-                    did += pipeline_pass<HasUnix, HasTls, kEp>(
+                    did += pipeline_pass<HasUnix, HasTls, kEp, SplitLocal>(
                         false, natural_order, submitted);
                 } else if constexpr (Fused) {
                     if (__builtin_expect(!routing_forward_.empty(), false))
@@ -699,7 +711,7 @@ private:
             // forever. Runs only when this thread has already concluded it has nothing to do.
             uint32_t sweep_work = 0;
             if constexpr (IoPipe)
-                sweep_work = pipeline_sweep<HasUnix, HasTls, kEp>(
+                sweep_work = pipeline_sweep<HasUnix, HasTls, kEp, SplitLocal>(
                     natural_order, submitted);
             else
                 sweep_work = sweep<HasUnix, HasTls, kEp, Fused>();
@@ -724,7 +736,7 @@ private:
                 // shutdown depend on a connection arriving.
                 if constexpr (Fused) {
                     if (!self_->any_fused_inbound())
-                        epoll_pass<HasUnix, HasTls, true, Pipeline>(50);
+                        epoll_pass<HasUnix, HasTls, !SplitLocal, Pipeline>(50);
                 } else if (!self_->any_io_inbound()) {
                     epoll_pass<HasUnix, HasTls, false, Pipeline>(50);
                 }
@@ -750,10 +762,12 @@ private:
             self_->clear_blocked();
         }
         if constexpr (Fused) {
-            // The read loop is over permanently. Teardown below may take longer than another
+            // The read loop is over for this tenure. Teardown may take longer than another
             // owner's bounded retire queue can tolerate, but it performs no foreign store probe.
-            if (srv_->read_local_enabled())
+            if (srv_->read_local_enabled()) {
+                self_->set_read_local_lane_active(false);
                 self_->publish_read_local_parked(srv_->read_local_epoch());
+            }
         }
         // A close requested by the last pass's read/send path has no later flush_ready to drain it,
         // and an undrained entry would show up as a live connection in the shutdown accounting.
@@ -781,6 +795,12 @@ private:
     // SEND-immediate / four-non-SEND N2 handling.
     template <bool HasUnix, bool HasTls, bool kEp, bool ThreeWay>
     void run_fused_iofused_loop() {
+        if (srv_->read_local_enabled()) {
+            if (ThreadCtx::read_local_publication_parked(self_->read_local_publication()))
+                self_->resume_read_local_tick();
+            self_->publish_read_local_tick(srv_->read_local_epoch());
+            self_->set_read_local_lane_active(true);
+        }
         if constexpr (!kEp) {
             if (listen_fd_ >= 0) arm_accept(UrKind::Accept);
             if constexpr (HasTls) arm_accept(UrKind::TlsAccept);
@@ -955,8 +975,10 @@ private:
             self_->clear_blocked();
         }
 
-        if (srv_->read_local_enabled())
+        if (srv_->read_local_enabled()) {
+            self_->set_read_local_lane_active(false);
             self_->publish_read_local_parked(srv_->read_local_epoch());
+        }
         if constexpr (kEp) {
             while (!epoll_closes_.empty()) {
                 Client* victim = epoll_closes_.back();
@@ -3916,13 +3938,13 @@ private:
     template <bool NoBorrow, uint32_t BatchOps = 0, bool IoPipe = false,
               bool BufferedIfid = false, bool TargetedIfid = false,
               bool SuppressOrdinaryActiveMark = false,
-              bool IofusedPrivateQueue = false>
+              bool IofusedPrivateQueue = false, bool SplitLocal = false>
     DispatchResult parse_and_dispatch(
         Client* c, IfidPipelineBatch* pipeline_batch = nullptr) {
         // The non-buffered overlap parser is fused too: geometry/active-list optimizations
         // must not compile out its ROB hazards, MGET fence, admission, or demotion protocol.
         // Buffered legacy streams stay outside the local-read protocol and have no boot caller.
-        static constexpr bool Fused = IofusedPrivateQueue || (
+        static constexpr bool Fused = SplitLocal || IofusedPrivateQueue || (
             BatchOps == kGenthreadIfidBatchOps &&
             !IoPipe && !BufferedIfid && !TargetedIfid &&
             !SuppressOrdinaryActiveMark);
@@ -5514,7 +5536,7 @@ ordinary_dispatch:
         return work;
     }
 
-    template <bool HasUnix, bool HasTls, bool kEp>
+    template <bool HasUnix, bool HasTls, bool kEp, bool SplitLocal = false>
     uint32_t pipeline_sweep(bool natural_order, bool& submitted) {
         uint32_t work = 0;
         if constexpr (HasUnix) work += flush_handoffs();
@@ -5528,7 +5550,7 @@ ordinary_dispatch:
             1, (active_at_start + kIoPipeIfidBatchClients - 1) /
                    kIoPipeIfidBatchClients);
         for (size_t pass = 0; pass < passes; pass++)
-            work += pipeline_pass<HasUnix, HasTls, kEp>(
+            work += pipeline_pass<HasUnix, HasTls, kEp, SplitLocal>(
                 true, natural_order, submitted);
         if (__builtin_expect(!routing_forward_.empty(), false))
             client_routing_cleanup_pass();
@@ -5984,6 +6006,7 @@ ordinary_dispatch:
     // outer boundary.
     template <bool HasUnix, bool HasTls, bool kEp>
     uint32_t genthread_three_way_pass(WbPipelineBatch& batch, bool& gate_open) {
+        srv_->mode_schedule_stats(self_->id()).note_overlap(OverlapSchedule::Fused, gate_open);
         if (batch.count || active_wb_context_) std::abort();
         LoopSignals& sig = self_->sig();
         uint32_t occupancy = 0;
@@ -6352,7 +6375,7 @@ ordinary_dispatch:
     }
 
     // ---- IFID.PARSE+HASH: read-buffer maintenance, decode/hash/route, quiet publication --------
-    template <bool HasTls, bool kEp>
+    template <bool HasTls, bool kEp, bool SplitLocal = false>
     uint32_t ifid_parse_hash(IfidBatch& batch) {
         uint32_t work = 0;
         backstop_pass_ = (++flush_tick_ >= kIoPipeWbBackstopTurns);
@@ -6430,21 +6453,21 @@ ordinary_dispatch:
                     const uint32_t rpos_before = conn.rpos();
                     if constexpr (HasTls) {
                         if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<true, 0, true>(c);
+                            dispatch_result = parse_and_dispatch<true, 0, true, false, false, false, false, SplitLocal>(c);
                         else
-                            dispatch_result = parse_and_dispatch<false, 0, true>(c);
+                            dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, false, SplitLocal>(c);
                     } else {
-                        dispatch_result = parse_and_dispatch<false, 0, true>(c);
+                        dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, false, SplitLocal>(c);
                     }
                     if (conn.rpos() != rpos_before) work++;
                 } else {
                     if constexpr (HasTls) {
                         if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<true, 0, true>(c);
+                            dispatch_result = parse_and_dispatch<true, 0, true, false, false, false, false, SplitLocal>(c);
                         else
-                            dispatch_result = parse_and_dispatch<false, 0, true>(c);
+                            dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, false, SplitLocal>(c);
                     } else {
-                        dispatch_result = parse_and_dispatch<false, 0, true>(c);
+                        dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, false, SplitLocal>(c);
                     }
                     if (__builtin_expect(dispatch_result != DispatchResult::NeedInput, true))
                         work++;
@@ -6489,6 +6512,9 @@ ordinary_dispatch:
                 epoll_close_now(victim);
             }
         }
+        // The IO role drains only its local-read lane. All writes and demotions still use
+        // the ordinary split owner inbox; publish QSBR only after every capture is consumed.
+        if constexpr (SplitLocal) work += fused_executor_->split_read_local_pass();
         return work;
     }
 
@@ -6502,7 +6528,7 @@ ordinary_dispatch:
 
     // WB.RETIRE+PREP: drain only the in-order Done prefix and construct reply buffers/iovecs. The
     // engine methods are the ordinary serve bodies with their final pump deliberately omitted.
-    template <bool HasTls, bool kEp>
+    template <bool HasTls, bool kEp, bool Coded = false>
     uint32_t wb_retire_prepare(WbBatch& batch) {
         uint32_t work = 0;
         for (uint32_t i = 0; i < batch.count; i++) {
@@ -6515,14 +6541,14 @@ ordinary_dispatch:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.prepare_tls<kEp, false>(*c, *tls, batch.submit_allowed[i])) work++;
+                    if (wb_.prepare_tls<kEp, Coded>(*c, *tls, batch.submit_allowed[i])) work++;
                     if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.prepare_ktls<kEp, false>(*c, batch.submit_allowed[i])) work++;
-                } else if (wb_.prepare<kEp, false>(*c, batch.submit_allowed[i])) {
+                    if (wb_.prepare_ktls<kEp, Coded>(*c, batch.submit_allowed[i])) work++;
+                } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
                     work++;
                 }
-            } else if (wb_.prepare<kEp, false>(*c, batch.submit_allowed[i])) {
+            } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
                 work++;
             }
         }
@@ -6565,7 +6591,7 @@ ordinary_dispatch:
 
     // At depth, completed IFID work already provides the latency-hiding window. Retain the plain
     // split loop's combined retire/stage/pump order and skip the separate WB prefetch walks.
-    template <bool HasTls, bool kEp>
+    template <bool HasTls, bool kEp, bool Coded = false>
     uint32_t wb_serve_natural(WbBatch& batch, bool& submitted) {
         uint32_t work = 0;
         for (uint32_t i = 0; i < batch.count; i++) {
@@ -6580,16 +6606,16 @@ ordinary_dispatch:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, false, false>(*c, *tls)) work++;
+                    if (wb_.serve_tls<kEp, false, Coded>(*c, *tls)) work++;
                     if (tls->socket_userspace() && tls->has_pinned_plain())
                         arm_tls_socket_poll<kEp>(c, tls->wanted());
                     if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, false, false>(*c)) work++;
-                } else if (wb_.serve<kEp, false, false>(*c)) {
+                    if (wb_.serve_ktls<kEp, false, Coded>(*c)) work++;
+                } else if (wb_.serve<kEp, false, Coded>(*c)) {
                     work++;
                 }
-            } else if (wb_.serve<kEp, false, false>(*c)) {
+            } else if (wb_.serve<kEp, false, Coded>(*c)) {
                 work++;
             }
             if constexpr (kEp)
@@ -6604,8 +6630,10 @@ ordinary_dispatch:
         return work;
     }
 
-    template <bool HasUnix, bool HasTls, bool kEp>
+    template <bool HasUnix, bool HasTls, bool kEp, bool SplitLocal = false>
     uint32_t pipeline_pass(bool unmasked, bool natural_order, bool& submitted) {
+        srv_->mode_schedule_stats(self_->id()).note_overlap(
+            OverlapSchedule::SplitIo, !natural_order);
         // One synchronous buffer per stream, exactly as measured. Cross-core queue publications
         // and kernel SQEs own their data after their stage, so no ping/pong lifetime is required.
         IfidBatch& ifid = ifid_batch_;
@@ -6615,10 +6643,10 @@ ordinary_dispatch:
         if (natural_order) {
             work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
             work += collect_retire_work<HasUnix, kEp>(unmasked);
-            work += ifid_parse_hash<HasTls, kEp>(ifid);
+            work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);
             work += ifid_post(ifid);
             work += wb_gather(wb);
-            work += wb_serve_natural<HasTls, kEp>(wb, submitted);
+            work += wb_serve_natural<HasTls, kEp, SplitLocal>(wb, submitted);
         } else {
             for (const IoPipeStage stage : kIoPipeSchedule) {
                 switch (stage) {
@@ -6632,10 +6660,10 @@ ordinary_dispatch:
                         wb_prefetch(wb);
                         break;
                     case IoPipeStage::IfidParseHash:
-                        work += ifid_parse_hash<HasTls, kEp>(ifid);
+                        work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);
                         break;
                     case IoPipeStage::WbRetirePrepare:
-                        work += wb_retire_prepare<HasTls, kEp>(wb);
+                        work += wb_retire_prepare<HasTls, kEp, SplitLocal>(wb);
                         break;
                     case IoPipeStage::IfidPost:
                         work += ifid_post(ifid);

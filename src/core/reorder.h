@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include "genthread_pipeline.h"
 #include "thread.h"
+#include "orthog.h"
 #include "../net/conn.h"
 #include "../cmd/command.h"
 
@@ -47,13 +48,13 @@ struct ExScheduleKey {
 };
 
 template <size_t BatchOps>
-void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
-    if (n < 2) return;
+uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
+    if (n < 2) return 0;
     Client* const only_client = tasks[0].client;
     uint32_t distinct_at = 1;
     while (distinct_at < n && tasks[distinct_at].client == only_client) distinct_at++;
     // Absolute per-connection order leaves no legal permutation in a one-client run.
-    if (distinct_at == n) return;
+    if (distinct_at == n) return 0;
 
     ExScheduleKey keys[BatchOps];
     uint8_t min_rank = UINT8_MAX;
@@ -77,7 +78,7 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
         const uint64_t distance = task.op_id - sampled_head;
         // A fresh unfinished task is always in the 64-slot live ROB window. If that invariant
         // is ever broken, preserve today's FIFO instead of collapsing ranks and risking order.
-        if (__builtin_expect(distance >= kRobWindow, false)) return;
+        if (__builtin_expect(distance >= kRobWindow, false)) return 1;
         keys[i] = ExScheduleKey{static_cast<uint8_t>(distance), base_lengths[i]};
         min_rank = std::min(min_rank, keys[i].rank);
         max_rank = std::max(max_rank, keys[i].rank);
@@ -88,7 +89,7 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
     // The measured-law escape is defined on the directly available gathered classes and runs
     // before conservative widening for an invisible predecessor. This is what keeps homogeneous
     // rank-adjacent traffic off the dependency and bucket paths.
-    if (one_length && max_rank - min_rank <= 1) return;
+    if (one_length && max_rank - min_rank <= 1) return 1;
 
     // Effective class is the prefix maximum for each connection in this gathered run. A rank
     // before the first represented task, or a gap in its ids, means an unrepresented blocker;
@@ -120,7 +121,7 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
             const uint8_t previous = chain_last[slot];
             // Preserve the existing FIFO if a producer-lane bug ever violates the gather
             // contract. The scheduler must never create a same-connection inversion.
-            if (tasks[i].op_id <= tasks[previous].op_id) return;
+            if (tasks[i].op_id <= tasks[previous].op_id) return 1;
             keys[i].length = std::max(keys[i].length, keys[previous].length);
             if (tasks[i].op_id != tasks[previous].op_id + 1)
                 keys[i].length = static_cast<uint8_t>(CommandLengthClass::Long);
@@ -129,7 +130,7 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
     }
     one_length = true;
     for (uint32_t i = 1; i < n; i++) one_length &= keys[i].length == keys[0].length;
-    if (one_length && max_rank - min_rank <= 1) return;
+    if (one_length && max_rank - min_rank <= 1) return 1;
 
     // Stable gather order often already matches the selected bucket order. Avoid scratch
     // setup and two Task copies when the policy would be an identity permutation.
@@ -140,7 +141,7 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
         already_ordered &= bucket >= previous_bucket;
         previous_bucket = bucket;
     }
-    if (already_ordered) return;
+    if (already_ordered) return 1;
 
     uint8_t counts[kExSchedBuckets];
     uint8_t cursors[kExSchedBuckets];
@@ -174,13 +175,14 @@ void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
         ordered[cursors[bucket]++] = tasks[i];
     }
     for (uint32_t i = 0; i < n; i++) tasks[i] = ordered[i];
+    return 2;
 }
 
 // Keep scratch behind the caller's boot-latched enable branch, including stack reservation.
 // Deduce capacity from the gathered array: exec_batch must not decay it to a Task pointer.
 // No heap allocation, persistent state, truncated suffix, or change to the scheduling policy.
 template <size_t BatchOps>
-__attribute__((noinline)) void ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
+__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
     static_assert(BatchOps == kGenthreadExBatchOps ||
                   BatchOps == kGenthreadPipelineExBatchOps,
                   "audit new executor geometry before enabling reorder");
@@ -188,6 +190,7 @@ __attribute__((noinline)) void ex_schedule_batch(Task (&tasks)[BatchOps], uint32
     static_assert((BatchOps & (BatchOps - 1)) == 0, "connection hash mask needs power of two");
     // A future broken gather must fail loudly even in release builds, never schedule a prefix.
     if (__builtin_expect(n > BatchOps, false)) std::abort();
+    ReorderResult result;
     uint8_t base_lengths[BatchOps];
     uint32_t begin = 0;
     while (begin < n) {
@@ -197,11 +200,15 @@ __attribute__((noinline)) void ex_schedule_batch(Task (&tasks)[BatchOps], uint32
         }
         uint32_t end = begin + 1;
         while (end < n && ex_sched_candidate(tasks[end], base_lengths[end])) end++;
-        ex_schedule_run<BatchOps>(tasks + begin, base_lengths + begin, end - begin);
+        const uint32_t witness = ex_schedule_run<BatchOps>(
+            tasks + begin, base_lengths + begin, end - begin);
+        result.multi_client_runs += witness != 0;
+        result.permuted_runs += witness == 2;
         // The failed candidate at end is a known barrier; consume it without reading its Op a
         // second time, then find the next eligible run.
         begin = end + (end < n);
     }
+    return result;
 }
 
 }  // namespace tomo
