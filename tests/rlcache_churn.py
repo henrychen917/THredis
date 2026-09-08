@@ -214,7 +214,9 @@ def main():
     for t in threads:
         t.join(timeout=30)
 
-    rep.check("workers completed", not errors, "; ".join(errors[:3]))
+    unfinished = [i for i, thread in enumerate(threads) if thread.is_alive() or counts[i] == 0]
+    rep.check("workers completed", not errors and not unfinished,
+              "; ".join(errors[:3]) + " unfinished/empty workers %s" % unfinished)
     alive = False
     try:
         alive = _lib.call(ctl, "PING") in (b"PONG", "PONG")

@@ -29,11 +29,11 @@ Two distinct engine bugs produced these, and this battery keeps both closed:
 
 NOT VACUOUS, BY CONSTRUCTION
 ----------------------------
-- GEOMETRY. The hash seed is drawn from the kernel at every boot, so a fixed key pair lands on one
-  owner roughly one boot in `shards` -- and a same-owner run proves nothing at all, because a
-  single owner serialises everything by itself. The key set is therefore wide enough that all keys
-  sharing one owner is a ~1e-9 event, and where DEBUG SHARD exists the exact span is printed and
-  asserted to be more than one owner.
+- GEOMETRY. DEBUG SHARD identifies shards, not owners. Fresh keys are selected from two proven
+  physical owners for every arm and bounded retry; the duration never increases on a retry.
+- ROUTING. One reader WATCHes the probe to exercise the owner read-cut/delay path; the remaining
+  readers keep ordinary GET/MGET admission, including local reads when enabled. WATCH changes
+  routing, not the value or ordering oracle. Armed local boots must witness WATCH fallback.
 - COUNTERS. With --atomic 1 the run asserts that atomic_read_cuts_held advanced (a read really was
   held to its pinned cut instead of "now") and, in the commit-delay arm, that atomic_commit_holds
   advanced (a read's cut really did exclude a drawn-but-unpublished ticket). Zero data with a gate
@@ -49,12 +49,13 @@ import threading
 import time
 from collections import Counter
 
+import _lib
+
 HOST, PORT = sys.argv[1], int(sys.argv[2])
 SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 20.0
 READERS = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 
-# Seven partners plus the probe key. Every key of one MSET carries the same counter value, so the
-# reply is self-checking; eight keys make "every key on one owner" a (1/shards)**7 accident.
+# Seven partners plus the probe key. Every key of one MSET carries the same counter value.
 PARTNERS = 7
 PROBE = "sm:a"
 KEYS = [PROBE] + ["sm:b%d" % i for i in range(PARTNERS)]
@@ -77,6 +78,10 @@ class Conn:
     def command(self, *args):
         self.s.sendall(enc(*args))
         return self.read_reply()
+
+    def close(self):
+        self.f.close()
+        self.s.close()
 
     def read_reply(self):
         line = self.f.readline()
@@ -122,6 +127,7 @@ class Run:
         self.writes = 0
         self.lags = Counter()
         self.samples = []
+        self.errors = []
 
 
 def writer(run):
@@ -133,13 +139,16 @@ def writer(run):
         args = []
         for key in KEYS:
             args += [key, n]
-        c.command("MSET", *args)
+        if c.command("MSET", *args) != b"OK":
+            raise AssertionError("writer MSET failed")
         run.writes = n
+    c.close()
 
 
-def reader(run):
+def reader(run, owner_route):
     c = Conn()
-    c.command("MSET", *[x for key in KEYS for x in (key, 0)])
+    if owner_route and c.command("WATCH", PROBE) != b"OK":
+        raise AssertionError("could not route the read-cut witness through its owner")
     payload = enc("GET", PROBE) + enc("MGET", *KEYS)
     nb = nv = nt = 0
     lags = Counter()
@@ -166,12 +175,22 @@ def reader(run):
         run.torn += nt
         run.lags.update(lags)
         run.samples.extend(samples)
+    c.close()
 
 
 def hammer(seconds):
     run = Run()
-    threads = [threading.Thread(target=writer, args=(run,))]
-    threads += [threading.Thread(target=reader, args=(run,)) for _ in range(READERS)]
+
+    def worker(fn, *args):
+        try:
+            fn(run, *args)
+        except Exception as exc:
+            with run.lock:
+                run.errors.append(repr(exc))
+            run.stop = True
+
+    threads = [threading.Thread(target=worker, args=(writer,))]
+    threads += [threading.Thread(target=worker, args=(reader, i == 0)) for i in range(READERS)]
     for t in threads:
         t.start()
     time.sleep(seconds)
@@ -217,8 +236,8 @@ def case_freshness_floor(failures, rounds=4000):
     if stale_cross or stale_own:
         failures.append("freshness floor: %d cross-connection and %d read-your-writes miss(es) of "
                         "an already-acknowledged write, first %r" % (stale_cross, stale_own, first))
-    w.s.close()
-    r.s.close()
+    w.close()
+    r.close()
 
 
 def main():
@@ -231,22 +250,32 @@ def main():
     if isinstance(mode, list) and len(mode) == 2:
         atomic_on = mode[1] != b"0"
 
+    local_mode = admin.command("CONFIG", "GET", "read-local")
+    local_on = isinstance(local_mode, list) and len(local_mode) == 2 and local_mode[1] == b"1"
+
     # ---- geometry gate -----------------------------------------------------------------------
-    shard_of = {}
     probe = admin.command("DEBUG", "SHARD", PROBE)
     have_debug = not isinstance(probe, Exception)
-    if have_debug:
-        for key in KEYS:
-            shard_of[key] = int(admin.command("DEBUG", "SHARD", key))
-        span = sorted(set(shard_of.values()))
-        print("geometry: %d key(s) over %d owner(s) %s" % (len(KEYS), len(span), span))
-        if len(span) < 2:
-            failures.append(
-                "every key landed on one owner: a single owner serialises the whole workload, so "
-                "this run could not have entered either window (re-boot; the hash seed is random)")
-    else:
-        print("geometry: DEBUG SHARD unavailable (no --enable-debug-command); relying on %d keys, "
-              "for which one-owner is a ~1e-9 accident" % len(KEYS))
+
+    def fresh_state(label):
+        global KEYS, PROBE
+        prefix = "sm:%d" % time.time_ns()
+        if have_debug:
+            geometry = _lib.Conn(HOST, PORT)
+            try:
+                buckets = _lib.owner_buckets(geometry, prefix, want_owners=2, per_owner=4)
+                owners = sorted(owner for owner, keys in buckets.items() if len(keys) >= 4)[:2]
+                KEYS = [key for owner in owners for key in buckets[owner][:4]]
+                print("geometry %s: %d fresh keys over physical owners %s" %
+                      (label, len(KEYS), owners))
+            finally:
+                geometry.close()
+        else:
+            KEYS = ["%s:%d" % (prefix, i) for i in range(PARTNERS + 1)]
+            print("geometry %s: DEBUG unavailable; owner span unproven" % label)
+        PROBE = KEYS[0]
+        if admin.command("MSET", *[x for key in KEYS for x in (key, 0)]) != b"OK":
+            raise AssertionError("fresh-state seed failed")
 
     def arm(name, value):
         if not have_debug:
@@ -257,20 +286,15 @@ def main():
         return True
 
     # ATTEMPTS, not one shot. The armed arms assert that the guard they claim to test really
-    # opened (atomic_read_cuts_held / atomic_commit_holds advanced), because a clean result from a
-    # window that never opened proves nothing. But a held read cut is a RACE, not a certainty: a
-    # 20us read delay over a ~5s window produced 6, 11, 12, 31, 273 and 672 held cuts across six
-    # measured runs of the same binary, so a run landing on zero is ordinary variance and not a
-    # defect. Retrying the whole arm with a wider window keeps the assertion falsifiable -- a build
-    # whose guard truly never opens still fails, after every attempt -- while a build that merely
-    # got an unlucky interleaving gets to show the counter moving. Fail only if every attempt is
-    # empty.
+    # opened (atomic_read_cuts_held / atomic_commit_holds advanced). Re-arm on fresh keys and
+    # connections with a fixed duration, bounded. Data errors always fail on their first attempt.
     ARM_ATTEMPTS = 3
 
     def run_arm(label, seconds, commit_delay=0, read_delay=0, expect_counter=None):
         checked = bool(expect_counter) and atomic_on
         attempts = ARM_ATTEMPTS if checked else 1
         for attempt in range(1, attempts + 1):
+            fresh_state("%s attempt %d" % (label, attempt))
             armed = True
             if commit_delay or read_delay or have_debug:
                 armed = arm("ATOMIC-COMMIT-DELAY", commit_delay) and \
@@ -278,9 +302,8 @@ def main():
             if (commit_delay or read_delay) and not armed:
                 notes.append("%s skipped: DEBUG window hooks unavailable" % label)
                 return
-            window = seconds * attempt
             before = stats(admin)
-            run = hammer(window)
+            run = hammer(seconds)
             after = stats(admin)
             arm("ATOMIC-COMMIT-DELAY", 0)
             arm("ATOMIC-READ-DELAY", 0)
@@ -290,10 +313,17 @@ def main():
 
             tag = label if attempt == 1 else "%s (retry %d)" % (label, attempt - 1)
             print("%-22s batches=%-9d writes=%-8d violations=%-7d torn=%-7d "
-                  "[groups+%d read_cuts_held+%d commit_holds+%d]" %
+                  "[groups+%d read_cuts_held+%d commit_holds+%d watch_fallback+%d local_hits+%d]" %
                   (tag, run.batches, run.writes, run.violations, run.torn,
                    delta("atomic_groups"), delta("atomic_read_cuts_held"),
-                   delta("atomic_commit_holds")))
+                   delta("atomic_commit_holds"), delta("read_local_fallback_watch"),
+                   delta("read_local_hits")))
+            if run.errors or not run.batches or not run.writes:
+                failures.append("%s: workers did not complete useful work: %r" % (tag, run.errors))
+                return
+            if local_on and delta("read_local_fallback_watch") == 0:
+                failures.append("%s: owner-routed reader never reached WATCH fallback" % tag)
+                return
             if run.lags:
                 print("      lag histogram (get_a - mget_a): %s" % dict(sorted(run.lags.items())))
             for kind, batch, ga, values in run.samples[:4]:
@@ -312,6 +342,8 @@ def main():
                                  "that is switched off)")
             if not atomic_on:
                 return
+            if run.violations or run.torn:
+                return
             if delta("atomic_groups") == 0:
                 failures.append("%s: no cross-shard atomic group committed, so the run never entered "
                                 "the window it claims to close" % tag)
@@ -320,11 +352,12 @@ def main():
             if delta(expect_counter) > 0:
                 return
             if attempt < attempts:
-                notes.append("%s: %s did not advance on attempt %d; retrying with a %.1fs window"
-                             % (label, expect_counter, attempt, seconds * (attempt + 1)))
+                notes.append("%s: %s did not advance on attempt %d; retrying fresh state for %.1fs"
+                             % (label, expect_counter, attempt, seconds))
         failures.append("%s: %s did not advance in %d attempts -- the guard never opened and the "
                         "clean result is vacuous" % (label, expect_counter, attempts))
 
+    fresh_state("freshness floor")
     case_freshness_floor(failures)
     short = max(4.0, SECONDS / 4.0)
     # Unarmed is the arm that fails on an unfixed engine; the armed arms are the deterministic ones.
@@ -337,6 +370,7 @@ def main():
     for failure in failures:
         print("  FAIL %s" % failure)
     print("session_monotonic: %s" % ("PASS" if not failures else "FAIL"))
+    admin.close()
     return 1 if failures else 0
 
 

@@ -652,7 +652,9 @@ for AT in 0 1; do
   # and its committed-MSETNX control asserts read-your-own-writes still crosses the two units --
   # a "fix" that merely hid the group's candidate would fail there.
   for t in lbsignals slowlog atomfix scriptatomic execatomic execiso execfix multires multirace session_monotonic xacct xmove xscript; do
-    py tests/$t.py 127.0.0.1 $PORT >/tmp/gate-$t-$AT.txt 2>&1 \
+    FEATURE_ARGS=()
+    [ "$t" = xmove ] && FEATURE_ARGS+=(--release-build)
+    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >/tmp/gate-$t-$AT.txt 2>&1 \
         && ok "$t battery (atomic $AT)" || bad "$t battery (atomic $AT)" "see /tmp/gate-$t-$AT.txt"
   done
   stop

@@ -136,6 +136,7 @@ class Resp:
 
 
 ADMIN = Resp()
+READ_LOCAL = b"\r\nread_local:1\r\n" in ADMIN.cmd("INFO", "server")
 
 
 def info_field(field):
@@ -330,7 +331,11 @@ def bare_reference_arm(mode):
         note(label, False, "needs --enable-debug-command yes")
         return
     torn, detail, opened = 0, [], 0
-    cut_counter = "atomic_groups" if mode else "atomic_fanout_cuts"
+    # The historical fanout counter counts only tracking-OFF cuts: old-generation
+    # debt can keep tracking on even after CONFIG atomic 0. Its delta is diagnostic.
+    # On an armed local boot, WATCH fallback proves owner routing in either atomic mode.
+    cut_counter = "read_local_mget_fallback_watch" if READ_LOCAL else "atomic_fanout_cuts"
+    require_counter = READ_LOCAL
     registered = 0
     for round_id in range(ROUNDS):
         old, new = "b%d-old" % round_id, "b%d-new" % round_id
@@ -373,9 +378,9 @@ def bare_reference_arm(mode):
             torn += 1
             if len(detail) < 3:
                 detail.append("round %d saw %r" % (round_id, values))
-    note(label, torn == 0 and opened == ROUNDS and registered == ROUNDS,
-         "rounds=%d torn=%d windows_opened=%d registered_reads=%d (%s) %r"
-         % (ROUNDS, torn, opened, registered, cut_counter, detail[:2]))
+    note(label, torn == 0 and opened == ROUNDS and (registered == ROUNDS or not require_counter),
+         "rounds=%d torn=%d windows_opened=%d route_witness=%d (%s) %r"
+         % (ROUNDS, torn, opened, registered, cut_counter if require_counter else "exact pinned-old oracle", detail[:2]))
 
 
 # ---- 3. the park is what parks (unarmed control) ----------------------------------------------
