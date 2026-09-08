@@ -44,16 +44,13 @@ namespace tomo {
 namespace {
 
 constexpr uint32_t kScriptMaxBytes = 1024 * 1024;
-constexpr uint64_t kDefaultInstructionLimit = 100000;
+constexpr uint64_t kInstructionLimit = 100000; // fixed existing default; no runtime selector
 constexpr int kHookInterval = 1000;
 constexpr uint32_t kReplyMaxDepth = 32;
 constexpr uint32_t kReplyMaxElements = 100000;
 
 Server* g_script_server = nullptr;
 char g_hook_context_key;
-// Latched at bind time from the config so the hook — which runs every kHookInterval VM
-// instructions — reads a plain global instead of walking Server. 0 = unlimited.
-uint64_t g_instruction_limit = kDefaultInstructionLimit;
 
 std::atomic<uint64_t> g_compile_hits{0};
 std::atomic<uint64_t> g_compile_misses{0};
@@ -330,10 +327,10 @@ void instruction_hook(lua_State* state, lua_Debug*) {
     ScriptContext* context = lua_context(state);
     if (!context) return;
     context->instructions += kHookInterval;
-    if (context->instructions > g_instruction_limit) {
+    if (context->instructions > kInstructionLimit) {
         context->timed_out = true;
         luaL_error(state, "script exceeded the %llu instruction limit",
-                   static_cast<unsigned long long>(g_instruction_limit));
+                   static_cast<unsigned long long>(kInstructionLimit));
     }
 }
 
@@ -1098,7 +1095,7 @@ void script_execute(Shard& shard, Op& op, const ScriptInvocation& call) {
         if (context.timed_out) {
             char busy[96];
             std::snprintf(busy, sizeof(busy), "script exceeded the %llu instruction limit",
-                          static_cast<unsigned long long>(g_instruction_limit));
+                          static_cast<unsigned long long>(kInstructionLimit));
             reply_text_error(op, "BUSY", busy);
         } else reply_raw_error(op, error);
         return;
@@ -1340,8 +1337,6 @@ static const CommandSpec kTable[] = {
 
 void scripting_bind_server(Server* server) {
     g_script_server = server;
-    if (server) g_instruction_limit = server->cfg().script_instruction_limit;
-    if (!g_instruction_limit) g_instruction_limit = UINT64_MAX;   // 0 = unlimited
 }
 
 ScriptStats script_stats() {

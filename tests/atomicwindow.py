@@ -1,6 +1,10 @@
 """Admission witnesses at the derived production window; no window configuration override.
 
-Arm, release the DEBUG hold, THEN demand completion. Only a clean, fully drained witness miss
+Arm, release the DEBUG hold, THEN demand completion. The hold retains the owner's commit queue
+without blocking that owner: CONFIG must be able to run while old-generation groups are live.
+The reserve/publish sleep used by torn-read tests blocks CONFIG behind commit batches and can
+consume its socket deadline, or drain every old group before CONFIG replies.
+Only a clean, fully drained witness miss
 can be re-armed. Per-attempt telemetry measures both the window hit and reply rates; four attempts
 are a bounded discovery budget, not a claim about an unmeasured false-failure probability.
 """
@@ -110,7 +114,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                     clients.append(_lib.Conn(host, port, timeout=30))
                 before = sample()
                 try:
-                    if admin.must("DEBUG", "ATOMIC-COMMIT-DELAY", "100000") != b"OK":
+                    if admin.must("DEBUG", "ATOMIC-COMMIT-HOLD", "1") != b"OK":
                         raise AssertionError("commit hold did not arm")
                     for index, client in enumerate(clients):
                         thread = threading.Thread(target=run, args=(index, client), daemon=True)
@@ -147,7 +151,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                     held_stalls = stalls
                     # This MUST precede the completion deadline. Holding every commit until all
                     # 640 gate-geometry groups finish was a timing test, not a resume witness.
-                    if admin.must("DEBUG", "ATOMIC-COMMIT-DELAY", "0") != b"OK":
+                    if admin.must("DEBUG", "ATOMIC-COMMIT-HOLD", "0") != b"OK":
                         raise AssertionError("commit hold did not disarm")
                     released = True
 
@@ -178,7 +182,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                 # be re-prepared if the owner task queue has no room (io_loop.h). Those admissions
                 # are conservatively included in `newer` above; they are not duplicate replies.
                 # Do not accept a transient sample gathered only during drain as the held witness.
-                witnessed = (armed and held_replies < groups and
+                witnessed = (armed and held_replies == 0 and
                              (carried > 0 or not reconfigure))
                 outcome = "armed" if witnessed else "clean-miss"
             finally:

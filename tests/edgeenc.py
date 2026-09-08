@@ -5,7 +5,7 @@ WHAT THIS LOCKS.  Every representation in this tree has at least one size thresh
 is a place where two different code paths must agree about the same value:
 
   * compact <-> expanded per collection type   (CompactValue::compact_fits / list_fits,
-    src/store/typeval.h; the four <type>-max-compact-{entries,value} knobs)
+    src/store/typeval.h; the live reference encoding limits)
   * the KvObj tail embed line, kEmbedThreshold = kCollectionEmbedMax = 192
     (src/store/kvobj.h) -- for strings it is visible as embstr vs raw, for collections it is the
     EmbeddedCompact-in-the-key-block form whose capacity is good_size() slack and therefore
@@ -131,11 +131,18 @@ c = Conn()
 check("clean slate", c.cmd("FLUSHALL"), b"OK")
 
 
-def limit(name):
+def compact_limit(kind, axis):
+    name = ("list-max-listpack-size" if kind == "list" else
+            "%s-max-listpack-%s" % (kind, axis))
     reply = c.cmd("CONFIG", "GET", name)
-    if not reply or len(reply) < 2:
-        raise SystemExit("CONFIG GET %s returned %r -- battery cannot adapt" % (name, reply))
-    return int(reply[1])
+    if not isinstance(reply, list) or len(reply) != 2 or reply[0] != name.encode():
+        raise AssertionError("missing encoding control: %s -> %r" % (name, reply))
+    value = int(reply[1])
+    if kind == "list":
+        if axis == "entries":
+            return 2**32 - 1 if value < 0 else max(1, value)
+        return 2048 << min(-value, 5) if value < 0 else 8192
+    return value
 
 
 V = lambda n, ch="x": (ch * n)[:n]
@@ -143,7 +150,7 @@ V = lambda n, ch="x": (ch * n)[:n]
 
 # ---------------------------------------------------------------------------------------------
 print("== 1. compact -> expanded promotion, ENTRY-count axis (all four collection types)")
-# The threshold is read from the live config so the arm follows the knob instead of a copy of it.
+# Each arm crosses the configured boundary and proves both representations.
 TYPES = [
     # name, knob prefix, compact encoding, expanded encoding, add(i)->argv, count->argv, read->argv
     ("hash", "hash", b"listpack", b"hashtable",
@@ -157,10 +164,10 @@ TYPES = [
 ]
 
 for name, knob, small, big, add, count in TYPES:
-    maxent = limit("%s-max-compact-entries" % knob)
+    maxent = compact_limit(knob, "entries")
     if maxent > 4096:
         # An unlimited entry axis (lists budget bytes, not entries) is not a promotion threshold.
-        SKIPPED.append("%s entry-axis promotion: %s-max-compact-entries is %d (no entry threshold)"
+        SKIPPED.append("%s entry-axis promotion: %s entry limit is %d (no entry threshold)"
                        % (name, knob, maxent))
         continue
     k = "prom:%s" % name
@@ -216,7 +223,7 @@ print("== 2. compact -> expanded promotion, VALUE-size axis")
 for name, knob, small, big in (("hash", "hash", b"listpack", b"hashtable"),
                                ("set", "set", b"listpack", b"hashtable"),
                                ("zset", "zset", b"listpack", b"skiplist")):
-    maxval = limit("%s-max-compact-value" % knob)
+    maxval = compact_limit(knob, "value")
     for delta, expect, tag in ((-1, small, "one below"), (0, small, "at"), (1, big, "one above")):
         k = "vprom:%s:%d" % (name, delta)
         c.cmd("DEL", k)
@@ -240,7 +247,7 @@ for name, knob, small, big in (("hash", "hash", b"listpack", b"hashtable"),
 
 # The list lane budgets AGGREGATE payload, not per-element length (typeval.h: "A single Compact is
 # our whole small list, so list.max_value is its aggregate payload budget"). Drive that axis.
-list_budget = limit("list-max-compact-value")
+list_budget = compact_limit("list", "value")
 k = "vprom:list"
 c.cmd("DEL", k)
 elem = 64
@@ -578,8 +585,8 @@ c.cmd("DEL", "int:set", "int:set2")
 
 # ---------------------------------------------------------------------------------------------
 print("== 8. DUMP/RESTORE round-trip across every boundary")
-maxent_hash = limit("hash-max-compact-entries")
-maxval_hash = limit("hash-max-compact-value")
+maxent_hash = compact_limit("hash", "entries")
+maxval_hash = compact_limit("hash", "value")
 
 
 def build(kind, k, entries, vlen):
