@@ -396,7 +396,7 @@ private:
             std::abort();
         }
 #endif
-        entry.reclaim(sink_, entry.owner, entry.payload, entry.auxiliary);
+        entry.reclaim(entry.owner, entry.payload, entry.auxiliary);
     }
 
     void seal_pending() {

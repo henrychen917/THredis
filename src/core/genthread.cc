@@ -113,7 +113,7 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
         for (uint32_t sid = 0; sid < srv.nshards(); sid++)
             srv.shard(static_cast<int32_t>(sid)).store().atomic_shutdown_release_records();
         for (IoLoop& io : ios) io.reap_atomic_deferred();
-        ShutdownReport report = collect_shutdown_report(srv, ios, executors);
+        ShutdownReport report = collect_shutdown_report(srv, ios);
         print_shutdown_report_human(report);
         final_report.arm(std::move(report));
         acl_shutdown();
@@ -190,15 +190,6 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
                         &executors[tid],
                         [](void* p) {
                             return static_cast<FusedExLoop*>(p)->fused_baseline_pass();
-                        },
-                        [](void* p, SnapshotManager* manager) {
-                            static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
-                        });
-                else if (cfg.overlap == 1)
-                    self.bind_fused_executor_hooks(
-                        &executors[tid],
-                        [](void* p) {
-                            return static_cast<FusedExLoop*>(p)->fused_coarse_pass();
                         },
                         [](void* p, SnapshotManager* manager) {
                             static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);

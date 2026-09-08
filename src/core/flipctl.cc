@@ -228,9 +228,8 @@ void FlipShiftDetector::anchor() {
     update_band();
 }
 
-bool FlipController::init(bool enabled, int32_t configured_band, uint32_t nthreads) {
+bool FlipController::init(bool enabled, uint32_t nthreads) {
     enabled_ = enabled;
-    configured_band_ = configured_band;
     signature_learning_windows_ = std::max<uint32_t>(1, nthreads);
     maneuver_learning_windows_ = 0;
     for (uint32_t value = nthreads; value > 1; value >>= 1)
@@ -238,7 +237,7 @@ bool FlipController::init(bool enabled, int32_t configured_band, uint32_t nthrea
     maneuver_learning_windows_ = std::max<uint32_t>(1, maneuver_learning_windows_);
     // The signature noise estimate's time constant is the same window count the controller already
     // uses to learn a signature at an anchor -- derived from the live pool, not typed.
-    shift_detector_ = FlipShiftDetector(configured_band, signature_learning_windows_);
+    shift_detector_ = FlipShiftDetector(-1, signature_learning_windows_);
     if (!enabled) {
         phase_ = Phase::Disabled;
         return true;
@@ -387,7 +386,6 @@ bool FlipController::sample_stabilized_rate(Server& server, uint64_t now_ms, dou
     stable_pair_delta_ = relative_distance(rate, prior_rate);
     previous_subwindow_rate_ = rate;
     double band = anchor_rate_band_;
-    if (configured_band_ > 0) band = static_cast<double>(configured_band_) / 100.0;
     if (band <= 0) band = automatic_rate_band(stable_pair_delta_, rate);
     // A pair is "stable" relative to how the load itself moves tick to tick, never to a band a
     // lucky settle window learned below that (0.02% measured: no pair ever fit and Measuring stuck).
@@ -750,12 +748,9 @@ double FlipController::baseline_band() const {
 
 // The throughput noise a projected gain has to beat before a flip could be VERIFIED: the band the
 // last anchor learned, if any, or the maneuver's own stabilized-pair jitter, and never below what
-// the baseline itself moved. The internal explicit-band unit-test control replaces the learned pair,
-// not the floor.
+// the baseline itself moved.
 double FlipController::verification_band(double rate) const {
     const double floor = std::max(baseline_band(), 2.0 * rate_ew_.sigma());
-    if (configured_band_ > 0)
-        return std::max(static_cast<double>(configured_band_) / 100.0, floor);
     return std::max({anchor_rate_band_, automatic_rate_band(maneuver_rate_jitter_, rate), floor});
 }
 
@@ -1065,10 +1060,8 @@ void FlipController::anchor(Server& server, double rate) {
         else if (moved_split)
             *responsible = std::max(kMinConfirmations, *responsible / 2);
     }
-    anchor_rate_band_ = configured_band_ > 0
-        ? static_cast<double>(configured_band_) / 100.0
-        : std::max(automatic_rate_band(anchor_rate_jitter_, anchor_rate_),
-                   2.0 * rate_ew_.sigma());
+    anchor_rate_band_ = std::max(automatic_rate_band(anchor_rate_jitter_, anchor_rate_),
+                                 2.0 * rate_ew_.sigma());
     anchor_rate_band_floor_ = anchor_rate_band_;
     // The placement model's own outcome loop (flip_policy.h, rule 3): a maneuver that FLIPPED and
     // still ended where it began is a projection that did not deliver, so the bar rises; a move
@@ -1244,11 +1237,11 @@ bool FlipController::tick(Server& server, uint64_t now_ms) {
         }
         const double reference = anchor_rate_;
         const double band = anchor_rate_band_;
-        if (configured_band_ != 0 && reference > 0 &&
+        if (reference > 0 &&
             rate > reference * (1.0 + band)) {
             surge_streak_++;
             collapse_streak_ = 0;
-        } else if (configured_band_ != 0 && reference > 0 &&
+        } else if (reference > 0 &&
                    rate < reference * (1.0 - band)) {
             collapse_streak_++;
             surge_streak_ = 0;
@@ -1289,15 +1282,10 @@ bool FlipController::tick(Server& server, uint64_t now_ms) {
         anchor_rate_jitter_ +=
             (jitter_sample - anchor_rate_jitter_) * kAnchorRateEwmaAlpha;
         anchor_rate_ += (rate - anchor_rate_) * kAnchorRateEwmaAlpha;
-        if (configured_band_ > 0) {
-            anchor_rate_band_ = static_cast<double>(configured_band_) / 100.0;
-        } else if (configured_band_ < 0) {
-            // The final settling windows define the minimum quiet jitter that this anchor already
-            // proved it needs. Live learning may widen the band, but must never erase that floor.
-            anchor_rate_band_ = std::max(
-                anchor_rate_band_floor_,
-                automatic_rate_band(anchor_rate_jitter_, anchor_rate_));
-        }
+        // The final settling windows define the minimum quiet jitter that this anchor already
+        // proved it needs. Live learning may widen the band, but must never erase that floor.
+        anchor_rate_band_ = std::max(
+            anchor_rate_band_floor_, automatic_rate_band(anchor_rate_jitter_, anchor_rate_));
     }
     return false;
 }

@@ -63,8 +63,8 @@ public:
     }
 
     // EVEN GLOBAL PLACEMENT. Counts are whole-server, so shapes no per-node grammar can express
-    // (15:2:15) are first-class. Each role is spread across the L3 domains as evenly as integer
-    // division allows and roles are interleaved within a domain, so sender pairing stays local.
+    // (15:2) are first-class. IO and EX roles spread across the L3 domains as evenly as
+    // integer division allows, with the roles interleaved within each domain.
     //
     // This is also the flip-era invariant in batch form: a runtime controller changing one thread's
     // role keeps these same quotas incrementally -- pick the convert candidate from the domain
@@ -437,9 +437,6 @@ private:
 //
 // Skipping step 2 puts two threads in one FlatStore, which has no locks precisely because that is
 // supposed to be impossible — it would corrupt silently rather than crash.
-//
-// Written as a contract rather than an implementation because there is no LB yet and a half-built
-// migration path is worse than none.
 // ---------------------------------------------------------------------------------------------
 struct MigrationPlan {
     int32_t  shard_id    = -1;

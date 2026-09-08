@@ -260,7 +260,7 @@ public:
     FlipController(const FlipController&) = delete;
     FlipController& operator=(const FlipController&) = delete;
 
-    bool init(bool enabled, int32_t configured_band, uint32_t nthreads);
+    bool init(bool enabled, uint32_t nthreads);
     bool enabled() const { return enabled_; }
     uint32_t signal_sample_rate() const {
         return signal_sample_rate_.load(std::memory_order_relaxed);
@@ -348,7 +348,6 @@ private:
 
     mutable std::mutex mutex_;
     bool enabled_ = false;
-    int32_t configured_band_ = -1;
     Phase phase_ = Phase::Disabled;
     Phase after_flip_ = Phase::Seeking;
     FlipctlTriggerReason last_trigger_ = FlipctlTriggerReason::None;

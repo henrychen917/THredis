@@ -353,7 +353,7 @@ int main(int argc, char** argv) {
         for (uint32_t sid = 0; sid < srv.nshards(); sid++)
             srv.shard(static_cast<int32_t>(sid)).store().atomic_shutdown_release_records();
         for (IoLoop& io : ios) io.reap_atomic_deferred();
-        ShutdownReport report = collect_shutdown_report(srv, ios, exs);
+        ShutdownReport report = collect_shutdown_report(srv, ios);
         print_shutdown_report_human(report);
         final_shutdown_line.arm(std::move(report));
         acl_shutdown();
