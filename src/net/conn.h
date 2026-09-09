@@ -61,14 +61,10 @@ void multi_session_destroy(MultiSession* session);
 // kRobWindow is defined by net/rob.h (included above), beside the ring that is sized from it.
 inline constexpr size_t   kRbufInitial  = 16 * 1024;
 inline constexpr size_t   kRbufSoftCap  = 1 * 1024 * 1024;  // stop BUFFERING BACKLOG past this
-// The parser accepts redis-compatible bulks (512MB). A single command must therefore be allowed to
-// exceed the soft cap, or a 2MB SET stalls its connection forever: the parser reports Incomplete,
-// read_space refuses to grow, and neither side can ever make progress -- a silent wedge with no
-// error, found by the perfected-checkpoint audit. The soft cap bounds BACKLOG (many buffered
-// commands); one oversized in-flight command may grow to the protocol bound. Memory tracks bytes
-// actually received, and reset_rbuf_at_quiescence sheds the growth after the command completes.
-inline constexpr size_t   kRbufFrameSlack = 64 * 1024;
-inline constexpr size_t   kRbufHardCap  = 512ull * 1024 * 1024 + kRbufFrameSlack;
+// The soft cap bounds buffered backlog. One incomplete command can contain several individually
+// legal bulks and may grow to the 32-bit receive cursor's bound. Growth requires ROB quiescence,
+// and the buffer is shed after the command completes.
+inline constexpr size_t   kRbufHardCap = UINT32_MAX;
 // Item 4: 512B inline, heap beyond. Two 16KB inline buffers made every connection carry 32KB of
 // worst-case staging whether it ever pipelined or not; SmallBuf grows on demand and clear() keeps
 // the allocation, so a busy connection pays ONE grow to its working size and idles at 1KB + that.
@@ -124,8 +120,9 @@ struct ReplySegment {
 // Metadata stays inline for the common [header, value, CRLF] case. BUF payloads own independent
 // blocks because queue growth and continued retirement must never move bytes named by an in-flight
 // sendmsg. BORROW and STATIC payloads are non-owning under their respective lifetime protocols.
-template <uint32_t Inline>
+template <uint32_t Inline, size_t MaxSegmentBytes = UINT32_MAX>
 class SegmentQueue {
+    static_assert(MaxSegmentBytes > 0 && MaxSegmentBytes <= UINT32_MAX);
 public:
     SegmentQueue() = default;
     ~SegmentQueue() { clear_without_releases(); if (segs_ != inline_) std::free(segs_); }
@@ -145,7 +142,7 @@ public:
 
     void append_buf(const char* ptr, size_t len) {
         while (len) {
-            const size_t take = std::min(len, static_cast<size_t>(std::numeric_limits<uint32_t>::max()));
+            const size_t take = std::min(len, MaxSegmentBytes);
             char* copy = static_cast<char*>(std::malloc(take));
             std::memcpy(copy, ptr, take);
             push(ReplySegment{SegmentKind::Buf, copy, static_cast<uint32_t>(take), -1});
@@ -155,6 +152,12 @@ public:
     }
 
     void append_buf(const char* a, size_t an, const char* b, size_t bn) {
+        // Each segment has a 32-bit length, even when a whole collection reply is larger.
+        if (an > MaxSegmentBytes || bn > MaxSegmentBytes - an) {
+            append_buf(a, an);
+            append_buf(b, bn);
+            return;
+        }
         const size_t total = an + bn;
         if (!total) return;
         char* copy = static_cast<char*>(std::malloc(total));
@@ -325,7 +328,10 @@ public:
         // Past the soft cap, growth continues ONLY while the entire buffer is one incomplete
         // command (rpos_ == 0 after the quiescence reset: nothing parsed, nothing in flight --
         // which is also what makes may_grow true). Backlog never grows past the soft cap.
-        const size_t hard_cap = static_cast<size_t>(proto_max_bulk_len) + kRbufFrameSlack;
+        // The parser enforces the limit PER BULK. A complete MSET can contain many legal bulks.
+        // The receive cursor's representation, not one argument's limit, bounds this buffer.
+        (void)proto_max_bulk_len;
+        const size_t hard_cap = kRbufHardCap;
         const size_t cap = (rpos_ == 0) ? hard_cap : kRbufSoftCap;
         if (avail < want && may_grow && rcap_ < cap) {
             size_t ncap = rcap_ * 2;
@@ -334,7 +340,7 @@ public:
             char* n = static_cast<char*>(std::realloc(rbuf_, ncap));
             if (n) { rbuf_ = n; rcap_ = ncap; avail = rcap_ - rlen_; }
         }
-        if (avail < kMinRecv) { out_avail = 0; return nullptr; }
+        if (avail < kMinRecv && rcap_ != hard_cap) { out_avail = 0; return nullptr; }
         out_avail = avail;
         return rbuf_ + rlen_;
     }

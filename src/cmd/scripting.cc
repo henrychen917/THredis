@@ -814,9 +814,9 @@ void bind_call_globals(lua_State* state, ScriptContext& context) {
     set_global_raw(state, "KEYS");
 }
 
-// Reply/error tables are data. Reading them must never execute a user __index outside pcall.
-void raw_result_field(lua_State* state, int index, const char* field) {
-    if (index < 0) index = lua_gettop(state) + index + 1;
+// Result conversion inspects data; __index must never execute outside the protected activation.
+void result_raw_field(lua_State* state, int index, const char* field) {
+    if (index < 0 && index > LUA_REGISTRYINDEX) index = lua_gettop(state) + index + 1;
     lua_pushstring(state, field);
     lua_rawget(state, index);
 }
@@ -856,34 +856,28 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     if (type != LUA_TTABLE) { reply_null(output, outer_resp3); return true; }
 
-    raw_result_field(state, index, "err");
+    result_raw_field(state, index, "err");
     if (!lua_isnil(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
         if (!value) { lua_pop(state, 1); error = "invalid redis error table"; return false; }
-        output.push_back('-');
-        for (size_t i = 0; i < length; i++)
-            output.push_back(value[i] == '\r' || value[i] == '\n' ? ' ' : value[i]);
-        output.append("\r\n", 2);
+        output.push_back('-'); reply_line_text(output, value, length); output.append("\r\n", 2);
         lua_pop(state, 1);
         return true;
     }
     lua_pop(state, 1);
-    raw_result_field(state, index, "ok");
+    result_raw_field(state, index, "ok");
     if (!lua_isnil(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
         if (!value) { lua_pop(state, 1); error = "invalid redis status table"; return false; }
-        output.push_back('+');
-        for (size_t i = 0; i < length; i++)
-            output.push_back(value[i] == '\r' || value[i] == '\n' ? ' ' : value[i]);
-        output.append("\r\n", 2);
+        output.push_back('+'); reply_line_text(output, value, length); output.append("\r\n", 2);
         lua_pop(state, 1);
         return true;
     }
     lua_pop(state, 1);
 
-    raw_result_field(state, index, "double");
+    result_raw_field(state, index, "double");
     if (lua_isnumber(state, -1)) {
         const double value = static_cast<double>(lua_tonumber(state, -1));
         lua_pop(state, 1);
@@ -892,7 +886,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    raw_result_field(state, index, "big_number");
+    result_raw_field(state, index, "big_number");
     if (lua_isstring(state, -1)) {
         size_t length = 0;
         const char* value = lua_tolstring(state, -1, &length);
@@ -904,13 +898,13 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    raw_result_field(state, index, "verbatim_string");
+    result_raw_field(state, index, "verbatim_string");
     if (lua_istable(state, -1)) {
         const int verbatim = lua_gettop(state);
-        raw_result_field(state, verbatim, "format");
+        result_raw_field(state, verbatim, "format");
         size_t format_length = 0;
         const char* format = lua_tolstring(state, -1, &format_length);
-        raw_result_field(state, verbatim, "string");
+        result_raw_field(state, verbatim, "string");
         size_t value_length = 0;
         const char* value = lua_tolstring(state, -1, &value_length);
         if (format && format_length >= 3 && value && value_length <= UINT32_MAX) {
@@ -924,7 +918,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    raw_result_field(state, index, "map");
+    result_raw_field(state, index, "map");
     if (lua_istable(state, -1)) {
         const int map = lua_gettop(state);
         uint32_t count = 0;
@@ -952,7 +946,7 @@ bool append_lua_result(lua_State* state, int index, SmallBuf<kInlineReply>& outp
     }
     lua_pop(state, 1);
 
-    raw_result_field(state, index, "set");
+    result_raw_field(state, index, "set");
     if (lua_istable(state, -1)) {
         const int set = lua_gettop(state);
         uint32_t count = 0;
@@ -1010,7 +1004,7 @@ std::string script_runtime_error(lua_State* state, const ScriptContext& context,
     std::string message;
     bool from_table = false;
     if (lua_istable(state, -1)) {
-        raw_result_field(state, -1, "err");
+        result_raw_field(state, -1, "err");
         if (lua_isstring(state, -1)) {
             size_t length = 0;
             const char* text = lua_tolstring(state, -1, &length);

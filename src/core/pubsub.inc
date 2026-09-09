@@ -716,6 +716,11 @@
         Op& op = client->rob().at(pending.op_id);
         auto sink = op.sink();
 
+        // Publications are independent frames. Suppression may discard only the command reply.
+        if (op.reply_skip() && !pending.deferred.empty()) {
+            wb_.defer_oob(*client, pending.deferred.data(), pending.deferred.size());
+            pending.deferred.clear();
+        }
         switch (pending.kind) {
             case PubSubPendingKind::Modify:
                 if (!pending.subscribe && !pending.deferred.empty())
@@ -763,6 +768,9 @@
                 break;
         }
 
+        if (pending.kind != PubSubPendingKind::Modify && pending.kind != PubSubPendingKind::Reset &&
+            !pending.deferred.empty())
+            sink.append(pending.deferred.data(), pending.deferred.size());
         op.state.store(OpState::Done, std::memory_order_release);
         enqueue_serve(client);
         mark_active(client);

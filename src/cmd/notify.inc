@@ -85,6 +85,12 @@ const char* notify_event_name(NotifyEventId event) {
         case NotifyEventId::Xadd: return "xadd";
         case NotifyEventId::Xdel: return "xdel";
         case NotifyEventId::Xtrim: return "xtrim";
+        case NotifyEventId::XgroupCreate: return "xgroup-create";
+        case NotifyEventId::XgroupDestroy: return "xgroup-destroy";
+        case NotifyEventId::XgroupCreateconsumer: return "xgroup-createconsumer";
+        case NotifyEventId::XgroupDelconsumer: return "xgroup-delconsumer";
+        case NotifyEventId::XgroupSetid: return "xgroup-setid";
+        case NotifyEventId::Xsetid: return "xsetid";
         case NotifyEventId::Expired: return "expired";
         case NotifyEventId::Evicted: return "evicted";
         case NotifyEventId::Keymiss: return "keymiss";
@@ -139,6 +145,12 @@ uint32_t notify_event_priority(NotifyEventId event) {
         case NotifyEventId::Xadd:
         case NotifyEventId::Xdel:
         case NotifyEventId::Xtrim:
+        case NotifyEventId::XgroupCreate:
+        case NotifyEventId::XgroupDestroy:
+        case NotifyEventId::XgroupCreateconsumer:
+        case NotifyEventId::XgroupDelconsumer:
+        case NotifyEventId::XgroupSetid:
+        case NotifyEventId::Xsetid:
         case NotifyEventId::RenameFrom:
         case NotifyEventId::RenameTo:
         case NotifyEventId::CopyTo:
@@ -209,17 +221,12 @@ std::shared_ptr<PubSubNotificationChain> notify_reserve_chain(
     const uint64_t count = chain ? chain->items.size() : 0;
     if (!count || !server.pubsub_notification_reserve(count, kNotifyInflightCap)) return {};
     PubSubNotificationChain* raw = chain.release();
-    try {
-        return std::shared_ptr<PubSubNotificationChain>(
-            raw, [&server, count](PubSubNotificationChain* owned) {
-                delete owned;
-                server.pubsub_notification_retire(count);
-            });
-    } catch (...) {
-        delete raw;
-        server.pubsub_notification_retire(count);
-        throw;
-    }
+    // The shared_ptr constructor invokes this deleter even if its control block allocation fails.
+    return std::shared_ptr<PubSubNotificationChain>(
+        raw, [&server, count](PubSubNotificationChain* owned) {
+            delete owned;
+            server.pubsub_notification_retire(count);
+        });
 }
 
 }  // namespace
@@ -450,23 +457,31 @@ uint32_t notify_ex_pass_entry(Server& server, Shard& shard, uint32_t producer,
         // holds tracking connections; each filters against its own table. The executor never
         // touches a Client here -- only the same io-to-io transport pub/sub already uses.
         if (__builtin_expect((out.routes & NOTIFY_TRACKING) != 0, 0)) {
+            // Re-sample destinations on every retry: tracking clients and IO roles can move
+            // while this record is parked. Repeating a delivered invalidation is conservative;
+            // remembering an old destination as complete can miss a newly migrated tracker.
             const uint64_t io_mask = server.climon_tracking_io_mask();
             for (uint32_t io : server.placement().ifid_threads()) {
-                if (!((io_mask >> (io & 63)) & 1)) continue;
-                auto* invalidate = new (std::nothrow) PubSubEvent;
-                if (!invalidate) break;
-                invalidate->kind = PubSubEventKind::TrackingInvalidate;
-                invalidate->target_io = io;
-                invalidate->caller_id = 0;
-                invalidate->route_mask = io_mask;
-                invalidate->items.push_back(PubSubEventItem{0, false, 0, out.key});
+                const uint64_t bit = uint64_t{1} << (io & 63);
+                if (!(io_mask & bit)) continue;
+                std::unique_ptr<PubSubEvent> invalidate;
+                try {
+                    invalidate = std::make_unique<PubSubEvent>();
+                    invalidate->kind = PubSubEventKind::TrackingInvalidate;
+                    invalidate->target_io = io;
+                    invalidate->caller_id = 0;
+                    invalidate->route_mask = io_mask;
+                    invalidate->items.push_back(PubSubEventItem{0, false, 0, out.key});
+                } catch (const std::bad_alloc&) { return work; }
                 server.pubsub_event_created();
                 if (!server.thread(io).post_pubsub_event_nonblocking(
-                        producer, invalidate, ring, signals)) {
+                        producer, invalidate.get(), ring, signals)) {
                     server.pubsub_event_retired();
-                    delete invalidate;
+                    return work;  // keep this target and the keyless record for the next pass
                 }
+                invalidate.release();
             }
+            out.routes &= ~NOTIFY_TRACKING;
         }
         std::unique_ptr<PubSubNotificationChain> building;
         try {

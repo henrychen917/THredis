@@ -99,6 +99,7 @@ public:
             const bool was_blocked = client.blocked();
             NotifyBatch* notifications = nullptr;
             if (op.has_scatter_state()) {
+                loop->climon_flush_completed(op);
                 notifications = notify_take_batch(op);
                 xshard_retire(*loop->srv_, *loop->self_, loop->ring_, client, op,
                     loop->scatter_pool_, loop->self_->id(), loop,
@@ -441,6 +442,7 @@ public:
     void run_split_read_local();
 
 private:
+    friend struct NetcmdRegression;
     void refresh_age_sampling() {
         const uint32_t wanted = srv_->effective_age_sample_rate();
         if (wanted == age_sample_rate_cached_) return;
@@ -1031,7 +1033,8 @@ private:
     void epoll_recv(Client* c) {
         for (;;) {
             size_t avail = 0;
-            char* dst = c->read_space(kRecvChunk, avail, c->rob().quiesced());
+            char* dst = c->read_space(kRecvChunk, avail, c->rob().quiesced(),
+                                      proto_max_bulk_len_);
             if (!dst) return;              // no usable space: stay un-armed so a later pass retries
             const ssize_t n = ::recv(c->fd(), dst, avail, MSG_DONTWAIT);
             if (n > 0) {
@@ -3130,7 +3133,18 @@ private:
             }
             security_check |= acl_active;
 
+            if (pr == ParseResult::Empty) {
+                conn.advance_parse(pos - conn.rpos());
+                continue;
+            }
             if (pr == ParseResult::Incomplete) {
+                if (pass_rlen == UINT32_MAX) {
+                    finish_locally(c, *op, "ERR command exceeds receive buffer limit");
+                    conn.advance_parse(pass_rlen - conn.rpos());
+                    c->mark_closing();
+                    result = DispatchResult::Error;
+                    break;
+                }
                 // No complete frame was consumed in this pass. The buffered tail is deliberately
                 // left in place; only a new recv/readability completion may make it actionable.
                 if (conn.rpos() == pass_rpos) result = DispatchResult::NeedInput;
@@ -4423,6 +4437,8 @@ ordinary_dispatch:
     }
 
     void finish_prebuilt(Client* c, Op& op) {
+        // Unknown-command and arity errors precede the ordinary armed gate.
+        if (!op.spec && (climon_armed_cached_ & Server::kClimonReply)) climon_mark_reply(c, op);
         op.state.store(OpState::Done, std::memory_order_release);
         c->rob().publish();
         enqueue_serve(c);
@@ -5979,7 +5995,13 @@ ordinary_dispatch:
         c->start_obuf_tracking();
         const ClientLimitsConfigSnapshot limits = srv_->client_limits_snapshot();
         const ClientBufferLimit& limit = c->subscriber_mode() ? limits.pubsub : limits.normal;
-        const uint64_t used = c->obuf_bytes();
+        if (!limit.hard_bytes && !limit.soft_bytes) {
+            c->set_obuf_soft_since_s(0);
+            return false;
+        }
+        uint64_t used = c->obuf_bytes() + wb_.deferred_output_bytes(*c);
+        const auto pending = pubsub_pending_.find(c->id());
+        if (pending != pubsub_pending_.end()) used += pending->second.deferred.size();
         bool over = limit.hard_bytes && used >= limit.hard_bytes;
         if (!over && limit.soft_bytes && used >= limit.soft_bytes) {
             if (!c->obuf_soft_since_s()) c->set_obuf_soft_since_s(cached_now_s_);
