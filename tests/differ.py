@@ -1783,9 +1783,10 @@ def gen_edgeenc(rng):
                 ["RENAME", k + "c", k + "r"], ["GET", k + "r"],
                 ["DEL", k, k + "r"]]
 
-    # promotion and the one-way rule, at the aligned limits (128 entries / 64 bytes)
-    for limit_kind, entries in (("entries", 129), ("value", 3)):
+    # Promotion and the one-way rule at the fixed limits: hash 512, set/zset 128, value 64.
+    for limit_kind in ("entries", "value"):
         for kind in ("hash", "set", "zset"):
+            entries = (513 if kind == "hash" else 129) if limit_kind == "entries" else 3
             k = "edge:%s:%s" % (kind, limit_kind)
             ops.append(["DEL", k])
             for i in range(entries):
@@ -1898,9 +1899,8 @@ def gen_edgeenc(rng):
 def gen_servertail(rng):
     """LCS-heavy, plus the introspection replies that are genuinely byte-comparable.
 
-    Threshold alignment is done in the suite preamble below, NOT here: the two servers spell their
-    encoding knobs differently, so the same intent needs two different CONFIG SET commands and they
-    cannot travel in the diffed op stream.
+    Threshold alignment is done in the suite preamble below: the oracle is configured to the
+    target's fixed compact limits, outside the diffed operation stream.
 
     Deliberately EXCLUDED, with reasons:
       - OBJECT ENCODING on strings of 45..192 bytes. Our embstr/raw boundary is kEmbedThreshold
@@ -5696,33 +5696,22 @@ for cs, cf in ((ts, tf), (os_, of)):
     cs.sendall(enc(["FLUSHALL"]))
     if read_reply(cf)[:1] != b"+": raise RuntimeError("FLUSHALL failed on clean-slate")
 script_stats_before = target_stats() if SUITE == "script" else None
-# OBJECT ENCODING is only comparable once both servers promote at the same sizes, and the two
-# spell those knobs differently, so the alignment cannot ride in the diffed op stream. Replies are
-# drained, NOT diffed -- the knob NAMES differ by design.
+# OBJECT ENCODING compares hash/set/zset only at matched promotion limits. TomoKV's limits
+# are fixed; configure the oracle to those values. These setup replies are drained, not diffed.
 if SUITE in ("servertail", "edgeenc"):
-    alignment = {
-        0: [["CONFIG", "SET", "hash-max-compact-entries", "128"],
-            ["CONFIG", "SET", "hash-max-compact-value", "64"],
-            ["CONFIG", "SET", "set-max-compact-entries", "128"],
-            ["CONFIG", "SET", "set-max-compact-value", "64"],
-            ["CONFIG", "SET", "zset-max-compact-entries", "128"],
-            ["CONFIG", "SET", "zset-max-compact-value", "64"],
-            ["CONFIG", "SET", "list-max-compact-entries", "128"],
-            ["CONFIG", "SET", "list-max-compact-value", "64"]],
-        1: [["CONFIG", "SET", "hash-max-listpack-entries", "128"],
-            ["CONFIG", "SET", "hash-max-listpack-value", "64"],
-            ["CONFIG", "SET", "set-max-listpack-entries", "128"],
-            ["CONFIG", "SET", "set-max-listpack-value", "64"],
-            ["CONFIG", "SET", "set-max-intset-entries", "128"],
-            ["CONFIG", "SET", "zset-max-listpack-entries", "128"],
-            ["CONFIG", "SET", "zset-max-listpack-value", "64"],
-            ["CONFIG", "SET", "list-max-listpack-size", "128"]],
-    }
-    for side, (cs, cf) in enumerate(((ts, tf), (os_, of))):
-        for command in alignment[side]:
-            cs.sendall(enc(command))
-            if read_reply(cf)[:1] != b"+":
-                raise RuntimeError("encoding alignment failed: %r" % command)
+    alignment = [["CONFIG", "SET", "hash-max-listpack-entries", "512"],
+                 ["CONFIG", "SET", "hash-max-listpack-value", "64"],
+                 ["CONFIG", "SET", "set-max-listpack-entries", "128"],
+                 ["CONFIG", "SET", "set-max-listpack-value", "64"],
+                 ["CONFIG", "SET", "set-max-intset-entries", "128"],
+                 ["CONFIG", "SET", "zset-max-listpack-entries", "128"],
+                 ["CONFIG", "SET", "zset-max-listpack-value", "64"],
+                 ["CONFIG", "SET", "list-max-listpack-size", "-2"]]
+    for command in alignment:
+        os_.sendall(enc(command))
+        if read_reply(of)[:1] != b"+":
+            raise RuntimeError("encoding alignment failed: %r" % command)
+
 diffs = 0
 # HLL's directed promotion stream uses many-argument PFADDs and byte-sized GET oracles, and the
 # cgaps suite carries wide numkeys forms; keep their pipeline chunks below the target's fixed

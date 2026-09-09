@@ -185,9 +185,12 @@ struct CoreConcurrencyTest {
         require(tasks.size() == 128 && tasks.size() > kExecBatch, "oversized fused batch armed");
         for (const Task& task : tasks) {
             uint8_t length = 255;
-            require(f.loops[0].ex_sched_candidate(task, length), "every gathered task eligible");
+            require(ex_sched_candidate(task, length), "every gathered task eligible");
         }
-        f.loops[0].ex_schedule_batch(tasks.data(), static_cast<uint32_t>(tasks.size()));
+        Task batch[kGenthreadPipelineExBatchOps];
+        std::copy(tasks.begin(), tasks.end(), batch);
+        ex_schedule_batch(batch, static_cast<uint32_t>(tasks.size()));
+        std::copy(std::begin(batch), std::end(batch), tasks.begin());
         uint64_t next[4] = {};
         for (const Task& task : tasks) {
             const size_t client = task.client - clients;
@@ -202,7 +205,9 @@ struct CoreConcurrencyTest {
             tasks.emplace_back(&one, one.rob().dispatch_id(), -1, nullptr);
             one.rob().publish();
         }
-        f.loops[0].ex_schedule_batch(tasks.data(), 64);
+        std::copy(tasks.begin(), tasks.end(), batch);
+        ex_schedule_batch(batch, 64);
+        std::copy(std::begin(batch), std::begin(batch) + 64, tasks.begin());
         for (uint32_t i = 0; i < 64; i++) require(tasks[i].op_id == i, "one-client FIFO shortcut");
     }
 

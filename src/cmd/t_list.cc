@@ -24,11 +24,10 @@ namespace tomo {
 void reply_maxmemory_oom(Op& op);
 namespace {
 
-// Redis/Valkey/our fork map list-max-listpack-size=-2 to 8 KiB. Dragonfly's QList uses the same
-// default and the same 16-bit per-node count bound. An element larger than the byte limit lives in
+// list-max-listpack-size defaults to an 8 KiB budget. Keep the existing 16-bit node count
+// bound; the shard supplies the configured count and byte limits. An oversized element lives in
 // a one-element Compact node, matching quicklist's isolated plain-node policy while retaining this
 // tree's one Compact node representation.
-constexpr uint32_t kNodeMaxBytes = 8 * 1024;
 constexpr uint32_t kNodeMaxEntries = std::numeric_limits<uint16_t>::max();
 
 void reply_oom(Op& op) { reply_err(op.sink(), "ERR out of memory"); }
@@ -97,15 +96,16 @@ void adopt_nodes(ListVal& dst, ListVal& src) {
     src.node_allocation_bytes = 0;
 }
 
-bool node_can_insert(const ListNode* node, Slice value) {
-    if (!node || value.n > kNodeMaxBytes || node->values.size() >= kNodeMaxEntries) return false;
+bool node_can_insert(const ListNode* node, Slice value, const CompactLimit& limit) {
+    if (!node || value.n > limit.max_value ||
+        node->values.size() >= std::min(limit.max_entries, kNodeMaxEntries)) return false;
     const uint64_t bytes = node->values.encoded_bytes();
-    return bytes + Compact::entry_encoded_size(value.n) <= kNodeMaxBytes;
+    return bytes + Compact::entry_encoded_size(value.n) <= limit.max_value;
 }
 
-bool expanded_push(ListVal& list, Slice value, bool left) {
+bool expanded_push(ListVal& list, Slice value, bool left, const CompactLimit& limit) {
     ListNode* node = left ? list.head : list.tail;
-    if (node_can_insert(node, value)) {
+    if (node_can_insert(node, value, limit)) {
         const size_t old_capacity = node->values.capacity_bytes();
         const bool ok = left ? node->values.prepend(value) : node->values.append(value);
         list.node_allocation_bytes += node->values.capacity_bytes() - old_capacity;
@@ -259,10 +259,11 @@ private:
     bool            valid_ = false;
 };
 
-bool append_all_expanded(const CollectionRef& source, ListVal& destination) {
+bool append_all_expanded(const CollectionRef& source, ListVal& destination,
+                         const CompactLimit& limit) {
     for (ListCursor cur = ListCursor::edge(source, false); cur.valid(); cur.next()) {
         Compact::Entry entry;
-        if (!cur.get(entry) || !expanded_push(destination, entry.value, false)) return false;
+        if (!cur.get(entry) || !expanded_push(destination, entry.value, false, limit)) return false;
     }
     return true;
 }
@@ -345,7 +346,7 @@ void push_generic(Shard& shard, Op& op, bool left, bool only_existing) {
             }
         } else {
             for (uint32_t i = 2; i < op.argc(); i++) {
-                if (!expanded_push(*list, op.arg(i), left)) {
+                if (!expanded_push(*list, op.arg(i), left, shard.type_limits().list)) {
                     delete list;
                     reply_oom(op);
                     return;
@@ -405,9 +406,9 @@ if (inserted_ != FlatStore::InsertResult::Inserted) {
             }
         } else {
             ListVal staging;
-            if (!append_all_expanded(list, staging)) { reply_oom(op); return; }
+            if (!append_all_expanded(list, staging, shard.type_limits().list)) { reply_oom(op); return; }
             for (uint32_t i = 2; i < op.argc(); i++) {
-                if (!expanded_push(staging, op.arg(i), left)) { reply_oom(op); return; }
+                if (!expanded_push(staging, op.arg(i), left, shard.type_limits().list)) { reply_oom(op); return; }
             }
             ListVal* expanded = list.external_as<ListVal>();
             adopt_nodes(*expanded, staging);
@@ -419,7 +420,7 @@ if (inserted_ != FlatStore::InsertResult::Inserted) {
     } else {
         ListVal* expanded = list.external_as<ListVal>();
         for (uint32_t i = 2; i < op.argc(); i++) {
-            if (!expanded_push(*expanded, op.arg(i), left)) { reply_oom(op); return; }
+            if (!expanded_push(*expanded, op.arg(i), left, shard.type_limits().list)) { reply_oom(op); return; }
             expanded->note_expanded_insert(op.arg(i).n, expanded->node_allocation_bytes);
         }
     }
@@ -559,11 +560,12 @@ void cmd_lrange(Shard& shard, Op& op) {
     }
 }
 
-bool build_replaced(const CollectionRef& source, uint32_t index, Slice value, ListVal& output) {
+bool build_replaced(const CollectionRef& source, uint32_t index, Slice value, ListVal& output,
+                    const CompactLimit& limit) {
     for (ListCursor cur = ListCursor::edge(source, false); cur.valid(); cur.next()) {
         Compact::Entry entry;
         if (!cur.get(entry)) return false;
-        if (!expanded_push(output, cur.position() == index ? value : entry.value, false)) return false;
+        if (!expanded_push(output, cur.position() == index ? value : entry.value, false, limit)) return false;
     }
     return true;
 }
@@ -606,7 +608,7 @@ void cmd_lset(Shard& shard, Op& op) {
         if (!list.replace(direct, replacement)) { reply_oom(op); return; }
     } else {
         ListVal staging;
-        if (!build_replaced(list, normalized, replacement, staging)) { reply_oom(op); return; }
+        if (!build_replaced(list, normalized, replacement, staging, shard.type_limits().list)) { reply_oom(op); return; }
         ListVal* expanded = list.external_as<ListVal>();
         adopt_nodes(*expanded, staging);
         const uint64_t allocation = expanded->node_allocation_bytes;
@@ -648,7 +650,7 @@ void cmd_linsert(Shard& shard, Op& op) {
          !list.list_fits(shard.type_limits().list, list.entries() + 1,
                          list.payload_bytes() + op.arg(4).n))) {
         ListVal staging;
-        if (!append_all_expanded(list, staging)) { reply_oom(op); return; }
+        if (!append_all_expanded(list, staging, shard.type_limits().list)) { reply_oom(op); return; }
         ListVal* expanded = list.external_as<ListVal>();
         adopt_nodes(*expanded, staging);
         expanded->promote(CollectionEncoding::Deque, expanded->node_allocation_bytes);
@@ -683,10 +685,10 @@ void cmd_linsert(Shard& shard, Op& op) {
             Compact::Entry entry;
             if (!cur.get(entry)) { reply_oom(op); return; }
             if (cur.position() == pivot_index && before &&
-                !expanded_push(staging, inserted, false)) { reply_oom(op); return; }
-            if (!expanded_push(staging, entry.value, false)) { reply_oom(op); return; }
+                !expanded_push(staging, inserted, false, shard.type_limits().list)) { reply_oom(op); return; }
+            if (!expanded_push(staging, entry.value, false, shard.type_limits().list)) { reply_oom(op); return; }
             if (cur.position() == pivot_index && !before &&
-                !expanded_push(staging, inserted, false)) { reply_oom(op); return; }
+                !expanded_push(staging, inserted, false, shard.type_limits().list)) { reply_oom(op); return; }
         }
         ListVal* expanded = list.external_as<ListVal>();
         adopt_nodes(*expanded, staging);
@@ -753,7 +755,7 @@ void cmd_lrem(Shard& shard, Op& op) {
             removed_payload += entry.value.n;
         } else {
             const bool ok = list.encoding() == CollectionEncoding::Compact
-                ? compact.append(entry.value) : expanded_push(staging, entry.value, false);
+                ? compact.append(entry.value) : expanded_push(staging, entry.value, false, shard.type_limits().list);
             if (!ok) { reply_oom(op); return; }
         }
     }
@@ -808,7 +810,7 @@ void cmd_ltrim(Shard& shard, Op& op) {
         if (!cur.get(entry)) { reply_oom(op); return; }
         retained_payload += entry.value.n;
         const bool ok = list.encoding() == CollectionEncoding::Compact
-            ? compact.append(entry.value) : expanded_push(staging, entry.value, false);
+            ? compact.append(entry.value) : expanded_push(staging, entry.value, false, shard.type_limits().list);
         if (!ok) { reply_oom(op); return; }
     }
     const uint32_t removed = list.entries() - keep;
@@ -1127,7 +1129,7 @@ XshardElementResult xshard_remove_list_element_impl(Shard& shard, Slice key, uin
             continue;
         }
         const bool ok = list.encoding() == CollectionEncoding::Compact
-            ? compact.append(entry.value) : expanded_push(staging, entry.value, false);
+            ? compact.append(entry.value) : expanded_push(staging, entry.value, false, shard.type_limits().list);
         if (!ok) return XshardElementResult::Oom;
     }
     if (!removed) return XshardElementResult::Missing;
@@ -1163,7 +1165,7 @@ XshardElementResult xshard_push_list_element_impl(Shard& shard, Slice key, uint6
                 return XshardElementResult::Oom;
             }
         } else {
-            if (!expanded_push(*list, element, left)) {
+            if (!expanded_push(*list, element, left, shard.type_limits().list)) {
                 delete list;
                 return XshardElementResult::Oom;
             }
@@ -1210,7 +1212,7 @@ XshardElementResult xshard_push_list_element_impl(Shard& shard, Slice key, uint6
                 return XshardElementResult::Oom;
         } else {
             ListVal staging;
-            if (!append_all_expanded(list, staging) || !expanded_push(staging, element, left))
+            if (!append_all_expanded(list, staging, shard.type_limits().list) || !expanded_push(staging, element, left, shard.type_limits().list))
                 return XshardElementResult::Oom;
             ListVal* expanded = list.external_as<ListVal>();
             adopt_nodes(*expanded, staging);
@@ -1220,7 +1222,7 @@ XshardElementResult xshard_push_list_element_impl(Shard& shard, Slice key, uint6
         }
     } else {
         ListVal* expanded = list.external_as<ListVal>();
-        if (!expanded_push(*expanded, element, left)) return XshardElementResult::Oom;
+        if (!expanded_push(*expanded, element, left, shard.type_limits().list)) return XshardElementResult::Oom;
         expanded->note_expanded_insert(element.n, expanded->node_allocation_bytes);
     }
     if (shard.has_blocking_waiters()) blocking_publish_key(shard, hash, key.p, key.n);
@@ -1309,7 +1311,7 @@ SnapshotHookStatus list_snapshot_load(Slice key, uint8_t encoding, int64_t expir
         const uint32_t len = snapshot_get_u32(p);
         const Slice value(reinterpret_cast<const char*>(p) + 4, len);
         p += 4ull + len; left -= 4ull + len;
-        const bool ok = compact ? list->append(value) : expanded_push(*list, value, false);
+        const bool ok = compact ? list->append(value) : expanded_push(*list, value, false, limits.list);
         if (!ok) { delete list; return SnapshotHookStatus::Oom; }
     }
     if (!compact) {

@@ -2,7 +2,7 @@
 """Directed B+ per-key atomic-filter gate. Usage: tests/bplus.py HOST PORT
 
 Boot requirement:
-  --thread-mode 1s --x-overlap 0 --read-local 1
+  --thread-mode 1s|2s --overlap 0|1 --read-local 1
   --atomic 1 --enable-debug-command yes
 
 The test does not infer routing from key names. DEBUG SHARD/LBSIGNALS select a real cross-owner
@@ -177,25 +177,28 @@ def topology(connection):
         raise AssertionError(
             "DEBUG LBSIGNALS unavailable; boot with --enable-debug-command yes: %r" % raw)
     threads = set()
+    readers = set()
     shard_owner = {}
     for line in raw.splitlines():
         fields = line.split()
-        # The role token is presentation (`io`, `ex`, or `fused`), not ownership. Thread rows
-        # establish the live tids; shard rows below are the only ownership oracle.
+        # Roles identify client-serving readers (`io` or `fused`); shard rows below
+        # remain the only ownership oracle, including for fused threads.
         if len(fields) >= 3 and fields[0] == b"thread":
             threads.add(int(fields[1]))
+            if fields[2] in (b"io", b"fused"):
+                readers.add(int(fields[1]))
         elif len(fields) >= 3 and fields[0] == b"shard":
             shard_owner[int(fields[1])] = int(fields[2])
     if len(threads) < 3:
         raise AssertionError(
-            "B+ held-group geometry needs two participating owners and one independent fused "
+            "B+ held-group geometry needs two participating owners and one independent local "
             "reader; found live threads %r" % sorted(threads))
     if not shard_owner:
         raise AssertionError("DEBUG LBSIGNALS reported no shard ownership")
     unknown = set(shard_owner.values()) - threads
     if unknown:
         raise AssertionError("shards name non-live owners %r" % sorted(unknown))
-    return threads, shard_owner
+    return readers, shard_owner
 
 
 def debug_shard(connection, key):
@@ -526,17 +529,19 @@ def main():
     retained = []
     try:
         expected_config = {
-            "thread-mode": b"1s",
-            "x-overlap": b"0",
             "read-local": b"1",
             "atomic": b"1",
         }
+        if config_value(discovery, "thread-mode") not in (b"1s", b"2s"):
+            raise AssertionError("B+ test requires 1s or 2s")
         for name, wanted in expected_config.items():
             got = config_value(discovery, name)
             if got != wanted:
                 raise AssertionError(
                     "B+ test needs CONFIG %s=%s, got %r" %
                     (name, wanted.decode(), got))
+        if config_value(discovery, "overlap") not in (b"0", b"1"):
+            raise AssertionError("B+ test needs a supported overlap schedule")
         if discovery.command("CONFIG", "GET", "read-local-atomic-filter") != []:
             raise AssertionError("removed read-local atomic-filter knob is still exposed")
 

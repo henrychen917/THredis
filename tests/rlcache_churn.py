@@ -2,7 +2,7 @@
 """ARMED-WRITE BLOCK CACHE churn stressor (src/store/kv_block_cache.h).
 
 Usage: rlcache_churn.py HOST PORT [SECONDS] [WORKERS]
-  boot: --thread-mode fused --read-local 1 --atomic 1 --enable-debug-command yes
+  boot: --thread-mode 1s|2s --read-local 1 --atomic 1 --enable-debug-command yes
 
 WHAT THIS DRIVES, AND WHY THE DIFFERENTIAL MATRIX DOES NOT. While read-local is armed a published
 object is immutable, so every write BUILDS a fresh object, publishes it, and retires the displaced
@@ -160,11 +160,14 @@ def main():
 
     ctl = _lib.Conn(host, port)
     mode = _lib.thread_mode(ctl)
-    if mode != "1s":
-        rep.bad("geometry", "needs --thread-mode fused, INFO says thread_mode:%s" % mode)
+    if mode not in ("1s", "2s"):
+        rep.bad("geometry", "unknown thread_mode:%s" % mode)
         return rep.finish()
     if _lib.info(ctl, "server").get("read_local") != "1":
         rep.bad("geometry", "needs --read-local 1")
+        return rep.finish()
+    if _lib.info_int(ctl, "server", "read_local_active_threads") == 0:
+        rep.bad("geometry", "read-local enabled but no reader lane is active")
         return rep.finish()
 
     before_hits = _lib.info_int(ctl, "all", "read_local_hits")
@@ -211,7 +214,9 @@ def main():
     for t in threads:
         t.join(timeout=30)
 
-    rep.check("workers completed", not errors, "; ".join(errors[:3]))
+    unfinished = [i for i, thread in enumerate(threads) if thread.is_alive() or counts[i] == 0]
+    rep.check("workers completed", not errors and not unfinished,
+              "; ".join(errors[:3]) + " unfinished/empty workers %s" % unfinished)
     alive = False
     try:
         alive = _lib.call(ctl, "PING") in (b"PONG", "PONG")

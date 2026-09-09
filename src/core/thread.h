@@ -292,13 +292,22 @@ struct ReadLocalStats {
     }
 };
 
-// Fused read-local publication and telemetry are absent from baseline ThreadCtx allocations. The
+// Read-local publication and telemetry are absent from baseline ThreadCtx allocations. The
 // lone owning pointer is placed in ThreadCtx's established tail padding below.
 struct ReadLocalThreadState {
     std::atomic<uint64_t> tick{0};
     ReadLocalRetireSink retire_sink{};
     ReadLocalStats stats{};
+    // Published only on actual reader-loop entry/exit, including FLIP. INFO must distinguish
+    // an enabled boot knob from a live parser/executor lane. No per-operation publication.
+    std::atomic<bool> lane_active{false};
 };
+#if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
+static_assert(offsetof(ReadLocalThreadState, lane_active) == 360,
+              "lane activation must follow the entire pre-RL2S sidecar");
+static_assert(sizeof(ReadLocalThreadState) == 368,
+              "lane activation adds one alignment word only to the optional sidecar");
+#endif
 
 class ThreadCtx {
 public:
@@ -919,7 +928,7 @@ public:
     }
     bool parked() const { return parked_.load(std::memory_order_acquire); }
 
-    // Fused read-local QSBR publication. A reader publishes once at the coarse rotation boundary,
+    // Read-local QSBR publication. A reader publishes once at the coarse rotation boundary,
     // never per operation. Parked shares this word with the tick so a grace scan cannot accept a
     // stale separate parked=true after the thread has resumed probing foreign stores. Sequential
     // consistency orders the park/resume edge with that scan; it is paid only at rotation/park.
@@ -953,6 +962,14 @@ public:
         if (!read_local_state_) std::abort();
         return read_local_state_->tick.load(std::memory_order_seq_cst);
     }
+    void set_read_local_lane_active(bool active) {
+        if (!read_local_state_ || !read_local_state_->retire_sink.defer) std::abort();
+        read_local_state_->lane_active.store(active, std::memory_order_release);
+    }
+    bool read_local_lane_active() const {
+        return read_local_state_ &&
+               read_local_state_->lane_active.load(std::memory_order_acquire);
+    }
     static bool read_local_publication_parked(uint64_t publication) {
         return (publication & kReadLocalParkedBit) != 0;
     }
@@ -968,8 +985,8 @@ public:
         if (!read_local_state_ || !read_local_state_->retire_sink.defer) std::abort();
         return read_local_state_->retire_sink;
     }
-    // The nullable form, for the shard-ownership edge in Server. A thread has no sink in split
-    // mode and on a fused boot with the lane disarmed; the edge must be able to ask without
+    // The nullable form, for the shard-ownership edge in Server. A thread has no sink with the
+    // lane disarmed; the edge must be able to ask without
     // knowing which, and must be able to tell "disarmed" from "armed but unbound" -- the latter is
     // a boot-order defect, and the caller aborts on it rather than moving a shard to an owner that
     // cannot retire for it.

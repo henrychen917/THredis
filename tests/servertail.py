@@ -17,6 +17,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
@@ -315,7 +316,7 @@ def scope_c(c):
 def boot(port, extra=(), conf=None, wait=6.0):
     args = ["taskset", "-c", CORES, os.path.abspath(BINARY)]
     if conf:
-        args += ["--conf", conf]
+        args += [conf]
     args += ["--port", str(port), "--bind", HOST, "--enable-debug-command", "yes"]
     args += list(extra)
     # LeakSanitizer's exit-time accounting would turn every clean stop into exit 1: terminating
@@ -384,13 +385,16 @@ def scope_rewrite(workdir):
     print("scope B: CONFIG REWRITE round trip")
     conf = os.path.join(workdir, "rewrite.conf")
     with open(conf, "w") as handle:
-        handle.write("# seed config\nshards 2\nmaxmemory 0\n")
+        handle.write("# seed config\nshards 2\nmaxmemory 0\n"
+                     "hash-max-ziplist-entries 3\nlist-max-ziplist-size -1\n")
     proc = boot(SPARE_PORT, ["--dir", workdir], conf=conf)
     if not check("server booted from conf", proc is not None, True):
         return
     c = Conn(SPARE_PORT)
     check("CONFIG SET before rewrite", c.cmd("CONFIG", "SET", "maxmemory", "64mb"), "OK")
     check("CONFIG SET slowlog knob", c.cmd("CONFIG", "SET", "slowlog-max-len", "77"), "OK")
+    check("CONFIG SET encoding aliases", c.cmd("CONFIG", "SET", "hash-max-ziplist-entries", "9",
+          "hash-max-listpack-value", "1kb", "list-max-ziplist-size", "4"), "OK")
     check("CONFIG REWRITE", c.cmd("CONFIG", "REWRITE"), "OK")
     c.close()
     proc.terminate()
@@ -398,6 +402,10 @@ def scope_rewrite(workdir):
 
     body = open(conf).read()
     check("rewritten file carries the mutation", body, lambda v: "maxmemory 67108864" in v)
+    check("encoding rewrite uses canonical names and current values", body,
+          lambda v: "hash-max-listpack-entries 9\n" in v and
+                    "hash-max-listpack-value 1024\n" in v and
+                    "list-max-listpack-size 4\n" in v and "max-ziplist" not in v)
     check("rewritten file omits non-boot names", body,
           lambda v: not any(line.startswith("aof-use-rdb-preamble ")
                             for line in v.splitlines()))
@@ -413,6 +421,14 @@ def scope_rewrite(workdir):
           ["maxmemory", "67108864"])
     check("slowlog knob survived", c.cmd("CONFIG", "GET", "slowlog-max-len"),
           ["slowlog-max-len", "77"])
+    for name, value in (("hash-max-listpack-entries", "9"), ("hash-max-ziplist-entries", "9"),
+                        ("hash-max-listpack-value", "1024"), ("list-max-listpack-size", "4")):
+        check("encoding survived reboot: " + name, c.cmd("CONFIG", "GET", name), [name, value])
+    c.cmd("DEL", "st:rewrite:list")
+    c.cmd("RPUSH", "st:rewrite:list", "a", "b", "c", "d")
+    check("reboot applies list count mode", c.cmd("OBJECT", "ENCODING", "st:rewrite:list"), "listpack")
+    c.cmd("RPUSH", "st:rewrite:list", "e")
+    check("reboot applies list promotion", c.cmd("OBJECT", "ENCODING", "st:rewrite:list"), "quicklist")
     check("repeated save clauses reboot as one CONFIG value", c.cmd("CONFIG", "GET", "save"),
           ["save", "3600 1 300 100 60 10000"])
     c.close()
@@ -421,10 +437,9 @@ def scope_rewrite(workdir):
 
 
 def main():
-    workdir = os.path.join(os.path.dirname(os.path.abspath(BINARY)), "..",
-                           "servertail-testdata")
-    workdir = os.path.abspath(workdir)
-    os.makedirs(workdir, exist_ok=True)
+    # Recovery now derives from dir/dbfilename; stale snapshots from a prior invocation must
+    # not become input to these independent shutdown/configuration tests. Keep files for diagnosis.
+    workdir = tempfile.mkdtemp(prefix="tomokv-servertail-")
 
     c = Conn()
     scope_a(c)

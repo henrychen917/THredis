@@ -2384,11 +2384,11 @@ struct ScriptWorkbench {
 };
 thread_local ScriptWorkbench t_script_workbench;
 
-Shard* script_workbench(Server& server, int32_t coordinator) {
+Shard* script_workbench(Server& server, int32_t coordinator, const TypeLimits& limits,
+                        const StreamLimits& stream_limits) {
     if (!t_script_workbench.shard) {
         auto shard = std::make_unique<Shard>();
-        shard->init_private(&server, coordinator, server.cfg().type_limits,
-                            server.cfg().stream_limits);
+        shard->init_private(&server, coordinator, limits, stream_limits);
         t_script_workbench.server = &server;
         t_script_workbench.shard = std::move(shard);
     }
@@ -2397,11 +2397,15 @@ Shard* script_workbench(Server& server, int32_t coordinator) {
     // One executor can coordinate activations for different KEYS[1] owners, so re-stamp the
     // identity when it changes. Nothing in the whitelisted handler set consults shard.id() today
     // except the zero-copy borrow, which zc_min == UINT32_MAX already makes unreachable here --
-    // but a stale id is the kind of thing the next handler quietly inherits. Re-stamping also
-    // picks up live CONFIG SET changes to the type/stream limits.
+    // but a stale id is the kind of thing the next handler quietly inherits. Limits come from
+    // this task's owner-local shard, not the immutable boot Config. Refresh even when identity
+    // is unchanged so a CONFIG SET between activations reaches the reused workbench.
     if (workbench->id() != coordinator)
-        workbench->init_private(&server, coordinator, server.cfg().type_limits,
-                                server.cfg().stream_limits);
+        workbench->init_private(&server, coordinator, limits, stream_limits);
+    else {
+        workbench->set_type_limits(limits);
+        workbench->set_stream_limits(stream_limits);
+    }
     return workbench;
 }
 
@@ -2473,7 +2477,8 @@ ScatterTaskResult execute_script_phase(const Task& task, Shard& shard, Op& op) {
         }
         case ScriptPhase::Run: {
             state.server->note_script_run();
-            Shard* work = script_workbench(*state.server, state.script_coordinator_shard);
+            Shard* work = script_workbench(*state.server, state.script_coordinator_shard,
+                                           shard.type_limits(), shard.stream_limits());
             work->store().clear();
             // The workbench is a shard object of its own, so xshard_execute's cut does not reach
             // it; give it the same instant explicitly.

@@ -26,7 +26,8 @@
 #include "flipctl.h"
 #include "weighted_lb.h"
 #include "placement.h"
-#include "config.h"        // struct Config: every runtime knob, one home
+#include "config.h"
+#include "orthog.h"        // struct Config: every runtime knob, one home
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -135,7 +136,7 @@ struct FlipReport {
     bool moving = false;
 };
 
-// Allocated only for the boot-armed fused read-local lane. The Server keeps only one pointer at its
+// Allocated only for the boot-armed read-local lane. The Server keeps only one pointer at its
 // true tail, so baseline member offsets and cache-line sharing remain unchanged.
 struct ReadLocalServerState {
     std::atomic<uint64_t> epoch{1};
@@ -288,7 +289,7 @@ public:
         if (!adjust_open_files_limit()) return false;
         check_tcp_backlog_settings();
         // Shard maps are resolved exactly once at boot; parsing never leaks onto a request path.
-        if (!placement_.assign_shard_homes(cfg.shards)) return false;
+        if (!placement_.assign_shard_homes(cfg.shards, cfg.shard_home)) return false;
 
         // ---- shards: bucket ranges, fixed for the life of the process ----------------------------
         shards_.resize(cfg.shards);
@@ -297,9 +298,9 @@ public:
             const uint32_t b0 = i * per;
             const uint32_t b1 = (i + 1 == cfg.shards) ? kNumBuckets : (i + 1) * per;
             shards_[i] = std::make_unique<Shard>();
-            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.type_limits,
+            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.encodings.type_limits(),
                              cfg.stream_limits);
-            if (lb_machinery_enabled() && !shards_[i]->enable_lb_signals()) {
+            if (key_lb_signals_enabled() && !shards_[i]->enable_lb_signals()) {
                 std::fprintf(stderr, "fatal: could not allocate weighted-placement signals\n");
                 return false;
             }
@@ -326,10 +327,10 @@ public:
             threads_[i] = std::make_unique<ThreadCtx>();
             // The fingerprint writer is armed only when its one reader, the flip controller, is
             // enabled (DESIGN-flipfp.md): with --flip-auto 0 and in 1s mode it is dark and costs
-            // one predicted branch per op. flip_work_window keeps its CONFIG value either way.
+            // one predicted branch per op. The enabled sampler keeps its measured 1-in-100 policy.
             threads_[i]->init(i, placement_.role_of(i), nthreads,
                               0,
-                              flipctl_.enabled() ? cfg.flip_work_window : 0);
+                              flip_fingerprint_window(flipctl_.enabled()));
             threads_[i]->init_command_counts(command_registry_size());
         }
         if (read_local_enabled()) {
@@ -351,11 +352,18 @@ public:
                 }
             }
         }
-        if (lb_machinery_enabled()) {
+        if (cfg_.overlap || cfg_.reorder) {
+            mode_schedule_stats_.reset(new (std::nothrow) ModeScheduleStats[nthreads]);
+            if (!mode_schedule_stats_) {
+                std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");
+                return false;
+            }
+        }
+        if (lb_controller_enabled()) {
             lb_policy_ = std::make_unique<LbAutotune>();
             lb_policy_->last_fold_ns = now_ns();
         }
-        if (lb_machinery_enabled()) {
+        if (key_lb_signals_enabled()) {
             try {
                 lb_bucket_last_samples_.assign(kNumBuckets, 0);
                 lb_bucket_weight_.assign(kNumBuckets, 0.0);
@@ -365,7 +373,7 @@ public:
                 return false;
             }
         }
-        if (lb_machinery_enabled()) {
+        if (lb_controller_enabled()) {
             try {
                 lb_thread_last_busy_.assign(nthreads, 0);
                 lb_thread_last_idle_.assign(nthreads, 0);
@@ -416,9 +424,16 @@ public:
         return cfg_.thread_mode == ThreadMode::Fused ? "1s" : "2s";
     }
 
-    bool lb_machinery_enabled() const {
-        return cfg_.lb != 0;
+    bool key_lb_signals_enabled() const {
+        return cfg_.key_lb != 0;
     }
+    bool client_lb_signals_enabled() const {
+        return cfg_.client_lb != 0;
+    }
+    bool lb_controller_enabled() const {
+        return key_lb_signals_enabled() || client_lb_signals_enabled();
+    }
+
     uint32_t lb_sample_rate() const {
         return lb_policy_ ? lb_policy_->sample_rate.load(std::memory_order_relaxed) : 0;
     }
@@ -460,7 +475,7 @@ public:
     // hence survives an IO ownership move without turning that move into a signal discontinuity.
     void lb_publish_client_observations(uint32_t owner,
                                         const std::vector<LbClientObservation>& observations) {
-        if (!lb_machinery_enabled() || owner >= nthreads()) return;
+        if (!client_lb_signals_enabled() || owner >= nthreads()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         double total = 0;
         for (const LbClientObservation& observation : observations) {
@@ -477,12 +492,12 @@ public:
             static_cast<uint64_t>(total * 1024.0 + 0.5), std::memory_order_release);
     }
     void lb_forget_client(uint64_t id) {
-        if (!lb_machinery_enabled()) return;
+        if (!client_lb_signals_enabled()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         lb_clients_.erase(id);
     }
     double lb_client_weight(uint64_t id) const {
-        if (!lb_machinery_enabled()) return 0.0;
+        if (!client_lb_signals_enabled()) return 0.0;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         const auto found = lb_clients_.find(id);
         return found == lb_clients_.end() ? 0.0 : found->second.weight;
@@ -491,24 +506,26 @@ public:
     // The controller owns this fold. Every bucket keeps a monotonic sampled counter on its
     // physical shard; EWMA history is indexed by immutable bucket id, never by executor owner.
     void lb_fold_signals() {
-        if (!lb_machinery_enabled()) return;
+        if (!lb_controller_enabled()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        uint64_t visits = 0;
-        for (uint32_t sid = 0; sid < nshards(); sid++) {
-            Shard& physical = shard(static_cast<int32_t>(sid));
-            for (uint32_t bucket = physical.bucket_begin();
-                 bucket < physical.bucket_end(); bucket++) {
-                const uint32_t current = physical.lb_bucket_samples(bucket);
-                const uint32_t delta = current - lb_bucket_last_samples_[bucket];
-                lb_bucket_last_samples_[bucket] = current;
-                visits += delta;
-                const double sample = static_cast<double>(delta);
-                lb_bucket_weight_[bucket] = lb_bucket_primed_
-                    ? 0.25 * sample + 0.75 * lb_bucket_weight_[bucket] : sample;
+        if (key_lb_signals_enabled()) {
+            uint64_t visits = 0;
+            for (uint32_t sid = 0; sid < nshards(); sid++) {
+                Shard& physical = shard(static_cast<int32_t>(sid));
+                for (uint32_t bucket = physical.bucket_begin();
+                     bucket < physical.bucket_end(); bucket++) {
+                    const uint32_t current = physical.lb_bucket_samples(bucket);
+                    const uint32_t delta = current - lb_bucket_last_samples_[bucket];
+                    lb_bucket_last_samples_[bucket] = current;
+                    visits += delta;
+                    const double sample = static_cast<double>(delta);
+                    lb_bucket_weight_[bucket] = lb_bucket_primed_
+                        ? 0.25 * sample + 0.75 * lb_bucket_weight_[bucket] : sample;
+                }
             }
+            lb_bucket_primed_ = true;
+            lb_policy_->observe_visits(visits, now_ns());
         }
-        lb_bucket_primed_ = true;
-        lb_policy_->observe_visits(visits, now_ns());
         // Occupancy is 1 - measured idle over the same window. cpu_ns deliberately does not enter:
         // polling/spinning is scheduled CPU but does not mean the role has useful work available.
         for (uint32_t tid = 0; tid < nthreads(); tid++) {
@@ -527,7 +544,7 @@ public:
         lb_occupancy_primed_ = true;
     }
     double lb_shard_weight(uint32_t sid) const {
-        if (sid >= nshards() || !lb_machinery_enabled()) return 0.0;
+        if (sid >= nshards() || !key_lb_signals_enabled()) return 0.0;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         const Shard& physical = shard(static_cast<int32_t>(sid));
         double weight = 0;
@@ -536,7 +553,7 @@ public:
         return weight;
     }
     uint64_t lb_shard_bytes(uint32_t sid) const {
-        if (sid >= nshards() || !lb_machinery_enabled()) return 0;
+        if (sid >= nshards() || !key_lb_signals_enabled()) return 0;
         const Shard& physical = shard(static_cast<int32_t>(sid));
         uint64_t bytes = 0;
         for (uint32_t bucket = physical.bucket_begin(); bucket < physical.bucket_end(); bucket++)
@@ -599,8 +616,14 @@ public:
         return count;
     }
 
+    ModeScheduleStats& mode_schedule_stats(uint32_t tid) {
+        return mode_schedule_stats_[tid];
+    }
+    const ModeScheduleStats* mode_schedule_stats() const { return mode_schedule_stats_.get(); }
+
     static bool read_local_enabled(const Config& cfg) {
-        return cfg.thread_mode == ThreadMode::Fused && cfg.overlap == 0 && cfg.read_local != 0;
+        // Both modes and both schedules consume local captures before publishing QSBR.
+        return cfg.read_local != 0;
     }
     bool read_local_enabled() const { return read_local_enabled(cfg_); }
     uint64_t read_local_epoch() const {
@@ -699,7 +722,7 @@ public:
         return flip_dispatch_paused() || lb_stage() != LbStage::Idle;
     }
     bool lb_cron_writer(uint32_t tid) const {
-        if (!lb_machinery_enabled() || flip_dispatch_paused()) return false;
+        if (!lb_controller_enabled() || flip_dispatch_paused()) return false;
         for (uint32_t candidate = 0; candidate < nthreads(); candidate++)
             if (thread(candidate).role() == Role::Ifid) return candidate == tid;
         return false;
@@ -842,7 +865,7 @@ public:
         flip_clients_transferred_.fetch_add(1, std::memory_order_relaxed);
         if (flip_stage() != FlipStage::Idle)
             flip_active_transfers_.fetch_add(1, std::memory_order_relaxed);
-        if (lb_machinery_enabled()) {
+        if (client_lb_signals_enabled()) {
             std::lock_guard<std::mutex> lock(lb_signal_mu_);
             const auto found = lb_clients_.find(id);
             if (found != lb_clients_.end()) found->second.owner = destination;
@@ -933,7 +956,7 @@ public:
             std::vector<Client*> clients;
             items.reserve(total);
             clients.reserve(total);
-            const bool weighted_client = lb_machinery_enabled();
+            const bool weighted_client = client_lb_signals_enabled();
             bool coordinator_seen = coordinator_client == nullptr;
             for (uint32_t owner = 0; owner < nthreads(); owner++) {
                 if (thread(owner).role() != Role::Ifid) continue;
@@ -1045,7 +1068,7 @@ public:
             }
             std::vector<WeightedLbItem> items;
             items.reserve(nshards());
-            const bool weighted_key = lb_machinery_enabled();
+            const bool weighted_key = key_lb_signals_enabled();
             for (uint32_t sid = 0; sid < nshards(); sid++) {
                 const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
                 if (owner >= nthreads()) {
@@ -1147,7 +1170,9 @@ public:
     // windows consumed by FLIP, then publishes either a short EX quiescence transaction or one
     // connection drain request. Nothing here runs on an operation path.
     bool lb_controller_tick(uint32_t coordinator, uint64_t now_ms) {
-        if (!lb_machinery_enabled() || coordinator >= nthreads()) return false;
+        if (!lb_controller_enabled() || coordinator >= nthreads()) return false;
+        const bool key_enabled = key_lb_signals_enabled();
+        const bool client_enabled = client_lb_signals_enabled();
         lb_ticks_.fetch_add(1, std::memory_order_relaxed);
         try {
             {
@@ -1164,13 +1189,13 @@ public:
             std::vector<uint32_t> executors;
             std::vector<uint32_t> ios;
             if (cfg_.thread_mode == ThreadMode::Fused) {
-                executors = placement_.ex_threads();
-                ios = placement_.ifid_threads();
+                if (key_enabled) executors = placement_.ex_threads();
+                if (client_enabled) ios = placement_.ifid_threads();
             } else {
                 for (uint32_t tid = 0; tid < nthreads(); tid++) {
                     const Role role = thread(tid).role();
-                    if (role == Role::Ex) executors.push_back(tid);
-                    else if (role == Role::Ifid) ios.push_back(tid);
+                    if (key_enabled && role == Role::Ex) executors.push_back(tid);
+                    else if (client_enabled && role == Role::Ifid) ios.push_back(tid);
                 }
             }
 
@@ -1211,7 +1236,7 @@ public:
             std::vector<LbShardMove> shard_plan;
             double shard_before = 0, shard_after = 0;
             double bytes_before = 0, bytes_after = 0;
-            if (executors.size() >= 2) {
+            if (key_enabled && executors.size() >= 2) {
                 double loads[kMaxThreads] = {};
                 double byte_loads[kMaxThreads] = {};
                 std::vector<WeightedLbItem> shard_items;
@@ -1299,14 +1324,14 @@ public:
                     shard_after = spread(loads, executors);
                     bytes_after = spread(byte_loads, executors);
                 }
-            } else {
+            } else if (key_enabled) {
                 lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
                 lb_bucket_hot_streak_ = 0;
             }
 
             LbClientMove client_plan;
             double client_before = 0, client_after = 0;
-            if (ios.size() >= 2) {
+            if (client_enabled && ios.size() >= 2) {
                 double loads[kMaxThreads] = {};
                 std::vector<WeightedLbItem> clients;
                 uint32_t cooldown_seen = 0;
@@ -1344,7 +1369,7 @@ public:
                         client_after = choice.after_weight_spread;
                     }
                 }
-            } else {
+            } else if (client_enabled) {
                 lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
                 lb_client_hot_streak_ = 0;
             }
@@ -1561,7 +1586,7 @@ public:
         if (role_count(Role::Ifid) + role_count(Role::Ex) != nthreads())
             return refuse("ERR FLIP thread conservation is already violated");
         flip_conservation_check();
-        if (lb_machinery_enabled()) lb_fold_signals();
+        if (lb_controller_enabled()) lb_fold_signals();
 
         const uint32_t live_io = role_count(Role::Ifid);
         for (uint32_t tid = 0; tid < kMaxThreads; tid++) {
@@ -2917,6 +2942,16 @@ public:
     void set_debug_hop_delay(uint32_t microseconds) {
         debug_hop_delay_.store(microseconds, std::memory_order_relaxed);
     }
+    // DEBUG ATOMIC-COMMIT-HOLD: retain the existing owner-private commit queue before drawing
+    // tickets, without blocking the executor. Admission/reconfiguration tests can then run
+    // CONFIG while groups are live. The ticket-publication delay above serves a different test:
+    // it deliberately stalls INSIDE the reserve/publish interval to exercise safe read cuts.
+    bool debug_atomic_commit_hold() const {
+        return debug_atomic_commit_hold_.load(std::memory_order_relaxed);
+    }
+    void set_debug_atomic_commit_hold(bool held) {
+        debug_atomic_commit_hold_.store(held, std::memory_order_relaxed);
+    }
     // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER). Microseconds every fragment of a cross-shard READ
     // except the one on its lead shard is PARKED -- re-queued, not spun -- after the command is
     // dispatched. That park is the fan-out window: the lead fragment answers from the world before
@@ -3528,8 +3563,8 @@ private:
     std::atomic<uint64_t> lb_bucket_bytes_spread_before_{0};
     std::atomic<uint64_t> lb_bucket_bytes_spread_after_{0};
 
-    // Weighted-placement state is absent when lb=0. Bucket arrays are indexed by the
-    // immutable routing id; client state is keyed by the immutable connection id. The mutex is a
+    // Weighted-placement state is absent when both key-lb and client-lb are 0. Bucket arrays
+    // are indexed by the immutable routing id; client state is keyed by the immutable connection id. The mutex is a
     // once-per-controller-beat/read-side lock and is never acquired on an operation path.
     std::unique_ptr<LbAutotune> lb_policy_;
     mutable std::mutex lb_signal_mu_;
@@ -3606,6 +3641,7 @@ private:
     std::atomic<uint32_t> debug_atomic_direct_defer_{0};
     std::atomic<uint32_t> debug_read_local_lane_cap_{0};   // 0 = derive (kInboxSlots)
     std::atomic<uint32_t> debug_hop_delay_{0};
+    std::atomic<bool> debug_atomic_commit_hold_{false};
     std::atomic<uint32_t> debug_atomic_read_delay_{0};
     std::atomic<uint32_t> debug_atomic_fanout_defer_{0};
     std::atomic<uint32_t> debug_script_stage_defer_{0};
@@ -3694,6 +3730,7 @@ private:
     // Appended cold state: disabled servers allocate no epoch state and no established offset
     // moves. Later test-only knobs stay behind this pointer for the same reason.
     std::unique_ptr<ReadLocalServerState> read_local_state_;
+    std::unique_ptr<ModeScheduleStats[]> mode_schedule_stats_;
     // Appended at the true tail: this test-only knob must not move any production member.
     std::atomic<uint64_t> debug_atomic_conditional_deadline_{0};
     // Registered at executor construction (including dormant FLIP roles), then read

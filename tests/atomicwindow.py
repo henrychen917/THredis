@@ -5,7 +5,7 @@ can be re-armed. Per-attempt telemetry measures both the window hit and reply ra
 are a bounded discovery budget, not a claim about an unmeasured false-failure probability.
 
 Reconfiguration additionally pre-admits a cross-owner EXEC with the existing fan-out park. Its
-copied ten-second deadline outlives the five-second arming budget, while the owner commit spin
+copied ten-second deadline outlives the five-second arming budget, while the owner commit hold
 is released BEFORE CONFIG. A faster MSET drain cannot remove that identified old-generation lease.
 """
 import select
@@ -124,8 +124,8 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                 try:
                     if reconfigure:
                         # Keep one identified old-generation lease alive independently of the
-                        # MSET commit batches. CONFIG fans out to their owners, so a commit spin
-                        # also holds CONFIG back and can let the entire burst retire first.
+                        # MSET commit batches. Releasing their queue before CONFIG can let the
+                        # entire burst retire first; the parked EXEC survives independently.
                         # This EXEC hook PARKS non-lead fragments. Disarm it once EXEC has
                         # copied its deadline, BEFORE CONFIG (which also takes the read fan-out
                         # hook). The parked transaction cannot finish within our arm budget.
@@ -159,7 +159,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                             raise AssertionError("lease hold did not disarm after dispatch")
                         if select.select([blocker.sock], [], [], 0)[0]:
                             raise AssertionError("lease holder completed before burst")
-                    if admin.must("DEBUG", "ATOMIC-COMMIT-DELAY", "100000") != b"OK":
+                    if admin.must("DEBUG", "ATOMIC-COMMIT-HOLD", "1") != b"OK":
                         raise AssertionError("commit hold did not arm")
                     for index, client in enumerate(clients):
                         thread = threading.Thread(target=run, args=(index, client), daemon=True)
@@ -172,9 +172,9 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                         table = observe()
                         armed = table["inflight"] >= 2 and (stalls > 0 or not whole_window)
                         if armed and reconfigure:
-                            # The full-window witness is captured. Release the owner spin so
-                            # CONFIG can run; the independently parked EXEC retains its lease.
-                            if admin.must("DEBUG", "ATOMIC-COMMIT-DELAY", "0") != b"OK":
+                            # The full-window witness is captured. Let the MSET burst drain
+                            # before CONFIG; the independently parked EXEC retains its lease.
+                            if admin.must("DEBUG", "ATOMIC-COMMIT-HOLD", "0") != b"OK":
                                 raise AssertionError("commit hold did not release before CONFIG")
                             # Same-value SET still rebuilds the credit generation (server.h).
                             # Keep atomic ON so all submitted groups remain subject to the bound.
@@ -204,7 +204,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                     held_stalls = stalls
                     # This MUST precede the completion deadline. Holding every commit until all
                     # 640 gate-geometry groups finish was a timing test, not a resume witness.
-                    if admin.must("DEBUG", "ATOMIC-COMMIT-DELAY", "0") != b"OK":
+                    if admin.must("DEBUG", "ATOMIC-COMMIT-HOLD", "0") != b"OK":
                         raise AssertionError("commit hold did not disarm")
                     if reconfigure:
                         # EXEC copied its delay at dispatch; zero prevents NEW holds.

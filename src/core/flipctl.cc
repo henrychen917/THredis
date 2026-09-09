@@ -296,7 +296,7 @@ FlipController::MovementStamp FlipController::movement_stamp(const Server& serve
 
 bool FlipController::sample_fingerprint(Server& server) {
     fingerprint_sampled_this_tick_ = false;
-    if (!server.cfg().flip_work_window) return false;
+    if (!enabled_) return false;
     FlipFingerprintWindow aggregate;
     bool any = false;
     for (uint32_t tid = 0; tid < server.nthreads(); tid++) {
@@ -445,12 +445,10 @@ bool FlipController::boot_load_stable(Server& server, uint64_t now_ms) {
     // workload has already held still, and at boot that is since the first non-idle tick.
     if (!stationary_since_ms_) stationary_since_ms_ = now_ms;
     // A command-rate sample made only of controller observability is not enough when work
-    // fingerprinting is available. Once real work closes a window, keep counting all non-idle
+    // fingerprinting is armed. Once real work closes a window, keep counting all non-idle
     // rate ticks: a workload below one fingerprint window per tick must still reach the cap.
-    if (server.cfg().flip_work_window) {
-        boot_work_observed_ = boot_work_observed_ || fingerprint_sampled_this_tick_;
-        if (!boot_work_observed_) return false;
-    }
+    boot_work_observed_ = boot_work_observed_ || fingerprint_sampled_this_tick_;
+    if (!boot_work_observed_) return false;
     const uint64_t max_deferral_ticks = std::max<uint64_t>(
         1, (kBootMaxDeferralMs + tick_ms - 1) / tick_ms);
     if (boot_nonidle_ticks_ >= max_deferral_ticks) return true;
@@ -1214,8 +1212,7 @@ bool FlipController::tick(Server& server, uint64_t now_ms) {
             anchor_learning_rate_max_ = std::max(anchor_learning_rate_max_, rate);
         }
         anchor_learning_rate_samples_++;
-        if (server.cfg().flip_work_window &&
-            anchor_signature_samples_ < signature_learning_windows_) return false;
+        if (anchor_signature_samples_ < signature_learning_windows_) return false;
         anchor(server, rate);
         return false;
     }

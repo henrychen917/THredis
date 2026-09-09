@@ -16,8 +16,8 @@
 
 namespace tomo {
 
-// Internal LB policy, allocated only by --lb 1. One decision spans the three sustained
-// controller ticks; sampling targets a fixed number of key visits over that whole window.
+// Internal LB policy, allocated only if key-lb or client-lb is on. One decision spans three
+// sustained controller ticks; sampling targets a fixed number of key visits over that whole window.
 // Executors latch the rate on their existing census beat and weight each sample by that rate,
 // so a rate change or owner migration cannot reinterpret counters collected at another rate.
 struct LbAutotune {

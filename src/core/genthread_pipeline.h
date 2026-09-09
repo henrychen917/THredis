@@ -11,7 +11,7 @@ inline constexpr uint32_t kGenthreadIfidBatchOps = 32;
 inline constexpr uint32_t kGenthreadExBatchOps = 32;
 inline constexpr uint32_t kGenthreadWbBatchConns = 16;
 
-// Pipelines 1 and 2 share the measured generalized-thread batch geometry. These names are
+// Fused overlap uses this generalized-thread geometry. These names are
 // deliberately separate from the coarse constants above so selecting the study baseline cannot
 // silently inherit the larger experimental batches.
 inline constexpr uint32_t kGenthreadPipelineExBatchOps = 128;

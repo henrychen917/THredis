@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <array>
 #include <atomic>
@@ -149,13 +150,10 @@ int main(int argc, char** argv) {
     std::vector<std::string> token_store;      // owns conf-file tokens; Config keeps views into it
     std::vector<const char*> conf_tokens, cli_tokens;
 
-    // Pre-scan: --conf FILE anywhere, or a bare first argument (redis-style ./tomokv tomokv.conf).
+    // Redis-style optional first argument: ./tomokv tomokv.conf. Flags override that file.
     const char* conf_path = nullptr;
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--conf")) {
-            if (i + 1 >= argc) { std::fprintf(stderr, "--conf wants a file path\n"); return 1; }
-            conf_path = argv[++i];
-        } else if (i == 1 && argv[i][0] != '-') {
+        if (i == 1 && argv[i][0] != '-') {
             conf_path = argv[i];
         } else {
             cli_tokens.push_back(argv[i]);
@@ -177,14 +175,6 @@ int main(int argc, char** argv) {
         if (rc != kConfigParsed) return rc == kConfigHelp ? 0 : 1;
     }
     if (validate_config(cfg) != kConfigParsed) return 1;
-    if (cfg.overlap == 2)
-        std::fprintf(stderr,
-                     "WARNING: --x-overlap 2 selects an experimental research schedule\n");
-    if (cfg.read_local &&
-        (cfg.thread_mode != ThreadMode::Fused || cfg.overlap != 0))
-        std::fprintf(stderr,
-                     "NOTICE: --read-local 1 requires --thread-mode 1s --x-overlap 0 "
-                     "in this version; using the ordinary owner-task path\n");
     // THE ENGINE IS LATCHED HERE, once, before anything that reads it exists. Every Ring in the
     // process must agree (a uring ring cannot receive an eventfd doorbell and vice versa), and no
     // thread has been spawned yet, so this store needs no synchronisation.
@@ -200,10 +190,6 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "TLS configuration failed: %s\n", tls_error.c_str());
             return 1;
         }
-    }
-    if (cfg.load_path && !*cfg.load_path) {
-        std::fprintf(stderr, "--load requires a non-empty path\n");
-        return 1;
     }
     if (!command_registry_init(cfg.tls_port != 0, cfg.thread_mode == ThreadMode::Fused,
                                Server::read_local_enabled(cfg))) {
@@ -241,13 +227,26 @@ int main(int argc, char** argv) {
     }
 
     std::unique_ptr<SnapshotLoadPlan> load_plan;
-    if (cfg.load_path && !aof_base_plan && aof_plans.empty()) {
-        std::string error;
-        load_plan = snapshot_read_plan(cfg.load_path, cfg.shards, error);
-        if (!load_plan) {
-            std::fprintf(stderr, "snapshot load plan failed: %s\n", error.c_str());
+    if (!aof_base_plan && aof_plans.empty()) {
+        // The recovery input derives from the existing persistence destination. AOF recovery
+        // keeps precedence; a missing dump boots empty, while an unreadable/corrupt dump fails.
+        // Path construction and filesystem work remain entirely behind this boot-only gate.
+        const std::string load_path = std::string(cfg.dir) + "/" + cfg.dbfilename;
+        struct stat dump_stat;
+        if (::stat(load_path.c_str(), &dump_stat) == 0) {
+            std::string error;
+            load_plan = snapshot_read_plan(load_path.c_str(), cfg.shards, error);
+            if (!load_plan) {
+                std::fprintf(stderr, "snapshot load plan failed: %s\n", error.c_str());
+                return 1;
+            }
+        } else if (errno != ENOENT) {
+            std::fprintf(stderr, "snapshot stat failed for '%s': %s\n",
+                         load_path.c_str(), std::strerror(errno));
             return 1;
         }
+    }
+    if (load_plan) {
         // The router consumes the keyed hash, so its key material is part of the persisted format.
         // Restore it before Server::init builds shard ownership and before any loaded key is hashed.
         g_hash_kind = static_cast<HashKind>(load_plan->hash_kind);
@@ -311,6 +310,11 @@ int main(int argc, char** argv) {
         srv.topo().dump(stdout);
         return run_fused_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
                                 tls_context.get(), unix_listener, final_shutdown_line);
+    }
+    if (srv.read_local_enabled()) {
+        srv.topo().dump(stdout);
+        return run_split_read_local_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
+                                           tls_context.get(), unix_listener, final_shutdown_line);
     }
 
     srv.topo().dump(stdout);
@@ -592,4 +596,3 @@ int main(int argc, char** argv) {
     report_graceful_shutdown();
     return io_boot_failed.load(std::memory_order_relaxed) ? 1 : 0;
 }
-
