@@ -1,11 +1,10 @@
-// ex_loop.h — the EX stage. Executes ops against the shards it owns; a sender (io in 2s, wb in 3s)
-// turns the completions into bytes. Same Channel signalling and LoopSignals units as io/wb loops.
+// ex_loop.h — executes ops against owned shards. The connection's IO owner retires and sends
+// their replies, using the same Channel signalling and LoopSignals units.
 //
 //   in   task_in from IO threads         a parsed op to execute
-//   out  ready-mask bit / client_in      "you have completed ops to retire" to the FIXED sender
+//   out  ready-mask bit / client_in      completed ops for the connection's IO owner
 //
-// A worker owns no file descriptors, so its "events" are channel entries. It still owns a Ring
-// because it needs somewhere to receive wakes.
+// The executor's Ring receives wakes and submits its snapshot/AOF persistence work.
 //
 // WAITING IS THE INTERESTING PART. A worker with an empty inbox must not spin a core at 100% — that
 // is a real cost at 64 workers and it distorts every utilisation reading a controller might use. It
@@ -163,11 +162,8 @@ struct ReadLocalExState<true> {
 using ReadLocalExImpl = ReadLocalExState<true>::Impl;
 static_assert(std::is_empty_v<ReadLocalExState<false>>);
 
-template <bool Enabled, uint32_t Capacity>
-struct ReadLocalCaptureBuffer {};
-
 template <uint32_t Capacity>
-struct ReadLocalCaptureBuffer<true, Capacity> {
+struct ReadLocalCaptureBuffer {
     FlatStore::ReadLocalPrefetchCapture entries[Capacity];
 };
 
@@ -176,20 +172,17 @@ class ExLoopT {
 public:
     using FusedCompletionFn = void (*)(void*, Client*);
 
-    WbEngine& engine() { return wb_; }
     bool init(Server* srv, ThreadCtx* self, bool dormant = false) {
         srv_ = srv; self_ = self;
         aof_manager_ = srv->aof().configured() ? &srv->aof() : nullptr;
         foreign_touch_random_ ^= (static_cast<uint64_t>(self->id()) + 1) * 0x9e3779b97f4a7c15ULL;
-        lb_sample_rate_ = srv->key_lb_signals_enabled() ? srv->lb_sample_rate() : 0;
+        lb_sample_rate_ = srv->lb_machinery_enabled() ? srv->lb_sample_rate() : 0;
         lb_sample_countdown_ = lb_sample_rate_;
-        lb_controller_armed_ = srv->key_lb_signals_enabled();
+        lb_controller_armed_ = srv->lb_machinery_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
         ex_sched_enabled_ = srv->cfg().ex_sched != 0;
         pipeline_batches_ = Fused && srv->cfg().overlap != 0;
-        // Both interwoven schedules use the proven iofused fixed producer lanes.  The legacy
-        // streams implementation remains in this file for branch comparison, but overlap 2 no
-        // longer reaches its reservation-aware task transport.
+        // Both interwoven schedules use the iofused fixed producer lanes.
         iofused_ = Fused && srv->cfg().overlap != 0;
         if constexpr (Fused) {
             if (srv->read_local_enabled()) {
@@ -208,7 +201,6 @@ public:
         }
         if (!ring_.init(1024)) return false;
         fused_handoff_ring_ = &ring_;
-        wb_.bind(&ring_);
         initialized_ = true;
         if (!dormant) activate();
         return true;
@@ -389,7 +381,7 @@ public:
 
     uint32_t fused_baseline_pass() {
         static_assert(Fused);
-        if (read_local_interleave_enabled())
+        if (read_local_enabled())
             return fused_pass_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_pass_impl<kGenthreadExBatchOps, true, false>();
     }
@@ -485,7 +477,7 @@ public:
         if constexpr (InterleaveLocalReads) {
             static_assert(Fused && ConsumeTasks);
             static_assert(BatchOps == kReadLocalOwnerTaskChunkOps);
-            if (!read_local_interleave_enabled()) std::abort();
+            if (!read_local_enabled()) std::abort();
             // Exceptional debt keeps its established total order. The ordinary saturated turn is
             // the only place that caps fresh owner work before WB.
             fairlane_turn = !lb_frozen && !fairlane_owner_debt_pending();
@@ -631,7 +623,7 @@ public:
 
     uint32_t fused_baseline_sweep() {
         static_assert(Fused);
-        if (read_local_interleave_enabled())
+        if (read_local_enabled())
             return fused_sweep_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_sweep_impl<kGenthreadExBatchOps, true, false>();
     }
@@ -664,7 +656,7 @@ public:
         if (lb_rebind_pending_) read_local_rebind_owned_shards_after_lb();
         uint32_t did = 0;
         if constexpr (InterleaveLocalReads) {
-            if (!read_local_interleave_enabled()) std::abort();
+            if (!read_local_enabled()) std::abort();
             if (fairlane_owner_debt_pending()) {
                 did += drain_local_reads() +
                     sweep<BatchOps, ConsumeTasks, IofusedPrivateQueue>();
@@ -832,12 +824,6 @@ private:
 
     bool read_local_enabled() const {
         if constexpr (Fused) return read_local_.impl != nullptr;
-        return false;
-    }
-
-    bool read_local_interleave_enabled() const {
-        if constexpr (Fused)
-            return read_local_.impl != nullptr;
         return false;
     }
 
@@ -1162,135 +1148,6 @@ private:
         Server::debug_stall_us(debug_fanout_defer_us_);
     }
 
-    PreparedLocalRead prepare_local_mget(Op& op) {
-        static constexpr uint32_t kAttempts = 2;
-        const uint32_t key_count = op.argc() - 1;
-        if (!key_count || srv_->nshards() > LocalMgetWindow::kMaxShards) std::abort();
-
-        uint64_t hashes[LocalMgetWindow::kMaxEpochKeys];
-        int32_t shards[LocalMgetWindow::kMaxEpochKeys];
-        const bool cached_routes = key_count <= LocalMgetWindow::kMaxEpochKeys;
-        uint64_t touched[LocalMgetWindow::kMaxShards / 64] = {};
-        for (uint32_t key = 0; key < key_count; key++) {
-            const uint64_t hash = FlatStore::hash_key(op.arg(key + 1));
-            const int32_t shard_id = srv_->router().shard_of(hash);
-            touched[static_cast<uint32_t>(shard_id) >> 6] |=
-                uint64_t{1} << (static_cast<uint32_t>(shard_id) & 63);
-            if (cached_routes) {
-                hashes[key] = hash;
-                shards[key] = shard_id;
-            }
-        }
-        const int64_t command_now_ms = cached_now_ms_;
-        if (__builtin_expect(debug_fanout_defer_us_ != 0, false)) debug_fanout_stall_local();
-
-        ReadLocalFallbackReason transient = ReadLocalFallbackReason::Generation;
-        for (uint32_t attempt = 0; attempt < kAttempts; attempt++) {
-            LocalMgetWindow window;
-            PreparedLocalRead prepared;
-            read_local_clear_reply(op);
-
-            // Capture every participant before touching any value. The close below is after every
-            // copy, giving all stable participant intervals one command-wide intersection.
-            transient = local_mget_window_open(
-                window, touched, hashes, shards, key_count, cached_routes);
-            bool retry = transient != ReadLocalFallbackReason::None;
-            if (!retry) reply_array_header(op.sink(), key_count);
-
-            for (uint32_t key = 0; key < key_count && !retry; key++) {
-                const Slice name = op.arg(key + 1);
-                const uint64_t hash = cached_routes ? hashes[key] : FlatStore::hash_key(name);
-                const int32_t shard_id = cached_routes
-                    ? shards[key] : srv_->router().shard_of(hash);
-                FlatStore& store = srv_->shard(shard_id).store();
-                store.read_local_prefetch(hash);
-                const FlatStore::ReadLocalProbe probe = store.read_local_probe(hash, name);
-                if (probe.result == FlatStore::ReadLocalProbeResult::AtomicPending) {
-                    read_local_clear_reply(op);
-                    return {ReadLocalFallbackReason::AtomicPending};
-                }
-                if (probe.result == FlatStore::ReadLocalProbeResult::Churn) {
-                    transient = ReadLocalFallbackReason::SeqChurn;
-                    retry = true;
-                    break;
-                }
-                if (probe.result == FlatStore::ReadLocalProbeResult::Missing) {
-                    // Parser admission excludes an armed keymiss notification, whose owner lookup
-                    // may emit an event. With that state ruled out, a validated absent slot has no
-                    // lazy-expiry side effect and is an ordinary array nil element.
-                    reply_null(op.sink(), op.resp3());
-                    prepared.keyspace_misses++;
-                    if (!window.use_epochs && !store.read_local_validate(probe.state)) {
-                        transient = ReadLocalFallbackReason::SeqChurn;
-                        retry = true;
-                    }
-                    continue;
-                }
-
-                const KvObj* object = probe.object;
-                if (!object) std::abort();
-                const uint8_t flags = object->read_local_flags();
-                if (static_cast<Type>(object->type) != Type::String) {
-                    read_local_clear_reply(op);
-                    return {ReadLocalFallbackReason::Typed};
-                }
-                if (flags & KvObjFlags::HasTtl) {
-                    const int64_t deadline = object->read_local_expire_at_ms(flags);
-                    if (deadline >= 0 && deadline <= command_now_ms) {
-                        // Unlike a plain stable miss, expiry-due needs the owner to perform lazy
-                        // expiry and its accounting/notifications, so one such key demotes all
-                        // MGET.
-                        read_local_clear_reply(op);
-                        return {ReadLocalFallbackReason::Expired};
-                    }
-                }
-
-                const Enc encoding = object->encoding();
-                if (encoding == Enc::Int) {
-                    char text[24];
-                    const uint32_t length = i64_to_dec(
-                        text, object->read_local_int_value(flags));
-                    reply_bulk(op.sink(), Slice(text, length));
-                } else if (encoding == Enc::Raw || encoding == Enc::Extern) {
-                    if (!read_local_reply_string(op, object, flags)) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                        self_->read_local_stats().settax.object_sequence_retries++;
-#endif
-                        transient = ReadLocalFallbackReason::SeqChurn;
-                        retry = true;
-                        break;
-                    }
-                } else {
-                    read_local_clear_reply(op);
-                    return {ReadLocalFallbackReason::Typed};
-                }
-                prepared.keyspace_hits++;
-                // Account only for a key this pass actually accepted, so a churned read that is
-                // about to be retried or demoted never records an access it did not serve.
-                if (!window.use_epochs && !store.read_local_validate(probe.state)) {
-                    transient = ReadLocalFallbackReason::SeqChurn;
-                    retry = true;
-                } else if (__builtin_expect(maxmemory_enabled_, false)) {
-                    note_local_read_access(op, object, flags);
-                }
-            }
-
-            // The complete reply is still private. Accept only if every participant is unchanged
-            // under its own rule since before the first value load.
-            if (!retry) {
-                transient = local_mget_window_close(
-                    window, touched, hashes, shards, key_count);
-                retry = transient != ReadLocalFallbackReason::None;
-            }
-            if (!retry) return prepared;
-            read_local_clear_reply(op);
-            if (attempt + 1 < kAttempts)
-                self_->read_local_stats().mget_generation_retries++;
-        }
-        return {local_mget_final_reason(
-            op, hashes, shards, key_count, cached_routes, transient)};
-    }
-
     PreparedLocalRead prepare_captured_local_mget(Op& op) {
         static constexpr uint32_t kAttempts = 2;
         const uint32_t key_count = op.argc() - 1;
@@ -1330,7 +1187,7 @@ private:
                     key_count - first, kReadLocalPrefetchKeys);
                 uint64_t hashes[kReadLocalPrefetchKeys];
                 int32_t shards[kReadLocalPrefetchKeys];
-                ReadLocalCaptureBuffer<true, kReadLocalPrefetchKeys> captures;
+                ReadLocalCaptureBuffer<kReadLocalPrefetchKeys> captures;
 
                 // I0 warms every home word in this bounded window. C0 then performs the complete
                 // key-verified walk and prefetches the exact object's value before E0 copies it.
@@ -1409,7 +1266,7 @@ private:
                         return {ReadLocalFallbackReason::Typed};
                     }
                     prepared.keyspace_hits++;
-                    // See prepare_local_mget: accept first, then account.
+                    // Account only for a key this pass accepted, before any retry or demotion.
                     if (!window.use_epochs && !store.read_local_validate(capture.state)) {
                         transient = ReadLocalFallbackReason::SeqChurn;
                         retry = true;
@@ -1441,45 +1298,28 @@ private:
     // keeps an overlapping younger read behind any operation that needs the owner path.
     // `op`, `store` and `mget` were resolved once by the chunk gather; a point read passes its
     // home store, an MGET passes null and takes its own multi-store path.
-    template <bool CapturePrefetch>
     PreparedLocalRead prepare_local_read(
             Op& op, FlatStore* home, bool mget,
             const FlatStore::ReadLocalPrefetchCapture* captured = nullptr) {
         if (mget) {
             if (captured) std::abort();
-            if constexpr (CapturePrefetch) return prepare_captured_local_mget(op);
-            else return prepare_local_mget(op);
+            return prepare_captured_local_mget(op);
         }
         FlatStore& store = *home;
         static constexpr uint32_t kRetries = 3;
-        [[maybe_unused]] ReadLocalCaptureBuffer<CapturePrefetch, 1> local_capture;
-        if constexpr (CapturePrefetch) {
-            // A mixed GET/MGET chunk executes in program order. Its point reads capture here so a
-            // later GET can never retain a version older than the preceding MGET returned.
-            if (!captured) {
-                store.read_local_prefetch(op.hash);
-                local_capture.entries[0] =
-                    store.read_local_prefetch_capture(op.hash, op.key());
-                captured = &local_capture.entries[0];
-            }
-        } else {
-            if (captured) std::abort();
+        ReadLocalCaptureBuffer<1> local_capture;
+        // A mixed GET/MGET chunk executes in program order. Its point reads capture here so a
+        // later GET can never retain a version older than the preceding MGET returned.
+        if (!captured) {
+            store.read_local_prefetch(op.hash);
+            local_capture.entries[0] = store.read_local_prefetch_capture(op.hash, op.key());
+            captured = &local_capture.entries[0];
         }
 
         for (uint32_t attempt = 0; attempt < kRetries; attempt++) {
-            FlatStore::ReadLocalProbeResult result;
-            const KvObj* object = nullptr;
-            uint64_t probe_state = 0;
-            if constexpr (CapturePrefetch) {
-                result = captured->result;
-                object = captured->object;
-                probe_state = captured->state;
-            } else {
-                const FlatStore::ReadLocalProbe probe = store.read_local_probe(op.hash, op.key());
-                result = probe.result;
-                object = probe.object;
-                probe_state = probe.state;
-            }
+            const FlatStore::ReadLocalProbeResult result = captured->result;
+            const KvObj* object = captured->object;
+            const uint64_t probe_state = captured->state;
             if (result == FlatStore::ReadLocalProbeResult::AtomicPending) {
                 read_local_clear_reply(op);
                 return {ReadLocalFallbackReason::AtomicPending};
@@ -1488,17 +1328,12 @@ private:
                 read_local_clear_reply(op);
                 return {ReadLocalFallbackReason::Missing};
             }
-            if (result == FlatStore::ReadLocalProbeResult::Churn) {
-                if constexpr (CapturePrefetch) break;
-                else continue;
-            }
+            if (result == FlatStore::ReadLocalProbeResult::Churn) break;
 
             if (!object) std::abort();
-            if constexpr (CapturePrefetch) {
-                // Keep the observed word's address as part of the snapshot, but consume only the
-                // decoded immutable object. Loading through slot here would chase a newer version.
-                if (!captured->slot) std::abort();
-            }
+            // Keep the observed word's address as part of the snapshot, but consume only the
+            // decoded immutable object. Loading through slot here would chase a newer version.
+            if (!captured->slot) std::abort();
             const uint8_t flags = object->read_local_flags();
             if (static_cast<Type>(object->type) != Type::String) {
                 read_local_clear_reply(op);
@@ -1534,8 +1369,7 @@ private:
 
             if (!store.read_local_validate(probe_state)) {
                 read_local_clear_reply(op);
-                if constexpr (CapturePrefetch) break;
-                else continue;
+                break;
             }
             // One predicted-not-taken test on the same per-pass byte the owner path tests, after
             // the validate that makes this read final. See note_local_read_access().
@@ -1560,11 +1394,11 @@ private:
             return 0;
         } else {
             if (!read_local_enabled() || !op_budget) return 0;
-            return drain_local_reads_bounded_impl<true, YieldToOwner>(op_budget);
+            return drain_local_reads_bounded_impl<YieldToOwner>(op_budget);
         }
     }
 
-    template <bool CapturePrefetch, bool YieldToOwner>
+    template <bool YieldToOwner>
     uint32_t drain_local_reads_bounded_impl(uint32_t op_budget) {
         static_assert(Fused);
         auto& lane = read_local_impl();
@@ -1579,8 +1413,7 @@ private:
             ReadLocalFallbackReason fallbacks[kReadLocalDrainChunkOps];
         } chunk;
         static_assert(kReadLocalDrainChunkOps <= 32, "mget_mask is one 32-bit word");
-        [[maybe_unused]] ReadLocalCaptureBuffer<
-            CapturePrefetch, kReadLocalDrainChunkOps> captures;
+        ReadLocalCaptureBuffer<kReadLocalDrainChunkOps> captures;
         const uint32_t nshards = srv_->nshards();
         ReadLocalStats& stats = self_->read_local_stats();
         uint32_t work = 0;
@@ -1645,26 +1478,17 @@ private:
             // Pure point chunks retain the widest I0/C0/E0 overlap. A mixed chunk captures and
             // consumes each command in program order below: MGET may retry and recapture, so
             // pre-capturing a following GET could otherwise let that later command regress.
-            [[maybe_unused]] const bool point_capture_batch = CapturePrefetch && mget_mask == 0;
-
-            if constexpr (CapturePrefetch) {
-                if (point_capture_batch) {
-                    // I0 retains the old whole-batch home-slot overlap. C0 consumes those warm
-                    // words, records their decoded objects, and hints object/value bytes for E0.
-                    for (uint32_t i = 0; i < count; i++)
-                        chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
-                    for (uint32_t i = 0; i < count; i++) {
-                        const Op& op = *chunk.ops[i];
-                        captures.entries[i] =
-                            chunk.stores[i]->read_local_prefetch_capture(op.hash, op.key());
-                    }
-                }
-            } else {
-                // Selector 0 is the original hint-only path, including MGET's established bounded
-                // prefetch inside prepare_local_mget().
+            const bool point_capture_batch = mget_mask == 0;
+            if (point_capture_batch) {
+                // I0 retains the old whole-batch home-slot overlap. C0 consumes those warm
+                // words, records their decoded objects, and hints object/value bytes for E0.
                 for (uint32_t i = 0; i < count; i++)
-                    if (!((mget_mask >> i) & 1u))
-                        chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
+                    chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
+                for (uint32_t i = 0; i < count; i++) {
+                    const Op& op = *chunk.ops[i];
+                    captures.entries[i] =
+                        chunk.stores[i]->read_local_prefetch_capture(op.hash, op.key());
+                }
             }
 
             // E0. The owner-map recheck is decided once per chunk: only this thread's parser and
@@ -1698,15 +1522,11 @@ private:
                 }
                 if (chunk.fallbacks[i] == ReadLocalFallbackReason::None) {
                     PreparedLocalRead prepared;
-                    if constexpr (CapturePrefetch) {
-                        if (point_capture_batch) {
-                            prepared = prepare_local_read<true>(
-                                op, chunk.stores[i], false, &captures.entries[i]);
-                        } else {
-                            prepared = prepare_local_read<true>(op, chunk.stores[i], mget);
-                        }
+                    if (point_capture_batch) {
+                        prepared = prepare_local_read(
+                            op, chunk.stores[i], false, &captures.entries[i]);
                     } else {
-                        prepared = prepare_local_read<false>(op, chunk.stores[i], mget);
+                        prepared = prepare_local_read(op, chunk.stores[i], mget);
                     }
                     chunk.fallbacks[i] = prepared.fallback;
                     if (first_fallback == count &&
@@ -3243,8 +3063,8 @@ private:
                 snd.wake_if_parked(handoff_ring(), self_->sig());
             return;
         }
-        // No slot yet: first contact. The claimed post carries the pointer to the sender, which
-        // adopts on receipt. Runs once per connection. (An executor is never its own sender.)
+        // No ready slot: use the claimed channel post. This remains the completion route
+        // for a connection while the sender's ready-slot table is full.
         notify_sender_to(c, target);
     }
 
@@ -3325,7 +3145,6 @@ private:
     Server*    srv_  = nullptr;
     ThreadCtx* self_ = nullptr;
     Ring       ring_;
-    WbEngine   wb_;    // never serves here; kept so the stats plumbing stays uniform across loops
     int64_t    cached_now_ms_ = 0;
     int64_t    blocking_beat_ms_ = 0;
     size_t     expire_shard_cursor_ = 0;
@@ -3419,6 +3238,7 @@ using FusedExLoop = ExLoopT<true>;
 // hook -- went into padding the lb bool run already carried and cost nothing. This is a per-
 // EXECUTOR object, one per thread, not a per-op or per-connection footprint: Op, Client,
 // ThreadCtx, Shard and Config are the locks that may not move, and none of them did.
-static_assert(sizeof(ExLoop) == 6112);
+// VESTCUT: removing the never-serving 256-byte WbEngine reduces 6112 to 5856 bytes.
+static_assert(sizeof(ExLoop) == 5856);
 
 }  // namespace tomo

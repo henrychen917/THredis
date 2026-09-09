@@ -247,9 +247,8 @@ public:
         atomic_activity_.store(cfg.atomic ? kAtomicEnabledBit : 0,
                                std::memory_order_relaxed);
         // Measured in-flight credit optimum, always derived from the resolved geometry.
-        const uint32_t resolved_window = std::min<uint32_t>(16u * cfg.shards, 1024u);
-        live_atomic_window_.store(resolved_window, std::memory_order_relaxed);
-        atomic_credit_pool_.store(resolved_window, std::memory_order_relaxed);
+        atomic_window_ = std::min<uint32_t>(16u * cfg.shards, 1024u);
+        atomic_credit_pool_.store(atomic_window_, std::memory_order_relaxed);
         script_stage_bytes_ = cfg.maxmemory
             ? std::max<uint64_t>(4ull * 1024 * 1024,
                   std::min<uint64_t>(cfg.maxmemory / cfg.shards / 16, 64ull * 1024 * 1024))
@@ -271,7 +270,7 @@ public:
             shards_[i] = std::make_unique<Shard>();
             shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.type_limits,
                              cfg.stream_limits);
-            if (key_lb_signals_enabled() && !shards_[i]->enable_lb_signals()) {
+            if (lb_machinery_enabled() && !shards_[i]->enable_lb_signals()) {
                 std::fprintf(stderr, "fatal: could not allocate weighted-placement signals\n");
                 return false;
             }
@@ -289,15 +288,10 @@ public:
         // and transfer channels stay uniform per-thread arrays.
         const uint32_t nthreads = placement_.total_threads();
         if (!flipctl_.init(cfg.thread_mode == ThreadMode::Split && cfg.flip_auto != 0,
-                           -1, nthreads)) {
+                           nthreads)) {
             std::fprintf(stderr, "fatal: could not allocate flip controller state\n");
             return false;
         }
-        for (uint32_t i = 0; i < kMaxThreads; i++) executor_slots_[i] = UINT8_MAX;
-        // Role changes may make any physical thread an executor. Stable tid-indexed slots avoid
-        // renumbering live atomic-group arrays at each flip.
-        for (uint32_t tid = 0; tid < nthreads; tid++)
-            executor_slots_[tid] = static_cast<uint8_t>(tid);
         threads_.resize(nthreads);
         for (uint32_t i = 0; i < nthreads; i++) {
             threads_[i] = std::make_unique<ThreadCtx>();
@@ -328,11 +322,11 @@ public:
                 }
             }
         }
-        if (lb_controller_enabled()) {
+        if (lb_machinery_enabled()) {
             lb_policy_ = std::make_unique<LbAutotune>();
             lb_policy_->last_fold_ns = now_ns();
         }
-        if (key_lb_signals_enabled()) {
+        if (lb_machinery_enabled()) {
             try {
                 lb_bucket_last_samples_.assign(kNumBuckets, 0);
                 lb_bucket_weight_.assign(kNumBuckets, 0.0);
@@ -342,7 +336,7 @@ public:
                 return false;
             }
         }
-        if (lb_controller_enabled()) {
+        if (lb_machinery_enabled()) {
             try {
                 lb_thread_last_busy_.assign(nthreads, 0);
                 lb_thread_last_idle_.assign(nthreads, 0);
@@ -396,16 +390,6 @@ public:
     bool lb_machinery_enabled() const {
         return cfg_.lb != 0;
     }
-    bool key_lb_signals_enabled() const {
-        return lb_machinery_enabled();
-    }
-    bool client_lb_signals_enabled() const {
-        return lb_machinery_enabled();
-    }
-    bool lb_controller_enabled() const {
-        return key_lb_signals_enabled() || client_lb_signals_enabled();
-    }
-
     uint32_t lb_sample_rate() const {
         return lb_policy_ ? lb_policy_->sample_rate.load(std::memory_order_relaxed) : 0;
     }
@@ -447,7 +431,7 @@ public:
     // hence survives an IO ownership move without turning that move into a signal discontinuity.
     void lb_publish_client_observations(uint32_t owner,
                                         const std::vector<LbClientObservation>& observations) {
-        if (!client_lb_signals_enabled() || owner >= nthreads()) return;
+        if (!lb_machinery_enabled() || owner >= nthreads()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         double total = 0;
         for (const LbClientObservation& observation : observations) {
@@ -464,12 +448,12 @@ public:
             static_cast<uint64_t>(total * 1024.0 + 0.5), std::memory_order_release);
     }
     void lb_forget_client(uint64_t id) {
-        if (!client_lb_signals_enabled()) return;
+        if (!lb_machinery_enabled()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         lb_clients_.erase(id);
     }
     double lb_client_weight(uint64_t id) const {
-        if (!client_lb_signals_enabled()) return 0.0;
+        if (!lb_machinery_enabled()) return 0.0;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         const auto found = lb_clients_.find(id);
         return found == lb_clients_.end() ? 0.0 : found->second.weight;
@@ -478,26 +462,24 @@ public:
     // The controller owns this fold. Every bucket keeps a monotonic sampled counter on its
     // physical shard; EWMA history is indexed by immutable bucket id, never by executor owner.
     void lb_fold_signals() {
-        if (!lb_controller_enabled()) return;
+        if (!lb_machinery_enabled()) return;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        if (key_lb_signals_enabled()) {
-            uint64_t visits = 0;
-            for (uint32_t sid = 0; sid < nshards(); sid++) {
-                Shard& physical = shard(static_cast<int32_t>(sid));
-                for (uint32_t bucket = physical.bucket_begin();
-                     bucket < physical.bucket_end(); bucket++) {
-                    const uint32_t current = physical.lb_bucket_samples(bucket);
-                    const uint32_t delta = current - lb_bucket_last_samples_[bucket];
-                    lb_bucket_last_samples_[bucket] = current;
-                    visits += delta;
-                    const double sample = static_cast<double>(delta);
-                    lb_bucket_weight_[bucket] = lb_bucket_primed_
-                        ? 0.25 * sample + 0.75 * lb_bucket_weight_[bucket] : sample;
-                }
+        uint64_t visits = 0;
+        for (uint32_t sid = 0; sid < nshards(); sid++) {
+            Shard& physical = shard(static_cast<int32_t>(sid));
+            for (uint32_t bucket = physical.bucket_begin();
+                 bucket < physical.bucket_end(); bucket++) {
+                const uint32_t current = physical.lb_bucket_samples(bucket);
+                const uint32_t delta = current - lb_bucket_last_samples_[bucket];
+                lb_bucket_last_samples_[bucket] = current;
+                visits += delta;
+                const double sample = static_cast<double>(delta);
+                lb_bucket_weight_[bucket] = lb_bucket_primed_
+                    ? 0.25 * sample + 0.75 * lb_bucket_weight_[bucket] : sample;
             }
-            lb_bucket_primed_ = true;
-            lb_policy_->observe_visits(visits, now_ns());
         }
+        lb_bucket_primed_ = true;
+        lb_policy_->observe_visits(visits, now_ns());
         // Occupancy is 1 - measured idle over the same window. cpu_ns deliberately does not enter:
         // polling/spinning is scheduled CPU but does not mean the role has useful work available.
         for (uint32_t tid = 0; tid < nthreads(); tid++) {
@@ -516,7 +498,7 @@ public:
         lb_occupancy_primed_ = true;
     }
     double lb_shard_weight(uint32_t sid) const {
-        if (sid >= nshards() || !key_lb_signals_enabled()) return 0.0;
+        if (sid >= nshards() || !lb_machinery_enabled()) return 0.0;
         std::lock_guard<std::mutex> lock(lb_signal_mu_);
         const Shard& physical = shard(static_cast<int32_t>(sid));
         double weight = 0;
@@ -525,7 +507,7 @@ public:
         return weight;
     }
     uint64_t lb_shard_bytes(uint32_t sid) const {
-        if (sid >= nshards() || !key_lb_signals_enabled()) return 0;
+        if (sid >= nshards() || !lb_machinery_enabled()) return 0;
         const Shard& physical = shard(static_cast<int32_t>(sid));
         uint64_t bytes = 0;
         for (uint32_t bucket = physical.bucket_begin(); bucket < physical.bucket_end(); bucket++)
@@ -685,7 +667,7 @@ public:
         return flip_dispatch_paused() || lb_stage() != LbStage::Idle;
     }
     bool lb_cron_writer(uint32_t tid) const {
-        if (!lb_controller_enabled() || flip_dispatch_paused()) return false;
+        if (!lb_machinery_enabled() || flip_dispatch_paused()) return false;
         for (uint32_t candidate = 0; candidate < nthreads(); candidate++)
             if (thread(candidate).role() == Role::Ifid) return candidate == tid;
         return false;
@@ -813,7 +795,7 @@ public:
         flip_clients_transferred_.fetch_add(1, std::memory_order_relaxed);
         if (flip_stage() != FlipStage::Idle)
             flip_active_transfers_.fetch_add(1, std::memory_order_relaxed);
-        if (client_lb_signals_enabled()) {
+        if (lb_machinery_enabled()) {
             std::lock_guard<std::mutex> lock(lb_signal_mu_);
             const auto found = lb_clients_.find(id);
             if (found != lb_clients_.end()) found->second.owner = destination;
@@ -904,7 +886,7 @@ public:
             std::vector<Client*> clients;
             items.reserve(total);
             clients.reserve(total);
-            const bool weighted_client = client_lb_signals_enabled();
+            const bool weighted_client = lb_machinery_enabled();
             bool coordinator_seen = coordinator_client == nullptr;
             for (uint32_t owner = 0; owner < nthreads(); owner++) {
                 if (thread(owner).role() != Role::Ifid) continue;
@@ -1016,7 +998,7 @@ public:
             }
             std::vector<WeightedLbItem> items;
             items.reserve(nshards());
-            const bool weighted_key = key_lb_signals_enabled();
+            const bool weighted_key = lb_machinery_enabled();
             for (uint32_t sid = 0; sid < nshards(); sid++) {
                 const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
                 if (owner >= nthreads()) {
@@ -1118,9 +1100,7 @@ public:
     // windows consumed by FLIP, then publishes either a short EX quiescence transaction or one
     // connection drain request. Nothing here runs on an operation path.
     bool lb_controller_tick(uint32_t coordinator, uint64_t now_ms) {
-        if (!lb_controller_enabled() || coordinator >= nthreads()) return false;
-        const bool key_enabled = key_lb_signals_enabled();
-        const bool client_enabled = client_lb_signals_enabled();
+        if (!lb_machinery_enabled() || coordinator >= nthreads()) return false;
         lb_ticks_.fetch_add(1, std::memory_order_relaxed);
         try {
             {
@@ -1137,13 +1117,13 @@ public:
             std::vector<uint32_t> executors;
             std::vector<uint32_t> ios;
             if (cfg_.thread_mode == ThreadMode::Fused) {
-                if (key_enabled) executors = placement_.ex_threads();
-                if (client_enabled) ios = placement_.ifid_threads();
+                executors = placement_.ex_threads();
+                ios = placement_.ifid_threads();
             } else {
                 for (uint32_t tid = 0; tid < nthreads(); tid++) {
                     const Role role = thread(tid).role();
-                    if (key_enabled && role == Role::Ex) executors.push_back(tid);
-                    else if (client_enabled && role == Role::Ifid) ios.push_back(tid);
+                    if (role == Role::Ex) executors.push_back(tid);
+                    else if (role == Role::Ifid) ios.push_back(tid);
                 }
             }
 
@@ -1184,7 +1164,7 @@ public:
             std::vector<LbShardMove> shard_plan;
             double shard_before = 0, shard_after = 0;
             double bytes_before = 0, bytes_after = 0;
-            if (key_enabled && executors.size() >= 2) {
+            if (executors.size() >= 2) {
                 double loads[kMaxThreads] = {};
                 double byte_loads[kMaxThreads] = {};
                 std::vector<WeightedLbItem> shard_items;
@@ -1272,14 +1252,14 @@ public:
                     shard_after = spread(loads, executors);
                     bytes_after = spread(byte_loads, executors);
                 }
-            } else if (key_enabled) {
+            } else {
                 lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
                 lb_bucket_hot_streak_ = 0;
             }
 
             LbClientMove client_plan;
             double client_before = 0, client_after = 0;
-            if (client_enabled && ios.size() >= 2) {
+            if (ios.size() >= 2) {
                 double loads[kMaxThreads] = {};
                 std::vector<WeightedLbItem> clients;
                 uint32_t cooldown_seen = 0;
@@ -1317,7 +1297,7 @@ public:
                         client_after = choice.after_weight_spread;
                     }
                 }
-            } else if (client_enabled) {
+            } else {
                 lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
                 lb_client_hot_streak_ = 0;
             }
@@ -1533,7 +1513,7 @@ public:
         if (role_count(Role::Ifid) + role_count(Role::Ex) != nthreads())
             return refuse("ERR FLIP thread conservation is already violated");
         flip_conservation_check();
-        if (lb_controller_enabled()) lb_fold_signals();
+        if (lb_machinery_enabled()) lb_fold_signals();
 
         const uint32_t live_io = role_count(Role::Ifid);
         for (uint32_t tid = 0; tid < kMaxThreads; tid++) {
@@ -2119,7 +2099,8 @@ public:
             ? placement_.is_executor(tid) : thread(tid).role() == Role::Ex;
     }
     uint32_t executor_slot(uint32_t thread_id) const {
-        return thread_id < kMaxThreads ? executor_slots_[thread_id] : UINT8_MAX;
+        // Atomic-group arrays use stable physical thread IDs, including across role changes.
+        return thread_id < nthreads() ? thread_id : UINT8_MAX;
     }
 
     std::atomic<uint64_t>& next_client_id() { return next_client_id_; }
@@ -2454,16 +2435,13 @@ public:
     }
     bool atomic_enabled() const { return atomic_mode_state() & kAtomicEnabledBit; }
     bool atomic_work_active() const { return (atomic_mode_state() & ~kAtomicEnabledBit) != 0; }
-    uint32_t atomic_window() const {
-        return live_atomic_window_.load(std::memory_order_acquire);
-    }
     void set_atomic_enabled(bool enabled) {
         if (enabled) {
-            atomic_reconfigure_credits(atomic_window());
+            atomic_reconfigure_credits();
             atomic_activity_.fetch_or(kAtomicEnabledBit, std::memory_order_release);
         } else {
             atomic_activity_.fetch_and(~kAtomicEnabledBit, std::memory_order_release);
-            atomic_reconfigure_credits(atomic_window());
+            atomic_reconfigure_credits();
         }
     }
 
@@ -2475,8 +2453,6 @@ public:
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return true;
         const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
         if (generation & 1) return false;
-        const uint32_t window = atomic_window();
-        if (!window) return true;
         const AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
         return (lease.generation == generation && lease.available != 0) ||
                atomic_credit_pool_.load(std::memory_order_acquire) != 0;
@@ -2489,12 +2465,11 @@ public:
         AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
         const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
         if (generation & 1) return false;
-        const uint32_t window = atomic_window();
         if (lease.generation != generation) {
             lease.generation = generation;
             lease.available = 0; // the reconfiguration reset the global pool without old leases
         }
-        if (window && lease.available == 0) {
+        if (lease.available == 0) {
             atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
             if (atomic_credit_generation_.load(std::memory_order_acquire) != generation) {
                 atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
@@ -2518,7 +2493,7 @@ public:
                 return false;
             }
         }
-        if (window) lease.available--;
+        lease.available--;
         const bool first = lease.active++ == 0;
         lease.published_active.store(lease.active, std::memory_order_release);
         if (first) atomic_activity_.fetch_add(1, std::memory_order_release);
@@ -2551,7 +2526,7 @@ public:
             // An idle IO must not strand its lease while a hot peer is window-stalled. The config
             // generation plus credit_ops handshake makes returning this batch race-free.
             const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-            if (atomic_window() && !(generation & 1) && lease.generation == generation &&
+            if (!(generation & 1) && lease.generation == generation &&
                 lease.available) {
                 const uint32_t returned = lease.available;
                 atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
@@ -3315,7 +3290,6 @@ private:
             __builtin_ia32_pause();
             generation = atomic_credit_generation_.load(std::memory_order_acquire);
         }
-        if (!atomic_window()) return;
         if (admitted_generation == generation && lease.generation == generation) {
             lease.available++;
             return;
@@ -3340,7 +3314,7 @@ private:
         atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
     }
 
-    void atomic_reconfigure_credits(uint32_t window) {
+    void atomic_reconfigure_credits() {
         // Odd generations close admission while CONFIG takes an exact active-group snapshot.
         // Borrow/return operations announce themselves so the rebuilt pool cannot race a credit
         // mutation. IO-local available batches are intentionally discarded by the generation
@@ -3366,13 +3340,13 @@ private:
             lease.reconfig_carry.store(live, std::memory_order_release);
             active += live;
         }
-        live_atomic_window_.store(window, std::memory_order_release);
+        const uint32_t window = atomic_window_;
         const uint64_t bounded = std::min<uint64_t>(active, UINT32_MAX);
         atomic_credit_pool_.store(
-            window && bounded < window ? window - static_cast<uint32_t>(bounded) : 0,
+            bounded < window ? window - static_cast<uint32_t>(bounded) : 0,
             std::memory_order_release);
         atomic_credit_debt_.store(
-            window && bounded > window ? static_cast<uint32_t>(bounded - window) : 0,
+            bounded > window ? static_cast<uint32_t>(bounded - window) : 0,
             std::memory_order_release);
         atomic_credit_generation_.store(generation + 2, std::memory_order_release);
     }
@@ -3505,7 +3479,6 @@ private:
     uint64_t script_stage_bytes_ = 4ull * 1024 * 1024;
     std::atomic<uint32_t> loading_{0};
 
-    uint8_t executor_slots_[kMaxThreads] = {};
     std::atomic<uint64_t> next_client_id_{1};
     std::atomic<bool>     shutting_down_{false};
     std::atomic<uint64_t> live_clients_{0};
@@ -3551,7 +3524,7 @@ private:
     std::atomic<uint64_t> climon_tracking_keys_{0};
     std::atomic<uint64_t> climon_tracking_items_{0};
     std::atomic<uint64_t> climon_tracking_prefixes_{0};
-    std::atomic<uint32_t> live_atomic_window_{256};
+    uint32_t atomic_window_ = 256; // positive, boot-derived; CONFIG only rebuilds credit leases
     // The drawn sequence and the visible read watermark share a line on purpose: readers used to
     // load commit_seq_ itself, so keeping the watermark beside it leaves reader traffic exactly
     // where it was, and a committer touches all three in one go.

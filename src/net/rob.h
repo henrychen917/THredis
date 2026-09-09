@@ -72,8 +72,8 @@ struct ReadLocalArmStats {
 struct alignas(64) ReadLocalRobState {
     // SIZED TO THE ROB WINDOW, WHICH MAKES CAPACITY OVERFLOW UNREACHABLE. A ring entry is removed
     // by retirement, so every live entry names an op in [flush_id, dispatch_id) -- distinct ids in
-    // a window that is at most kRobWindow wide. Both insert sites prune immediately before testing
-    // capacity, and the write being inserted holds one of those ids itself, so after the prune
+    // a window that is at most kRobWindow wide. Insertion prunes first, and the write being
+    // inserted holds one of those ids itself, so after the prune
     // write_count <= in_flight - 1 <= kRobWindow - 1. Rob asserts kWriteRingCapacity >= Capacity,
     // which is the whole argument. Measured against the instrument that does not depend on it
     // (scratchpad/ringsize): a client pipelining 64 deep at 100% writes tops out at exactly 63
@@ -514,19 +514,7 @@ public:
             std::abort();
         // Once overflowed, every subsequently published write extends the conservative generation
         // until that whole run drains. Do not start tracking precise hashes again in its middle.
-        //
-        // THE SECOND TEST IS A KEPT FALLBACK, NOT A LIVE PATH. mark_current_write() pruned the ring
-        // to the ops still in flight one statement ago, and this frame holds a window position of
-        // its own, so write_count is at most Capacity-1 against a ring of Capacity slots (the
-        // static_assert in Rob). It is kept because "conservative" is the only safe answer if that
-        // reasoning is ever wrong, and deleting a correct fallback to celebrate a proof is how a
-        // proof gets to be wrong in silence. Conservative generations remain ordinary traffic by
-        // the OTHER door: any write that never refines -- a wide multi-key write, or a point write
-        // under an evicting maxmemory policy -- is one, and the ring's overflow machinery below
-        // serves them exactly as before.
-        if (state.overflow ||
-            state.write_count == ReadLocalRobState::kWriteRingCapacity)
-            return false;
+        if (state.overflow) return false;
         state.pending_hash = hash;
         state.pending_write = ReadLocalRobState::PendingWrite::Hash;
         return true;
@@ -547,11 +535,7 @@ public:
         if (state.pending_write != ReadLocalRobState::PendingWrite::Overflow ||
             state.pending_op_id != dispatch_id())
             std::abort();
-        // Same kept fallback as refine_current_write_hash: unreachable by the window argument,
-        // retained because conservative is the safe answer if the argument is ever wrong.
-        if (state.overflow ||
-            state.write_count == ReadLocalRobState::kWriteRingCapacity)
-            return false;
+        if (state.overflow) return false;
         state.pending_hash = filter;
         state.pending_write = ReadLocalRobState::PendingWrite::Keyset;
         return true;
@@ -797,9 +781,8 @@ private:
 
     // THE STRUCTURAL BOUND THE RING IS SIZED BY. A ring entry lives exactly while its op is in
     // flight, so the live entries name distinct ids inside a window at most Capacity wide, and both
-    // insert sites prune to that set immediately before testing capacity. With a slot per window
-    // position the capacity test can therefore never fire -- see refine_current_write_hash and
-    // read_local_resolve_pending_body, where the conservative fallback is kept anyway.
+    // insertion prunes to that set first. The incoming op occupies its own window position,
+    // so there is always a free ring slot. Wide writes still start conservative generations.
     static_assert(ReadLocalRobState::kWriteRingCapacity >= Capacity,
                   "the RYOW write ring must cover the whole ROB window");
     static_assert(ReadLocalRobState::kWriteRingCapacity <= 64,
@@ -1009,19 +992,6 @@ private:
             return;
         }
 
-        // The commit-side half of the same kept fallback. read_local_prune ran one statement ago
-        // and the op being committed holds a window position that no ring entry can, so a full ring
-        // is unreachable; a connection that somehow reached it still becomes a conservative
-        // generation here and still fences every later read until that generation drains.
-        if (state.write_count == ReadLocalRobState::kWriteRingCapacity) {
-            state.overflow = true;
-            state.overflow_through = op_id;
-            state.write_head = 0;
-            state.write_count = 0;
-            state.write_keyset_slots = 0;
-            read_local_write_enter_overflow();
-            return;
-        }
         const uint32_t tail =
             (static_cast<uint32_t>(state.write_head) + state.write_count) &
             (ReadLocalRobState::kWriteRingCapacity - 1);

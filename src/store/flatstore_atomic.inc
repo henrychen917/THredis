@@ -1429,7 +1429,6 @@ private:
     // was requested at. Returns false when the block was not cached and the caller must free it.
     bool read_local_cache_put(KvObj* object, size_t capacity) {
         KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache;
-        if (!cache) return false;
         // Only inline String blocks take part. An Extern object owns a second allocation whose
         // class is independent of this one, and a collection's block is not what a SET builds.
         if (static_cast<Type>(object->type) != Type::String) return false;
@@ -1450,7 +1449,7 @@ private:
     // Armed write path. `allocation` is already good_size()-rounded.
     void* read_local_cache_take(size_t allocation) {
         KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache;
-        return cache ? cache->take(allocation) : nullptr;
+        return cache->take(allocation);
     }
 
     // Hand every cached block back to the allocator: maxmemory pressure (return cached memory
@@ -1459,8 +1458,7 @@ private:
     // contributed; that is correct for both callers, which are whole-server events.
     void read_local_cache_release_all() {
         if (!read_local_enabled_) return;
-        if (KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache)
-            cache->release_all();
+        read_local_store_state_armed().retire_sink.block_cache->release_all();
     }
 
     void read_local_cache_trim_on_pressure() { read_local_cache_release_all(); }

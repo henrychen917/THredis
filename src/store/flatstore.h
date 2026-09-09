@@ -739,7 +739,7 @@ public:
     // Enabled is boot-latched. The sink may be rebound only at a quiesced fused ownership handoff;
     // false keeps the old store path and every installed writer hook predicted cold.
     void configure_read_local(bool enabled, ReadLocalRetireSink sink) {
-        if (enabled && !sink.defer) std::abort();
+        if (enabled && (!sink.defer || !sink.block_cache)) std::abort();
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         if (enabled && !sink.diagnostics()) std::abort();
 #endif
@@ -764,7 +764,7 @@ public:
         read_local_enabled_ = enabled;
     }
     void rebind_read_local_retire_sink(ReadLocalRetireSink sink) {
-        if (!read_local_enabled_ || !sink.defer) std::abort();
+        if (!read_local_enabled_ || !sink.defer || !sink.block_cache) std::abort();
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         if (!sink.diagnostics()) std::abort();
 #endif
@@ -3438,8 +3438,7 @@ private:
     }
 #endif
 
-    static void read_local_reclaim_table(const ReadLocalRetireSink&, void*, void* payload,
-                                         size_t) {
+    static void read_local_reclaim_table(void*, void* payload, size_t) {
         std::free(payload);
     }
 
@@ -3448,16 +3447,14 @@ private:
     // owner may touch the block, which is exactly the licence the old code used to call free() on
     // it. Offer it to the shard's block cache first; anything the cache refuses is destroyed on the
     // unchanged path (including the borrowed-value retention destroy_retired_obj owns).
-    static void read_local_reclaim_object(const ReadLocalRetireSink&, void* owner,
-                                          void* payload, size_t capacity) {
+    static void read_local_reclaim_object(void* owner, void* payload, size_t capacity) {
         FlatStore* store = static_cast<FlatStore*>(owner);
         KvObj* object = static_cast<KvObj*>(payload);
         if (!store->read_local_cache_put(object, capacity))
             store->destroy_retired_obj(object, capacity);
     }
 
-    static void read_local_reclaim_atomic_object(const ReadLocalRetireSink&, void* owner,
-                                                 void* payload, size_t capacity) {
+    static void read_local_reclaim_atomic_object(void* owner, void* payload, size_t capacity) {
         FlatStore* store = static_cast<FlatStore*>(owner);
         KvObj* object = static_cast<KvObj*>(payload);
         if (store->atomic_recycle_value(object)) {

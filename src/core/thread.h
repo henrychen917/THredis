@@ -840,7 +840,7 @@ public:
 
     // IO-only INFO surface. Published for each IO tenure when IoLoop binds its send engine; INFO then
     // sums the engine's single-writer counters with the same exceptional cross-thread read shape
-    // used for sig(). Executor threads leave this null because their WbEngine never sends.
+    // used for sig(). Executor threads leave this null because they do not send.
     void set_wb_engine(WbEngine* engine) {
         wb_engine_.store(engine, std::memory_order_release);
     }
