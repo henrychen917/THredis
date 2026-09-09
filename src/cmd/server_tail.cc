@@ -691,8 +691,13 @@ bool config_rewrite(std::string& error) {
             error = "invalid original config line"; return false;
         }
         if (words.empty()) continue;
+        // Encoding aliases belong to the same runtime directive as their canonical name.
+        // Keeping an old alias would preserve a stale value beside the rewritten live value.
+        const int encoding = EncodingConfig::find(Slice(words.front().data(), words.front().size()));
+        const std::string_view name = encoding >= 0
+            ? EncodingConfig::settings[encoding].name : std::string_view(words.front());
         const bool replaced = std::any_of(items.begin(), items.end(), [&](const auto& item) {
-            return item.first == words.front();
+            return item.first == name;
         });
         if (!replaced) body += line + "\n";
     }

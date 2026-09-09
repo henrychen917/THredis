@@ -41,13 +41,19 @@ void test_config_rewrite() {
     // The harness binds a server whose config path is initialized below by its friend fixture.
     const char* path = tomo::command_server()->cfg().conf_path;
     std::FILE* original = std::fopen(path, "w"); check(original, "create original config");
-    std::fputs("user reader on nopass ~* +get\nload \"/tmp/recovery source.tomo\"\nrequirepass old\n", original);
+    std::fputs("user reader on nopass ~* +get\nload \"/tmp/recovery source.tomo\"\nrequirepass old\n"
+               "hash-max-ziplist-entries 3\nhash-max-ziplist-value 9\nlist-max-ziplist-size -1\n"
+               "zset-max-ziplist-entries 3\nzset-max-ziplist-value 9\n", original);
     std::fclose(original);
     std::string error;
     check(tomo::config_rewrite(error), "first rewrite");
     std::ifstream in(path); std::string body((std::istreambuf_iterator<char>(in)), {});
     check(body.find("user reader on nopass ~* +get\n") != std::string::npos, "inline ACL survived rewrite");
     check(body.find("load \"/tmp/recovery source.tomo\"\n") != std::string::npos, "recovery source survived rewrite");
+    check(body.find("max-ziplist-") == std::string::npos, "stale encoding aliases were replaced");
+    for (const char* name : {"hash-max-listpack-entries", "hash-max-listpack-value", "list-max-listpack-size",
+                             "zset-max-listpack-entries", "zset-max-listpack-value"})
+        check(body.find(std::string(name) + " ") != std::string::npos, "canonical encoding directive emitted");
     std::vector<std::string> loaded;
     check(tomo::load_conf_file(path, loaded), "rewritten config loads");
     auto password = std::find(loaded.begin(), loaded.end(), "--requirepass");
