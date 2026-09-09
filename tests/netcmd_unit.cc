@@ -60,7 +60,9 @@ struct NetcmdRegression {
 
     static void notify_retry() {
         Server server;
-        Config cfg; cfg.even_ifid = 1; cfg.even_ex = 1; cfg.shards = 16;
+        // The gate runs this serverless row without taskset. Automatic SMT placement requires
+        // whole sibling pairs for BOTH roles; only one IO is a tracking destination below.
+        Config cfg; cfg.even_ifid = 2; cfg.even_ex = 2; cfg.shards = 16;
         check(server.prepare_boot(cfg), "notification topology");
         server.threads_.resize(server.placement().total_threads());
         for (uint32_t i = 0; i < server.threads_.size(); ++i) {
@@ -94,7 +96,8 @@ struct NetcmdRegression {
     }
 
     static void flush() {
-        Server server; Config cfg; cfg.even_ifid = 2; cfg.even_ex = 1; cfg.shards = 16;
+        // Two IOs still prove the foreign delivery; an even EX count also admits SMT placement.
+        Server server; Config cfg; cfg.even_ifid = 2; cfg.even_ex = 2; cfg.shards = 16;
         check(server.prepare_boot(cfg), "flush topology");
         const auto& ios = server.placement().ifid_threads();
         check(ios.size() == 2, "foreign tracking IO exists");
@@ -136,7 +139,16 @@ struct NetcmdRegression {
         Server server; ThreadCtx self; IoLoop loop;
         loop.srv_ = &server; loop.self_ = &self;
         sender.bind(loop.wb_);
-        server.live_obuf_normal_hard_.store(8); server.client_obuf_armed_.store(true);
+        // Mirror Server::init's mailbox initialization without starting workers or opening rings.
+        // cx-waits made raw live-field stores writer-only; IO reads the published snapshot.
+        server.live_config_committed_ = server.capture_live_config(server.live_config_version_.load());
+        server.live_config_mailboxes_ = std::make_unique<LiveConfigMailbox[]>(server.nthreads() + 1);
+        server.live_config_mailboxes_[self.id()].init(server.live_config_committed_);
+        ClientOutputBufferLimits limits{}; limits.normal.hard_bytes = 8;
+        server.set_client_output_buffer_limits(limits);
+        check(server.client_obuf_armed() &&
+              server.client_limits_snapshot(self.id()).normal.hard_bytes == 8,
+              "hard limit published to the IO config mailbox");
         Client held(-1); held.set_id(1);
         check(held.rob().acquire(), "held ordinary operation"); held.rob().publish();
         check(!held.blocked(), "ordinary operation, not blocking exception");
