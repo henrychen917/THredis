@@ -29,8 +29,8 @@
 // Rehashing a large table in one pass is a multi-second stall on the write tail — the fork measured
 // exactly that and had to move to serve-while-copy to turn a 2.4 s p99.99 into 39 ms. So this works
 // the way Redis's dict does: allocate the new table, keep the old one, and migrate a BOUNDED number
-// of slots on every subsequent operation. No operation pays more than that bound, so the tail stays
-// flat while the table grows underneath the workload.
+// of slots on subsequent mutations and owner maintenance passes. Lookups search both tables and
+// do not advance the move. The slot budget does not bound QSBR retirement when read-local is armed.
 //
 //   t_[0]  the CURRENT table. Every insert goes here. Always present.
 //   t_[1]  the OLD table, present only while rehashing. Drains, then is freed.
@@ -984,6 +984,14 @@ public:
     }
 
     bool     rehashing() const { return tab_[1] != nullptr; }
+    // Owner-only observation: DEBUG REHASH-STATE runs on shard 0's owner, so these real
+    // migration counters need neither cross-thread sampling nor new per-step instrumentation.
+    struct RehashProgress {
+        uint32_t current_capacity, old_capacity, cursor, old_live;
+    };
+    RehashProgress rehash_progress() const {
+        return {cap_[0], cap_[1], rehash_pos_, live_[1]};
+    }
     uint32_t size() const { return live_[0] + live_[1]; }
     uint64_t capacity() const { return static_cast<uint64_t>(cap_[0]) + cap_[1]; }
     size_t   object_bytes() const { return obj_bytes_ + atomic_version_bytes_; }
@@ -1198,7 +1206,8 @@ public:
     }
 
     KvObj* find(uint64_t h, Slice key) {
-        if (rehashing() && !snapshot_active_) rehash_step();
+        // Lookup must not inherit a resize's QSBR retirement wait. Both tables remain searchable;
+        // mutations and owner maintenance advance rehashing, including its final table retirement.
         KvObj* found = nullptr;
         if (__builtin_expect(atomic_pending_ != nullptr, false) &&
             __builtin_expect(atomic_pending_->live != 0, false)) {
@@ -2279,9 +2288,8 @@ private:
     uint32_t slot_start(int t, uint64_t h) const { return static_cast<uint32_t>(mix64(h)) & mask_[t]; }
 
     KvObj* find_without_touch(uint64_t h, Slice key) {
-        // During capture tab_[1] is the positional frozen image. Moving even an unrelated entry
-        // here can carry it past the snapshot cursor and omit it from the BASE.
-        if (rehashing() && !snapshot_active_) rehash_step();
+        // Like find(), this lookup never moves slots or retires a rehash table. This also preserves
+        // the positional frozen image in tab_[1] during snapshot capture.
         if (KvObj* o = find_in(0, h, key)) return live_or_expire(0, h, key, o);
         if (rehashing())
             if (KvObj* o = find_in(1, h, key)) return live_or_expire(1, h, key, o);
@@ -2616,6 +2624,8 @@ private:
         const int64_t at = deadline(h, o);
         if (at < 0 || at > cached_now_ms_) return o;
         if (snapshot_active_ && t == 1) return nullptr;
+        // Lazy expiry is still a physical deletion and can wait for armed QSBR capacity. Removing
+        // lookup-triggered rehash does not remove this separate obligation (WAITS.md).
         (void)aof_.record_delete(key);
         erase_in(t, h, key);
         if (expired_counter_) (*expired_counter_)++;
@@ -3697,9 +3707,8 @@ private:
         return true;
     }
 
-    // Move a BOUNDED number of SLOT WORDS from the old table to the current one. Called at the head
-    // of every operation, so the cost is amortised and no single operation stalls. The KvObjs those
-    // words point at are not touched.
+    // Move a bounded number of slot words during mutations/owner maintenance, never lookup.
+    // This bounds table work, not the armed retirement queue's grace wait (see WAITS.md).
     void rehash_step() {
         if (__builtin_expect(read_local_enabled_, false)) {
             rehash_step_read_local();

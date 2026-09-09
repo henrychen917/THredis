@@ -26,8 +26,10 @@
 #include "flipctl.h"
 #include "weighted_lb.h"
 #include "placement.h"
-#include "config.h"
-#include "orthog.h"        // struct Config: every runtime knob, one home
+#include "config.h"        // struct Config: every runtime knob, one home
+#include "live_config.h"
+#include "atomic_admission.h"
+#include "orthog.h"
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -40,35 +42,6 @@
 #endif
 
 namespace tomo {
-
-struct LiveConfigSnapshot {
-    uint64_t version;
-    uint64_t maxmemory;
-    MaxmemoryPolicy policy;
-    uint32_t samples;
-    uint32_t notify_events;
-    // Lane F: CLIENT TRACKING arms the same executor-side write observer keyspace notifications
-    // use.  It rides the existing live-config snapshot so ExLoop's per-pass shard mask refresh
-    // stays one load, and so a shard never reads a second armed word per operation.
-    bool     tracking_armed;
-    // Appended at the tail: executors latch these once per pass through the same seqlock, so the
-    // slow-log arming decision costs the pass nothing beyond the version compare it already made.
-    int64_t  slowlog_log_slower_than;
-    uint32_t latency_monitor_threshold;
-    bool     save_armed;
-    uint64_t proto_max_bulk_len;
-    // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER), the read-local half. Fused executors latch it once
-    // per pass with the rest of this snapshot, so the local MGET path pays one thread-private test
-    // and no atomic load; arm/disarm publishes it by bumping the version, exactly like CONFIG SET.
-    uint32_t debug_fanout_defer_us;
-};
-
-struct ClientLimitsConfigSnapshot {
-    uint64_t version = 0;
-    uint32_t timeout = 0;
-    ClientBufferLimit normal{};
-    ClientBufferLimit pubsub{};
-};
 
 struct LbClientObservation {
     uint64_t id = 0;
@@ -278,8 +251,7 @@ public:
         atomic_activity_.store(cfg.atomic ? kAtomicEnabledBit : 0,
                                std::memory_order_relaxed);
         // Measured in-flight credit optimum, always derived from the resolved geometry.
-        atomic_window_ = std::min<uint32_t>(16u * cfg.shards, 1024u);
-        atomic_credit_pool_.store(atomic_window_, std::memory_order_relaxed);
+        atomic_credits_.init(std::min<uint32_t>(16u * cfg.shards, 1024u));
         script_stage_bytes_ = cfg.maxmemory
             ? std::max<uint64_t>(4ull * 1024 * 1024,
                   std::min<uint64_t>(cfg.maxmemory / cfg.shards / 16, 64ull * 1024 * 1024))
@@ -324,6 +296,15 @@ public:
             return false;
         }
         threads_.resize(nthreads);
+        // One consumer per physical worker, plus the serialized ownership-transfer coordinator.
+        live_config_mailboxes_.reset(new (std::nothrow) LiveConfigMailbox[nthreads + 1]);
+        if (!live_config_mailboxes_) {
+            std::fprintf(stderr, "fatal: could not allocate live configuration mailboxes\n");
+            return false;
+        }
+        live_config_committed_ = capture_live_config(2);
+        for (uint32_t i = 0; i <= nthreads; i++)
+            live_config_mailboxes_[i].init(live_config_committed_);
         for (uint32_t i = 0; i < nthreads; i++) {
             threads_[i] = std::make_unique<ThreadCtx>();
             // The fingerprint writer is armed only when its one reader, the flip controller, is
@@ -2176,7 +2157,11 @@ public:
         // A destination may already have cached this version while the source's last
         // pass used the previous one. Configure the incoming store at the ownership
         // edge; an unchanged destination version must never leave it on stale limits.
-        const LiveConfigSnapshot config = live_config_snapshot();
+        // Transfers are serialized by the shape transition, but IO-side tracking/ACL publication
+        // may continue while executors are quiesced. The coordinator has its OWN mailbox: neither
+        // the writer's mutable committed copy nor the destination's consumer slot is safe here.
+        const LiveConfigSnapshot config =
+            live_config_mailboxes_[nthreads()].read(live_config_version_).live;
         shard.configure_maxmemory(config.maxmemory != 0, config.maxmemory / nshards(),
                                   config.policy, config.samples);
         shard.set_notify_mask(config.notify_events |
@@ -2236,20 +2221,8 @@ public:
         end_live_config_update(version);
     }
 
-    ClientLimitsConfigSnapshot client_limits_snapshot() const {
-        for (;;) {
-            ClientLimitsConfigSnapshot out;
-            out.version = live_config_version_.load(std::memory_order_acquire);
-            if (out.version & 1) continue;
-            out.timeout = live_timeout_.load(std::memory_order_relaxed);
-            out.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
-            out.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
-            out.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
-            out.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
-            out.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
-            out.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
-            if (live_config_version_.load(std::memory_order_acquire) == out.version) return out;
-        }
+    ClientLimitsConfigSnapshot client_limits_snapshot(uint32_t reader_tid) const {
+        return live_config_mailboxes_[reader_tid].read(live_config_version_).clients;
     }
     void set_client_output_buffer_limits(const ClientOutputBufferLimits& limits) {
         const uint64_t version = begin_live_config_update();
@@ -2279,8 +2252,8 @@ public:
     }
     uint64_t climon_monitors() const { return climon_monitors_.load(std::memory_order_relaxed); }
 
-    // Tracking arms shard-side write observation, so it must publish through the live-config
-    // seqlock the executors already poll (one version compare per pass when nothing changed).
+    // Tracking arms shard-side write observation, so it publishes through the same mailboxes
+    // executors already poll (one version compare per pass when nothing changed).
     void climon_tracking_added() {
         const uint64_t version = begin_live_config_update();
         climon_tracking_.fetch_add(1, std::memory_order_relaxed);
@@ -2530,108 +2503,60 @@ public:
     }
     bool atomic_enabled() const { return atomic_mode_state() & kAtomicEnabledBit; }
     bool atomic_work_active() const { return (atomic_mode_state() & ~kAtomicEnabledBit) != 0; }
+    uint32_t atomic_window() const {
+        return atomic_credits_.window();
+    }
     void set_atomic_enabled(bool enabled) {
         if (enabled) {
-            atomic_reconfigure_credits();
             atomic_activity_.fetch_or(kAtomicEnabledBit, std::memory_order_release);
         } else {
             atomic_activity_.fetch_and(~kAtomicEnabledBit, std::memory_order_release);
-            atomic_reconfigure_credits();
         }
     }
-
     bool atomic_tracking_active() const {
         return atomic_mode_state() != 0;
     }
-    bool atomic_can_admit(uint32_t owner_io, bool force = false) const {
+    bool atomic_can_admit(uint32_t /*owner_io*/, bool force = false) const {
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return true;
-        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-        if (generation & 1) return false;
-        const AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
-        return (lease.generation == generation && lease.available != 0) ||
-               atomic_credit_pool_.load(std::memory_order_acquire) != 0;
+        return atomic_credits_.can_admit();
     }
-    bool atomic_try_admit(uint32_t owner_io, uint64_t& admitted_generation,
+    bool atomic_try_admit(uint32_t owner_io, uint64_t& admission_token,
                           bool force = false) {
-        admitted_generation = 0;
+        admission_token = 0;
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return false;
-        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
-        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-        if (generation & 1) return false;
-        if (lease.generation != generation) {
-            lease.generation = generation;
-            lease.available = 0; // the reconfiguration reset the global pool without old leases
-        }
-        if (lease.available == 0) {
-            atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
-            if (atomic_credit_generation_.load(std::memory_order_acquire) != generation) {
-                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
-                return false;
-            }
-            uint32_t available = atomic_credit_pool_.load(std::memory_order_relaxed);
-            bool borrowed = false;
-            while (available) {
-                const uint32_t take = std::min<uint32_t>(available, kAtomicLeaseBatch);
-                if (atomic_credit_pool_.compare_exchange_weak(
-                        available, available - take, std::memory_order_acq_rel,
-                        std::memory_order_relaxed)) {
-                    lease.available = take;
-                    borrowed = true;
-                    break;
-                }
-            }
-            atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
-            if (!borrowed) {
+        const auto attempt = atomic_credits_.try_admit();
+        if (attempt != AtomicAdmissionCredits::Attempt::Admitted) {
+            if (attempt == AtomicAdmissionCredits::Attempt::Full)
                 atomic_window_stalls_.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
+            return false;
         }
-        lease.available--;
-        const bool first = lease.active++ == 0;
-        lease.published_active.store(lease.active, std::memory_order_release);
+        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
+        const bool first = local.active++ == 0;
         if (first) atomic_activity_.fetch_add(1, std::memory_order_release);
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire) ||
-            atomic_credit_generation_.load(std::memory_order_acquire) != generation ||
             (!force && !(atomic_mode_state() & kAtomicEnabledBit))) {
-            lease.active--;
-            lease.published_active.store(lease.active, std::memory_order_release);
+            local.active--;
             if (first) atomic_activity_.fetch_sub(1, std::memory_order_release);
-            atomic_release_admission_credit(lease, generation);
+            atomic_credits_.retire();
             return false;
         }
         thread(owner_io).note_atomic_group();
-        admitted_generation = generation;
+        // Existing EXEC/scatter state has a receipt word named admission_generation. Keep its
+        // representation (and layouts) while removing generation-dependent credit accounting.
+        admission_token = 1;
         return true;
     }
     void set_snapshot_atomic_barrier(bool enabled) {
         snapshot_atomic_barrier_.store(enabled, std::memory_order_release);
     }
-    void atomic_retire_group(uint32_t owner_io, uint64_t admitted_generation) {
-        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
-        if (!lease.active) std::abort();
-        lease.active--;
-        lease.published_active.store(lease.active, std::memory_order_release);
-
-        atomic_release_admission_credit(lease, admitted_generation);
-
-        if (lease.active == 0) {
-            atomic_activity_.fetch_sub(1, std::memory_order_release);
-            // An idle IO must not strand its lease while a hot peer is window-stalled. The config
-            // generation plus credit_ops handshake makes returning this batch race-free.
-            const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-            if (!(generation & 1) && lease.generation == generation &&
-                lease.available) {
-                const uint32_t returned = lease.available;
-                atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
-                if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
-                    atomic_credit_pool_.fetch_add(returned, std::memory_order_release);
-                    lease.available = 0;
-                }
-                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
-            }
-        }
+    void atomic_retire_group(uint32_t owner_io, uint64_t admission_token) {
+        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
+        if (admission_token != 1 || !local.active) std::abort();
+        local.active--;
+        atomic_credits_.retire();
+        if (!local.active) atomic_activity_.fetch_sub(1, std::memory_order_release);
     }
     // GROUP COMMIT IS TWO STEPS AND A READER MUST NEVER SEE THE FIRST WITHOUT THE SECOND.
     // A cross-shard group installs its versions on every owner while the shared epoch word still
@@ -2856,13 +2781,7 @@ public:
         for (uint32_t io : placement_.ifid_threads()) groups += thread(io).atomic_groups();
         return groups;
     }
-    uint64_t atomic_inflight() const {
-        uint64_t inflight = 0;
-        for (uint32_t io : placement_.ifid_threads())
-            inflight += thread(io).atomic_admission_lease().published_active.load(
-                std::memory_order_acquire);
-        return inflight;
-    }
+    uint64_t atomic_inflight() const { return atomic_credits_.active(); }
     // GROUPS WHOSE RECORDS ARE ONLY PARTLY INSTALLED -- the quantity a snapshot cut must wait on.
     // It is NOT atomic_inflight(). A group leaves atomic_inflight() only when its REPLY retires on
     // the IO thread that admitted it, and that retire runs in the very loop a blocking SAVE is
@@ -3117,47 +3036,18 @@ public:
         const uint64_t deadline = now_ns() + static_cast<uint64_t>(microseconds) * 1000ull;
         while (now_ns() < deadline) __builtin_ia32_pause();
     }
-    uint32_t atomic_credit_pool() const {
-        return atomic_credit_pool_.load(std::memory_order_acquire);
-    }
-    uint32_t atomic_credit_debt() const {
-        return atomic_credit_debt_.load(std::memory_order_acquire);
-    }
+    uint32_t atomic_credit_pool() const { return atomic_credits_.pool(); }
+    uint32_t atomic_credit_debt() const { return atomic_credits_.debt(); }
 
-    LiveConfigSnapshot live_config_snapshot() const {
-        // CONFIG writers make version odd around a change. Executors take this coherent snapshot
-        // once per pass; no atomic reaches an individual operation or store lookup.
-        for (;;) {
-            LiveConfigSnapshot snapshot;
-            snapshot.version = live_config_version_.load(std::memory_order_acquire);
-            if (snapshot.version & 1) continue;
-            snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
-            snapshot.policy = static_cast<MaxmemoryPolicy>(
-                live_maxmemory_policy_.load(std::memory_order_relaxed));
-            snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
-            snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
-            snapshot.tracking_armed =
-                (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
-            snapshot.slowlog_log_slower_than =
-                live_slowlog_us_.load(std::memory_order_relaxed);
-            snapshot.latency_monitor_threshold =
-                live_latency_ms_.load(std::memory_order_relaxed);
-            snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
-            snapshot.proto_max_bulk_len =
-                live_proto_max_bulk_len_.load(std::memory_order_relaxed);
-            snapshot.debug_fanout_defer_us =
-                debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
-            if (live_config_version_.load(std::memory_order_acquire) == snapshot.version)
-                return snapshot;
-        }
+    // A mailbox belongs to a physical worker, across fused/split roles and shard migrations.
+    // Callers copy the result before their next snapshot call; only the consumer-owned slot is read.
+    LiveConfigSnapshot live_config_snapshot(uint32_t reader_tid) const {
+        return live_config_mailboxes_[reader_tid].read(live_config_version_).live;
     }
-    bool live_config_snapshot_if_changed(uint64_t known_version,
+    bool live_config_snapshot_if_changed(uint32_t reader_tid, uint64_t known_version,
                                          LiveConfigSnapshot& snapshot) const {
-        // The unchanged per-pass case is one acquire load. Field loads and the retry loop exist
-        // only after CONFIG has published a different stable version.
-        const uint64_t version = live_config_version_.load(std::memory_order_acquire);
-        if (version == known_version) return false;
-        snapshot = live_config_snapshot();
+        if (live_config_version_.load(std::memory_order_acquire) == known_version) return false;
+        snapshot = live_config_snapshot(reader_tid);
         return snapshot.version != known_version;
     }
     void set_maxmemory_config(uint64_t memory, MaxmemoryPolicy policy, uint32_t samples,
@@ -3311,8 +3201,6 @@ public:
     }
 
 private:
-    static constexpr uint32_t kAtomicLeaseBatch = 8;
-
     bool adjust_open_files_limit() {
         rlimit limit{};
         if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
@@ -3388,72 +3276,34 @@ private:
                                  normal || pubsub, std::memory_order_release);
     }
 
-    void atomic_release_admission_credit(AtomicAdmissionLease& lease,
-                                         uint64_t admitted_generation) {
-        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-        while (generation & 1) {
-            __builtin_ia32_pause();
-            generation = atomic_credit_generation_.load(std::memory_order_acquire);
-        }
-        if (admitted_generation == generation && lease.generation == generation) {
-            lease.available++;
-            return;
-        }
-        if (admitted_generation == generation) return;
-        uint32_t carry = lease.reconfig_carry.load(std::memory_order_relaxed);
-        while (carry && !lease.reconfig_carry.compare_exchange_weak(
-                              carry, carry - 1, std::memory_order_acq_rel,
-                              std::memory_order_relaxed)) {}
-        if (carry) atomic_return_reconfigured_credit(generation);
-    }
-
-    void atomic_return_reconfigured_credit(uint64_t generation) {
-        atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
-        if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
-            uint32_t debt = atomic_credit_debt_.load(std::memory_order_relaxed);
-            while (debt && !atomic_credit_debt_.compare_exchange_weak(
-                               debt, debt - 1, std::memory_order_acq_rel,
-                               std::memory_order_relaxed)) {}
-            if (!debt) atomic_credit_pool_.fetch_add(1, std::memory_order_release);
-        }
-        atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
-    }
-
-    void atomic_reconfigure_credits() {
-        // Odd generations close admission while CONFIG takes an exact active-group snapshot.
-        // Borrow/return operations announce themselves so the rebuilt pool cannot race a credit
-        // mutation. IO-local available batches are intentionally discarded by the generation
-        // change; only published active groups survive into the new accounting epoch.
-        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
-        for (;;) {
-            if (generation & 1) {
-                generation = atomic_credit_generation_.load(std::memory_order_acquire);
-                continue;
-            }
-            if (atomic_credit_generation_.compare_exchange_weak(
-                    generation, generation + 1, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-                break;
-        }
-        while (atomic_credit_ops_.load(std::memory_order_acquire) != 0)
-            __builtin_ia32_pause();
-
-        uint64_t active = 0;
-        for (uint32_t io : placement_.ifid_threads()) {
-            AtomicAdmissionLease& lease = thread(io).atomic_admission_lease();
-            const uint32_t live = lease.published_active.load(std::memory_order_acquire);
-            lease.reconfig_carry.store(live, std::memory_order_release);
-            active += live;
-        }
-        const uint32_t window = atomic_window_;
-        const uint64_t bounded = std::min<uint64_t>(active, UINT32_MAX);
-        atomic_credit_pool_.store(
-            bounded < window ? window - static_cast<uint32_t>(bounded) : 0,
-            std::memory_order_release);
-        atomic_credit_debt_.store(
-            bounded > window ? static_cast<uint32_t>(bounded - window) : 0,
-            std::memory_order_release);
-        atomic_credit_generation_.store(generation + 2, std::memory_order_release);
+    // Only boot or the serialized CONFIG writer reads these mutable fields as a group. Readers
+    // consume immutable, committed mailbox copies and never collect/revalidate these atomics.
+    LiveConfigValues capture_live_config(uint64_t version) const {
+        LiveConfigValues values;
+        auto& snapshot = values.live;
+        snapshot.version = version;
+        snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
+        snapshot.policy = static_cast<MaxmemoryPolicy>(
+            live_maxmemory_policy_.load(std::memory_order_relaxed));
+        snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
+        snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
+        snapshot.tracking_armed =
+            (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
+        snapshot.slowlog_log_slower_than = live_slowlog_us_.load(std::memory_order_relaxed);
+        snapshot.latency_monitor_threshold = live_latency_ms_.load(std::memory_order_relaxed);
+        snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
+        snapshot.proto_max_bulk_len = live_proto_max_bulk_len_.load(std::memory_order_relaxed);
+        snapshot.debug_fanout_defer_us = debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
+        auto& clients = values.clients;
+        clients.version = version;
+        clients.timeout = live_timeout_.load(std::memory_order_relaxed);
+        clients.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
+        clients.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
+        clients.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
+        clients.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
+        clients.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
+        clients.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
+        return values;
     }
 
     uint64_t begin_live_config_update() {
@@ -3469,6 +3319,11 @@ private:
         }
     }
     void end_live_config_update(uint64_t write_version) {
+        const LiveConfigValues next = capture_live_config(write_version + 1);
+        if (live_config_mailboxes_)
+            for (uint32_t tid = 0; tid <= nthreads(); tid++)
+                live_config_mailboxes_[tid].publish(live_config_committed_, next);
+        live_config_committed_ = next;
         live_config_version_.store(write_version + 1, std::memory_order_release);
     }
 
@@ -3629,7 +3484,8 @@ private:
     std::atomic<uint64_t> climon_tracking_keys_{0};
     std::atomic<uint64_t> climon_tracking_items_{0};
     std::atomic<uint64_t> climon_tracking_prefixes_{0};
-    uint32_t atomic_window_ = 256; // positive, boot-derived; CONFIG only rebuilds credit leases
+    // Preserve the commit-watermark block's placement after folding window into atomic_credits_.
+    uint32_t atomic_window_layout_padding_ = 0;
     // The drawn sequence and the visible read watermark share a line on purpose: readers used to
     // load commit_seq_ itself, so keeping the watermark beside it leaves reader traffic exactly
     // where it was, and a committer touches all three in one go.
@@ -3656,11 +3512,11 @@ private:
     std::atomic<uint64_t> atomic_read_cuts_held_{0};
     std::atomic<uint64_t> atomic_fanout_cuts_{0};
     std::atomic<uint64_t> atomic_exec_read_cuts_{0};
-    std::atomic<uint64_t> atomic_credit_generation_{2};
-    std::atomic<uint32_t> atomic_credit_pool_{0};
-    std::atomic<uint32_t> atomic_credit_debt_{0};
-    std::atomic<uint32_t> atomic_credit_ops_{0};
-    // Enabled is the high bit; every admitted group and live record contributes one low-bit unit.
+    AtomicAdmissionCredits atomic_credits_;
+    // Preserve every following cache-line offset formerly occupied by pool/debt/credit_ops.
+    uint32_t atomic_credit_layout_padding_[3] = {};
+    // Enabled is the high bit; every IO with admitted groups and every live record contributes
+    // one low-bit unit. Exact group counts belong to atomic_credits_.
     // Dispatch therefore decides OFF/ON/draining with one acquire load and one predictable test.
     std::atomic<uint64_t> atomic_activity_{0};
     std::atomic<uint64_t> atomic_read_floors_[kMaxThreads] = {};
@@ -3717,7 +3573,7 @@ private:
     // Cold observability for proving CLIENT catalog work reached every IO owner.
     std::atomic<uint64_t> client_scatter_requests_{0};
     std::atomic<uint64_t> client_scatter_io_responses_{0};
-    // Slow-log arming, published through the same seqlock as the eviction/notify knobs and read
+    // Slow-log arming, published through the same mailboxes as the eviction/notify knobs and read
     // once per executor pass. Appended at the true tail so no pre-existing offset moves.
     std::atomic<int64_t>  live_slowlog_us_{10000};
     std::atomic<uint32_t> live_latency_ms_{0};
@@ -3740,6 +3596,10 @@ private:
     bool* owner_notify_pending_[kMaxThreads] = {};
     struct alignas(64) ClientWorkEpoch { std::atomic<uint64_t> epoch{0}; };
     ClientWorkEpoch client_work_[kMaxThreads];
+    // Fixed storage per physical worker plus one transfer consumer, allocated before workers start.
+    // CONFIG copies into this storage; arbitrarily many updates or a stopped reader cannot grow it.
+    std::unique_ptr<LiveConfigMailbox[]> live_config_mailboxes_;
+    LiveConfigValues live_config_committed_{}; // serialized CONFIG writer only
 };
 
 }  // namespace tomo

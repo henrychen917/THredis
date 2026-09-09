@@ -62,15 +62,12 @@ static_assert(kInboxSlots <= UINT16_MAX, "lane_admit_cap is a uint16");
 
 enum class Role : uint8_t { Idle = 0, Ifid = 1, Ex = 2 };
 
-// Admission credits are leased to the connection-owning IO. Plain fields have exactly one writer;
-// CONFIG/INFO consult only the published mirrors. No field names a shard or shard-side structure.
-struct alignas(64) AtomicAdmissionLease {
-    uint64_t generation = 0;
-    uint32_t available = 0;
+// Active groups on this connection-owning thread: one writer, independent of shard ownership.
+// The first/last group arms/disarms atomic_activity_. Keep the former lease's cache-line footprint.
+struct alignas(64) AtomicAdmissionState {
     uint32_t active = 0;
-    std::atomic<uint32_t> published_active{0};
-    std::atomic<uint32_t> reconfig_carry{0};
 };
+static_assert(sizeof(AtomicAdmissionState) == 64);
 
 // What travels on task_in_. A handle rather than a raw Op*: the worker resolves it through the
 // client's ROB, so a recycled slot cannot be reached through a stale pointer. The client itself
@@ -465,8 +462,8 @@ public:
     // for the scan-ordering fix, so it must be observable rather than merely believed.
     void note_atomic_scan_hold() { atomic_scan_holds_++; }
     uint64_t atomic_scan_holds() const { return atomic_scan_holds_; }
-    AtomicAdmissionLease& atomic_admission_lease() { return atomic_admission_lease_; }
-    const AtomicAdmissionLease& atomic_admission_lease() const { return atomic_admission_lease_; }
+    AtomicAdmissionState& atomic_admission_state() { return atomic_admission_state_; }
+    const AtomicAdmissionState& atomic_admission_state() const { return atomic_admission_state_; }
 
     // ---- posting (producer side) ---------------------------------------------------------------
     // Push AND flag, in that order. Flagging before the push would let the consumer take the bit,
@@ -1171,7 +1168,7 @@ private:
     uint64_t atomic_groups_ = 0;
     uint64_t atomic_localfast_ = 0;
     uint64_t atomic_scan_holds_ = 0;
-    AtomicAdmissionLease atomic_admission_lease_;
+    AtomicAdmissionState atomic_admission_state_;
     ReadyMask  ready_;                     // as a sender: which of my clients completed work
     std::vector<Client*>  slots_;          // slot -> client, sender-owned
     std::vector<uint32_t> free_slots_;

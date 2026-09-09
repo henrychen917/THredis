@@ -5993,7 +5993,7 @@ ordinary_dispatch:
             return false;
         }
         c->start_obuf_tracking();
-        const ClientLimitsConfigSnapshot limits = srv_->client_limits_snapshot();
+        const ClientLimitsConfigSnapshot limits = srv_->client_limits_snapshot(self_->id());
         const ClientBufferLimit& limit = c->subscriber_mode() ? limits.pubsub : limits.normal;
         if (!limit.hard_bytes && !limit.soft_bytes) {
             c->set_obuf_soft_since_s(0);
@@ -6079,7 +6079,8 @@ ordinary_dispatch:
 
     void refresh_notify_config() {
         LiveConfigSnapshot snapshot;
-        if (!srv_->live_config_snapshot_if_changed(notify_config_version_, snapshot)) return;
+        if (!srv_->live_config_snapshot_if_changed(
+                self_->id(), notify_config_version_, snapshot)) return;
         notify_config_armed_ = snapshot.notify_events != 0;
         save_config_armed_ = snapshot.save_armed;
         notify_armed_ = notify_config_armed_ || save_config_armed_ ||

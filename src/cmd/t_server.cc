@@ -766,8 +766,23 @@ void cmd_reset(Shard&, Op& op) {
     reply_simple(op.sink(), "RESET");
 }
 
-void cmd_debug_impl(Shard&, Op& op) {
+void cmd_debug_impl(Shard& shard, Op& op) {
     const Slice subcommand = op.arg(1);
+    // DEBUG's ConfigRoute owns shard 0. Observe only that store, on its owner; sampling
+    // other shards here would race their cursors. No lookup or maintenance is performed.
+    if (eq_icase(subcommand, "rehash-state") && op.argc() == 2) {
+        const auto progress = shard.store().rehash_progress();
+        auto sink = op.sink();
+        reply_array_header(sink, 7);
+        reply_int(sink, shard.id());
+        reply_int(sink, shard.stats().rehashes);
+        reply_int(sink, progress.current_capacity);
+        reply_int(sink, progress.old_capacity);
+        reply_int(sink, progress.cursor);
+        reply_int(sink, progress.old_live);
+        reply_int(sink, shard.store().size());
+        return;
+    }
     // Directed transport tests use this cold hook to prove that their retained sockets cover every
     // live IO producer before a 63:1 -> 1:63 flip. Returning the connection owner is observational;
     // it does not alter placement and is available only behind the existing DEBUG permission gate.
@@ -1395,7 +1410,7 @@ void cmd_config(Shard& sh, Op& op) {
                                (save_armed ? NOTIFY_SAVE : 0u));
         }
 
-        // Eviction config is process-global (odd/even snapshot read by owners each pass); publish
+        // Eviction config is process-global (committed mailbox copies read each pass); publish
         // it once from shard 0's task rather than per shard.
         if (sh.id() == 0 && g_server) {
             for (const auto& update : updates) {
@@ -1412,7 +1427,8 @@ void cmd_config(Shard& sh, Op& op) {
                     g_proto_max_bulk_len.store(value, std::memory_order_relaxed);
                 }
             }
-            LiveConfigSnapshot desired = g_server->live_config_snapshot();
+            LiveConfigSnapshot desired =
+                g_server->live_config_snapshot(g_server->worker_of_shard(sh.id()));
             bool set_memory = false, set_policy = false, set_samples = false;
             for (const auto& update : updates) {
                 const Slice text(update.second.data(),

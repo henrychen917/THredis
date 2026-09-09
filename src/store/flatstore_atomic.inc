@@ -604,11 +604,10 @@
         return atomic_resolve_internal(hash, key, snapshot, true).value;
     }
 
-    // A scatter owner hoists atomic_has_records() once before its per-key read loop. This direct arm
-    // retains find()'s bounded rehash progress but avoids reloading and retesting the pending-list
-    // pointer for every key in the group.
+    // A scatter owner hoists atomic_has_records() once before its per-key read loop. Like find(),
+    // this direct lookup must not retire a rehash table; it only avoids reloading and retesting the
+    // pending-list pointer for every key in the group.
     KvObj* atomic_find_tracked(uint64_t hash, Slice key) {
-        if (rehashing() && !snapshot_active_) rehash_step();
         KvObj* found = atomic_resolve(hash, key, atomic_read_epoch_);
         if (__builtin_expect(maxmemory_enabled_, false) && found) touch(found);
         return found;

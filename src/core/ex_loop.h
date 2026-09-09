@@ -1745,7 +1745,8 @@ private:
     template <bool OwnsShards = true>
     void refresh_live_config() {
         LiveConfigSnapshot snapshot;
-        if (!srv_->live_config_snapshot_if_changed(live_config_version_, snapshot)) return;
+        if (!srv_->live_config_snapshot_if_changed(
+                self_->id(), live_config_version_, snapshot)) return;
         const bool enabled = snapshot.maxmemory != 0;
         if constexpr (OwnsShards) {
             const uint64_t shard_limit = snapshot.maxmemory / srv_->nshards();

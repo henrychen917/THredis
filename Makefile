@@ -116,16 +116,23 @@ build/store-regression-tsan: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wil
 	$(CXX) $(CXXFLAGS) -O1 -fsanitize=thread -fno-omit-frame-pointer -no-pie \
 	  -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST -I. \
 	  $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
-unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit build/reorder-unit
+build/waits-unit: tests/waits_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -I. tests/waits_unit.cc -o $@
+unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit build/reorder-unit build/waits-unit
 	./build/config-parser-test
 	./build/flipctl-unit
 	./build/read-local-ring-unit
 	./build/read-local-write-ring-unit
 	./build/reorder-unit
+	./build/waits-unit
 
 # Deterministic core regressions: the test TU instantiates the real executor/IO methods
 # with ASAN/UBSAN and test-only interleaving hooks. No server or ring is started.
 CORE_TEST_OBJ := $(filter-out build/src/main.o build/src/core/genthread.o,$(OBJ))
+build/rehash-waits-unit: tests/rehash_waits_unit.cc $(CORE_TEST_OBJ) $(wildcard src/*/*.h) Makefile
+	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. $< $(CORE_TEST_OBJ) -o $@ $(JELIBS) $(LDLIBS) -lm
+
 build/core-concurrency-unit: tests/core_concurrency_unit.cc $(CORE_TEST_OBJ) $(wildcard src/*/*.h)
 	$(CXX) $(CXXFLAGS) $(JEFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 	  -DTOMO_CORE_CONCURRENCY_TEST -I. $< $(CORE_TEST_OBJ) -o $@ \

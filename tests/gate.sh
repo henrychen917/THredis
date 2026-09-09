@@ -485,6 +485,41 @@ py tests/cmdmeta_coverage.py >/tmp/gate-cmdmeta-coverage.txt 2>&1 \
     || bad "cmdmeta covers every registered command" "see /tmp/gate-cmdmeta-coverage.txt"
 
 # ---- 3. correctness: smoke + torture + RYOW on the release build ------------------------------
+# MERGEWAITS.md: six rows, all BEFORE the quick-tier exit. Build/boot failure belongs to its
+# dependent row, so it cannot change the count. The retirement row intentionally includes lazy
+# expiry: cx-waits alone still fails that broader no-quiescence-wait law. Never skip/xfail it.
+pausable make build/waits-unit >/tmp/gate-waits-unit.txt 2>&1 \
+    && timeout --foreground 60 taskset -c "$CORES" ./build/waits-unit >>/tmp/gate-waits-unit.txt 2>&1 \
+    && ok "waits config publication + admission unit" \
+    || bad "waits config publication + admission unit" "see /tmp/gate-waits-unit.txt"
+pausable make build/rehash-waits-unit >/tmp/gate-rehash-waits-unit.txt 2>&1 \
+    && timeout --foreground 60 taskset -c "$CORES" ./build/rehash-waits-unit retirement \
+        >>/tmp/gate-rehash-waits-unit.txt 2>&1 \
+    && ok "reads never wait for retirement quiescence" \
+    || bad "reads never wait for retirement quiescence" "see /tmp/gate-rehash-waits-unit.txt"
+for WAIT_MODE in split fused; do
+  for WAIT_LOCAL in 0 1; do
+    WAIT_BOOTED=0
+    if [ "$WAIT_MODE" = split ]; then
+      boot ./build/tomokv --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
+          --flip-auto 0 --enable-debug-command yes && WAIT_BOOTED=1
+    else
+      boot_fused ./build/tomokv --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
+          --flip-auto 0 --enable-debug-command yes && WAIT_BOOTED=1
+    fi
+    WAIT_OK=0
+    WAIT_LOG="/tmp/gate-rehash-readonly-$WAIT_MODE-$WAIT_LOCAL.txt"
+    if [ "$WAIT_BOOTED" = 1 ] && py tests/rehash_readonly.py 127.0.0.1 "$PORT" "$WAIT_MODE" "$WAIT_LOCAL" >"$WAIT_LOG" 2>&1; then
+      WAIT_OK=1
+    fi
+    if [ "$SRV" -gt 0 ]; then stop; fi
+    if [ "$WAIT_OK" = 1 ] && shutdown_clean >>"$WAIT_LOG" 2>&1; then
+      ok "read-only resize $WAIT_MODE read-local=$WAIT_LOCAL"
+    else
+      bad "read-only resize $WAIT_MODE read-local=$WAIT_LOCAL" "see $WAIT_LOG and $SRVLOG"
+    fi
+  done
+done
 boot ./build/tomokv --enable-debug-command yes || bad "release boot"
 py tests/torture.py 127.0.0.1 $PORT >/tmp/gate-tort.txt 2>&1 \
     && ok "torture battery" || bad "torture battery" "see /tmp/gate-tort.txt"
