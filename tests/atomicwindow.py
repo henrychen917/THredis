@@ -90,6 +90,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
             lease_checked = not reconfigure
             lease_pool = None
             isolated_config = False
+            lease_reclaims = 0
 
             def run(index, client):
                 try:
@@ -226,6 +227,22 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                         if time.monotonic() >= config_deadline:
                             raise AssertionError("old lease accounting did not settle within "
                                                  "arm budget: %r" % table)
+                        if (not burst_done and table["inflight"] == 1 and
+                                table["credit_pool"] == 0):
+                            # The parked EXEC can keep its IO active after that IO's MSETs
+                            # retire. Their unused credits stay in its local lease, so another
+                            # IO's unsent burst cannot finish before we reclaim that cache.
+                            # Rebuild while the identified old lease is STILL live; waiting
+                            # for burst_done first makes reclamation depend on its own credits.
+                            if (lease_reclaims >= connections or
+                                    select.select([blocker.sock], [], [], 0)[0]):
+                                raise AssertionError("could not reclaim idle credits with old lease live")
+                            if admin.must("CONFIG", "SET", "atomic", "1") != b"OK":
+                                raise AssertionError("idle lease reclamation failed")
+                            lease_reclaims += 1
+                            if select.select([blocker.sock], [], [], 0)[0]:
+                                raise AssertionError("old lease completed during idle credit reclamation")
+                            continue
                         if burst_done and not isolated_config:
                             if admin.must("CONFIG", "SET", "atomic", "1") != b"OK":
                                 raise AssertionError("isolated lease reconfiguration failed")
@@ -299,7 +316,7 @@ def held_burst(host, port, *, whole_window, reconfigure=False):
                            carried, held_replies, arm_elapsed, held_rate, released, sum(replies),
                            groups, resume_elapsed, resume_rate))
                 if reconfigure:
-                    detail += " lease_pool=%s" % lease_pool
+                    detail += " lease_pool=%s lease_reclaims=%d" % (lease_pool, lease_reclaims)
                 history.append(detail)
                 print("  note atomic-window " + detail, flush=True)
                 if stuck:
