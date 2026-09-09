@@ -129,7 +129,8 @@ def run(host, port, expected_mode=None, expected_local=None):
             current = state(conn)
             samples += 1
             require(current.starts == armed.starts and current.keys == armed.keys and
-                    current.capacity == armed.capacity, "unexpected mutation/new resize during reads")
+                    current.capacity == armed.capacity,
+                    "unexpected mutation/new resize during reads: %r -> %r" % (armed, current))
             require(current.remaining <= previous.remaining and current.old_live <= previous.old_live,
                     "resize counters went backwards")
             previous = current

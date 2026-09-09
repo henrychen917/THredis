@@ -300,10 +300,10 @@ struct ReadLocalThreadState {
     std::atomic<bool> lane_active{false};
 };
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
-static_assert(offsetof(ReadLocalThreadState, lane_active) == 360,
-              "lane activation must follow the entire pre-RL2S sidecar");
-static_assert(sizeof(ReadLocalThreadState) == 368,
-              "lane activation adds one alignment word only to the optional sidecar");
+static_assert(offsetof(ReadLocalThreadState, lane_active) == 376,
+              "resize retirement adds two cold sink hooks to the optional sidecar");
+static_assert(sizeof(ReadLocalThreadState) == 384,
+              "resize retirement grows only the armed sidecar by 16 bytes, never ThreadCtx");
 #endif
 
 class ThreadCtx {

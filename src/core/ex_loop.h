@@ -1652,7 +1652,17 @@ private:
         // A stage may start after the loop's initial freeze sample. Finish EVERY
         // owner access before a control pass can acknowledge ExDrain: the coordinator
         // may transfer shards and rewrite this vector immediately after that store.
-        uint32_t work = drain_notify_keyless(self_->sig());
+        uint32_t work = 0;
+        // Busy owners must get the same maintenance as idle sweeps. Reuse the pass's cached
+        // clock, at most once per distinct millisecond (a clock adjustment cannot postpone it).
+        const uint32_t now = static_cast<uint32_t>(cached_now_ms_);
+        if (now != expire_beat_ms_) {
+            expire_beat_ms_ = now;
+            work += active_expire_cycle();
+        }
+        if constexpr (Fused)
+            if (read_local_enabled() && read_local_impl().deferred.resize_pending()) work++;
+        work += drain_notify_keyless(self_->sig());
         lb_bucket_bytes_pass();
         work += lb_control_pass();
         if constexpr (!Fused) work += flip_control_pass();
@@ -1878,6 +1888,12 @@ private:
             if (n) sh->publish_size();
             removed += n;
         }
+        // With more shards than this pass's visit budget, the last busy command may have
+        // started a resize outside the sampled slice. Do not let an otherwise empty sweep
+        // park before the round-robin cursor reaches that shard.
+        if (!removed && visits < shards.size())
+            for (Shard* shard : shards)
+                if (shard->store().rehashing() && !shard->store().snapshot_active()) return 1;
         return removed;
     }
 
@@ -3065,6 +3081,7 @@ private:
     uint64_t   foreign_touch_random_ = 0x9e3779b97f4a7c15ULL;
     SnapshotManager* snapshot_manager_ = nullptr;
     SnapshotOwnerState snapshot_owner_state_ = SnapshotOwnerState::None;
+    uint32_t expire_beat_ms_ = 0; // existing alignment padding before snapshot_epoch_
     uint64_t snapshot_epoch_ = 0;
     bool snapshot_was_cancelled_ = false;
     size_t snapshot_prepare_cursor_ = 0;

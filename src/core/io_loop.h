@@ -3789,6 +3789,15 @@ subscriber_checks_done:
                 // pipeline order while this IO thread continues serving unrelated clients (and,
                 // in 1s, continues owning shards). All other DEBUG forms fall through unchanged.
                 if (__builtin_expect((spec->flags & CmdFlags::DebugSleep) != 0, false)) {
+                    if (op->argc() == 2 && op->arg(1).eq_icase("rehash-state")) {
+                        // This diagnostic reads mutable table counters. ConfigRoute normally
+                        // executes on the connection's IO thread, even though it passes shard 0
+                        // to the handler. Dispatch to the real owner instead, using the ordinary
+                        // queue/forwarding/publication path below. No read performs maintenance.
+                        op->hash = 0;
+                        op->shard = 0;
+                        goto ordinary_shard_ready;
+                    }
                     uint64_t delay_ms = 0;
                     const uint64_t slow_started =
                         __builtin_expect(slowlog_armed_, false) ? now_ns() : 0;
@@ -4013,12 +4022,11 @@ nonblocking_dispatch:
             // Ordinary single-key commands never enter the scatter engine. Keep xshard_prepare's
             // own classification guard for its other callers, but avoid paying the cross-TU call
             // just to discover that GET/SET have none of the three scatter-routing flags.
-            constexpr uint32_t kScatterRouteFlags =
-                CmdFlags::AllShards | CmdFlags::MultiShard | CmdFlags::ConfigRoute;
             if constexpr (Fused)
                 if (read_local_enabled && read_local_mget_candidate && read_local_eligible)
                     goto ordinary_dispatch;
-            if (!(spec->flags & kScatterRouteFlags)) goto ordinary_dispatch;
+            if (!(spec->flags & (CmdFlags::AllShards | CmdFlags::MultiShard |
+                                CmdFlags::ConfigRoute))) goto ordinary_dispatch;
             {
             ScatterDispatch scatter_dispatch;
             const ScatterPrepare scatter_prepared =
@@ -4217,6 +4225,7 @@ ordinary_dispatch:
                 }
             }
 
+ordinary_shard_ready:
             if constexpr (Fused) {
                 if (read_local_enabled && read_local_commit_at_ordinary) {
                     // prepare() reserved the selected reads and this operation before any stateful
