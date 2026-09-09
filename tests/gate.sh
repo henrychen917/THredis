@@ -138,8 +138,8 @@ ROW_T=$(date +%s.%N)
 # Merged 2026-09-07: the ring unit is one row in BOTH tiers (server-less, under two seconds), so
 # quick is 326 + 1 = 327 and full is 343 + 1 = 344. Counted by line: the ring row is emitted with
 # the static rows, far above the quick-tier exit, and the P0 rows stay below it.
-EXPECT_QUICK=335
-EXPECT_FULL=352                 # full without the optional NIC row.
+EXPECT_QUICK=377
+EXPECT_FULL=394                 # full without the optional NIC row.
 say(){ printf '  %-52s %s\n' "$1" "$2"; }
 ledger(){ # verdict label -> one ledger line; the elapsed column is wall time since the last row
   local now; now=$(date +%s.%N)
