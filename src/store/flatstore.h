@@ -995,14 +995,16 @@ public:
     // Registration is idempotent and keyed by key hash only, exactly like expires_. A stale entry
     // (key replaced, deleted, or persisted) is harmless: the cycle drops it on its next visit.
     void note_field_ttl(uint64_t h) {
-        (void)field_expires_.insert(h);
-        field_ttl_gate_ = field_expires_.size();
+        // A missed registration must not disarm logical expiry. Keep the lazy-access gate
+        // sticky until FLUSH if the attention index could not allocate its entry.
+        if (!field_expires_.insert(h)) field_ttl_index_incomplete_ = true;
+        refresh_field_ttl_gate();
     }
     // FIRED-proof for the lazy reap: >0 means a hash field really was collected on an access path,
     // not merely filtered out of a reply. INFO reports it as expired_hash_fields.
     void note_field_expired(uint32_t n) { field_expired_ += n; }
-    // Re-arms type-specific attention for an object that arrived from a snapshot, an AOF replay or
-    // RESTORE rather than from a command. Load-only, so it costs the hot path nothing.
+    // Re-arms type-specific attention for an imported image, including atomic COPY/RENAME APPLY.
+    // The type guard keeps hash-field machinery behind the hash-only branch.
     void note_loaded_object(uint64_t h, const KvObj* o) {
         if (static_cast<Type>(o->type) != Type::Hash) return;
         if (static_cast<Enc>(o->enc) == Enc::Compact) return;
@@ -1606,7 +1608,7 @@ public:
                 // Key gone, replaced, re-typed, or every field TTL removed. Self-healing here is
                 // what lets registration stay a cheap unconditional insert on the write path.
                 field_expires_.erase(h);
-                field_ttl_gate_ = field_expires_.size();
+                refresh_field_ttl_gate();
                 return;
             }
             if (atomic_has_record(h, o->key())) return;
@@ -1617,8 +1619,10 @@ public:
             const Slice key = o->key();
             notify_flat_store_emit(this, NOTIFY_HASH, NotifyEventId::Hexpired, key);
             field_expired_ += reaped;
+            // Reaping already shrank the object, including when the last field disappeared.
+            // erase_in() will subtract only the remaining footprint.
+            note_object_size_change(before, kvobj_size(o));
             if (!empty) {
-                note_object_size_change(before, kvobj_size(o));
                 (void)aof_.record_post_image_buffered(*this, h, key);
                 removed += reaped;
                 return;
@@ -1627,7 +1631,7 @@ public:
             notify_flat_store_emit(this, NOTIFY_GENERIC, NotifyEventId::Del, key);
             if (erase_in(0, h, key) || (rehashing() && erase_in(1, h, key))) removed += reaped;
             field_expires_.erase(h);
-            field_ttl_gate_ = field_expires_.size();
+            refresh_field_ttl_gate();
         });
         return removed;
     }
@@ -1789,6 +1793,7 @@ public:
         }
         field_expires_.clear();
         field_ttl_gate_ = 0;
+        field_ttl_index_incomplete_ = false;
         rehash_pos_ = 0;
         if (fresh) install_empty_table(0, fresh, 1024);
     }
@@ -1815,16 +1820,18 @@ public:
         }
         field_expires_.clear();
         field_ttl_gate_ = 0;
+        field_ttl_index_incomplete_ = false;
     }
 
     // RANDOMKEY starts from an owner-private draw, independent of the IO-side draw that selected
     // this shard. Reusing that routing draw correlates its low bits with the shard id and leaves
     // physical-slot residue classes unreachable when table capacities are powers of two. Reservoir
     // selection across the one wrapped walk keeps adjacent live slots from inheriting a tiny share
-    // of a sparse table's probability. Lazy expiry is performed before a key becomes a candidate.
+    // of a sparse table's probability. Resolve the owner's read cut before sampling, including
+    // predecessors whose candidate is a physical deletion. Frozen snapshot objects stay resident.
     KvObj* random_live() {
         const uint64_t total = static_cast<uint64_t>(cap_[0]) + cap_[1];
-        if (!total || size() == 0) return nullptr;
+        if (!total) return nullptr;
         const uint64_t start_pos = next_random() % total;
         KvObj* chosen = nullptr;
         uint64_t live_seen = 0;
@@ -1836,15 +1843,19 @@ public:
             KvObj* o = ptr_of(tab_[t][slot]);
             if (!o) continue;
             const uint64_t h = hash_key(o->key());
-            if (!deadline_elapsed(h, o, cached_now_ms_)) {
-                if (next_random() % ++live_seen == 0) chosen = o;
-                continue;
+            if (atomic_pending_ && atomic_pending_->live) {
+                o = atomic_resolve(h, o->key(), atomic_read_epoch_);
+            } else {
+                if (deadline_elapsed(h, o, cached_now_ms_) && !(snapshot_active_ && t == 1))
+                    notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, o->key());
+                o = live_or_expire(t, h, o->key(), o);
             }
-            notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, o->key());
-            (void)aof_.record_delete(o->key());
-            erase_in(t, h, o->key());
-            if (expired_counter_) (*expired_counter_)++;
+            if (o && next_random() % ++live_seen == 0) chosen = o;
         }
+        atomic_for_each_side_key(atomic_read_epoch_, [&](Slice key) {
+            KvObj* o = atomic_resolve(hash_key(key), key, atomic_read_epoch_);
+            if (o && next_random() % ++live_seen == 0) chosen = o;
+        });
         return chosen;
     }
 
@@ -1933,6 +1944,11 @@ public:
     }
 
 private:
+    void refresh_field_ttl_gate() {
+        // Once registration was lost, the count is no longer exact until FLUSH. Preserve a
+        // positive gate without reporting an artificial UINT32_MAX population through INFO.
+        field_ttl_gate_ = std::max(field_expires_.size(), uint32_t{field_ttl_index_incomplete_});
+    }
     static constexpr uint32_t kSnapshotRecordTag = 0x44434552;  // "RECD", little endian
     static constexpr uint32_t kSnapshotRecordHeader = 32;
 
@@ -1942,7 +1958,13 @@ private:
     bool track_expire(uint64_t hash, KvObj* object) {
         if (!object) return true;
         const int64_t at = object->expire_at_ms();
-        if (at >= 0) return expires_.insert(hash, at);
+        if (at >= 0) {
+            if (expires_.insert(hash, at)) return true;
+            // An extension may have failed while growing an existing index. A missing sidecar
+            // falls back to the object's deadline; a stale sidecar would expire it too soon.
+            if constexpr (kTtlDeadlineSidecar) expires_.erase(hash);
+            return false;
+        }
         // The un-TTL'd store never reaches the index at all. Repeated here rather than left to
         // ExpireIndex::erase() so the CALL goes too, which is most of what it cost.
         //
@@ -2349,7 +2371,7 @@ private:
             KvObj* candidate = maxmemory_policy_is_volatile(maxmemory_policy_)
                 ? random_volatile_candidate() : random_allkeys_candidate();
             if (!candidate || candidate->key().key_eq(protected_key)) continue;
-            if (atomic_has_record(hash_key(candidate->key()), candidate->key())) continue;
+            if (atomic_needs_version(hash_key(candidate->key()), candidate->key())) continue;
             bool duplicate = false;
             for (uint32_t j = 0; j < seen_count; j++)
                 if (seen[j] == candidate) { duplicate = true; break; }
@@ -2429,6 +2451,8 @@ private:
     }
 
     bool make_room_for(Slice protected_key, size_t incoming_bytes) {
+        // Every caller, including same-class overwrite, must preserve unvisited pre-images.
+        if (snapshot_active_) return true;
         if (projected_bytes(protected_key, incoming_bytes) <= maxmemory_limit_) return true;
         if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return refuse_over_budget();
 
@@ -3021,6 +3045,7 @@ private:
         }
         field_expires_.clear();
         field_ttl_gate_ = 0;
+        field_ttl_index_incomplete_ = false;
         rehash_pos_ = 0;
         // The keyspace this cache was serving has gone. Nothing is about to ask for those blocks,
         // and the per-put ceiling would refuse new ones anyway (obj_bytes_ is now 0), so hand them
@@ -3046,6 +3071,7 @@ private:
         }
         field_expires_.clear();
         field_ttl_gate_ = 0;
+        field_ttl_index_incomplete_ = false;
     }
 
     void initialize_meta_read_local(KvObj* o) {
@@ -3080,7 +3106,7 @@ private:
             KvObj* candidate = maxmemory_policy_is_volatile(maxmemory_policy_)
                 ? random_volatile_candidate() : random_allkeys_candidate();
             if (!candidate || candidate->key().key_eq(protected_key)) continue;
-            if (atomic_has_record(hash_key(candidate->key()), candidate->key())) continue;
+            if (atomic_needs_version(hash_key(candidate->key()), candidate->key())) continue;
             bool duplicate = false;
             for (uint32_t j = 0; j < seen_count; j++)
                 if (seen[j] == candidate) { duplicate = true; break; }
@@ -3296,10 +3322,12 @@ private:
         while (budget && rehash_pos_ < cap_[1]) {
             const uint64_t w = tab_[1][rehash_pos_];
             if (KvObj* o = ptr_of(w)) {
+                // Publish the destination before withdrawing the old slot. A refused insertion
+                // must leave its source and accounting intact.
+                if (!insert_into_read_local(0, hash_key(o->key()), o, false)) return;
                 read_local_slot_store(&tab_[1][rehash_pos_], kTombBit);
                 live_[1]--; tombs_[1]++;
                 obj_bytes_ -= kvobj_size(o);
-                insert_into_read_local(0, hash_key(o->key()), o, false);
             }
             rehash_pos_++;
             budget--;
@@ -3686,15 +3714,13 @@ private:
         while (rehash_pos_ < end) {
             const uint64_t w = tab_[1][rehash_pos_];
             if (KvObj* o = ptr_of(w)) {
+                // Preserve the source if admission's capacity invariant is ever violated.
+                if (!insert_into(0, hash_key(o->key()), o, false)) return;
                 // TOMBSTONE, not EMPTY. Writing 0 here would terminate any probe run passing
                 // through this slot, making every key that probed past it unreachable in the old
                 // table for the rest of the rehash — a silent, transient, load-dependent miss.
                 tab_[1][rehash_pos_] = kTombBit;
                 live_[1]--; tombs_[1]++;
-                // Already charged and already indexed: fresh=false moves only the slot word.
-                // A failure here would lose the key silently (its old slot is already a tomb);
-                // the load bound makes it unreachable, so fail loud, as the atomic exchange does.
-                if (!insert_into(0, hash_key(o->key()), o, false)) std::abort();
             }
             rehash_pos_++;
         }
@@ -3706,6 +3732,9 @@ private:
     }
 
     friend struct FlatStoreLayoutLock;
+#ifdef TOMO_STORE_REGRESSION_TEST
+    friend struct FlatStoreRegressionTest;
+#endif
 
     // ============================================================================================
     // THE READER BLOCK vs TWO SETS OF OWNER WRITES — NONE OF WHICH MAY SHARE A 64-BYTE LINE.
@@ -3762,7 +3791,9 @@ private:
     // It belongs ON the topology line rather than 200 bytes past it: co-located, the whole foreign
     // read reduces to one line of FlatStore. Armed state itself stays sidecarred.
     bool      read_local_enabled_ = false;
-    uint8_t   reader_reserved_ = 0; // retain the measured reader/owner line separation
+    // Consumes the reserved byte without moving either cache-line boundary. Written only on
+    // field-index allocation failure or FLUSH; ordinary reads/writes never consult this byte.
+    bool      field_ttl_index_incomplete_ = false;
 
     // ---- SEPARATOR. Read-mostly only: config, bind-once counter bindings, and the snapshot
     // scalars that are latched once when a capture is prepared. NOTHING here is written by an
