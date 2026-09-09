@@ -30,7 +30,8 @@
 // exactly that and had to move to serve-while-copy to turn a 2.4 s p99.99 into 39 ms. So this works
 // the way Redis's dict does: allocate the new table, keep the old one, and migrate a BOUNDED number
 // of slots on subsequent mutations and owner maintenance passes. Lookups search both tables and
-// do not advance the move. The slot budget does not bound QSBR retirement when read-local is armed.
+// do not advance the move. Armed resizes reserve a QSBR record before starting, so their final
+// step cannot wait for object-retirement capacity. Grace may delay freeing an unlinked old table.
 //
 //   t_[0]  the CURRENT table. Every insert goes here. Always present.
 //   t_[1]  the OLD table, present only while rehashing. Drains, then is freed.
@@ -561,6 +562,7 @@ struct ReadLocalStoreState {
     // `foreign_reads`.
     std::atomic<uint64_t> probe_sequence{0};
     ReadLocalRetireSink retire_sink{};
+    std::unique_ptr<ResizeRetirement> resize_retirement;
     uint32_t table_mutation_depth = 0;
     uint32_t pending_count = 0;
     ForeignReadSafety foreign_reads{};
@@ -734,7 +736,12 @@ public:
     FlatStore& operator=(const FlatStore&) = delete;
 
     // Boot-only allocation, before persistence replay or any foreign probe can exist.
-    bool prepare_read_local() { return ensure_read_local_store_state(); }
+    bool prepare_read_local() {
+        if (!ensure_read_local_store_state()) return false;
+        // Persistence replay may leave a resize in flight before the lane is armed. Reserve
+        // its completion record at boot as well as at every later resize admission.
+        return prepare_resize_retirement();
+    }
 
     // Enabled is boot-latched. The sink may be rebound only at a quiesced fused ownership handoff;
     // false keeps the old store path and every installed writer hook predicted cold.
@@ -777,6 +784,11 @@ public:
         read_local_store_state_required().retire_sink = sink;
     }
     bool read_local_enabled() const { return read_local_enabled_; }
+    bool read_retirement_available() const {
+        if (!read_local_enabled_) return true;
+        const auto& sink = read_local_store_state_required().retire_sink;
+        return !sink.available || sink.available(sink.context);
+    }
 #ifdef TOMO_RL_CACHE_DEBUG
     // Debug builds only: lets Server assert that this store's sink still names its CURRENT owner.
     const ReadLocalRetireSink& read_local_retire_sink_debug() const {
@@ -1055,6 +1067,8 @@ public:
             return SnapshotWriteResult::Pending;
         }
         if (snapshot_prepared_) return SnapshotWriteResult::Ready;
+        if (read_local_enabled_ && !prepare_resize_retirement())
+            return SnapshotWriteResult::Error;
         uint64_t wanted = static_cast<uint64_t>(cap_[0]) * 2;
         if (wanted > UINT32_MAX) return SnapshotWriteResult::Error;
         const uint32_t cap = round_pow2(static_cast<uint32_t>(wanted));
@@ -1231,7 +1245,8 @@ public:
         if (!candidate && rehashing()) candidate = find_in(1, h, key);
         const bool expired = candidate && deadline_elapsed(h, candidate, cached_now_ms_) &&
                              !(snapshot_active_ && candidate == find_in(1, h, key));
-        if (expired) notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
+        if (expired && read_retirement_available())
+            notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
         KvObj* found = find(h, key);
         if (!found) notify_emit(sink, NOTIFY_KEY_MISS, NotifyEventId::Keymiss, key);
         return found;
@@ -1564,7 +1579,7 @@ public:
     }
 
     // Returns a WORK count, while `budget` bounds examined expire-index slots. The count is the
-    // number of expired keys removed, plus one while a sidecar move is still in flight: half the
+    // number of expired keys removed, plus resize/retirement-capacity debt and sidecar work: half the
     // index is then parked in the old table, and an owner that treats a barren sampling pass as
     // "nothing to do" parks with those deadlines unsampled until the next command wakes it.
     // Finding an object from its full hash follows only that hash's FlatStore probe run; it never
@@ -1573,8 +1588,11 @@ public:
         // Expiry after the cut is a post-cut deletion.  Leaving the object physically present lets
         // traversal serialize its absolute deadline; find() still reports it logically absent.
         if (snapshot_active_) return 0;
-        if (rehashing()) rehash_step();
-        uint32_t removed = 0;
+        const bool resizing = rehashing();
+        if (resizing) rehash_step();
+        // Count structural work even without TTL keys, including the final step. Idle owners
+        // must revisit an unfinished resize instead of parking until another command arrives.
+        uint32_t removed = resizing ? 1 : 0;
         expires_.sample(budget, [&](uint64_t h) {
             KvObj* o = find_hash_in(0, h);
             if (!o && rehashing()) o = find_hash_in(1, h);
@@ -1586,6 +1604,7 @@ public:
             const int64_t at = deadline(h, o);
             if (at < 0) { untrack_expire(h); return; }
             if (at > cached_now_ms_) return;
+            if (!read_retirement_available()) { removed++; return; }
             const Slice key = o->key();
             notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, key);
             (void)aof_.record_delete(key);
@@ -1621,6 +1640,7 @@ public:
                 return;
             }
             if (atomic_has_record(h, o->key())) return;
+            if (!read_retirement_available()) { removed++; return; }
             uint32_t reaped = 0;
             const size_t before = kvobj_size(o);
             const bool empty = hash_ttl_active_reap(*this, o, cached_now_ms_, reaped);
@@ -2624,8 +2644,10 @@ private:
         const int64_t at = deadline(h, o);
         if (at < 0 || at > cached_now_ms_) return o;
         if (snapshot_active_ && t == 1) return nullptr;
-        // Lazy expiry is still a physical deletion and can wait for armed QSBR capacity. Removing
-        // lookup-triggered rehash does not remove this separate obligation (WAITS.md).
+        // Logical expiry never needs reclamation. With a full armed ring, leave the object and
+        // its deadline index resident for owner maintenance. Only the eventual physical delete
+        // emits expiry/AOF/accounting effects; repeated reads cannot enqueue or wait for grace.
+        if (!read_retirement_available()) return nullptr;
         (void)aof_.record_delete(key);
         erase_in(t, h, key);
         if (expired_counter_) (*expired_counter_)++;
@@ -3061,6 +3083,7 @@ private:
         // and the per-put ceiling would refuse new ones anyway (obj_bytes_ is now 0), so hand them
         // straight back rather than holding them until the next write pressure.
         read_local_cache_release_all();
+        read_local_store_state_armed().resize_retirement.reset();
         if (fresh) install_empty_table_read_local(0, fresh, 1024);
     }
 
@@ -3315,6 +3338,7 @@ private:
         if (newcap < kMinCap) newcap = kMinCap;
         uint64_t* fresh = allocate_table(newcap);
         if (!fresh) return false;
+        if (!prepare_resize_retirement()) { std::free(fresh); return false; }
         ReadLocalTableGuard table_change(*this);
         if (rehash_counter_) (*rehash_counter_)++;
         read_local_topology_store(&tab_[1], tab_[0]);
@@ -3349,8 +3373,21 @@ private:
             read_local_topology_store(&mask_[1], uint32_t{0});
             live_[1] = 0; tombs_[1] = 0;
             rehash_pos_ = 0;
-            retire_table_read_local(retired);
+            auto& state = read_local_store_state_armed();
+            if (state.retire_sink.defer_resize) {
+                if (!state.resize_retirement) std::abort();
+                state.retire_sink.defer_resize(state.retire_sink.context,
+                                              state.resize_retirement.release(), retired);
+            } else {
+                retire_table_read_local(retired); // synchronous serverless sink
+            }
         }
+    }
+
+    bool prepare_resize_retirement() {
+        auto& record = read_local_store_state_required().resize_retirement;
+        if (!record) record.reset(new (std::nothrow) ResizeRetirement);
+        return record != nullptr;
     }
 
     template <typename T>
@@ -3708,7 +3745,7 @@ private:
     }
 
     // Move a bounded number of slot words during mutations/owner maintenance, never lookup.
-    // This bounds table work, not the armed retirement queue's grace wait (see WAITS.md).
+    // Armed completion hands off a preallocated retirement record without waiting for grace.
     void rehash_step() {
         if (__builtin_expect(read_local_enabled_, false)) {
             rehash_step_read_local();

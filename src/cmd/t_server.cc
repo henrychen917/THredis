@@ -768,9 +768,13 @@ void cmd_reset(Shard&, Op& op) {
 
 void cmd_debug_impl(Shard& shard, Op& op) {
     const Slice subcommand = op.arg(1);
-    // DEBUG's ConfigRoute owns shard 0. Observe only that store, on its owner; sampling
-    // other shards here would race their cursors. No lookup or maintenance is performed.
+    // REHASH-STATE is explicitly queued to shard 0 by IoLoop, unlike ordinary ConfigRoute
+    // commands (which are IO-local). Reject an unrouted call before touching owner-only state.
     if (eq_icase(subcommand, "rehash-state") && op.argc() == 2) {
+        if (op.shard != 0 || shard.id() != 0) {
+            reply_err(op.sink(), "ERR REHASH-STATE requires shard-owner dispatch");
+            return;
+        }
         const auto progress = shard.store().rehash_progress();
         auto sink = op.sink();
         reply_array_header(sink, 7);
