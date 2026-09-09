@@ -374,6 +374,21 @@ pausable make build/store-regression-sidecar >/tmp/gate-store-sidecar.txt 2>&1 \
         >>/tmp/gate-store-sidecar.txt 2>&1 \
     && ok "storage deadline-sidecar regression" \
     || bad "storage deadline-sidecar regression" "see /tmp/gate-store-sidecar.txt"
+# SURVIVING.md's atomic lane: one build and fifteen named, deterministic defect rows.
+# Counted by line: all sixteen are ABOVE the quick-tier exit, so both tiers gain sixteen.
+# EXPECT_QUICK/EXPECT_FULL are deliberately left to the maintainer (see FIXES.md).
+pausable make -j2 build/atomic-survivors-unit >/tmp/gate-atomic-survivors-build.txt 2>&1 \
+    && ok "atomic survivors unit build" \
+    || bad "atomic survivors unit build" "see /tmp/gate-atomic-survivors-build.txt"
+for defect in admission closure script_keys rename_overlay write_latest script_apply \
+              lua_conversion watch_parent watch_cycle mset_arity watch_oom lua_lines \
+              library_limit stage_flag instruction_limit; do
+  quiet_wait
+  taskset -c "$CORES" timeout --foreground 30 ./build/atomic-survivors-unit "$defect" \
+      >"/tmp/gate-atomic-survivors-$defect.txt" 2>&1 \
+      && ok "atomic survivor: $defect" \
+      || bad "atomic survivor: $defect" "see /tmp/gate-atomic-survivors-$defect.txt"
+done
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
       --check src/cmd/acl_categories_generated.h \

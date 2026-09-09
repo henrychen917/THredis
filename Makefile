@@ -131,6 +131,12 @@ build/core-concurrency-unit: tests/core_concurrency_unit.cc $(CORE_TEST_OBJ) $(w
 	  -DTOMO_CORE_CONCURRENCY_TEST -I. $< $(CORE_TEST_OBJ) -o $@ \
 	  $(JELIBS) $(LDLIBS) -lm
 
+# Directed owner-phase tests. The test includes xshard.cc to drive the real private phases
+# without starting worker threads or opening a listener; all other code is the release objects.
+build/atomic-survivors-unit: tests/atomic_survivors_unit.cc src/cmd/xshard.cc $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) $(wildcard src/*/*.inc) $(wildcard src/*/*.h) Makefile
+	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. tests/atomic_survivors_unit.cc \
+	  $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) -o $@ $(JELIBS) $(LDLIBS) -lm
+
 # Load drivers: not part of `all`, kept compiling here so they cannot rot unnoticed.
 build/benchtxn: tools/benchtxn.cc Makefile
 	@mkdir -p build
