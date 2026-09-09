@@ -103,6 +103,14 @@ unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit bui
 	./build/read-local-ring-unit
 	./build/read-local-write-ring-unit
 
+# Deterministic core regressions: the test TU instantiates the real executor/IO methods
+# with ASAN/UBSAN and test-only interleaving hooks. No server or ring is started.
+CORE_TEST_OBJ := $(filter-out build/src/main.o build/src/core/genthread.o,$(OBJ))
+build/core-concurrency-unit: tests/core_concurrency_unit.cc $(CORE_TEST_OBJ) $(wildcard src/*/*.h)
+	$(CXX) $(CXXFLAGS) $(JEFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -DTOMO_CORE_CONCURRENCY_TEST -I. $< $(CORE_TEST_OBJ) -o $@ \
+	  $(JELIBS) $(LDLIBS) -lm
+
 # Load drivers: not part of `all`, kept compiling here so they cannot rot unnoticed.
 build/benchtxn: tools/benchtxn.cc Makefile
 	@mkdir -p build

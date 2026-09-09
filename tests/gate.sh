@@ -319,6 +319,23 @@ g++ -std=c++20 -O2 -march=native -pthread -I. tests/read_local_write_ring_unit.c
     && /tmp/tomokv-read-local-write-ring-unit >>/tmp/gate-ring-unit.txt 2>&1 \
     && ok "read-local write ring + arming transient unit" \
     || bad "read-local write ring + arming transient unit" "see /tmp/gate-ring-unit.txt"
+# SURVIVING core concurrency regressions. Eight rows, all ABOVE the quick-tier exit.
+# Each selection asserts its hazardous state; ASAN/UBSAN and bounded interleaving hooks
+# make a broken mechanism fail. The fixture starts no server and opens no listener.
+CORE_UNIT_READY=1
+pausable make -j2 build/core-concurrency-unit >build/gate-core-concurrency-build.txt 2>&1 \
+    || CORE_UNIT_READY=0
+for core_row in watch scheduler lifetime drain route snapshot config notify; do
+  quiet_wait
+  if [ "$CORE_UNIT_READY" = 1 ] && \
+      ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+      timeout --foreground 60 taskset -c "$CORES" ./build/core-concurrency-unit "$core_row" \
+          >"build/gate-core-$core_row.txt" 2>&1; then
+    ok "core concurrency $core_row"
+  else
+    bad "core concurrency $core_row" "see build/gate-core-$core_row.txt and build/gate-core-concurrency-build.txt"
+  fi
+done
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
       --check src/cmd/acl_categories_generated.h \

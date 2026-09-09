@@ -174,6 +174,7 @@ public:
 
     bool init(Server* srv, ThreadCtx* self, bool dormant = false) {
         srv_ = srv; self_ = self;
+        srv_->bind_owner_notify_pending(self_->id(), &notify_keyless_pending_);
         aof_manager_ = srv->aof().configured() ? &srv->aof() : nullptr;
         foreign_touch_random_ ^= (static_cast<uint64_t>(self->id()) + 1) * 0x9e3779b97f4a7c15ULL;
         lb_sample_rate_ = srv->lb_machinery_enabled() ? srv->lb_sample_rate() : 0;
@@ -421,6 +422,7 @@ public:
               bool IofusedPrivateQueue = false, bool InterleaveLocalReads = false,
               typename Filler = void>
     uint32_t fused_pass_impl(Filler* filler = nullptr) {
+        Server::ClientWorkScope client_work(*srv_, self_->id());
         constexpr bool HasFiller = !std::is_void_v<Filler>;
         [[maybe_unused]] bool filler_used = false;
         auto finish_filler = [&] {
@@ -554,8 +556,6 @@ public:
             }
             did += aof_flush_pass();
             did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
-            did += lb_control_pass();
-            lb_bucket_bytes_pass();
         }
         if (fairlane_turn) {
             owner_work_remains |= fairlane_owner_debt_pending();
@@ -580,8 +580,8 @@ public:
             if (__builtin_expect(read_local_impl().lane_admit_cap != want, false))
                 read_local_impl().lane_admit_cap = want;
         }
+        if (!lb_frozen) did += owner_control_tail();
         if (did) {
-            did += drain_notify_keyless(self_->sig());
             fused_submit_boundary<CoalesceSubmit>();
             fused_idle_spins_ = 0;
             return did;
@@ -707,6 +707,7 @@ public:
             uint32_t did = 0;
             uint64_t pass_ns = 0;
             {
+                Server::ClientWorkScope client_work(*srv_, self_->id());
                 Span busy(pass_ns);
                 if (self_->sample_depth(busy.start_ns() / 1000)) {
                     const uint32_t age_rate = srv_->effective_age_sample_rate();
@@ -737,8 +738,8 @@ public:
                         did += drain_notify_keyless(sig);
                     }
                     did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
-                    did += flip_control_pass();
                     did += lb_control_pass();
+                    did += flip_control_pass();
                 } else {
                     did += snapshot_control_pass();
                     did += service_stale_forwards();
@@ -761,9 +762,7 @@ public:
                     }
                     did += aof_flush_pass();
                     did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
-                    did += flip_control_pass();
-                    did += lb_control_pass();
-                    lb_bucket_bytes_pass();
+                    did += owner_control_tail();
                 }
             }
             // A pass that found nothing -- every drain and control pass came back empty -- is
@@ -780,7 +779,6 @@ public:
             // the busy path without submitting strands them in the SQ forever, and the peer
             // that is waiting on that wake never runs.
             if (did) {
-                did += drain_notify_keyless(sig);
                 ring_.submit_and_reap(); idle_spins = 0; continue;
             }
 
@@ -821,6 +819,11 @@ public:
 
 private:
     friend class IoLoop;
+    friend struct CoreConcurrencyTest;
+#ifdef TOMO_CORE_CONCURRENCY_TEST
+    inline static void (*test_after_done_)(Client*) = nullptr;
+    inline static void (*test_after_drain_ack_)() = nullptr;
+#endif
 
     bool read_local_enabled() const {
         if constexpr (Fused) return read_local_.impl != nullptr;
@@ -1626,6 +1629,17 @@ private:
         return true;
     }
 
+    uint32_t owner_control_tail() {
+        // A stage may start after the loop's initial freeze sample. Finish EVERY
+        // owner access before a control pass can acknowledge ExDrain: the coordinator
+        // may transfer shards and rewrite this vector immediately after that store.
+        uint32_t work = drain_notify_keyless(self_->sig());
+        lb_bucket_bytes_pass();
+        work += lb_control_pass();
+        if constexpr (!Fused) work += flip_control_pass();
+        return work;
+    }
+
     uint32_t flip_control_pass() {
         const FlipStage stage = srv_->flip_stage();
         if (stage == FlipStage::IoPrepare &&
@@ -1641,6 +1655,9 @@ private:
         if (stage == FlipStage::ExDrain && !srv_->flip_acked(self_->id(), stage) &&
             flip_quiesced()) {
             srv_->flip_ack(self_->id(), stage);
+#ifdef TOMO_CORE_CONCURRENCY_TEST
+            if (test_after_drain_ack_) test_after_drain_ack_();
+#endif
             return 1;
         }
         if (stage == FlipStage::ExInstall && !srv_->flip_acked(self_->id(), stage)) {
@@ -1697,6 +1714,9 @@ private:
         if (srv_->lb_acked(self_->id())) return 0;
         if (!flip_quiesced()) return 0;
         srv_->lb_ack(self_->id());
+#ifdef TOMO_CORE_CONCURRENCY_TEST
+        if (test_after_drain_ack_) test_after_drain_ack_();
+#endif
         lb_ack_wake_pending_ = true;
         lb_rebind_pending_ = true;   // membership may change before the stage ends; rebind after
         return wake_coordinator();
@@ -1756,6 +1776,7 @@ private:
     template <uint32_t BatchOps = kGenthreadExBatchOps, bool ConsumeTasks = true,
               bool IofusedPrivateQueue = false, bool InterleaveLocalReads = false>
     uint32_t sweep() {
+        Server::ClientWorkScope client_work(*srv_, self_->id());
         [[maybe_unused]] bool owner_work_remains = false;
         uint32_t n = snapshot_control_pass<BatchOps, IofusedPrivateQueue>() +
                      service_stale_forwards<BatchOps, IofusedPrivateQueue>() +
@@ -2121,6 +2142,14 @@ private:
     }
 
     void ex_schedule_batch(Task* tasks, uint32_t n) {
+        // The experimental fused gather holds 128 tasks; the scheduler's rank/index
+        // scratch and 64-bit chain occupancy are deliberately sized for 32. Schedule
+        // consecutive bounded runs so no permutation can cross a chunk boundary.
+        if (n > kExecBatch) {
+            for (uint32_t begin = 0; begin < n; begin += kExecBatch)
+                ex_schedule_batch(tasks + begin, std::min(kExecBatch, n - begin));
+            return;
+        }
         uint8_t base_lengths[kExecBatch];
         uint32_t begin = 0;
         while (begin < n) {
@@ -2313,6 +2342,9 @@ private:
 
     template <bool IofusedPrivateQueue = false>
     bool execute_snapshot_task(const Task& task, bool capture_writes) {
+        // Pre-image preparation and backlog ownership belong to the current owner too.
+        // execute()'s forwarding guard runs too late for this wrapper.
+        if (forward_stale_task<IofusedPrivateQueue>(task)) return true;
         // MULTI's tagged task owns its command images outside the public ROB and performs the
         // snapshot pre-image gate per installed transaction key.  Never decode it as a normal op.
         if (multi_task_tagged(task)) return execute<IofusedPrivateQueue>(task);
@@ -2419,6 +2451,7 @@ private:
     template <bool IofusedPrivateQueue = false>
     __attribute__((noinline, cold))
     void exec_batch_timed(const Task* batch, uint32_t n) {
+        Server::ClientWorkScope client_work(*srv_, self_->id());
         const SlowlogArm arm = slowlog_arm_;
         const int64_t now_ms = cached_now_ms_;
         slowlog_note_batch_timed();
@@ -2588,6 +2621,7 @@ private:
 
     template <bool IofusedPrivateQueue = false, bool ReadLocalNoEvict = false>
     bool execute(const Task& t) {
+        Server::ClientWorkScope client_work(*srv_, self_->id());
         // Forwarding, rather than a request epoch, resolves the route-read/enqueue race.  This check
         // must precede every shard dereference, including tagged MULTI and ownerless cleanup tasks.
         if (forward_stale_task<IofusedPrivateQueue>(t)) return true;
@@ -2637,8 +2671,7 @@ private:
             }
             // The no-touch answer is PER TASK; a MULTI body inherits the transaction owner's.
             if (__builtin_expect(maxmemory_enabled_, false)) {
-                const Op& carrier = t.client->rob().at(t.op_id);
-                const bool no_touch = carrier.no_touch();
+                const bool no_touch = t.client && t.client->rob().at(t.op_id).no_touch();
                 shard.set_no_touch(no_touch);
                 if (no_touch) srv_->climon_note_no_touch();
             }
@@ -2796,6 +2829,9 @@ private:
         // Release pairs with the IO thread's acquire on Done: everything the handler wrote into
         // op.reply becomes visible through this one store.
         op.state.store(OpState::Done, std::memory_order_release);
+#ifdef TOMO_CORE_CONCURRENCY_TEST
+        if (test_after_done_) test_after_done_(t.client);
+#endif
 
         // Notify the connection's io thread; the claim flag dedupes a burst into one post.
         // EXECUTOR-ISSUED SENDS ARE A CLOSED DOOR: the exwb mode (executor
@@ -3014,6 +3050,7 @@ private:
     }
     void flush_xshard_commits() {
         if (__builtin_expect(!xshard_commit_pending_, true)) return;
+        Server::ClientWorkScope client_work(*srv_, self_->id());
         xshard_flush_commits(
             *srv_, *self_, ring_, this,
             [](void* context, Client* client) {
