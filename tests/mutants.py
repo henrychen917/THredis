@@ -17,7 +17,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -71,12 +70,16 @@ def feature_module():
     return module
 
 
-def registry(path, only=None):
+def revision_text(revision, path):
+    return subprocess.check_output(['git', '-C', str(ROOT), 'show', f'{revision}:{path}'], text=True)
+
+
+def registry(path, only=None, revision='HEAD'):
     data = json.loads(path.read_text())
     if data.get('schema') != 1:
         raise ValueError('unknown mutant registry schema')
     features = feature_module()
-    gate = (ROOT / 'tests/gate.sh').read_text()
+    gate = revision_text(revision, 'tests/gate.sh')
     result, names = [], set()
     for item in data['mutants']:
         name = item['name']
@@ -86,9 +89,11 @@ def registry(path, only=None):
         if only and name not in only:
             continue
         source = ROOT / item['file']
-        if not source.resolve().is_relative_to(ROOT) or not source.is_file():
+        if not source.resolve().is_relative_to(ROOT):
             raise ValueError(f'{name}: invalid source path')
-        text = source.read_text()
+        # ROOT can be on another revision or have pending source edits. An anchor matching those
+        # bytes says nothing about the detached revision that will actually be compiled.
+        text = revision_text(revision, item['file'])
         if not item['find'] or text.count(item['find']) != 1 or item['find'] == item['replace']:
             raise ValueError(f'{name}: STALE registry: mutation must change exactly one source match')
         rows = []
@@ -130,6 +135,52 @@ def process_identity(pid):
         return None
 
 
+def session_processes(session):
+    owned = {}
+    for path in Path('/proc').iterdir():
+        if not path.name.isdigit():
+            continue
+        try:
+            fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+            if int(fields[3]) == session and fields[0] != 'Z':
+                owned[int(path.name)] = (int(fields[1]), fields[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    return owned
+
+
+def become_subreaper():
+    # A nested row helper starts its own session too. If its parent exits, a session-only scan
+    # cannot find that child. Linux reparents our orphaned descendants to this runner when it is a
+    # subreaper; unrelated processes can never become its children through this mechanism.
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), 'cannot retain ownership of orphaned row descendants')
+
+
+def adopted_children(before, primary, reap=True):
+    owned = {}
+    for path in Path('/proc').iterdir():
+        if not path.name.isdigit():
+            continue
+        pid = int(path.name)
+        if pid == primary or pid in before:
+            continue
+        try:
+            fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+            if int(fields[1]) != os.getpid():
+                continue
+            if fields[0] == 'Z' and reap:
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+            else:
+                owned[pid] = (int(fields[1]), fields[19])
+        except (OSError, ValueError, IndexError):
+            continue
+    return owned
+
+
 def descendants(pid):
     found = {}
     for path in Path('/proc').iterdir():
@@ -148,8 +199,15 @@ def descendants(pid):
         parents.update(children)
 
 
-def stop_owned(process):
-    owned = descendants(process.pid)
+def _stop_owned(process, owned=None, prior_children=None):
+    # Every command starts its own session. An orphaned child retains that session after its
+    # parent exits, even though a PPID-only walk can no longer find it. These are still exactly
+    # the processes we started; no process-name/argv matching and no process-group signals.
+    owned = dict(owned or {})
+    owned.update(descendants(process.pid))
+    owned.update(session_processes(process.pid))
+    if prior_children is not None:
+        owned.update(adopted_children(prior_children, process.pid))
     identity = process_identity(process.pid)
     if identity:
         owned[process.pid] = identity
@@ -162,6 +220,9 @@ def stop_owned(process):
         except subprocess.TimeoutExpired:
             pass
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        owned.update(session_processes(process.pid))
+        if prior_children is not None:
+            owned.update(adopted_children(prior_children, process.pid))
         for pid, expected in owned.items():
             actual = process_identity(pid)
             # A surviving child can be reparented after its battery exits. Its starttime still
@@ -172,49 +233,114 @@ def stop_owned(process):
         if process.poll() is None:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=5)
+        if sig == signal.SIGTERM:
+            until = time.monotonic() + 2
+            while time.monotonic() < until and session_processes(process.pid):
+                time.sleep(.025)
+    # Killing a nested parent can expose one more orphan generation. Drain that finite tree,
+    # reaping only adopted children, before the worktree containing their binary is removed.
+    until = time.monotonic() + 5
+    while prior_children is not None:
+        remaining = adopted_children(prior_children, process.pid)
+        if not remaining:
+            break
+        owned.update(remaining)
+        for pid, expected in remaining.items():
+            actual = process_identity(pid)
+            if actual and actual[1] == expected[1]:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+        if time.monotonic() >= until:
+            raise RuntimeError('owned descendants survived SIGKILL: ' + ','.join(map(str, remaining)))
+        time.sleep(.025)
+    if process.poll() is None:
+        raise RuntimeError(f'owned command PID {process.pid} survived SIGKILL')
+    return sorted(owned)
+
+
+def stop_owned(process, owned=None, prior_children=None):
+    # A second Ctrl-C must not interrupt cleanup halfway through and strand a TERM-ignoring child.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    try:
+        return _stop_owned(process, owned, prior_children)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 def command(argv, cwd, logfile, timeout, env=None):
     start = time.monotonic()
+    become_subreaper()
+    prior_children = set(adopted_children(set(), None, reap=False))
     logfile.parent.mkdir(parents=True, exist_ok=True)
+    leaked = []
     with logfile.open('w') as output:
-        process = subprocess.Popen(list(map(str, argv)), cwd=cwd, env=env, stdout=output,
-                                   stderr=subprocess.STDOUT, start_new_session=True)
+        process = None
+        # Block cancellation only across acquiring the Popen ownership token. Restore the mask in
+        # the child before exec: an inherited blocked SIGTERM would defeat its cleanup handlers.
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
         try:
+            process = subprocess.Popen(list(map(str, argv)), cwd=cwd, env=env, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True,
+                                       preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, mask))
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
             code = process.wait(timeout=timeout)
             expired = False
+            remaining = session_processes(process.pid)
+            remaining.update(adopted_children(prior_children, process.pid))
+            if remaining:
+                leaked = sorted(remaining)
+                stop_owned(process, remaining, prior_children)
         except subprocess.TimeoutExpired:
-            stop_owned(process)
+            stop_owned(process, prior_children=prior_children)
             code, expired = process.returncode, True
         except BaseException:
-            stop_owned(process)
+            if process is not None:
+                stop_owned(process, prior_children=prior_children)
             raise
-    return dict(returncode=code, expired=expired, seconds=time.monotonic() - start,
-                output=logfile.read_text(errors='replace'))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    return dict(pid=process.pid, returncode=code, expired=expired, seconds=time.monotonic() - start,
+                output=logfile.read_text(errors='replace'), leaked_pids=leaked)
 
 
 @contextlib.contextmanager
 def worktree(parent, name, revision):
     path = parent / name
-    subprocess.run(['git', '-C', str(ROOT), 'worktree', 'add', '--detach', str(path), revision],
-                   check=True, stdout=subprocess.DEVNULL)
+    created = False
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
     try:
+        subprocess.run(['git', '-C', str(ROOT), 'worktree', 'add', '--detach', str(path), revision],
+                       check=True, stdout=subprocess.DEVNULL)
+        created = True
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         yield path
     finally:
         # Removal is strictly the path created above. Keep neither mutant source nor a stale git
         # worktree registration on exceptions, Ctrl-C, failed compilation, or failed controls.
-        subprocess.run(['git', '-C', str(ROOT), 'worktree', 'remove', '--force', str(path)], check=True)
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+        try:
+            if created or (path / '.git').exists():
+                subprocess.run(['git', '-C', str(ROOT), 'worktree', 'remove', '--force', str(path)], check=True)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
 
 def build(tree, mutant, rows, output, args):
+    def status(result):
+        if result['expired']:
+            return 'timeout'
+        if result.get('leaked_pids'):
+            return 'leaked-children'
+        return 'ok' if result['returncode'] == 0 else 'compile-failed'
+
     flags = '-std=c++20 -O2 -g -Wall -Wextra -march=native -pthread'
     if mutant.get('debug_cache'):
         flags += ' -DTOMO_RL_CACHE_DEBUG'
     targets = ['all', *sorted({row['target'] for row in rows if 'target' in row})]
     result = command(['taskset', '-c', args.build_cpus, 'make', '-j' + str(args.jobs),
                       'CXXFLAGS=' + flags, *targets], tree, output / 'build.log', args.build_timeout)
-    if result['returncode'] != 0 or result['expired']:
-        return False
+    if status(result) != 'ok':
+        return status(result)
     for row in rows:
         if 'source' not in row:
             continue
@@ -222,21 +348,21 @@ def build(tree, mutant, rows, output, args):
         result = command(['taskset', '-c', args.build_cpus, os.environ.get('CXX', 'g++'),
                           *compile_flags, row['source'], '-o', 'build/mutant-' + row['id']],
                          tree, output / ('build-' + row['id'] + '.log'), args.build_timeout)
-        if result['returncode'] != 0 or result['expired']:
-            return False
-    return True
+        if status(result) != 'ok':
+            return status(result)
+    return 'ok'
 
 
 def row_command(args, tree, row, output):
     if 'feature' in row:
-        argv = [sys.executable, ROOT / 'tests/feature_gate.py', '--cell', row['feature'],
+        argv = [sys.executable, tree / 'tests/feature_gate.py', '--cell', row['feature'],
                 '--binary', tree / 'build/tomokv', '--server-cpus', args.server_cpus,
                 '--load-cpus', args.load_cpus, '--ratio', '6:2', '--port', str(args.port),
                 '--output', output / 'feature']
     elif 'live' in row:
         # The same script owns boot and battery, so its signal/finally path tears down the exact
         # server PID even when the outer per-row deadline fires.
-        argv = [sys.executable, __file__, '--_live-row', row['id'], '--_tree', str(tree),
+        argv = [sys.executable, tree / 'tests/mutants.py', '--_live-row', row['id'], '--_tree', str(tree),
                 '--output', str(output), '--server-cpus', args.server_cpus,
                 '--load-cpus', args.load_cpus, '--port', str(args.port)]
     else:
@@ -244,7 +370,7 @@ def row_command(args, tree, row, output):
         argv = ['taskset', '-c', args.server_cpus, tree / binary, *row.get('arguments', [])]
     env = dict(os.environ, TOMO_GATE_STRICT='1', ASAN_OPTIONS='detect_leaks=1',
                UBSAN_OPTIONS='halt_on_error=1')
-    return command(argv, ROOT, output / 'row.log', row['timeout'], env)
+    return command(argv, tree, output / 'row.log', row['timeout'], env)
 
 
 def classify(result, *, reached, passed, failure, evidence):
@@ -252,6 +378,8 @@ def classify(result, *, reached, passed, failure, evidence):
     # port, overlapping CPUs, or compile failure. A matching assertion is mandatory evidence.
     if result['expired']:
         return 'ERROR', 'row deadline expired; no mechanism verdict'
+    if result.get('leaked_pids'):
+        return 'ERROR', 'row parent left owned child processes running; forcibly cleaned up'
     if not reached:
         return 'UNREACHED', 'row did not reach its assertion/contract'
     if result['returncode'] == 0 and passed:
@@ -261,27 +389,53 @@ def classify(result, *, reached, passed, failure, evidence):
     return 'ERROR', 'row failed for another reason, or exit status disagrees with its result'
 
 
+def read_row_artifact(path):
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError('expected a JSON object')
+        for field in ('reached', 'passed'):
+            if field in data and not isinstance(data[field], bool):
+                raise ValueError(f'{field} must be a boolean')
+        if 'verdict' in data and data['verdict'] not in ('ok', 'FAIL'):
+            raise ValueError('unknown verdict')
+        if 'reason' in data and not isinstance(data['reason'], str):
+            raise ValueError('reason must be text')
+        return data, None
+    except (OSError, ValueError) as exc:
+        return {}, f'invalid row artifact {path}: {exc}'
+
+
 def run_row(args, tree, row, output, control=False):
     output.mkdir(parents=True, exist_ok=False)
     result = row_command(args, tree, row, output)
     evidence = result['output']
     reached = passed = False
+    artifact_error = None
     if 'feature' in row:
         artifact = output / 'feature' / row['feature'] / 'result.json'
         if artifact.exists():
-            data = json.loads(artifact.read_text())
+            data, artifact_error = read_row_artifact(artifact)
             if data.get('cell') == row['feature']:
                 evidence += '\n' + data.get('reason', '')
-                # An older feature runner has no reached field: its successful complete result or
-                # this precise expected assertion still identifies the contract, never a generic
-                # boot error. Missing artifacts, including CPU preflight errors, remain UNREACHED.
-                passed = data.get('verdict') == 'ok'
-                reached = data.get('reached', False) or passed or bool(re.search(row['failure'], evidence))
+                # Existing feature results have no reached flag. Their actual child PID plus the
+                # completed witness payload (or exact refusal contract) establishes it. Merely
+                # writing {verdict:ok}, or exiting 0 with no result, cannot become a green control.
+                completed = (data.get('contract') == 'refusal' and
+                             'refused as documented:' in data.get('reason', '')) or (
+                             isinstance(data.get('task_affinities'), list) and
+                             isinstance(data.get('evidence'), dict))
+                passed = data.get('verdict') == 'ok' and completed
+                started = (artifact.parent / 'pid').is_file()
+                reached = started and (data.get('reached', False) or passed or
+                                       bool(re.search(row['failure'], evidence)))
     elif 'live' in row:
         artifact = output / 'live-result.json'
         if artifact.exists():
-            data = json.loads(artifact.read_text())
-            reached, passed = data['reached'], data['passed']
+            data, artifact_error = read_row_artifact(artifact)
+            reached = (data.get('reached', False) and (output / 'server/pid').is_file() and
+                       (output / 'battery.log').is_file())
+            passed = data.get('passed', False) and bool(re.search(row['success'], evidence))
             evidence += '\n' + data.get('reason', '')
             log = output / 'server' / 'server.log'
             if log.exists():
@@ -291,11 +445,14 @@ def run_row(args, tree, row, output, control=False):
         reached = passed or bool(re.search(row['failure'], evidence))
     status, reason = classify(result, reached=reached, passed=passed,
                               failure=row['failure'], evidence=evidence)
+    if artifact_error:
+        status, reason = 'ERROR', artifact_error
     if control:
         status = 'CONTROL-PASS' if status == 'SURVIVED' else 'CONTROL-FAIL'
         reason = 'unmutated row passed' if status == 'CONTROL-PASS' else reason
     report = dict(row=row['label'], status=status, reason=reason, reached=reached,
-                  returncode=result['returncode'], expired=result['expired'], seconds=result['seconds'])
+                  returncode=result['returncode'], expired=result['expired'], seconds=result['seconds'],
+                  leaked_pids=result.get('leaked_pids', []))
     write_json(output / 'result.json', report)
     print(f'  {status:12} {row["label"]}: {reason}', flush=True)
     return report
@@ -373,14 +530,85 @@ def self_test():
         (bad, True, False, 'ERROR', 'ModuleNotFoundError'),
         (bad, True, False, 'KILLED', 'mechanism assertion'),
         (good, True, False, 'ERROR', 'mechanism assertion'),
+        (good, False, False, 'UNREACHED', ''),
         (dict(bad, expired=True), True, False, 'ERROR', 'mechanism assertion'),
+        (dict(good, leaked_pids=[123]), True, True, 'ERROR', ''),
     ]
     for result, reached, passed, expected, evidence in cases:
         status, _ = classify(result, reached=reached, passed=passed,
                              failure='mechanism assertion', evidence=evidence)
         if status != expected:
             raise AssertionError((expected, status))
-    print('MUTANTS self-test: 6 classification controls passed; no servers/builds')
+    (ROOT / 'build').mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='mutants-self-test-', dir=ROOT / 'build') as temporary:
+        output = Path(temporary)
+        # Exercise row_command -> actual child -> artifact parser -> classifier, not just made-up
+        # classify() inputs. The selected tree's fake driver exits 0 without running any server.
+        # It must remain UNREACHED, proving both immutable-script selection and missing evidence.
+        fake = output / 'fake-tree'
+        (fake / 'tests').mkdir(parents=True)
+        driver = fake / 'tests/feature_gate.py'
+        driver.write_text('print("selected-tree driver")\n')
+        args = argparse.Namespace(server_cpus='0-7', load_cpus='8-15', port=8990)
+        row = dict(id='fake-feature', feature='1s-0-0-0-1', label='fake feature', timeout=5,
+                   failure='mechanism assertion')
+        report = run_row(args, fake, row, output / 'missing-result')
+        if report['status'] != 'UNREACHED' or 'selected-tree driver' not in (output / 'missing-result/row.log').read_text():
+            raise AssertionError('missing-result/selected-worktree end-to-end control failed')
+        driver.write_text('import json,pathlib,sys\n'
+                          'p=pathlib.Path(sys.argv[sys.argv.index("--output")+1])/"1s-0-0-0-1"\n'
+                          'p.mkdir(parents=True)\n'
+                          '(p/"result.json").write_text(json.dumps({"cell":"1s-0-0-0-1","verdict":"ok","reached":"false"}))\n')
+        if run_row(args, fake, row, output / 'malformed-result')['status'] != 'ERROR':
+            raise AssertionError('malformed boolean was accepted as reachability evidence')
+
+        # A parent can exit 0 while leaving a TERM-ignoring child in ANOTHER session. Both a PPID
+        # walk and the old parent's session scan miss it. Exercise subreaper ownership, cleanup,
+        # and the independent existing-child control through the real subprocess runner.
+        child = ('import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                 'print("CHILD",os.getpid(),flush=True); time.sleep(90)')
+        parent = ('import subprocess,sys; '
+                  f'p=subprocess.Popen([sys.executable,"-c",{child!r}],stdout=subprocess.PIPE,text=True,start_new_session=True); '
+                  'print(p.stdout.readline(),end="",flush=True); print("ROW PASS",flush=True)')
+        spectator = subprocess.Popen([sys.executable, '-c', 'import time; print("ready",flush=True); time.sleep(90)'],
+                                     stdout=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            if spectator.stdout.readline().strip() != 'ready':
+                raise AssertionError('existing-child control did not arm')
+            result = command([sys.executable, '-c', parent], ROOT, output / 'orphan.log', 5)
+            if spectator.poll() is not None:
+                raise AssertionError('command cleanup stopped a child it did not start')
+        finally:
+            spectator.terminate()
+            spectator.wait(timeout=5)
+            spectator.stdout.close()
+        if result['returncode'] != 0 or not result['leaked_pids'] or session_processes(result['pid']):
+            raise AssertionError('normal-parent orphan cleanup did not run')
+        if classify(result, reached=True, passed=True, failure='FAIL', evidence=result['output'])[0] != 'ERROR':
+            raise AssertionError('orphaned child turned into a green row')
+
+        def interrupted(_signum, _frame):
+            raise KeyboardInterrupt('self-test cancellation')
+        previous = signal.signal(signal.SIGTERM, interrupted)
+        interrupted_path = output / 'interrupted-worktree'
+        try:
+            try:
+                with worktree(output, interrupted_path.name, 'HEAD') as tree:
+                    child = ('import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+                             'print("OWNED",os.getpid(),flush=True); '
+                             'os.kill(os.getppid(),signal.SIGTERM); time.sleep(90)')
+                    command([sys.executable, '-c', child], tree, output / 'interrupt.log', 5)
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError('interruption negative control was never reached')
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        child_pid = int((output / 'interrupt.log').read_text().split()[1])
+        listed = subprocess.check_output(['git', '-C', str(ROOT), 'worktree', 'list', '--porcelain'], text=True)
+        if interrupted_path.exists() or str(interrupted_path) in listed or session_processes(child_pid):
+            raise AssertionError('interrupted child/worktree survived cleanup')
+    print('MUTANTS self-test: 8 classification controls; actual selected-tree/artifact/orphan/cancellation/PID/worktree controls passed; no servers/builds')
     return 0
 
 
@@ -388,6 +616,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--only', action='append', help='mutant name; repeat to select several')
     parser.add_argument('--registry', type=Path, default=ROOT / 'tests/mutants.registry')
+    parser.add_argument('--revision', default='HEAD', help='commit to test; source/tests must match this checkout')
     parser.add_argument('--list', action='store_true')
     parser.add_argument('--check-registry', action='store_true')
     parser.add_argument('--self-test', action='store_true')
@@ -405,7 +634,20 @@ def main():
         return live_row(args)
     if args.self_test:
         return self_test()
-    items = registry(args.registry, args.only)
+    revision = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', '--verify',
+                                       args.revision + '^{commit}'], text=True).strip()
+    if not (args.list or args.check_registry):
+        # Run source and row bodies from one immutable revision. A clean ROOT at another commit
+        # is a mismatch too; silently mixing its tests with an older binary would test a different
+        # claim. Untracked tests/modules can shadow imports, so they cannot be treated as harmless.
+        changed = subprocess.check_output(['git', '-C', str(ROOT), 'diff', revision, '--name-only',
+                                          '--', 'src', 'tests', 'Makefile'], text=True)
+        untracked = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', '--others',
+                                            '--exclude-standard', '--', 'src', 'tests', 'Makefile'], text=True)
+        if changed.strip() or untracked.strip():
+            raise ValueError('source/tests must be committed and match --revision before mutation mode: ' +
+                             '\n'.join(part.strip() for part in (changed, untracked) if part.strip()))
+    items = registry(args.registry, args.only, revision)
     if args.list or args.check_registry:
         for item in items:
             print(f'{item["name"]}: {len(item["expanded_rows"])} rows')
@@ -419,12 +661,6 @@ def main():
     output = Path(args.output).resolve() if args.output else Path(tempfile.mkdtemp(prefix='gate-mutants-results-'))
     if args.output:
         output.mkdir(parents=True, exist_ok=False)
-    revision = subprocess.check_output(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True).strip()
-    # Tests and mechanism sources must be the same reviewable tree, not uncommitted changes that
-    # vanish when git worktree add checks out HEAD. Untracked artifacts are harmless.
-    changed = subprocess.check_output(['git', '-C', str(ROOT), 'diff', 'HEAD', '--name-only', '--', 'src', 'tests', 'Makefile'], text=True)
-    if changed.strip():
-        raise ValueError('commit the candidate test/source changes before mutation mode: ' + changed.strip())
     write_json(output / 'run.json', dict(revision=revision, server_cpus=args.server_cpus,
                load_cpus=args.load_cpus, mutants=[item['name'] for item in items]))
     print(f'MUTANTS revision={revision} server={args.server_cpus} load={args.load_cpus} output={output}', flush=True)
@@ -435,7 +671,7 @@ def main():
         raise KeyboardInterrupt(f'signal {signum}')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
-    with tempfile.TemporaryDirectory(prefix='gate-mutants-worktrees-') as temporary, contextlib.ExitStack() as controls_stack:
+    with tempfile.TemporaryDirectory(prefix='worktrees-', dir=output) as temporary, contextlib.ExitStack() as controls_stack:
         parent = Path(temporary)
         controls = {}
         for item in items:
@@ -457,8 +693,8 @@ def main():
                 built = build(control, item, list(control_rows.values()), output / ('control-build-' + profile_name), args)
                 controls[profile] = (control, built)
             control, built = controls[profile]
-            if not built:
-                report.update(status='CONTROL-BUILD-FAIL', reason='unmutated build failed')
+            if built != 'ok':
+                report.update(status='CONTROL-BUILD-FAIL', reason='unmutated build: ' + built)
             else:
                 report['control'] = [run_row(args, control, row, artifact / 'control' / row['id'], True)
                                      for row in rows]
@@ -474,8 +710,10 @@ def main():
                         report.update(status='STALE', reason='mutation does not match checked-out revision exactly once')
                     else:
                         source.write_text(original.replace(item['find'], item['replace'], 1))
-                        if not build(mutant, item, rows, artifact / 'mutant', args):
-                            report.update(status='STALE', reason='mutant did not compile; no row was tested')
+                        build_status = build(mutant, item, rows, artifact / 'mutant', args)
+                        if build_status != 'ok':
+                            report.update(status='STALE' if build_status == 'compile-failed' else 'MUTANT-BUILD-ERROR',
+                                          reason='mutant build: ' + build_status + '; no row was tested')
                         else:
                             report['mutant_rows'] = [run_row(args, mutant, row, artifact / 'mutant' / row['id'])
                                                     for row in rows]
