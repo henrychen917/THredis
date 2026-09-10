@@ -104,8 +104,10 @@ class QualificationMonitor(quiet.QuietMonitor):
             owned = quiet.owned_processes(after, self.root) | self.ancestors | self.helpers.keys()
             active = {(row["pid"], row["start_ticks"]) for row in activity if row["cpu_ticks"]}
             sockets, server_activity = None, []
+            inspecting = []
             try:
                 for key, expected in self.reviewed.items():
+                    inspecting = [key]
                     current = after.get(key[0])
                     if current is None or current.identity != key:
                         raise quiet.QuietViolation(f"reviewed PID/start {key} exited or changed")
@@ -119,8 +121,10 @@ class QualificationMonitor(quiet.QuietMonitor):
                     # get this diagnostic-only treatment. No name/UID exemption,
                     # no descendants, and no server CPU budget relaxation follows.
                     ports = {port for declared in self.idle_servers.values() for port in declared}
+                    inspecting = list(self.idle_servers)
                     sockets = tcp_snapshot(ports)
                     for key in self.idle_servers:
+                        inspecting = [key]
                         current, prior = after[key[0]], before.get(key[0])
                         declaration = next(row for row in self.document["processes"]
                                            if (row["pid"], row["start_ticks"]) == key)
@@ -133,6 +137,7 @@ class QualificationMonitor(quiet.QuietMonitor):
                         server_activity.append({"pid": key[0], "start_ticks": key[1], "cpu_ticks": ticks})
                         descendants = quiet.owned_processes(after, key) - {key}
                         if descendants:
+                            inspecting = sorted(descendants)
                             raise quiet.QuietViolation(f"reviewed idle-server has unapproved descendants: {sorted(descendants)}")
                     self.idle_windows.append((began, self.previous_at, server_activity))
                     while self.idle_windows and self.idle_windows[0][1] <= self.previous_at - self.window_seconds:
@@ -141,6 +146,7 @@ class QualificationMonitor(quiet.QuietMonitor):
                                          for row in rows) * self.tick_seconds
                     sample_seconds = sum(row["cpu_ticks"] for row in server_activity) * self.tick_seconds
                     self.idle_peak_seconds = max(self.idle_peak_seconds, server_seconds, sample_seconds)
+                    inspecting = list(self.idle_servers)
                     if max(server_seconds, sample_seconds) > self.cpu_budget_seconds:
                         raise quiet.QuietViolation(f"reviewed idle-server CPU budget exceeded: "
                             f"{max(server_seconds, sample_seconds):.6f}s > {self.cpu_budget_seconds:.6f}s per {self.window_seconds:g}s")
@@ -148,6 +154,7 @@ class QualificationMonitor(quiet.QuietMonitor):
                 for row in after.values():
                     if row.kernel_thread or row.identity in owned:
                         continue
+                    inspecting = [row.identity]
                     if row.name in quiet.ACTIVE_EXPERIMENTS or row.experiment_driver:
                         raise quiet.QuietViolation(f"active foreign experiment PID {row.pid} ({row.name})")
                     if row.identity not in active:
@@ -161,7 +168,11 @@ class QualificationMonitor(quiet.QuietMonitor):
                         raise quiet.QuietViolation(f"unreviewed CPU-active PID/start {row.identity} ({row.name}): "
                                                    f"{detail}; background cannot be qualified")
             except (OSError, quiet.QuietViolation) as error:
-                self.failure = self.failure or {"observed_at": time.time(), "error": str(error)}
+                if self.failure is None:
+                    self.failure = {"observed_at": time.time(), "error": str(error),
+                        "process_provenance": [quiet.failure_provenance(
+                            after if after.get(pid) and after[pid].start == start else before,pid,start)
+                            for pid,start in inspecting]}
             event = {"phase": self.phase, "started_monotonic": began, "ended_monotonic": self.previous_at,
                      "user_cpu_activity": activity, "kernel_cpu_activity": kernel,
                      "rolling_cpu_seconds": sum(row["cpu_ticks"] for _, _, rows in self.activity_windows
@@ -465,6 +476,26 @@ def self_test():
                 monitor = QualificationMonitor(list(range(32)), list(range(32, 64)), own_root_pid=10,
                     reviewed=reviewed_inventory(declaration), document=declaration, output=Path(tmp))
                 yield monitor, rows, clock
+
+        def test_short_lived_unreviewed_activity_keeps_origin_before_hard_refusal(self):
+            with self.fixture() as (monitor,rows,clock):
+                rows[40]=quiet.Process(40,2,1,"bash",0,frozenset([32]))
+                rows[30]=quiet.Process(30,4,40,"curl",2,frozenset([32]),argv_sha256="e"*64)
+                clock[0]=1
+                monitor.sample()
+                with self.assertRaisesRegex(quiet.QuietViolation,"unreviewed CPU-active"):
+                    monitor.check()
+                failure=monitor.failure
+                provenance=failure["process_provenance"][0]
+                self.assertEqual(provenance["snapshot"]["parent_pid"],40)
+                self.assertEqual(provenance["snapshot"]["argv_sha256"],"e"*64)
+                self.assertEqual(provenance["ancestors"][0]["pid"],40)
+                rows.pop(30)
+                saved=json.loads(monitor.sample_path.read_text().splitlines()[-1])
+                self.assertEqual(saved["hard_failure"],failure)
+                activity=next(row for row in saved["user_cpu_activity"] if row["pid"]==30)
+                self.assertEqual((activity["parent_pid"],activity["parent_start_ticks"]),(40,2))
+                self.assertFalse(monitor.evidence()["diagnostic_complete"])
 
         def test_idle_server_requires_explicit_ports_and_identity_review(self):
             for weak in (False, True):

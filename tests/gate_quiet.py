@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
+import hashlib
 import math
 import json
 import os
@@ -64,6 +65,9 @@ class Process:
     affinity: frozenset[int]
     experiment_driver: bool = False
     kernel_thread: bool = False
+    # None also covers a reviewed unreadable argv substituted by the reader;
+    # it is not a claim that the observed process had an empty command line.
+    argv_sha256: str | None = None
 
     @property
     def identity(self):
@@ -113,10 +117,12 @@ def snapshot(proc_root=Path("/proc"), *, cmdline_reader=None) -> dict[int, Proce
             affinity = thread_affinity(entry)
             if not affinity:
                 continue  # The complete thread group exited while being read.
+            argv = b"" if kernel else read_cmdline(entry, int(fields[19]))
             result[pid] = Process(pid, int(fields[19]), int(fields[1]), name,
                                   int(fields[11]) + int(fields[12]),
                                   affinity, False if kernel else experiment_driver(
-                                      read_cmdline(entry, int(fields[19])).split(b"\0")), kernel)
+                                      argv.split(b"\0")), kernel,
+                                  hashlib.sha256(argv).hexdigest() if argv else None)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError as exc:
@@ -135,6 +141,70 @@ def owned_processes(rows: dict[int, Process], root: tuple[int, int]) -> set[tupl
         if not added:
             return owned
         owned.update(added)
+
+
+def failure_provenance(rows, pid, expected_start, proc_root=Path("/proc")):
+    """Capture before raising; never let an exited offender erase its sampled parent.
+
+    The chain uses the SAME process snapshot as the decision, not later /proc PPIDs.
+    Enumeration is not atomic. Live identity reads are bracketed by PID/start checks;
+    partial/failed reads remain explicit and can never authorize the process. Only
+    argv digests are retained: error strings can contain interpreter arguments, so
+    diagnostic read failures record their type/errno without interpolating arguments.
+    """
+    def saved(row):
+        return dict(pid=row.pid, start_ticks=row.start, parent_pid=row.parent, comm=row.name,
+                    total_cpu_ticks=row.ticks, affinity=sorted(row.affinity), argv_sha256=row.argv_sha256)
+    result = dict(pid=pid, start_ticks=expected_start, snapshot=None, ancestors=[],
+                  ancestry_end=None, live_identity={"verified":False,"errors":{}})
+    current = rows.get(pid)
+    if current is None or current.start != expected_start:
+        result["ancestry_end"] = {"status":"identity-absent-from-decision-snapshot"}
+    else:
+        result["snapshot"] = saved(current)
+        seen = {current.identity}
+        while current.parent:
+            parent = rows.get(current.parent)
+            if parent is None:
+                result["ancestry_end"] = {"status":"parent-absent-from-snapshot","parent_pid":current.parent}
+                break
+            if parent.identity in seen:
+                result["ancestry_end"] = {"status":"snapshot-ancestry-cycle","pid":parent.pid}
+                break
+            result["ancestors"].append(saved(parent));seen.add(parent.identity);current=parent
+        else:
+            result["ancestry_end"] = {"status":"root-parent-zero"}
+    live = result["live_identity"]
+    entry = proc_root / str(pid)
+    def attempt(name, callback):
+        try:
+            live[name] = callback()
+            return True
+        except Exception as error:
+            live["errors"][name] = {"error_type":type(error).__name__,"errno":getattr(error,"errno",None)}
+            return False
+    def start():
+        return int((entry/"stat").read_text().rsplit(")",1)[1].split()[19])
+    if not attempt("start_before", start):
+        live["status"]="exited-or-unreadable-before-provenance"
+        return result
+    if live["start_before"] != expected_start:
+        live["status"]="PID-reused-before-provenance"
+        return result
+    # Read transient argv before hashing executable bytes; a short curl may exit
+    # in that interval. The initial snapshot digest survives either way.
+    attempt("argv_sha256",lambda:hashlib.sha256((entry/"cmdline").read_bytes()).hexdigest())
+    attempt("uid",lambda:entry.stat().st_uid)
+    attempt("executable_path",lambda:os.readlink(entry/"exe"))
+    from background_environment import file_identity
+    attempt("executable",lambda:file_identity(entry/"exe"))
+    attempt("start_after",start)
+    sampled_argv = result["snapshot"]["argv_sha256"] if result["snapshot"] else None
+    live["snapshot_argv_matches"] = None if sampled_argv is None else live.get("argv_sha256") == sampled_argv
+    live["verified"] = (not live["errors"] and live.get("start_after") == expected_start and
+                        live["snapshot_argv_matches"] is not False)
+    live["status"] = "verified" if live["verified"] else "partial-or-identity-changed-during-provenance"
+    return result
 
 
 def controller_ancestors(rows: dict[int, Process], root: tuple[int, int]) -> set[tuple[int, int]]:
@@ -222,6 +292,9 @@ def interference(before: dict[int, Process], after: dict[int, Process],
         active = not row.kernel_thread and (row.name in ACTIVE_EXPERIMENTS or row.experiment_driver)
         if active or delta:
             offenders.append({"pid": row.pid, "start_ticks": row.start, "comm": row.name,
+                              "parent_pid": row.parent,
+                              "parent_start_ticks": after[row.parent].start if row.parent in after else None,
+                              "affinity": sorted(row.affinity), "argv_sha256": row.argv_sha256,
                               "cpu_ticks": delta, "reason": "active foreign experiment" if active
                               else "kernel CPU activity (PF_KTHREAD)" if row.kernel_thread else "foreign CPU activity",
                               "kernel_thread": row.kernel_thread,
@@ -366,7 +439,11 @@ class QuietMonitor:
                 inspection = self.background.inspect(self.previous, current, owned)
             except (OSError, ValueError, QuietViolation) as error:
                 inspection = self.background.last_inspection
-                self.failure = self.failure or {"observed_at": time.time(), "error": str(error)}
+                if self.failure is None:
+                    self.failure = {"observed_at": time.time(), "error": str(error),
+                        "process_provenance": [failure_provenance(
+                            current if current.get(pid) and current[pid].start == start else self.previous,pid,start)
+                            for pid,start in (inspection or {}).get("inspecting_identities", [])]}
         for row in current.values():
             prior = self.previous.get(row.pid)
             if row.identity in self.ancestors and prior and prior.identity == row.identity:
@@ -388,6 +465,12 @@ class QuietMonitor:
                 "rolling_cpu_seconds": ticks * self.tick_seconds,
                 "sample_cpu_seconds": sample_ticks * self.tick_seconds,
                 "cpu_budget_seconds": self.cpu_budget_seconds}
+            # Historical diagnostic budget events are audited, not hard failures;
+            # do not hash every ordinary service during a measurement. The subclass
+            # captures provenance when its independent hard criterion identifies one.
+            if not self.legacy_diagnostic or any(row["reason"] == "active foreign experiment" for row in offenders):
+                self.failure["process_provenance"] = [failure_provenance(current,pid,start)
+                    for pid,start in dict.fromkeys((row["pid"],row["start_ticks"]) for row in offenders)]
         if self.background:
             event = {"started_monotonic": now - elapsed, "ended_monotonic": now,
                      "user_cpu_activity": activity, "kernel_cpu_activity": kernel_activity,
@@ -508,6 +591,51 @@ def self_test():
             from dataclasses import replace
             bad = {**self.before, 20: replace(self.other, ticks=101)}
             self.assertEqual(self.check_rows(bad)[0]["pid"], 20)
+
+        def test_failure_provenance_keeps_sampled_chain_and_no_raw_arguments(self):
+            import tempfile
+            from dataclasses import replace
+            argv=b"curl\0--header\0Authorization: private-control-secret\0"
+            parent=Process(40,2,1,"bash",9,frozenset([1]))
+            ancestor=Process(1,1,0,"supervisor",10,frozenset([0,1]))
+            child=replace(self.other,parent=40,argv_sha256=hashlib.sha256(argv).hexdigest())
+            rows={20:child,40:parent,1:ancestor}
+            with tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary);entry=root/"20";entry.mkdir()
+                fields=["0"]*20;fields[19]="3"
+                (entry/"stat").write_text("20 (curl) "+" ".join(fields))
+                (entry/"cmdline").write_bytes(argv)
+                binary=root/"curl-bytes";binary.write_bytes(b"owned fixture executable bytes")
+                (entry/"exe").symlink_to(binary)
+                captured=failure_provenance(rows,20,3,root)
+                self.assertTrue(captured["live_identity"]["verified"])
+                self.assertEqual([r["pid"] for r in captured["ancestors"]],[40,1])
+                self.assertEqual(captured["snapshot"]["parent_pid"],40)
+                self.assertEqual(captured["snapshot"]["affinity"],[0,1])
+                self.assertEqual(captured["live_identity"]["argv_sha256"],hashlib.sha256(argv).hexdigest())
+                self.assertNotIn("private-control-secret",json.dumps(captured))
+                (entry/"stat").unlink()
+                gone=failure_provenance(rows,20,3,root)
+                self.assertEqual(gone["snapshot"],captured["snapshot"])
+                self.assertEqual(gone["ancestors"],captured["ancestors"])
+                self.assertEqual(gone["live_identity"]["errors"]["start_before"]["error_type"],"FileNotFoundError")
+                fields[19]="99";(entry/"stat").write_text("20 (curl) "+" ".join(fields))
+                reused=failure_provenance(rows,20,3,root)
+                self.assertEqual(reused["live_identity"]["status"],"PID-reused-before-provenance")
+                self.assertNotIn("executable",reused["live_identity"])
+
+        def test_normal_refusal_retains_provenance_before_check_without_reclassification(self):
+            from dataclasses import replace
+            active={**self.before,20:replace(self.other,ticks=102)}
+            with mock.patch(__name__+".snapshot",side_effect=[self.before,active]), \
+                 mock.patch(__name__+".failure_provenance",return_value={"snapshot":{"parent_pid":1}}) as capture:
+                monitor=QuietMonitor([0],[1],own_root_pid=10)
+                monitor.sample()
+                self.assertEqual(capture.call_args.args,(active,20,3))
+                self.assertEqual(monitor.failure["process_provenance"][0]["snapshot"]["parent_pid"],1)
+                self.assertEqual(monitor.failure["processes"][0]["parent_pid"],1)
+                with self.assertRaisesRegex(QuietViolation,"2 CPU ticks"):monitor.check()
+                capture.assert_called_once()
 
         def test_foreign_workload_refused_even_while_sleeping(self):
             from dataclasses import replace
@@ -721,6 +849,8 @@ PY
                     rows = snapshot(proc)
                 self.assertTrue(rows[100].kernel_thread)
                 self.assertFalse(rows[101].kernel_thread)
+                self.assertIsNone(rows[100].argv_sha256)
+                self.assertEqual(rows[101].argv_sha256,hashlib.sha256(b"user-service\0").hexdigest())
 
         def test_kernel_cpu_is_recorded_without_spending_foreign_user_budget(self):
             from dataclasses import replace

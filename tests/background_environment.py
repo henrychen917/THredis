@@ -338,12 +338,14 @@ class EnvironmentObserver:
             return b""
 
     def inspect(self, before, current, owned):
-        result = {"checked_at": time.time(), "identities_checked": 0, "tcp_snapshot": None}
+        result = {"checked_at": time.time(), "identities_checked": 0, "tcp_snapshot": None,
+                  "inspecting_identities": []}
         self.last_inspection = result
         # All declared identities stay bound even when their current CPU count is
         # zero. Missing/reused PIDs, exec, UID/permission changes and parent/worker
         # affinity changes cannot inherit the declaration silently.
         for key, expected in self.reviewed.items():
+            result["inspecting_identities"] = [key]
             process = current.get(key[0])
             row = self.rows[key]
             if process is None or process.identity != key:
@@ -360,12 +362,16 @@ class EnvironmentObserver:
             if row["classification"] == "idle-server":
                 children = quiet.owned_processes(current, key) - {key}
                 if children:
+                    result["inspecting_identities"] = sorted(children)
                     raise quiet.QuietViolation(f"reviewed idle-server has unapproved descendants: {sorted(children)}")
             result["identities_checked"] += 1
         if self.ports:
+            result["inspecting_identities"] = [key for key,row in self.rows.items()
+                                                if row["classification"] == "idle-server"]
             result["tcp_snapshot"] = tcp_snapshot(self.ports)
             self.listener_snapshots += 1
             check_idle_connections(result["tcp_snapshot"], self.ports)
+        result["inspecting_identities"] = []
         # QuietMonitor independently rejects known experiments even between CPU
         # bursts and any CPU-active unreviewed child. No descendant is inserted
         # into self.reviewed by this inspection.
