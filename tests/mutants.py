@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -52,6 +53,18 @@ ROWS = {
                       success='XSCRIPT all directed battery passed', timeout=300),
     'xscript-1': dict(label='xscript battery (atomic 1)', live='xscript', atomic=1,
                       success='XSCRIPT all directed battery passed', timeout=300),
+    'hash-ttl-bytes': dict(label='storage hash-bytes regression',
+                           target='build/store-regression', arguments=['hash-bytes'],
+                           gate_loop=('STORE_CASE', 'storage $STORE_CASE regression'),
+                           success='PASS storage hash-bytes', timeout=60),
+    'multi-arity': dict(label='atomic survivor: mset_arity',
+                        target='build/atomic-survivors-unit', arguments=['mset_arity'],
+                        gate_loop=('defect', 'atomic survivor: $defect'),
+                        success='PASS mset_arity', timeout=60),
+    'lua-budget': dict(label='atomic survivor: instruction_limit',
+                       target='build/atomic-survivors-unit', arguments=['instruction_limit'],
+                       gate_loop=('defect', 'atomic survivor: $defect'),
+                       success='PASS instruction_limit', timeout=60),
 }
 
 
@@ -72,6 +85,24 @@ def feature_module():
 
 def revision_text(revision, path):
     return subprocess.check_output(['git', '-C', str(ROOT), 'show', f'{revision}:{path}'], text=True)
+
+
+def named_row_declared(row, gate):
+    if row.get('live') == 'xscript':
+        return 'xacct xmove xscript' in gate and 'ok "$t battery (atomic $AT)"' in gate
+    if 'gate_loop' not in row:
+        return row['label'] in gate
+    # These existing unit families emit labels from shell loops. Check the selected case AND
+    # its executable/argument AND the counted success declaration in that same loop; finding
+    # a case name somewhere in the file would conceal an accidentally removed iteration.
+    variable, label = row['gate_loop']
+    pattern = (rf'for {re.escape(variable)} in ([^;]+);\s*do\b(.*?)\bdone\b')
+    for values, body in re.findall(pattern, gate, re.S):
+        cases = shlex.split(values.replace('\\\n', ' '))
+        command = f'./{row["target"]} "${variable}"'
+        if row['arguments'][0] in cases and command in body and f'ok "{label}"' in body:
+            return True
+    return False
 
 
 def registry(path, only=None, revision='HEAD'):
@@ -108,11 +139,7 @@ def registry(path, only=None, revision='HEAD'):
             else:
                 key = selection['row']
                 row = dict(ROWS[key], id=key, failure=selection['failure'])
-                # The xscript rows are emitted by an existing shell loop; every other named body
-                # has a literal label. Refuse stale labels rather than silently invent coverage.
-                declared = (row['label'] in gate if row.get('live') != 'xscript' else
-                            'xacct xmove xscript' in gate and 'ok "$t battery (atomic $AT)"' in gate)
-                if not declared:
+                if not named_row_declared(row, gate):
                     raise ValueError(f'{name}: UNREACHED: gate row declaration missing: {row["label"]}')
                 rows.append(row)
         if not rows or len({row['id'] for row in rows}) != len(rows):
@@ -539,6 +566,17 @@ def self_test():
                              failure='mechanism assertion', evidence=evidence)
         if status != expected:
             raise AssertionError((expected, status))
+    gate = (ROOT / 'tests/gate.sh').read_text()
+    for key in ('hash-ttl-bytes', 'multi-arity', 'lua-budget'):
+        row = ROWS[key]
+        if not named_row_declared(row, gate):
+            raise AssertionError(f'{key}: actual gate declaration not reached')
+        # Neither an omitted loop member nor an unrelated matching label establishes
+        # reachability. Keep both inadmissible as evidence that a row ran.
+        if named_row_declared(row, gate.replace(row['arguments'][0], 'removed_case')):
+            raise AssertionError(f'{key}: missing loop member was accepted')
+        if named_row_declared(row, gate.replace('./' + row['target'], './build/wrong-binary')):
+            raise AssertionError(f'{key}: wrong loop executable was accepted')
     (ROOT / 'build').mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='mutants-self-test-', dir=ROOT / 'build') as temporary:
         output = Path(temporary)

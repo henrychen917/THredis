@@ -7,21 +7,38 @@
       "file": "src/core/config.h",
       "find": "if (cfg.thread_mode == ThreadMode::Fused && cfg.flip_auto) {",
       "replace": "if (false) {",
-      "rows": [{"feature": "^1s-[01]-[01]-[01]-1$", "count": 8, "failure": "server BOOTED with --flip-auto in 1s: the config guard is gone"}]
+      "rows": [
+        {
+          "feature": "^1s-[01]-[01]-[01]-1$",
+          "count": 8,
+          "failure": "server BOOTED with --flip-auto in 1s: the config guard is gone"
+        }
+      ]
     },
     {
       "name": "owner-map",
       "file": "src/core/server.h",
       "find": "shard_owner_[shard_id].store(thread_id, std::memory_order_release);",
       "replace": "shard_owner_[shard_id].store((thread_id + 1) % nthreads(), std::memory_order_release);",
-      "rows": [{"feature": "^(split-home-min|fused-home-max-nopin)$", "count": 2, "failure": "live owners differ from explicit homes"}]
+      "rows": [
+        {
+          "feature": "^(split-home-min|fused-home-max-nopin)$",
+          "count": 2,
+          "failure": "live owners differ from explicit homes"
+        }
+      ]
     },
     {
       "name": "qsbr-skip-retirement",
       "file": "src/core/read_local.h",
       "find": "void defer(void* reclaim_owner, void* payload, size_t auxiliary,\n               ReadLocalRetireSink::ReclaimFn reclaim) {",
       "replace": "void defer(void* reclaim_owner, void* payload, size_t auxiliary,\n               ReadLocalRetireSink::ReclaimFn reclaim) {\n        (void)reclaim_owner; (void)payload; (void)auxiliary; (void)reclaim; return;",
-      "rows": [{"row": "retirement", "failure": "full, sealed, unreclaimable ring"}]
+      "rows": [
+        {
+          "row": "retirement",
+          "failure": "full, sealed, unreclaimable ring"
+        }
+      ]
     },
     {
       "name": "stale-owner-retire-sink",
@@ -30,8 +47,14 @@
       "replace": "#if 1 // throwaway mutant: remove ownership-edge sink adoption",
       "debug_cache": true,
       "rows": [
-        {"row": "cache-churn", "failure": "RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION"},
-        {"row": "cache-invariants", "failure": "RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION"}
+        {
+          "row": "cache-churn",
+          "failure": "RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION"
+        },
+        {
+          "row": "cache-invariants",
+          "failure": "RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION"
+        }
       ]
     },
     {
@@ -40,8 +63,14 @@
       "find": "#ifdef TOMO_XSCRIPT_NO_RESERVE",
       "replace": "#if 1 // throwaway mutant: skip declared-key reservation",
       "rows": [
-        {"row": "xscript-0", "failure": "FAIL plain write into the reservation window is forced through MVCC"},
-        {"row": "xscript-1", "failure": "FAIL plain write into the reservation window is forced through MVCC"}
+        {
+          "row": "xscript-0",
+          "failure": "FAIL plain write into the reservation window is forced through MVCC"
+        },
+        {
+          "row": "xscript-1",
+          "failure": "FAIL plain write into the reservation window is forced through MVCC"
+        }
       ]
     },
     {
@@ -50,8 +79,15 @@
       "find": "__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {",
       "replace": "__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {\n    return {}; // throwaway mutant: leave every task in FIFO order",
       "rows": [
-        {"row": "reorder", "failure": "reorder battery: FAIL: actual permutation differs from exact oracle"},
-        {"feature": "^[12]s-[01]-[01]-1-0$", "count": 8, "failure": "reorder witness reorder_multi_client_runs did not match knob|reorder witness reorder_permuted_runs did not match knob"}
+        {
+          "row": "reorder",
+          "failure": "reorder battery: FAIL: actual permutation differs from exact oracle"
+        },
+        {
+          "feature": "^[12]s-[01]-[01]-1-0$",
+          "count": 8,
+          "failure": "reorder witness reorder_multi_client_runs did not match knob|reorder witness reorder_permuted_runs did not match knob"
+        }
       ]
     },
     {
@@ -59,14 +95,60 @@
       "file": "src/net/rob.h",
       "find": "        state.write_tags[tail] = static_cast<uint16_t>(hash);",
       "replace": "        // throwaway mutant: do not publish the pending write's tag",
-      "rows": [{"row": "ryow-ring", "failure": "(?m)^  FAIL "}]
+      "rows": [
+        {
+          "row": "ryow-ring",
+          "failure": "(?m)^  FAIL "
+        }
+      ]
     },
     {
       "name": "foreign-read-filter-empty",
       "file": "src/store/foreign_read_safety.h",
       "find": "    bool might_contain(uint64_t hash) const {",
       "replace": "    bool might_contain(uint64_t hash) const {\n        return false; // throwaway mutant: hide every occupied key",
-      "rows": [{"row": "foreign-filter", "failure": "same-fingerprint references did not merge exactly"}]
+      "rows": [
+        {
+          "row": "foreign-filter",
+          "failure": "same-fingerprint references did not merge exactly"
+        }
+      ]
+    },
+    {
+      "name": "hash-ttl-byte-accounting",
+      "file": "src/store/flatstore.h",
+      "find": "// erase_in() will subtract only the remaining footprint.\n            note_object_size_change(before, kvobj_size(o));",
+      "replace": "// throwaway mutant: omit the bytes already removed by field TTL reaping.\n            (void)before;",
+      "rows": [
+        {
+          "row": "hash-ttl-bytes",
+          "failure": "FAIL: last-field reaping leaves no phantom bytes"
+        }
+      ]
+    },
+    {
+      "name": "multi-mset-pair-arity",
+      "file": "src/cmd/multi.inc",
+      "find": "(has_name(command->queued, \"mset\") || has_name(command->queued, \"msetnx\")) &&\n                (command->queued.argv.size() & 1u) == 0)",
+      "replace": "(has_name(command->queued, \"mset\") || has_name(command->queued, \"msetnx\")) &&\n                false)",
+      "rows": [
+        {
+          "row": "multi-arity",
+          "failure": "FAIL: EXEC has a command error element|FAIL: malformed MSET/MSETNX changed no key"
+        }
+      ]
+    },
+    {
+      "name": "lua-caught-budget",
+      "file": "src/cmd/scripting.cc",
+      "find": "if (status != 0 || context.timed_out) {",
+      "replace": "if (status != 0) { // throwaway mutant: forget a caught instruction budget exhaustion",
+      "rows": [
+        {
+          "row": "lua-budget",
+          "failure": "FAIL: caught instruction-limit error still fails the activation"
+        }
+      ]
     }
   ]
 }
