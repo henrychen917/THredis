@@ -5,16 +5,19 @@ This observer never stops a process. /proc identities, not argv patterns, distin
 the driver's children from foreign work. Ordinary sleeping services are harmless;
 known compilers, load generators and ABBA drivers are competing experiments even
 while temporarily asleep between phases. Every observed foreign CPU tick is
-recorded. Without an explicit reviewed-environment contract, any foreign user
-activity refuses the run. A contract permits only its declared ordinary background.
+recorded. Ordinary processes whose affinity leaves other CPUs available
+share a rolling CPU budget scaled to the server cores. Affinity overlap alone is
+permission to run there, not evidence that a desktop service ran on those cores.
+CPU-active processes confined to the reserved cores and known experiments refuse
+the run; an optional identity review never exempts them or widens that budget.
 PF_KTHREAD identifies kernel threads; their CPU activity is recorded separately
 and cannot be mistaken for a foreign user workload because exe access is denied.
 The gate's declared row watchdog is controller housekeeping only after its exact
 PID/start identity, script and captured controller parent are independently verified.
 CPU time is never converted to performance error; the standing identical-binary
 null must independently validate the comparison instrument.
-The sample cannot see a process born and reaped entirely between observations; the
-exclusive-box rule remains necessary, and the evidence records this limitation.
+The sample cannot see a process born and reaped entirely between observations;
+the evidence records this limitation and never claims absolute exclusivity.
 """
 from __future__ import annotations
 
@@ -38,12 +41,13 @@ ACTIVE_EXPERIMENTS = frozenset(("make", "gmake", "ninja", "cc1", "cc1plus", "cla
 SERVERS = frozenset(("redis-server", "tomokv", "dragonfly", "keydb-server", "memcached", "GarnetServer"))
 COMPETING = ACTIVE_EXPERIMENTS | SERVERS
 
-# Historical diagnostics borrowed the owner's throughput resolution to construct
-# a CPU budget. The 68.757s idle capture established only2.53 CPU-s and a rolling
-# 20s peak of.92s, not a CPU-time→performance-error relationship. Preserve this
-# number solely to interpret those permanently untrusted diagnostic experiments.
-# It is not a normal gate precondition and cannot confer measurement trust.
-LEGACY_DIAGNOSTIC_CPU_FRACTION = 0.0015
+# Retain the existing screening budget, rather than widening it to pass a busy
+# environment. The 68.757s idle capture observed 2.53 CPU-s and a rolling 20s peak
+# of .92s. Neither that capture nor this fraction converts CPU time into a bound
+# on throughput error: the standing identical-binary null checks the instrument.
+# This is code policy, never measured config or a tunable regression tolerance.
+BACKGROUND_CPU_FRACTION = 0.0015
+LEGACY_DIAGNOSTIC_CPU_FRACTION = BACKGROUND_CPU_FRACTION
 
 # Verified against the installed Linux 7.0.0-31 include/linux/sched.h:1781.
 # /proc/PID/stat field9 exports task flags. Neither comm nor an unreadable exe
@@ -283,7 +287,8 @@ def interference(before: dict[int, Process], after: dict[int, Process],
         prior = before.get(row.pid)
         same_process = prior and prior.identity == row.identity
         affinity = row.affinity | (prior.affinity if same_process else frozenset())
-        if row.identity in owned or not cpus.intersection(affinity):
+        known = not row.kernel_thread and (row.name in COMPETING or row.experiment_driver)
+        if row.identity in owned or (not cpus.intersection(affinity) and not known):
             continue
         # A process first observed during the session has no earlier baseline.
         # Its own accumulated ticks still witness work; treating absence as zero
@@ -300,6 +305,20 @@ def interference(before: dict[int, Process], after: dict[int, Process],
                               "kernel_thread": row.kernel_thread,
                               "overlapping_cpus": sorted(cpus.intersection(affinity))})
     return offenders
+
+
+def confined_to_reserved_cpus(row, before, after, cpus):
+    """An overlapping mask with an escape core is not proof of contention.
+
+    Inspect both endpoints: broadening a formerly pinned mask cannot erase work
+    earlier in the sampled interval. Process masks already include every worker;
+    known experiments have a separate veto even when their workers run elsewhere,
+    since a compiler/server/load generator can contend for shared memory bandwidth.
+    """
+    current = after[row["pid"]]
+    prior = before.get(current.pid)
+    return bool(current.affinity <= cpus or
+                prior and prior.identity == current.identity and prior.affinity <= cpus)
 
 
 class QuietMonitor:
@@ -333,8 +352,7 @@ class QuietMonitor:
         self.core_of_cpu = {sibling: min(topology[cpu]) for cpu in requested
                             for sibling in topology[cpu]}
         self.window_seconds = window_seconds
-        self.cpu_budget_seconds = (LEGACY_DIAGNOSTIC_CPU_FRACTION * self.server_physical_cores * window_seconds
-                                   if self.legacy_diagnostic else None)
+        self.cpu_budget_seconds = BACKGROUND_CPU_FRACTION * self.server_physical_cores * window_seconds
         self.tick_seconds = 1 / os.sysconf("SC_CLK_TCK")
         self.previous = self._snapshot()
         self.previous_at = time.monotonic()
@@ -381,6 +399,14 @@ class QuietMonitor:
         kernel_activity = interference(self.previous, current, self.root, self.cpus,
                                        self.ancestors, self.helpers, kernel_only=True)
         offenders = [row for row in activity if row["reason"] == "active foreign experiment"]
+        if not self.legacy_diagnostic:
+            # The granted logical CPU set decides unavoidable placement. The
+            # observer also watches unused SMT siblings for shared-core activity,
+            # but expanding the reservation to that watch set makes default
+            # affinity "confined" on the 224-CPU ABBA geometry (watch set=256).
+            offenders += [row for row in activity if row not in offenders and
+                          (row["comm"] in SERVERS or
+                           confined_to_reserved_cpus(row, self.previous, current, self.requested_cpus))]
         # Every foreign tick contributes to one aggregate ceiling. Charging the
         # complete overlapping process also avoids hiding workers behind a leader
         # pinned elsewhere; no load/whole-machine denominator dilutes a hot core.
@@ -428,13 +454,11 @@ class QuietMonitor:
         # The ceiling also applies to a single sample, even if sampling was delayed
         # for longer than WINDOW: an observation gap cannot purchase extra budget.
         sample_ticks = sum(row["cpu_ticks"] for row in activity)
-        if self.legacy_diagnostic and max(ticks, sample_ticks) * self.tick_seconds > self.cpu_budget_seconds:
+        if max(ticks, sample_ticks) * self.tick_seconds > self.cpu_budget_seconds:
             offenders = rolling
         owned = owned_processes(current, self.root) | self.ancestors | self.helpers.keys()
         inspection = None
         if self.background:
-            offenders += [row for row in activity if (row["pid"], row["start_ticks"]) not in self.background.reviewed
-                          and row not in offenders]
             try:
                 inspection = self.background.inspect(self.previous, current, owned)
             except (OSError, ValueError, QuietViolation) as error:
@@ -450,7 +474,7 @@ class QuietMonitor:
                 self.excluded_activity[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
             if row.identity in self.helpers and prior and prior.identity == row.identity:
                 self.helpers[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
-            if row.kernel_thread or row.identity in owned or not self.cpus.intersection(row.affinity):
+            if row.kernel_thread or row.identity in owned:
                 continue
             if row.name in COMPETING or row.experiment_driver:
                 self.known_programs[row.identity] = {"pid": row.pid, "start_ticks": row.start,
@@ -491,8 +515,8 @@ class QuietMonitor:
                 "foreign_cpu_activity": list(self.foreign_activity.values()),
                 "kernel_cpu_activity": list(self.kernel_activity.values()),
                 "generic_cpu_screening": {"server_physical_cores": self.server_physical_cores,
-                    "capacity_fraction": LEGACY_DIAGNOSTIC_CPU_FRACTION if self.legacy_diagnostic else None,
-                    "status": "unsupported historical diagnostic heuristic" if self.legacy_diagnostic else "observations only; no CPU budget",
+                    "capacity_fraction": BACKGROUND_CPU_FRACTION,
+                    "status": "unsupported historical diagnostic heuristic" if self.legacy_diagnostic else "reserved-core competitors vetoed; roaming background budgeted",
                     "window_seconds": self.window_seconds,
                     "cpu_budget_seconds": self.cpu_budget_seconds, "peak_rolling": self.peak_rolling,
                     "peak_possible_core_concentration": self.peak_core_concentration,
@@ -517,12 +541,10 @@ class QuietMonitor:
             details = self.failure.get("processes", [])
             reason = "; ".join(f"PID {p['pid']} ({p['comm']}): {p['reason']}, "
                                f"{p['cpu_ticks']} CPU ticks" for p in details)
-            if self.legacy_diagnostic and self.failure.get("rolling_cpu_seconds", 0) > self.cpu_budget_seconds:
+            if self.failure.get("rolling_cpu_seconds", 0) > self.cpu_budget_seconds:
                 reason = (f"foreign CPU screening budget exceeded: "
                           f"{self.failure['rolling_cpu_seconds']:.6f}s > {self.cpu_budget_seconds:.6f}s "
                           f"per {self.window_seconds:g}s on {self.server_physical_cores} physical server cores; " + reason)
-            if not self.legacy_diagnostic and reason:
-                reason += "; no permission to compute concurrently; ordinary idle background needs an explicit --background-environment review"
             raise QuietViolation("QUIET-BOX PRECONDITION FAILED: " + (reason or self.failure["error"]))
 
     def preflight(self):
@@ -880,10 +902,13 @@ PY
             after = {**self.before, 20: replace(self.other, ticks=101, affinity=frozenset((2,)))}
             self.assertEqual(self.check_rows(after)[0]["overlapping_cpus"], [0])
 
-        def test_nonoverlapping_activity_is_irrelevant(self):
+        def test_nonoverlapping_ordinary_activity_is_irrelevant_but_experiments_veto(self):
             from dataclasses import replace
-            after = {**self.before, 20: replace(self.other, name="make", affinity=frozenset((2,)))}
+            after = {**self.before, 20: replace(self.other, ticks=101, affinity=frozenset((2,)))}
             self.assertEqual(interference(after, after, self.root.identity, {0}), [])
+            experiment = {**after, 20: replace(after[20], name="make")}
+            self.assertEqual(interference(experiment, experiment, self.root.identity, {0})[0]["reason"],
+                             "active foreign experiment")
 
         def test_interference_is_latched(self):
             from dataclasses import replace
@@ -895,13 +920,13 @@ PY
                 with self.assertRaisesRegex(RuntimeError, "PID 20"):
                     monitor.check()
 
-        def budget_fixture(self, server_count=32, window=20):
+        def budget_fixture(self, server_count=32, window=20, *, legacy=True, before=None):
             topology = {cpu: frozenset((cpu % 128, cpu % 128 + 128)) for cpu in range(256)}
             with mock.patch(__name__ + ".read_topology", return_value=topology), \
-                 mock.patch(__name__ + ".snapshot", return_value=self.before), \
+                 mock.patch(__name__ + ".snapshot", return_value=before or self.before), \
                  mock.patch.object(time, "monotonic", return_value=0):
-                return QuietMonitor(list(range(server_count)), list(range(server_count, 256)),
-                                    own_root_pid=10, window_seconds=window, _diagnostic_legacy_budget=True)
+                return QuietMonitor(list(range(server_count)), list(range(server_count, 256 if legacy else 64)),
+                                    own_root_pid=10, window_seconds=window, _diagnostic_legacy_budget=legacy)
 
         def budget_sample(self, monitor, second, rows):
             with mock.patch(__name__ + ".snapshot", return_value=rows), \
@@ -923,6 +948,79 @@ PY
             self.budget_sample(small, 1, {**self.before, 20: replace(self.other, ticks=102)})
             with self.assertRaisesRegex(QuietViolation, "1 physical server cores"):
                 small.check()
+
+        def test_normal_desktop_session_passes_and_records_each_background_tick(self):
+            from dataclasses import replace
+            # Half the physical cores are reserved; default-affinity desktop
+            # services can run elsewhere. This exercises the NORMAL monitor, not
+            # the diagnostic-only helper that originally hid the strict veto.
+            before = {**self.before, **{pid: Process(pid, pid, 1, name, 100,
+                       frozenset(range(256))) for pid, name in
+                       ((20, "gnome-shell"), (21, "dbus-daemon"), (22, "systemd"), (23, "Xwayland"))}}
+            monitor = self.budget_fixture(legacy=False, before=before)
+            after = {pid: replace(row, ticks=row.ticks + 1) if pid >= 20 else row
+                     for pid, row in before.items()}
+            self.budget_sample(monitor, 1, after)
+            monitor.check()
+            evidence = monitor.evidence()
+            self.assertEqual({row["comm"]: row["cpu_ticks"] for row in evidence["foreign_cpu_activity"]},
+                             {"gnome-shell": 1, "dbus-daemon": 1, "systemd": 1, "Xwayland": 1})
+            budget = evidence["generic_cpu_screening"]
+            self.assertAlmostEqual(budget["cpu_budget_seconds"], .96)
+            self.assertAlmostEqual(budget["peak_possible_core_concentration"]["cpu_seconds"], .04)
+            self.assertEqual(len(budget["peak_possible_core_concentration"]["possible_physical_cores"]), 64)
+
+        def test_normal_pinned_benchmark_and_generic_competitor_are_refused(self):
+            from dataclasses import replace
+            for name, ticks in (("memtier_benchmark", 100), ("worker", 101)):
+                with self.subTest(name=name):
+                    monitor = self.budget_fixture(legacy=False)
+                    self.budget_sample(monitor, 1, {**self.before,
+                        20: replace(self.other, name=name, ticks=ticks, affinity=frozenset((0,)))})
+                    with self.assertRaisesRegex(QuietViolation, "PID 20"):
+                        monitor.check()
+
+        def test_normal_default_224_cpu_geometry_does_not_reserve_all_256_watched_cpus(self):
+            from dataclasses import replace
+            before = {**self.before, 20: replace(self.other, name="gnome-shell", affinity=frozenset(range(256)))}
+            topology = {cpu: frozenset((cpu % 128, cpu % 128 + 128)) for cpu in range(256)}
+            with mock.patch(__name__ + ".read_topology", return_value=topology), \
+                 mock.patch(__name__ + ".snapshot", return_value=before):
+                monitor = QuietMonitor(list(range(32)), list(range(32, 128)) + list(range(160, 256)),
+                                       own_root_pid=10)
+            self.assertEqual(len(monitor.requested_cpus), 224)
+            self.assertEqual(len(monitor.cpus), 256)
+            self.budget_sample(monitor, monitor.previous_at + 1, {**before, 20: replace(before[20], ticks=101)})
+            monitor.check()
+            self.assertEqual(monitor.evidence()["foreign_cpu_activity"][0]["cpu_ticks"], 1)
+
+        def test_normal_known_experiment_off_reserved_cores_is_still_refused(self):
+            from dataclasses import replace
+            for name, ticks in (("cc1plus", 100), ("memtier_benchmark", 100), ("tomokv", 101)):
+                with self.subTest(name=name):
+                    before = {**self.before, 20: replace(self.other, name=name, affinity=frozenset((100,)))}
+                    monitor = self.budget_fixture(legacy=False, before=before)
+                    self.budget_sample(monitor, 1, {**before, 20: replace(before[20], ticks=ticks)})
+                    with self.assertRaisesRegex(QuietViolation, "PID 20"):
+                        monitor.check()
+
+        def test_normal_roaming_background_budget_stays_loud_and_scales_to_server_cores(self):
+            from dataclasses import replace
+            before = {**self.before, 20: replace(self.other, affinity=frozenset(range(256)))}
+            for server_count, ticks in ((32, 97), (1, 4)):
+                with self.subTest(server_count=server_count):
+                    monitor = self.budget_fixture(server_count=server_count, legacy=False, before=before)
+                    self.budget_sample(monitor, 1, {**before, 20: replace(before[20], ticks=100 + ticks)})
+                    with self.assertRaisesRegex(QuietViolation, "foreign CPU screening budget exceeded"):
+                        monitor.check()
+
+        def test_normal_broadening_affinity_does_not_erase_confined_activity(self):
+            from dataclasses import replace
+            monitor = self.budget_fixture(legacy=False)
+            self.budget_sample(monitor, 1, {**self.before,
+                20: replace(self.other, ticks=101, affinity=frozenset(range(256)))})
+            with self.assertRaisesRegex(QuietViolation, "PID 20"):
+                monitor.check()
 
         def test_hot_core_and_many_small_tasks_cannot_hide_in_256_cpu_geometry(self):
             from dataclasses import replace

@@ -25,7 +25,7 @@ def document(server=False, incomplete=False):
             "executable_observation":env.denied(PermissionError(13,"denied")),
             "argv_observation":{"status":"readable","bytes":20,"sha256":"b"*64},
             "limitation":"executable provenance unknown"}
-    row = {"pid":20,"start_ticks":3,"comm":comm,"parent_pid":1,"affinity":[0,1],"cpu_ticks":100,
+    row = {"pid":20,"start_ticks":3,"comm":comm,"parent_pid":1,"affinity":[0,1,2],"cpu_ticks":100,
            "reviewed":True,"classification":"idle-server" if server else "interactive-frontend","identity":identity}
     if server:
         row["listener_ports"] = [11211]
@@ -38,7 +38,8 @@ class Controls(unittest.TestCase):
     @contextlib.contextmanager
     def observer(self, declaration=None):
         rows = {10:quiet.Process(10,1,1,"python3",0,frozenset([0,1])),
-                20:quiet.Process(20,3,1,declaration["processes"][0]["comm"] if declaration else "frontend",100,frozenset([0,1]))}
+                20:quiet.Process(20,3,1,declaration["processes"][0]["comm"] if declaration else "frontend",100,
+                    frozenset(declaration["processes"][0]["affinity"] if declaration else [0,1,2]))}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)/"review.json"
             if declaration:
@@ -52,26 +53,25 @@ class Controls(unittest.TestCase):
                     background_environment=path if declaration else None,sample_artifact=Path(tmp)/"samples.jsonl")
                 yield observer,rows,tcp
 
-    def test_default_one_tick_refuses_and_remedy_is_explicit_review(self):
+    def test_default_one_roaming_tick_passes_without_explicit_review(self):
         with self.observer() as (observer,rows,tcp):
             rows[20]=replace(rows[20],ticks=101)
             observer.sample()
-            with self.assertRaisesRegex(quiet.QuietViolation,"background-environment"):
-                observer.check()
-            self.assertIsNone(observer.cpu_budget_seconds)
+            observer.check()
+            self.assertAlmostEqual(observer.cpu_budget_seconds,.03)
             self.assertEqual(observer.evidence()["foreign_cpu_activity"][0]["cpu_ticks"],1)
 
     def test_reviewed_ticks_are_recorded_without_translating_them_to_rate_error(self):
         with self.observer(document()) as (observer,rows,tcp):
-            rows[20]=replace(rows[20],ticks=201)
+            rows[20]=replace(rows[20],ticks=101)
             observer.sample();observer.check();observer.close();observer.check()
             evidence=observer.evidence()
             self.assertTrue(evidence["complete"])
-            self.assertIsNone(evidence["generic_cpu_screening"]["cpu_budget_seconds"])
-            self.assertEqual(evidence["foreign_cpu_activity"][0]["cpu_ticks"],101)
+            self.assertAlmostEqual(evidence["generic_cpu_screening"]["cpu_budget_seconds"],.03)
+            self.assertEqual(evidence["foreign_cpu_activity"][0]["cpu_ticks"],1)
             self.assertEqual(evidence["background_environment"]["sample_count"],2)
             samples=[json.loads(s) for s in observer.sample_artifact.read_text().splitlines()]
-            self.assertEqual(samples[0]["user_cpu_activity"][0]["cpu_ticks"],101)
+            self.assertEqual(samples[0]["user_cpu_activity"][0]["cpu_ticks"],1)
             self.assertEqual(samples[0]["environment"]["identities_checked"],1)
 
     def test_children_and_known_work_never_inherit_frontend_review(self):
@@ -98,13 +98,26 @@ class Controls(unittest.TestCase):
             observer.sample()
             with self.assertRaisesRegex(quiet.QuietViolation,"unobserved"):observer.check()
 
-    def test_full_and_incomplete_idle_servers_keep_every_tcp_sample_and_tick(self):
+    def test_full_and_incomplete_idle_servers_keep_tcp_samples_but_activity_refuses(self):
         for incomplete in (False,True):
             with self.subTest(incomplete=incomplete),self.observer(document(True,incomplete)) as (observer,rows,tcp):
-                rows[20]=replace(rows[20],ticks=101);observer.sample();observer.check();observer.close()
+                observer.sample();observer.check()
+                rows[20]=replace(rows[20],ticks=101);observer.sample();observer.close()
+                with self.assertRaisesRegex(quiet.QuietViolation,"PID 20"):
+                    observer.check()
                 evidence=observer.evidence()["background_environment"]
-                self.assertEqual((evidence["sample_count"],evidence["listener_snapshots"]),(2,2))
-                self.assertEqual(tcp.call_count,2)
+                self.assertEqual((evidence["sample_count"],evidence["listener_snapshots"]),(3,3))
+                self.assertEqual(tcp.call_count,3)
+
+    def test_review_cannot_exempt_roaming_budget_or_pinned_activity(self):
+        for affinity,ticks in (([0,1,2],104), ([0,1],101)):
+            declaration=document();declaration["processes"][0]["affinity"]=affinity
+            with self.subTest(affinity=affinity),self.observer(declaration) as (observer,rows,tcp):
+                rows[20]=replace(rows[20],ticks=ticks)
+                observer.sample()
+                with self.assertRaises(quiet.QuietViolation):observer.check()
+                self.assertEqual(observer.failure["processes"][0]["pid"],20)
+                self.assertNotIn("error",observer.failure)
 
     def test_foreign_server_live_tcp_state_remains_loud_and_retained(self):
         with self.observer(document(True,True)) as (observer,rows,tcp):
@@ -127,6 +140,11 @@ class Controls(unittest.TestCase):
         self.assertEqual(env.validate_contract(contract),contract)
         for key,replacement in (("sha256","0"*64),("policy",env.STRICT),("reviewed_identities",[])):
             with self.subTest(key=key),self.assertRaises(ValueError):env.validate_contract({**contract,key:replacement})
+        # A null captured under the old zero-tick/default or unlimited-reviewed
+        # policy cannot certify this different observation environment.
+        for policy in ("strict-foreign-activity-v1", "reviewed-idle-environment-v1"):
+            with self.subTest(policy=policy),self.assertRaises(ValueError):
+                env.validate_contract({**contract,"policy":policy})
 
 
 if __name__=="__main__":

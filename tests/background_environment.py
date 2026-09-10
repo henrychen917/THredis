@@ -257,8 +257,10 @@ def summary(document):
 
 
 POLICY = "operational-environment-v1"
-STRICT = "strict-foreign-activity-v1"
-REVIEWED = "reviewed-idle-environment-v1"
+# The contract hash must change with the screening policy, so a standing null from
+# the former all-foreign-ticks veto cannot silently authorize the roaming policy.
+STRICT = "affinity-background-budget-v1"
+REVIEWED = "reviewed-affinity-background-budget-v1"
 FIELDS = ("pid", "start_ticks", "identity", "comm", "parent_pid", "affinity", "classification")
 OPTIONAL_FIELDS = ("accept_incomplete_executable", "listener_ports")
 
@@ -372,9 +374,9 @@ class EnvironmentObserver:
             self.listener_snapshots += 1
             check_idle_connections(result["tcp_snapshot"], self.ports)
         result["inspecting_identities"] = []
-        # QuietMonitor independently rejects known experiments even between CPU
-        # bursts and any CPU-active unreviewed child. No descendant is inserted
-        # into self.reviewed by this inspection.
+        # QuietMonitor independently rejects known experiments and activity
+        # confined to the reserved cores, and budgets roaming background even
+        # after review. No identity declaration exempts work from those checks.
         self.samples += 1
         return result
 

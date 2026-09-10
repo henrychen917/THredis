@@ -8,7 +8,7 @@ import re
 
 from abba_instrument import validate_fingerprint
 from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
-from background_environment import canonical_contract, validate_contract
+from background_environment import canonical_contract, validate_contract, STRICT
 
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
@@ -109,7 +109,7 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
             "missing or unsupported operational quiet-box policy")
     background = quiet.get("background_environment")
     require(isinstance(background, dict), "missing quiet-box background environment evidence")
-    # Bind the exact reviewed identities (or the explicit strict policy), not the
+    # Bind the exact reviewed identities (or the default affinity/budget policy), not the
     # inventory capture time or its changing CPU counters. Both arms and any reused
     # null must run under this same contract; observation provenance stays in quiet.
     contract = validate_contract(environment.get("background_environment"))
@@ -130,7 +130,7 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
     provenance = background.get("source")
     require(isinstance(provenance, dict) and set(provenance) == {"path", "sha256"},
             "missing background environment source provenance")
-    if contract["policy"] == "strict-foreign-activity-v1":
+    if contract["policy"] == STRICT:
         require(provenance == {"path": None, "sha256": None} and
                 background.get("reviewed_inventory", "missing") is None,
                 "strict background policy unexpectedly carries reviewed identities")
