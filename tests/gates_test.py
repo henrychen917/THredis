@@ -469,6 +469,15 @@ bad(){ printf 'FAIL\t0\t%s\n' "$1" >> "$LEDGER"; FAIL=$((FAIL+1)); }
         self.assertEqual(self.collect('0\t1\t0\n')[0], (1, 0))
         self.assertEqual(self.collect('1\t0\t1\n', 'FAIL\t0.125000\tfixture\n')[0], (0, 1))
 
+    def test_collection_preserves_each_rows_own_duration(self):
+        # Collection happens in canonical order after arbitrary worker completion. The
+        # coordinator must preserve the worker's measured spans, including a failed row;
+        # collector time or time since the previous public row is unrelated to either.
+        fragment = 'ok\t0.125000\tfirst\nFAIL\t1.750000\tsecond\n'
+        counts, ledger = self.collect('1\t1\t1\n', fragment)
+        self.assertEqual(counts, (1, 1))
+        self.assertEqual(ledger, fragment)
+
     def test_explicit_failure_or_wrong_counts_cannot_be_hidden_by_a_passing_fragment(self):
         for completion in ('0\t1\t1\n', '0\t0\t1\n', '0\t2\t0\n', '0\t0\t0\n',
                            '1\t1\t0\n'):
@@ -1043,6 +1052,23 @@ python3(){
                                          'smoke' if purpose == 'iteration' else 'full')
                         self.assertEqual(argv[-2:], ['--output', str(directory / 'abba')])
                         self.assertRegex((directory / 'watchdog').read_text().strip(), r'^[1-9][0-9]*:[1-9][0-9]*$')
+                        if purpose == 'iteration':
+                            # Delete only the production measurement barrier. The same
+                            # workload-boundary assertion must refuse ABBA before it emits
+                            # any measurement evidence; a control that never reaches this
+                            # assertion would otherwise pass on the broken coordinator.
+                            barrier = '\njoin_workers\nphase abba-begin'
+                            self.assertEqual(coordinator.count(barrier), 1)
+                            poisoned = coordinator.replace(barrier, '\nphase abba-begin', 1)
+                            (directory / 'events').unlink()
+                            (directory / 'argv').unlink()
+                            result = subprocess.run(
+                                ['bash', '-uc', script + stub + start + poisoned + '\nexit "$ABBA_RC"\n'],
+                                cwd=root, env=env, text=True, capture_output=True, timeout=5)
+                            self.assertEqual(result.returncode, 72, result.stdout + result.stderr)
+                            self.assertIn('measurement before worker join', result.stderr)
+                            self.assertNotIn('ABBA', (directory / 'events').read_text().splitlines())
+                            self.assertFalse((directory / 'argv').exists())
 
 
 class PerfCandidateDispatch(unittest.TestCase):
