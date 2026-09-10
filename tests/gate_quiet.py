@@ -452,15 +452,16 @@ def self_test():
             root = Path(__file__).resolve().parents[1]
             (root / "build").mkdir(exist_ok=True)
             gate = (root / "tests/gate.sh").read_text()
-            watch = gate[gate.index("row_watch(){"):gate.index("\nrow_unwatch(){")]
+            watch = gate[gate.index("row_clock(){"):gate.index("\nrow_unwatch(){")]
             token = gate[gate.index("ABBA_WATCH_START=missing\n"):gate.index('GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START"')]
             with tempfile.TemporaryDirectory(prefix="quiet-watchdog-", dir=root / "build") as temporary:
                 # Run the real row watcher and the gate's actual token-producing shell code.
                 # The child only validates /proc metadata; no server, workload, or quiet sampling
                 # of the contended box is started. Cleanup addresses exactly the watcher we own.
                 script = '''set -eu
-ROW_TIMEOUT=30; ROW_START=$EPOCHREALTIME; ROW_PAUSED=0; ROW_MARKER=$TEST_MARKER
+ROW_TIMEOUT=30; ROW_PAUSED=0; ROW_MARKER=$TEST_MARKER
 ''' + watch + '''
+row_clock; ROW_START=$ROW_NOW
 row_watch
 trap 'kill -TERM "$ROW_WATCHDOG" 2>/dev/null || :; wait "$ROW_WATCHDOG" 2>/dev/null || :' EXIT
 ''' + token + '''

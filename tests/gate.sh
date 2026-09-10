@@ -28,6 +28,7 @@
 #   A load CPU must never share a physical core with a server CPU. --subset smoke is forbidden
 #   for push/release/full; iteration can opt into full, and perf can select either diagnostically.
 #   --candidate-binary bypasses only the release build; instrumented source builds still run.
+#   Such external binaries remain valid perf/iteration diagnostics but cannot earn a source receipt.
 #   Push/release/full also require a source/binary-bound local receipt. GATE_RECEIPT_BASELINE
 #   selects a trusted full ledger; GATE_RECEIPT_NULL selects a recent full byte-identical ABBA
 #   control. Defaults come only from a previous certified receipt. On first use, every check still
@@ -129,10 +130,7 @@ export TOMO_GATE_STRICT=1
 # assembled in source order. Compare identities/verdicts after projecting out duration.
 # The sidecar retains observed labels/counters; families.tsv measures whole worker jobs.
 LEDGER=${GATE_LEDGER:-$PWD/build/gate-ledger-$GATE_PURPOSE.txt}
-[ -f "$LEDGER" ] && mv -f "$LEDGER" "$LEDGER.prev"
 TIMINGS="$LEDGER.timings"
-[ ! -f "$TIMINGS" ] || mv -f "$TIMINGS" "$TIMINGS.prev"
-: > "$LEDGER"; : > "$TIMINGS"
 ROW_T=$(date +%s.%N)
 ROW_HISTORY=${GATE_HISTORY:-$PWD/.gate-history/rows}
 ROW_RUN_ID="$GATE_PURPOSE:${RUN_DIR##*/}"
@@ -149,6 +147,12 @@ case "$GATE_PURPOSE" in
     cat "$RUN_DIR/receipt-begin.log" >&2
     ;;
 esac
+# Freeze the reviewed baseline before rotating outputs: an explicit GATE_RECEIPT_BASELINE may
+# name this very ledger from the previous run. Reading it after truncation would discard the
+# owner's bootstrap evidence. The manifest keeps exact labels and its digest before any writes.
+[ -f "$LEDGER" ] && mv -f "$LEDGER" "$LEDGER.prev"
+[ ! -f "$TIMINGS" ] || mv -f "$TIMINGS" "$TIMINGS.prev"
+: > "$LEDGER"; : > "$TIMINGS"
 ROW_PLAN="$RUN_DIR/row-timeouts.json"
 HISTORY_ARGS=()
 [ ! -s "$TIMINGS.prev" ] || HISTORY_ARGS+=(--import-ledger "$TIMINGS.prev")
@@ -962,8 +966,16 @@ fi
 if [ "$FAIL" = 0 ] && [ -n "$RECEIPT_START" ]; then
   # Publish the binary binding before this worker's done marker unlocks release batteries.
   # A binding problem withholds certification; it does not delete or bypass any gate row.
-  python3 tests/gate_receipt.py bind --start "$RECEIPT_START" --candidate "$CANDIDATE_BINARY" \
-      >"$RUN_DIR/receipt-bind.log" 2>&1 || cat "$RUN_DIR/receipt-bind.log" >&2
+  # An external executable has no demonstrated relationship to this source tree. Its full
+  # diagnostic run remains useful, but only our normal source build can obtain a push receipt.
+  if [ "$BUILD_CANDIDATE" = 1 ]; then
+    python3 tests/gate_receipt.py bind --start "$RECEIPT_START" --candidate "$CANDIDATE_BINARY" \
+        >"$RUN_DIR/receipt-bind.log" 2>&1 || cat "$RUN_DIR/receipt-bind.log" >&2
+  else
+    echo 'GATE RECEIPT WITHHELD: --candidate-binary skips the source build; all diagnostic rows still run, but external bytes cannot certify this source tree' \
+        >"$RUN_DIR/receipt-bind.log"
+    cat "$RUN_DIR/receipt-bind.log" >&2
+  fi
 fi
 }
 

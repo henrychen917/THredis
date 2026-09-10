@@ -677,7 +677,7 @@ def self_test():
             (self.root / "tests").mkdir()
             (self.root / ".githooks").mkdir()
             (self.root / "build").mkdir()
-            (self.root / ".gitignore").write_text("/build/\n/.gate-history/\n")
+            (self.root / ".gitignore").write_text("/build/\n/.gate-history/\n__pycache__/\n")
             (self.root / "tests/gate.sh").write_text("EXPECT_FULL=437\n")
             (self.root / "tests/headline_cells.txt").write_text(fixture_cells())
             shutil.copyfile(__file__, self.root / "tests/gate_receipt.py")
@@ -696,7 +696,10 @@ def self_test():
             self.candidate.write_bytes(b"synthetic executable bytes, never run\n")
             self.candidate.chmod(0o755)
             self.ledger = self.root / "build/ledger.tsv"
-            self.ledger.write_text("".join(f"ok\t1.0\trow {i}\n" for i in range(436)) + f"ok\t1.0\t{ABBA_LABEL}\n")
+            # Distinct real gate loops can publish the same AOF label. Every occurrence needs
+            # its own observation; a set of labels would quietly erase one of these first rows.
+            self.ledger.write_text("".join(f"ok\t1.0\trow {0 if i == 1 else i}\n" for i in range(436)) +
+                                   f"ok\t1.0\t{ABBA_LABEL}\n")
             self.args = argparse.Namespace(run_id="fixture", tier="push", expected_ledger=self.ledger,
                                            cells=self.root / "tests/headline_cells.txt", nic=False)
             self.start_time = float(int(time.time()) - 40000)
@@ -781,7 +784,7 @@ def self_test():
             with self.assertRaisesRegex(ValueError, "missing, duplicated"):
                 finish(self.root, self.finish_args)
             self.ledger.write_text("".join(rows))
-            self.observed.pop()
+            self.observed.pop(1)  # The duplicate label is still present; its second execution is not.
             self.save_results()
             with self.assertRaisesRegex(ValueError, "independent own-row"):
                 finish(self.root, self.finish_args)
@@ -820,32 +823,128 @@ def self_test():
             start_block = gate[gate.index("RECEIPT_REQUIRED=0;"):gate.index('ROW_PLAN="$RUN_DIR/row-timeouts.json"')]
             release = gate[gate.index("job_release(){"):gate.index("\njob_asan(){")]
             final = gate[gate.index("GATE_CLEANUP_RC=0\n"):]
-            for tier, expected in (("push", 1), ("iteration", 0)):
-                with self.subTest(tier=tier):
-                    run = self.root / "build" / ("fragment-" + tier)
+            for tier, built, expected in (("push", 1, 1), ("iteration", 1, 0),
+                                           ("push", 0, 1), ("iteration", 0, 0)):
+                with self.subTest(tier=tier, built=built):
+                    run_id = f"{tier}:fragment-{built}"
+                    run = self.root / "build" / ("fragment-" + tier + str(built))
                     run.mkdir()
                     script = '''set -u
-RUN_DIR=$TEST_RUN; TMPDIR=$TEST_RUN; ROW_RUN_ID="$GATE_PURPOSE:fragment"
+RUN_DIR=$TEST_RUN; TMPDIR=$TEST_RUN; ROW_RUN_ID=$TEST_RUN_ID
 GATE_STARTED=$SECONDS; GATE_RECEIPT_BASELINE="$PWD/build/missing"
-BUILD_CANDIDATE=1; BUILD_CORES=0; BUILD_JOBS=1; CANDIDATE_BINARY="$PWD/build/candidate"
+if [ "$TEST_BUILT" = 0 ]; then GATE_RECEIPT_BASELINE="$PWD/build/ledger.tsv"; fi
+BUILD_CANDIDATE=$TEST_BUILT; BUILD_CORES=0; BUILD_JOBS=1; CANDIDATE_BINARY="$PWD/build/candidate"
+LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"
 PASS=0; FAIL=0
 row_begin(){ :; }; pausable(){ :; }; ok(){ PASS=$((PASS+1)); }; bad(){ FAIL=$((FAIL+1)); }
 cleanup(){ :; }
 ''' + start_block + release + '''
 job_release
-if [ "$RECEIPT_REQUIRED" = 1 ]; then test -f "${RECEIPT_START%/*}/candidate.json" || exit 99; fi
+if [ "$RECEIPT_REQUIRED" = 1 ]; then
+  if [ "$BUILD_CANDIDATE" = 1 ]; then test -f "${RECEIPT_START%/*}/candidate.json" || exit 99
+  else test ! -f "${RECEIPT_START%/*}/candidate.json" || exit 98; fi
+fi
 printf 'correctness\\nabba\\n' > "$RUN_DIR/reached"
 PASS=437; FAIL=0; ABBA_RC=0; NIC_CHECKED=0; ROW_HISTORY="$PWD/build"
 ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
 ''' + final
                     process = subprocess.run(["bash"], cwd=self.root, input=script, text=True, capture_output=True,
-                                             env={**os.environ, "TEST_RUN": str(run), "GATE_PURPOSE": tier})
+                                             env={**os.environ, "TEST_RUN": str(run), "GATE_PURPOSE": tier,
+                                                  "TEST_RUN_ID": run_id, "TEST_BUILT": str(built)})
                     self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
                     self.assertEqual((run / "reached").read_text(), "correctness\nabba\n")
                     self.assertEqual((run / "gate-result.json").exists(), tier == "push")
                     if tier == "push":
-                        self.assertIn("rows are not automatically trusted", process.stderr)
-                    self.assertFalse((history_directory(self.root) / "runs" / (tier + ":fragment") / "receipt.json").exists())
+                        if built:
+                            self.assertIn("rows are not automatically trusted", process.stderr)
+                        else:
+                            self.assertIn("external bytes cannot certify this source tree", process.stderr)
+                    self.assertFalse((history_directory(self.root) / "runs" / run_id / "receipt.json").exists())
+
+        def test_actual_begin_reads_explicit_previous_ledger_before_rotation(self):
+            gate = (ROOT / "tests/gate.sh").read_text()
+            block = gate[gate.index("LEDGER=${GATE_LEDGER:"):gate.index('ROW_PLAN="$RUN_DIR/row-timeouts.json"')]
+            run = self.root / "build" / "explicit-baseline"
+            run.mkdir()
+            previous = self.ledger.read_bytes()
+            script = 'set -u\nRUN_DIR=$TEST_RUN\n' + block + '\nprintf "%s\\n" "$RECEIPT_START"\n'
+            process = subprocess.run(["bash"], cwd=self.root, input=script, text=True, capture_output=True,
+                env={**os.environ, "TEST_RUN": str(run), "GATE_PURPOSE": "push",
+                     "GATE_LEDGER": str(self.ledger), "GATE_RECEIPT_BASELINE": str(self.ledger)})
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            state = read_json(Path(process.stdout.strip()))
+            self.assertEqual(state["baseline"]["sha256"], digest(previous))
+            self.assertEqual(Counter(state["expected_labels"]), Counter(self.state["expected_labels"]))
+            self.assertIsNone(state["withheld_reason"])
+            self.assertEqual(self.ledger.read_bytes(), b"")
+            self.assertEqual(Path(str(self.ledger) + ".prev").read_bytes(), previous)
+
+        def test_ignored_generated_outputs_preserve_fingerprint_but_tracked_ignored_files_count(self):
+            for relative in ("build/obj/source.o", ".gate-history/rows/index.sqlite",
+                             "tests/__pycache__/helper.pyc"):
+                path = self.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"generated after gate start")
+            self.assertEqual(source_fingerprint(self.root), self.state["source"])
+            self.certify_and_commit()
+            self.assertEqual(len(verify_refs(self.root, [("HEAD", self.oid)])), 1)
+            tracked = self.root / "build/forced-tracked-header.h"
+            tracked.write_text("tracked despite ignore\n")
+            git(self.root, "add", "-f", "build/forced-tracked-header.h")
+            fingerprint = source_fingerprint(self.root)
+            self.assertTrue(any(row["path"] == "build/forced-tracked-header.h" for row in fingerprint["entries"]))
+            tracked.write_text("tracked bytes changed\n")
+            self.assertNotEqual(source_fingerprint(self.root), fingerprint)
+
+        def test_actual_history_recorder_matches_context_and_unscored_prerequisites(self):
+            import gate_history
+            directory = self.root / "build" / "real-history"
+            with mock.patch.object(time, "time", return_value=self.start_time + 500):
+                for index, row in enumerate(ledger_rows(self.ledger, passing=True)):
+                    gate_history.record(directory, run_id=self.args.run_id,
+                        label=row["label"] + " [geometry context]", ledger_label=row["label"],
+                        seconds=row["seconds"], verdict="ok", timed_out=False, observation_id=f"actual-{index}")
+                gate_history.record(directory, run_id=self.args.run_id, label="unscored build dependency: test.o",
+                    seconds=2., verdict="ok", timed_out=False, observation_id="actual-dependency", scored=False)
+            self.finish_args.observations = directory / gate_history.HISTORY_FILE
+            receipt = finish(self.root, self.finish_args)
+            retained = read_json(receipt.parent / "evidence.json")["observations"]
+            self.assertEqual(sum(row["scored"] for row in retained), 437)
+            self.assertEqual(len(retained), 438)
+
+        def test_future_full_row_count_needs_new_baseline_and_actual_observation(self):
+            # Only this disposable Git fixture changes EXPECT. The repository's maintainer-owned
+            # constants are never edited; the certificate must follow a future intentional raise.
+            (self.root / "tests/gate.sh").write_text("EXPECT_FULL=438\n")
+            self.args.run_id = "larger-full-run"
+            with self.assertRaisesRegex(ValueError, "exactly 438 rows"):
+                begin(self.root, self.args)
+            self.ledger.write_text(self.ledger.read_text() + "ok\t2.0\tnew required row\n")
+            with mock.patch.object(time, "time", return_value=self.start_time):
+                self.start = begin(self.root, self.args)
+            with mock.patch.object(time, "time", return_value=self.start_time + 1):
+                bind(self.root, argparse.Namespace(start=self.start, candidate=self.candidate))
+            self.state = read_json(self.start)
+            self.binding = read_json(self.start.parent / "candidate.json")
+            self.assertEqual(self.state["expected_checks"], 438)
+            self.finish_args.start = self.start
+            self.completed["run_id"] = self.args.run_id
+            self.report = self.make_report(self.start_time + 100, self.binding["sha256"], "b" * 64)
+            self.control = self.make_report(self.start_time - 18000, "a" * 64, "a" * 64)
+            for row in self.observed:
+                row["run_id"] = self.args.run_id
+            self.save_results()
+            with self.assertRaisesRegex(ValueError, "incorrect gate completion checks"):
+                finish(self.root, self.finish_args)
+            self.completed.update(checks=438, passed=438)
+            self.save_results()
+            with self.assertRaisesRegex(ValueError, "independent own-row observations"):
+                finish(self.root, self.finish_args)
+            self.observed.append(dict(schema=1, timing="own-row", run_id=self.args.run_id,
+                observation_id="extra", label="new required row", ledger_label="new required row", scored=True,
+                seconds=2., verdict="ok", timed_out=False, recorded_at=self.start_time + 100))
+            self.save_results()
+            self.assertTrue(finish(self.root, self.finish_args).is_file())
 
         def test_smoke_partial_failed_unreached_quiet_and_null_controls(self):
             self.args.tier = "smoke"
