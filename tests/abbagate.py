@@ -66,6 +66,7 @@ import time
 from _lib import Conn
 from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
 from gate_quiet import QuietMonitor, QuietViolation
+from gate_receipt import harness_fingerprint
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
                             require_workload_witness, workload_command_names)
 
@@ -976,7 +977,7 @@ def main(args):
         report.update(verdict="FAIL", reason=reason, measurement_valid=False)
         for row in report["cells"]:
             row["instrument_valid"] = False
-            row["instrument_failure"] = "quiet-box contention invalidated the whole tier"
+            row["instrument_failure"] = reason
 
     def interrupted(signum, _frame):
         raise InterruptedError(f"interrupted by signal {signum}")
@@ -1009,6 +1010,10 @@ def main(args):
         if pending and not args.escalate:
             raise ValueError("unmeasured load floors for " + ",".join(pending) +
                              "; calibrate with --escalate and record the validated pins before gating")
+        # Standing nulls can use another server binary, but must use these exact harness bytes.
+        # Capture before the quiet observer starts, and check again after its final sample so
+        # fingerprinting itself never becomes foreign CPU work inside a measurement interval.
+        report["receipt_harness_sha256"] = harness_fingerprint(ROOT)["sha256"]
         quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid())
         quiet.start()  # Fail before reference builds, capability probes, or server boots.
         report["quiet_box"] = quiet.evidence()
@@ -1124,6 +1129,9 @@ def main(args):
         # cleanup-only check in finally would run after Python chose that code.
         report["quiet_box"] = quiet.close()
         quiet.check()
+        if harness_fingerprint(ROOT)["sha256"] != report["receipt_harness_sha256"]:
+            invalidate_instrument("measurement harness changed during the ABBA tier")
+            raise RuntimeError(report["reason"])
         report["measurement_valid"] = True
         report["verdict"], report["worst_cell"] = overall(report["cells"])
         if args.only and report["verdict"] == "PASS":
@@ -1553,6 +1561,16 @@ def self_test():
             self.assertFalse(report["cells"][0]["instrument_valid"])
             self.assertIn("QuietViolation", report["reason"])
             self.assertEqual(paired(self.round([100, 100, 100, 100])["runs"])["threshold_pct"], threshold_before)
+
+        def test_changed_harness_invalidates_the_real_measurement_loop(self):
+            with mock.patch(__name__ + ".harness_fingerprint", side_effect=[
+                    {"sha256": "a" * 64}, {"sha256": "b" * 64}]):
+                rc, measurements, _, report, _ = self.fake_main(pin="4")
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(measurements), 4)
+            self.assertFalse(report["measurement_valid"])
+            self.assertFalse(report["cells"][0]["instrument_valid"])
+            self.assertIn("harness changed", report["reason"])
 
         def test_contended_preflight_never_reaches_support_or_measurement(self):
             self.quiet.start.side_effect = QuietViolation("foreign compiler is active")

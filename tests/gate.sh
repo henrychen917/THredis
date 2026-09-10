@@ -28,6 +28,11 @@
 #   A load CPU must never share a physical core with a server CPU. --subset smoke is forbidden
 #   for push/release/full; iteration can opt into full, and perf can select either diagnostically.
 #   --candidate-binary bypasses only the release build; instrumented source builds still run.
+#   Push/release/full also require a source/binary-bound local receipt. GATE_RECEIPT_BASELINE
+#   selects a trusted full ledger; GATE_RECEIPT_NULL selects a recent full byte-identical ABBA
+#   control. Defaults come only from a previous certified receipt. On first use, every check still
+#   runs; missing baseline/null evidence withholds the receipt and makes the final gate nonzero.
+#   The owner reviews that completed full ledger before explicitly using it as the next baseline.
 #
 #   Every feature battery runs on three boots: split (both atomic modes), fused, and fused with the
 #   read-local lane ARMED (--read-local 1, the recommended read-heavy production posture; that leg
@@ -132,6 +137,18 @@ ROW_T=$(date +%s.%N)
 ROW_HISTORY=${GATE_HISTORY:-$PWD/.gate-history/rows}
 ROW_RUN_ID="$GATE_PURPOSE:${RUN_DIR##*/}"
 export GATE_RUN_ID="$ROW_RUN_ID"
+RECEIPT_REQUIRED=0; RECEIPT_START=
+case "$GATE_PURPOSE" in
+  push|release|full)
+    RECEIPT_REQUIRED=1
+    # A missing baseline must not abort before correctness or silently skip performance. The
+    # helper records a withheld bootstrap state; only a reviewed prior full ledger can arm it.
+    RECEIPT_START=$(python3 tests/gate_receipt.py begin --run-id "$ROW_RUN_ID" --tier "$GATE_PURPOSE" \
+        --expected-ledger "${GATE_RECEIPT_BASELINE:-$PWD/.gate-history/receipts/baselines/full.tsv}" \
+        --allow-missing-baseline --nic-auto 2>"$RUN_DIR/receipt-begin.log") || RECEIPT_START=
+    cat "$RUN_DIR/receipt-begin.log" >&2
+    ;;
+esac
 ROW_PLAN="$RUN_DIR/row-timeouts.json"
 HISTORY_ARGS=()
 [ ! -s "$TIMINGS.prev" ] || HISTORY_ARGS+=(--import-ledger "$TIMINGS.prev")
@@ -941,6 +958,12 @@ else
   row_begin "release build (+footprint locks)" external-candidate
   [ -x "$CANDIDATE_BINARY" ] && ok "release build (+footprint locks)" \
       || bad "release build" "candidate is not executable: $CANDIDATE_BINARY"
+fi
+if [ "$FAIL" = 0 ] && [ -n "$RECEIPT_START" ]; then
+  # Publish the binary binding before this worker's done marker unlocks release batteries.
+  # A binding problem withholds certification; it does not delete or bypass any gate row.
+  python3 tests/gate_receipt.py bind --start "$RECEIPT_START" --candidate "$CANDIDATE_BINARY" \
+      >"$RUN_DIR/receipt-bind.log" 2>&1 || cat "$RUN_DIR/receipt-bind.log" >&2
 fi
 }
 
@@ -2552,11 +2575,32 @@ ABBA_PENDING=1
 LEDGER="$RUN_DIR/abba.ledger"; TIMINGS="$RUN_DIR/abba.timings"; : > "$LEDGER"; : > "$TIMINGS"
 ROW_T=$(date +%s.%N)
 quiet_wait
+# Resolve the actual parser's output option, including caller-supplied abbreviations/paths.
+# Recording one explicit destination makes the receipt consume this run's result, never a glob
+# that could select another lane's or a previous run's results.json.
+ABBA_OUTPUT=$(python3 - "$RUN_DIR/abba" "${ABBA_ARGS[@]}" <<'PY'
+from pathlib import Path
+import sys
+default = Path(sys.argv.pop(1))
+sys.path.insert(0, 'tests')
+from abbagate import parse_args
+print((parse_args().output or default).resolve())
+PY
+) || exit 2
 # Bash defers a TERM trap while waiting for a foreground external command. An explicit wait on
 # our tracked background child is interruptible, so stopping the gate reaches ABBA's cleanup.
 ABBA_HISTORY_CONTEXT=$(python3 tests/gate_history.py abba-context -- "${ABBA_ARGS[@]}") || exit 2
 row_begin "headline ABBA vs last pushed binary" "$ABBA_HISTORY_CONTEXT"
-python3 tests/abbagate.py "${ABBA_ARGS[@]}" &
+# The row watcher is this driver's sibling, not its child. Exempt only the declared exact
+# watcher identity; gate_quiet independently verifies its script, direct controller parent,
+# and --pid/--parent-start arguments on every sample. All other gate children stay foreign.
+ABBA_WATCH_START=missing
+if read -r ABBA_WATCH_STAT < "/proc/$ROW_WATCHDOG/stat"; then
+  ABBA_WATCH_STAT=${ABBA_WATCH_STAT##*) }; read -ra ABBA_WATCH_FIELDS <<< "$ABBA_WATCH_STAT"
+  ABBA_WATCH_START=${ABBA_WATCH_FIELDS[19]}
+fi
+GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START" \
+  python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &
 ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?
@@ -2676,6 +2720,28 @@ fi
 
 phase end
 program_state "$((EXPECT_FULL+NIC_CHECKED))"
+GATE_CLEANUP_RC=0
+cleanup || GATE_CLEANUP_RC=$?
+RECEIPT_RC=0
+if [ "$RECEIPT_REQUIRED" = 1 ]; then
+  # All correctness, ABBA, optional NIC work and owned-child cleanup precede completion. The
+  # receipt is an additional certification condition, not a counted row or a weakened EXPECT.
+  RECEIPT_COORDINATOR_ARGS=()
+  [ -z "$RECEIPT_START" ] || RECEIPT_COORDINATOR_ARGS+=(--start "$RECEIPT_START")
+  python3 tests/gate_receipt.py coordinator "${RECEIPT_COORDINATOR_ARGS[@]}" \
+      --run-id "$ROW_RUN_ID" --tier "$GATE_PURPOSE" --passed "$PASS" --failed "$FAIL" \
+      --abba-rc "$ABBA_RC" --cleanup-rc "$GATE_CLEANUP_RC" --nic "$NIC_CHECKED" \
+      --output "$RUN_DIR/gate-result.json" || RECEIPT_RC=1
+  if [ -n "$RECEIPT_START" ] && [ "$RECEIPT_RC" = 0 ]; then
+    python3 tests/gate_receipt.py finish --start "$RECEIPT_START" --gate-result "$RUN_DIR/gate-result.json" \
+        --ledger "$LEDGER" --observations "$ROW_HISTORY/row-observations.jsonl" \
+        --abba-result "$ABBA_OUTPUT/results.json" \
+        --null-result "${GATE_RECEIPT_NULL:-$PWD/.gate-history/receipts/baselines/full-null.json}" || RECEIPT_RC=1
+  else
+    echo "GATE RECEIPT WITHHELD: start/binding evidence was unavailable; full gate work has completed; see $RUN_DIR/receipt-begin.log" >&2
+    RECEIPT_RC=1
+  fi
+fi
 echo
-echo "GATE($GATE_PURPOSE): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED, wall $((SECONDS-GATE_STARTED))s)"
-[ $FAIL -eq 0 ] || exit 1
+echo "GATE($GATE_PURPOSE): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED, cleanup rc=$GATE_CLEANUP_RC, receipt required=$RECEIPT_REQUIRED rc=$RECEIPT_RC, wall $((SECONDS-GATE_STARTED))s)"
+[ "$FAIL" -eq 0 ] && [ "$GATE_CLEANUP_RC" -eq 0 ] && [ "$RECEIPT_RC" -eq 0 ] || exit 1

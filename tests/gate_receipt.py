@@ -270,18 +270,35 @@ def expected_count(root, nic):
 def begin(root, args):
     require(args.tier in ("full", "push", "release"), "smoke/iteration gates cannot create push receipts")
     directory = history_directory(root)
-    require(re.fullmatch(r"[A-Za-z0-9_.-]+", args.run_id), "invalid run ID")
-    baseline = ledger_rows(args.expected_ledger, passing=False)
-    count = expected_count(root, args.nic)
-    require(len(baseline) == count and sum(r["label"] == ABBA_LABEL for r in baseline) == 1,
-            f"trusted baseline ledger must contain exactly {count} rows including the ABBA row")
+    require(re.fullmatch(r"[A-Za-z0-9_.:-]+", args.run_id) and args.run_id not in (".", ".."), "invalid run ID")
+    baseline, baseline_identity, withheld = [], None, None
+    nic = args.nic
+    try:
+        baseline = ledger_rows(args.expected_ledger, passing=False)
+        if getattr(args, "nic_auto", False):
+            nic = any(row["label"] == "NIC regression cells (all within -3%)" for row in baseline)
+        count = expected_count(root, nic)
+        require(len(baseline) == count and sum(r["label"] == ABBA_LABEL for r in baseline) == 1,
+                f"trusted baseline ledger must contain exactly {count} rows including the ABBA row")
+        baseline_identity = {"path": str(args.expected_ledger.resolve()),
+                             "sha256": digest(args.expected_ledger.read_bytes())}
+    except (ValueError, OSError) as error:
+        if not getattr(args, "allow_missing_baseline", False):
+            raise
+        # Bootstrap is a state worth preserving, never authorization to shrink/skip the gate or
+        # to trust its own newly observed labels. An owner can review the completed full ledger
+        # and explicitly supply it as GATE_RECEIPT_BASELINE for the next run. Automatic discovery
+        # uses only baselines written after a previous receipt was successfully certified.
+        baseline = []
+        withheld = "missing/invalid trusted baseline: " + str(error)
+        print("GATE RECEIPT PENDING: " + withheld + "; all gate work still runs; no push receipt will be issued", file=sys.stderr)
+    count = expected_count(root, nic)
     source = source_fingerprint(root)
     state = {"schema": SCHEMA, "kind": "gate-start", "run_id": args.run_id, "tier": args.tier,
              "started_at": time.time(), "source": source, "harness": harness_from_source(source),
              "inventory": inventory(root, args.cells.resolve()), "expected_checks": count,
-             "expected_labels": [r["label"] for r in baseline], "nic": args.nic,
-             "baseline": {"path": str(args.expected_ledger.resolve()),
-                          "sha256": digest(args.expected_ledger.read_bytes())}}
+             "expected_labels": [r["label"] for r in baseline], "nic": nic,
+             "baseline": baseline_identity, "withheld_reason": withheld}
     path = directory / "runs" / args.run_id / "start.json"
     write_json(path, state, exclusive=True)
     return path
@@ -428,6 +445,9 @@ def observations(path, state, actual, finished):
 
 def finish(root, args):
     state = load_start(root, args.start)
+    require(state.get("baseline") is not None and not state.get("withheld_reason"),
+            (state.get("withheld_reason") or "missing trusted baseline") +
+            "; completed full-run evidence is retained, but its rows are not automatically trusted")
     candidate = read_json(args.start.parent / "candidate.json")
     require(candidate.get("start_sha256") == digest(args.start.read_bytes()) and
             candidate.get("source_sha256") == state["source"]["sha256"], "candidate binding is from another run")
@@ -479,7 +499,39 @@ def finish(root, args):
                "null_control_sha256": control["candidate"]["sha256"]}
     path = args.start.parent / "receipt.json"
     write_json(path, receipt, exclusive=True)
+    # Only an issued receipt advances durable defaults. The first untrusted full run, any failed
+    # run, and a 436-row correctness prefix can never bootstrap this file automatically.
+    directory = history_directory(root) / "baselines"
+    write_json(directory / "full-null.json", control)
+    ledger = "".join(f"{row['verdict']}\t{row['seconds']!r}\t{row['label']}\n" for row in actual)
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".full-ledger-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(ledger)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / "full.tsv")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return path
+
+
+def coordinator(root, args):
+    state = read_json(args.start) if args.start is not None else {}
+    binding_path = args.start.parent / "candidate.json" if args.start is not None else None
+    binding = read_json(binding_path) if binding_path is not None and binding_path.exists() else {}
+    successful = args.failed == 0 and args.abba_rc == 0 and args.cleanup_rc == 0
+    result = {"schema": 1, "run_id": args.run_id, "tier": args.tier,
+              "completed": args.cleanup_rc == 0, "verdict": "PASS" if successful else "FAIL",
+              "exit_code": 0 if successful else 1, "started_at": state.get("started_at"),
+              "finished_at": time.time(), "checks": args.passed + args.failed, "passed": args.passed,
+              "failed": args.failed, "skipped": 0, "abba_exit_code": args.abba_rc,
+              "nic_checked": bool(args.nic), "candidate_sha256": binding.get("sha256"),
+              "cleanup_exit_code": args.cleanup_rc}
+    write_json(args.output, result, exclusive=True)
+    return args.output
 
 
 def validate_receipt(root, path, source):
@@ -743,6 +795,58 @@ def self_test():
             self.certify_and_commit()
             self.assertEqual(len(verify_refs(self.root, [("HEAD", self.oid)])), 1)
 
+        def test_missing_baseline_retains_start_binding_and_completed_work_without_receipt(self):
+            self.args.run_id = "push:bootstrap"
+            self.args.expected_ledger = self.root / "build/missing-baseline"
+            self.args.allow_missing_baseline = True
+            start = begin(self.root, self.args)
+            state = read_json(start)
+            self.assertIsNone(state["baseline"])
+            self.assertIn("missing/invalid trusted baseline", state["withheld_reason"])
+            bind(self.root, argparse.Namespace(start=start, candidate=self.candidate))
+            args = copy.copy(self.finish_args)
+            args.start = start
+            with self.assertRaisesRegex(ValueError, "rows are not automatically trusted"):
+                finish(self.root, args)
+            self.assertFalse((start.parent / "receipt.json").exists())
+            self.assertFalse((history_directory(self.root) / "baselines/full.tsv").exists())
+
+        def test_actual_shell_receipt_blocks_do_not_short_circuit_work_or_certify_iteration(self):
+            # Execute the gate's real begin/release-binding/footer blocks. Only workload bodies
+            # are fake: no make/server/benchmark runs. A missing baseline must still reach both
+            # workload markers, bind before them, then exit red with no receipt. Iteration reaches
+            # those same markers and invokes no receipt stages even when its counters are green.
+            gate = (ROOT / "tests/gate.sh").read_text()
+            start_block = gate[gate.index("RECEIPT_REQUIRED=0;"):gate.index('ROW_PLAN="$RUN_DIR/row-timeouts.json"')]
+            release = gate[gate.index("job_release(){"):gate.index("\njob_asan(){")]
+            final = gate[gate.index("GATE_CLEANUP_RC=0\n"):]
+            for tier, expected in (("push", 1), ("iteration", 0)):
+                with self.subTest(tier=tier):
+                    run = self.root / "build" / ("fragment-" + tier)
+                    run.mkdir()
+                    script = '''set -u
+RUN_DIR=$TEST_RUN; TMPDIR=$TEST_RUN; ROW_RUN_ID="$GATE_PURPOSE:fragment"
+GATE_STARTED=$SECONDS; GATE_RECEIPT_BASELINE="$PWD/build/missing"
+BUILD_CANDIDATE=1; BUILD_CORES=0; BUILD_JOBS=1; CANDIDATE_BINARY="$PWD/build/candidate"
+PASS=0; FAIL=0
+row_begin(){ :; }; pausable(){ :; }; ok(){ PASS=$((PASS+1)); }; bad(){ FAIL=$((FAIL+1)); }
+cleanup(){ :; }
+''' + start_block + release + '''
+job_release
+if [ "$RECEIPT_REQUIRED" = 1 ]; then test -f "${RECEIPT_START%/*}/candidate.json" || exit 99; fi
+printf 'correctness\\nabba\\n' > "$RUN_DIR/reached"
+PASS=437; FAIL=0; ABBA_RC=0; NIC_CHECKED=0; ROW_HISTORY="$PWD/build"
+ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
+''' + final
+                    process = subprocess.run(["bash"], cwd=self.root, input=script, text=True, capture_output=True,
+                                             env={**os.environ, "TEST_RUN": str(run), "GATE_PURPOSE": tier})
+                    self.assertEqual(process.returncode, expected, process.stdout + process.stderr)
+                    self.assertEqual((run / "reached").read_text(), "correctness\nabba\n")
+                    self.assertEqual((run / "gate-result.json").exists(), tier == "push")
+                    if tier == "push":
+                        self.assertIn("rows are not automatically trusted", process.stderr)
+                    self.assertFalse((history_directory(self.root) / "runs" / (tier + ":fragment") / "receipt.json").exists())
+
         def test_smoke_partial_failed_unreached_quiet_and_null_controls(self):
             self.args.tier = "smoke"
             with self.assertRaisesRegex(ValueError, "smoke/iteration"):
@@ -848,12 +952,23 @@ def main():
     start.add_argument("--expected-ledger", type=Path, required=True)
     start.add_argument("--cells", type=Path, default=ROOT / "tests/headline_cells.txt")
     start.add_argument("--nic", action="store_true")
+    start.add_argument("--nic-auto", action="store_true", help="infer optional NIC inventory from the trusted baseline")
+    start.add_argument("--allow-missing-baseline", action="store_true",
+                       help="record a withheld bootstrap attempt so the entire authorized gate can still run")
     binding = sub.add_parser("bind")
     binding.add_argument("--start", type=Path, required=True)
     binding.add_argument("--candidate", type=Path, required=True)
     final = sub.add_parser("finish")
     for name in ("start", "gate-result", "ledger", "observations", "abba-result", "null-result"):
         final.add_argument("--" + name, type=Path, required=True)
+    completed = sub.add_parser("coordinator")
+    completed.add_argument("--start", type=Path)
+    completed.add_argument("--output", type=Path, required=True)
+    completed.add_argument("--run-id", required=True)
+    completed.add_argument("--tier", choices=("full", "push", "release"), required=True)
+    for name in ("passed", "failed", "abba-rc", "cleanup-rc"):
+        completed.add_argument("--" + name, type=int, required=True)
+    completed.add_argument("--nic", type=int, choices=(0, 1), required=True)
     sub.add_parser("fingerprint").add_argument("--harness", action="store_true")
     sub.add_parser("verify").add_argument("--ref", action="append", default=[])
     hook = sub.add_parser("pre-push")
@@ -865,7 +980,7 @@ def main():
     if args.install or args.uninstall:
         require(not (args.install and args.uninstall), "choose install or uninstall")
         install(ROOT, uninstall=args.uninstall)
-    elif args.action in ("begin", "bind", "finish"):
+    elif args.action in ("begin", "bind", "finish", "coordinator"):
         print(globals()[args.action](ROOT, args))
     elif args.action == "fingerprint":
         print(json.dumps(harness_fingerprint(ROOT) if args.harness else source_fingerprint(ROOT), sort_keys=True))

@@ -7,6 +7,8 @@ known compilers, load generators and ABBA drivers are competing experiments even
 while temporarily asleep between phases. An idle unrelated server is recorded,
 then refused if traffic produces CPU activity. Other processes are reported if their sampled
 CPU time advances by at least one accounting tick on an overlapping affinity mask.
+The gate's declared row watchdog is controller housekeeping only after its exact
+PID/start identity, script and captured controller parent are independently verified.
 That is an interference witness, not a chosen regression tolerance or noise floor.
 The sample cannot see a process born and reaped entirely between observations; the
 exclusive-box rule remains necessary, and the evidence records this limitation.
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -69,7 +72,7 @@ def experiment_driver(argv: list[bytes]) -> bool:
             return False
         if argument.startswith(b"-"):
             continue
-        return Path(os.fsdecode(argument)).name in ("abbagate.py", "abba_experiments.py")
+        return Path(os.fsdecode(argument)).name in ("abbagate.py", "abba_experiments.py", "legacy_reorder_witness.py")
     return False
 
 
@@ -135,9 +138,52 @@ def controller_ancestors(rows: dict[int, Process], root: tuple[int, int]) -> set
     return result
 
 
+def read_watchdog(pid):
+    entry = Path("/proc") / str(pid)
+    argv = [os.fsdecode(value) for value in (entry / "cmdline").read_bytes().split(b"\0") if value]
+    script = ((entry / "cwd").resolve() / argv[1]).resolve() if len(argv) > 1 else None
+    # Read stat after argv/cwd so PID reuse cannot turn the earlier snapshot's identity into an
+    # exemption for another process. The caller also checks the captured parent identity.
+    fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+    return argv, script, (pid, int(fields[19])), int(fields[1])
+
+
+def controller_watchdog(rows, ancestors, spec, *, reader=None):
+    if not spec:
+        return {}
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", spec)
+    if not match:
+        raise QuietViolation("invalid exact watchdog PID:start declaration")
+    identity = tuple(map(int, match.groups()))
+    row = rows.get(identity[0])
+    if row is None or row.identity != identity:
+        raise QuietViolation("declared ABBA watchdog exited or its PID identity changed")
+    parent = rows.get(row.parent)
+    if parent is None or parent.identity not in ancestors:
+        raise QuietViolation("declared watchdog does not belong to a captured controller ancestor")
+    try:
+        argv, script, live_identity, live_parent = (reader or read_watchdog)(row.pid)
+        expected_script = Path(__file__).resolve().with_name("gate_history.py")
+        if (live_identity != identity or live_parent != parent.pid or len(argv) < 3 or
+                not re.fullmatch(r"python[0-9.]*", Path(argv[0]).name) or
+                script != expected_script or argv[2] != "watch" or len(argv[3:]) % 2):
+            raise ValueError("watchdog executable/script/parent differs")
+        options = dict(zip(argv[3::2], argv[4::2]))
+        if (len(options) * 2 != len(argv[3:]) or
+                set(options) - {"--pid", "--parent-start", "--seconds", "--marker", "--grace"} or
+                options.get("--pid") != str(parent.pid) or options.get("--parent-start") != str(parent.start) or
+                "--seconds" not in options or "--marker" not in options):
+            raise ValueError("watchdog arguments do not name its exact controller parent")
+    except (OSError, ValueError, IndexError) as error:
+        raise QuietViolation("cannot validate declared ABBA watchdog: " + str(error)) from error
+    return {identity: {"pid": row.pid, "start_ticks": row.start, "parent_pid": parent.pid,
+                       "parent_start_ticks": parent.start, "script": str(script), "argv": argv,
+                       "cpu_ticks": 0, "classification": "exact declared row-watchdog housekeeping"}}
+
+
 def interference(before: dict[int, Process], after: dict[int, Process],
-                 root: tuple[int, int], cpus: set[int], excluded_ancestors=()) -> list[dict]:
-    owned = owned_processes(after, root) | set(excluded_ancestors)
+                 root: tuple[int, int], cpus: set[int], excluded_ancestors=(), excluded_helpers=()) -> list[dict]:
+    owned = owned_processes(after, root) | set(excluded_ancestors) | set(excluded_helpers)
     offenders = []
     for row in after.values():
         prior = before.get(row.pid)
@@ -176,6 +222,8 @@ class QuietMonitor:
         # driver. Exclude only their captured identities, never all descendants
         # of an ancestor: a sibling compiler/test is still competing CPU work.
         self.ancestors = controller_ancestors(self.previous, self.root)
+        self.watchdog_spec = os.getenv("GATE_QUIET_WATCHDOG", "")
+        self.helpers = controller_watchdog(self.previous, self.ancestors, self.watchdog_spec)
         self.excluded_activity = {identity: {"pid": identity[0], "start_ticks": identity[1],
             "comm": self.previous[identity[0]].name, "cpu_ticks": 0}
             for identity in self.ancestors}
@@ -191,12 +239,17 @@ class QuietMonitor:
 
     def sample(self):
         current = snapshot()
-        offenders = interference(self.previous, current, self.root, self.cpus, self.ancestors)
-        owned = owned_processes(current, self.root) | self.ancestors
+        # Revalidate every sample, including the final one. An exited/reparented watcher or a
+        # process execing another program cannot retain the original helper exemption.
+        controller_watchdog(current, self.ancestors, self.watchdog_spec)
+        offenders = interference(self.previous, current, self.root, self.cpus, self.ancestors, self.helpers)
+        owned = owned_processes(current, self.root) | self.ancestors | self.helpers.keys()
         for row in current.values():
             prior = self.previous.get(row.pid)
             if row.identity in self.ancestors and prior and prior.identity == row.identity:
                 self.excluded_activity[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
+            if row.identity in self.helpers and prior and prior.identity == row.identity:
+                self.helpers[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
             if row.identity in owned or not self.cpus.intersection(row.affinity):
                 continue
             if row.name in COMPETING or row.experiment_driver:
@@ -217,6 +270,7 @@ class QuietMonitor:
                 "interference": self.failure,
                 "known_programs": list(self.known_programs.values()),
                 "excluded_controller_ancestors": list(self.excluded_activity.values()),
+                "excluded_controller_helpers": list(self.helpers.values()),
                 "limitation": "processes born and reaped between samples may be missed"}
 
     def check(self):
@@ -325,11 +379,105 @@ def self_test():
 
         def test_python_driver_detection_uses_script_argument_not_source_substrings(self):
             self.assertTrue(experiment_driver([b"python3", b"-u", b"/work/tests/abbagate.py", b"--only", b"h01"]))
+            self.assertTrue(experiment_driver([b"python3", b"/work/tests/legacy_reorder_witness.py"]))
             self.assertFalse(experiment_driver([b"python3", b"-c", b"source mentions /work/tests/abbagate.py"]))
             self.assertFalse(experiment_driver([b"bash", b"-c", b"cat tests/abbagate.py"]))
             from dataclasses import replace
             sleeping = {**self.before, 20: replace(self.other, experiment_driver=True)}
             self.assertEqual(self.check_rows(sleeping)[0]["reason"], "active foreign experiment")
+
+        def watchdog_fixture(self):
+            controller = Process(1, 77, 0, "bash", 5, frozenset((0,)))
+            watcher = Process(30, 42, 1, "python3", 0, frozenset((0,)))
+            rows = {**self.before, 1: controller, 30: watcher}
+            script = Path(__file__).resolve().with_name("gate_history.py")
+            argv = ["python3", "tests/gate_history.py", "watch", "--pid", "1", "--parent-start", "77",
+                    "--seconds", "30", "--marker", "/tmp/test-row-marker"]
+            return rows, (argv, script, watcher.identity, controller.pid)
+
+        def test_exact_declared_watcher_is_housekeeping_but_compiler_and_server_siblings_fail(self):
+            from dataclasses import replace
+            before, metadata = self.watchdog_fixture()
+            before[50] = Process(50, 99, 1, "tomokv", 0, frozenset((0,)))
+            after = {**before, 30: replace(before[30], ticks=2)}
+            busy = {**after, 50: replace(before[50], ticks=1),
+                    40: Process(40, 88, 1, "cc1plus", 0, frozenset((0,)))}
+            with mock.patch.dict(os.environ, {"GATE_QUIET_WATCHDOG": "30:42"}), \
+                 mock.patch(__name__ + ".read_watchdog", return_value=metadata), \
+                 mock.patch(__name__ + ".snapshot", side_effect=[before, after, busy]):
+                monitor = QuietMonitor([0], [1], own_root_pid=10)
+                monitor.sample()
+                monitor.check()
+                helper = monitor.evidence()["excluded_controller_helpers"][0]
+                self.assertEqual((helper["pid"], helper["start_ticks"], helper["cpu_ticks"]), (30, 42, 2))
+                self.assertEqual((helper["parent_pid"], helper["parent_start_ticks"]), (1, 77))
+                self.assertEqual(helper["argv"], metadata[0])
+                monitor.sample()
+                with self.assertRaises(QuietViolation):
+                    monitor.check()
+                self.assertEqual({row["pid"] for row in monitor.failure["processes"]}, {40, 50})
+            # Without the explicit declaration the identical sibling Python workload is foreign.
+            self.assertEqual(interference(before, after, self.root.identity, {0}, {(1, 77)})[0]["pid"], 30)
+
+        def test_watchdog_identity_parent_and_script_cannot_be_spoofed(self):
+            from dataclasses import replace
+            rows, metadata = self.watchdog_fixture()
+            argv, script, identity, parent = metadata
+            cases = [
+                (rows, "30:43", metadata),
+                ({**rows, 1: replace(rows[1], start=78)}, "30:42", metadata),
+                (rows, "30:42", (argv, script, (30, 43), parent)),
+                (rows, "30:42", (argv, script.with_name("abbagate.py"), identity, parent)),
+                (rows, "30:42", ([*argv[:4], "2", *argv[5:]], script, identity, parent)),
+                (rows, "30:42", ([*argv, "--pid", "1"], script, identity, parent)),
+            ]
+            for snapshot_rows, spec, data in cases:
+                with self.subTest(spec=spec, argv=data[0]), self.assertRaises(QuietViolation):
+                    controller_watchdog(snapshot_rows, {(1, 77)}, spec, reader=lambda pid: data)
+
+        def test_watchdog_revalidation_latches_exec_or_exit_during_session(self):
+            rows, metadata = self.watchdog_fixture()
+            bad = (["python3", "tests/abbagate.py"], metadata[1].with_name("abbagate.py"), metadata[2], metadata[3])
+            with mock.patch.dict(os.environ, {"GATE_QUIET_WATCHDOG": "30:42"}), \
+                 mock.patch(__name__ + ".read_watchdog", side_effect=[metadata, bad]), \
+                 mock.patch(__name__ + ".snapshot", side_effect=[rows, rows]):
+                monitor = QuietMonitor([0], [1], own_root_pid=10)
+                monitor.observe()
+                with self.assertRaisesRegex(QuietViolation, "cannot validate declared ABBA watchdog"):
+                    monitor.check()
+
+        def test_actual_gate_watchdog_token_and_proc_argv_are_accepted(self):
+            import subprocess
+            import tempfile
+            root = Path(__file__).resolve().parents[1]
+            (root / "build").mkdir(exist_ok=True)
+            gate = (root / "tests/gate.sh").read_text()
+            watch = gate[gate.index("row_watch(){"):gate.index("\nrow_unwatch(){")]
+            token = gate[gate.index("ABBA_WATCH_START=missing\n"):gate.index('GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START"')]
+            with tempfile.TemporaryDirectory(prefix="quiet-watchdog-", dir=root / "build") as temporary:
+                # Run the real row watcher and the gate's actual token-producing shell code.
+                # The child only validates /proc metadata; no server, workload, or quiet sampling
+                # of the contended box is started. Cleanup addresses exactly the watcher we own.
+                script = '''set -eu
+ROW_TIMEOUT=30; ROW_START=$EPOCHREALTIME; ROW_PAUSED=0; ROW_MARKER=$TEST_MARKER
+''' + watch + '''
+row_watch
+trap 'kill -TERM "$ROW_WATCHDOG" 2>/dev/null || :; wait "$ROW_WATCHDOG" 2>/dev/null || :' EXIT
+''' + token + '''
+GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START" python3 - <<'PY'
+import os,sys
+sys.path.insert(0, 'tests')
+from gate_quiet import snapshot,controller_ancestors,controller_watchdog
+rows=snapshot(); root=rows[os.getpid()].identity
+helpers=controller_watchdog(rows, controller_ancestors(rows, root), os.environ['GATE_QUIET_WATCHDOG'])
+assert len(helpers)==1
+print('real gate watchdog metadata accepted')
+PY
+'''
+                result = subprocess.run(["bash"], cwd=root, input=script, text=True, capture_output=True,
+                    timeout=10, env={**os.environ, "TEST_MARKER": str(Path(temporary) / "marker.json")})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("real gate watchdog metadata accepted", result.stdout)
 
         def test_pid_reuse_does_not_inherit_ticks_or_ownership(self):
             from dataclasses import replace
