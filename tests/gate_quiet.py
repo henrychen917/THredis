@@ -5,17 +5,19 @@ This observer never stops a process. /proc identities, not argv patterns, distin
 the driver's children from foreign work. Ordinary sleeping services are harmless;
 known compilers, load generators and ABBA drivers are competing experiments even
 while temporarily asleep between phases. An idle unrelated server is recorded,
-then refused if traffic produces CPU activity. Other processes are reported if their sampled
-CPU time advances by at least one accounting tick on an overlapping affinity mask.
+then subject to the same bounded CPU screening as other generic foreign processes.
+Every observed foreign CPU tick is recorded, including activity below the budget.
 The gate's declared row watchdog is controller housekeeping only after its exact
 PID/start identity, script and captured controller parent are independently verified.
-That is an interference witness, not a chosen regression tolerance or noise floor.
+The screening budget is not a regression tolerance or a bound on cache/tail effects;
+the standing identical-binary null must still validate the comparison instrument.
 The sample cannot see a process born and reaped entirely between observations; the
 exclusive-box rule remains necessary, and the evidence records this limitation.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import math
 import os
 from pathlib import Path
@@ -31,6 +33,20 @@ ACTIVE_EXPERIMENTS = frozenset(("make", "gmake", "ninja", "cc1", "cc1plus", "cla
     "memtier_benchmar", "memtier_benchmark", "binary-A", "binary-B", "redis-benchmark"))
 SERVERS = frozenset(("redis-server", "tomokv", "dragonfly", "keydb-server", "memcached"))
 COMPETING = ACTIVE_EXPERIMENTS | SERVERS
+
+# The first live preflight rejected two isolated 10ms desktop ticks. A subsequent
+# idle-box capture (2026-09-10, quiet-background-60s.json) recorded ~2.6 CPU seconds
+# in 68.77 wall seconds, with 0.16-second bursts but every rolling20s below 0.96s.
+# This screening heuristic uses the owner's recorded 0.15% quiet benchmark
+# resolution as its capacity scale: 0.0015 * SERVER physical cores * measurement
+# seconds. The owner did not specify a CPU-time bound.
+# Load cores and SMT threads never enlarge it. This is not evidence that CPU time
+# bounds cache displacement or tail latency. The all-cell null remains mandatory.
+# Test the full rolling budget at every sample; a strict per-second rate cap would
+# reject ten samples of that same idle capture. No measured burst factor is added.
+# Replaying that capture gives 0.92s/0.96s at20s (PASS), 0.53s/0.48s at10s (FAIL).
+# Shortening the measurement does not preserve this precondition automatically.
+GENERIC_CPU_FRACTION = 0.0015
 
 
 class QuietViolation(RuntimeError):
@@ -215,16 +231,26 @@ def interference(before: dict[int, Process], after: dict[int, Process],
 
 class QuietMonitor:
     """Latch the first interference; checking never retries a bad sample into green."""
-    def __init__(self, server_cpus, load_cpus, *, own_root_pid=None, interval=1.0):
+    def __init__(self, server_cpus, load_cpus, *, own_root_pid=None, interval=1.0,
+                 window_seconds=20):
         requested = set(server_cpus) | set(load_cpus)
-        if not requested or not math.isfinite(interval) or interval <= 0:
-            raise ValueError("quiet monitor requires CPUs and a positive finite sample interval")
+        if (not requested or not server_cpus or not math.isfinite(interval) or interval <= 0 or
+                not math.isfinite(window_seconds) or window_seconds <= 0):
+            raise ValueError("quiet monitor requires server CPUs and positive finite intervals")
         topology = read_topology(sorted(requested))
         # An unused SMT sibling still shares the measured physical core. Monitor
         # it even when the driver's cgroup cannot schedule a task on that sibling.
         self.cpus = set().union(*(topology[cpu] for cpu in requested))
         self.requested_cpus = requested
+        self.server_physical_cores = len({topology[cpu] for cpu in server_cpus})
+        self.core_of_cpu = {sibling: min(topology[cpu]) for cpu in requested
+                            for sibling in topology[cpu]}
+        self.window_seconds = window_seconds
+        self.cpu_budget_seconds = GENERIC_CPU_FRACTION * self.server_physical_cores * window_seconds
+        self.tick_seconds = 1 / os.sysconf("SC_CLK_TCK")
         self.previous = snapshot()
+        self.previous_at = time.monotonic()
+        self.started_monotonic = self.previous_at
         pid = os.getpid() if own_root_pid is None else own_root_pid
         self.root = self.previous[pid].identity
         # Log-reading/control wakes the invoking shell/Codex as well as this
@@ -237,6 +263,13 @@ class QuietMonitor:
             "comm": self.previous[identity[0]].name, "cpu_ticks": 0}
             for identity in self.ancestors}
         self.known_programs = {}
+        self.foreign_activity = {}
+        self.activity_windows = deque()
+        self.peak_rolling = None
+        self.peak_core_concentration = None
+        self.max_sample_interval = 0.0
+        self.samples_longer_than_window = 0
+        self.preflight_seconds = None
         self.interval = interval
         self.started = time.time()
         self.samples = 0
@@ -248,10 +281,60 @@ class QuietMonitor:
 
     def sample(self):
         current = snapshot()
+        now = time.monotonic()
+        elapsed = now - self.previous_at
+        if elapsed < 0:
+            raise QuietViolation("quiet observer monotonic clock moved backwards")
         # Revalidate every sample, including the final one. An exited/reparented watcher or a
         # process execing another program cannot retain the original helper exemption.
         controller_watchdog(current, self.ancestors, self.watchdog_spec)
-        offenders = interference(self.previous, current, self.root, self.cpus, self.ancestors, self.helpers)
+        activity = interference(self.previous, current, self.root, self.cpus, self.ancestors, self.helpers)
+        offenders = [row for row in activity if row["reason"] == "active foreign experiment"]
+        # Every foreign tick contributes to one aggregate ceiling. Charging the
+        # complete overlapping process also avoids hiding workers behind a leader
+        # pinned elsewhere; no load/whole-machine denominator dilutes a hot core.
+        self.activity_windows.append((self.previous_at, now, activity))
+        while self.activity_windows and self.activity_windows[0][1] <= now - self.window_seconds:
+            self.activity_windows.popleft()
+        self.max_sample_interval = max(self.max_sample_interval, elapsed)
+        self.samples_longer_than_window += elapsed > self.window_seconds
+        for row in activity:
+            identity = row["pid"], row["start_ticks"]
+            saved = self.foreign_activity.setdefault(identity, {
+                "pid": row["pid"], "start_ticks": row["start_ticks"], "comm": row["comm"],
+                "cpu_ticks": 0, "first_observed_monotonic": now, "last_observed_monotonic": now,
+                "possible_physical_cores": []})
+            saved["cpu_ticks"] += row["cpu_ticks"]
+            saved["last_observed_monotonic"] = now
+            saved["possible_physical_cores"] = sorted(set(saved["possible_physical_cores"]) |
+                {self.core_of_cpu[cpu] for cpu in row["overlapping_cpus"]})
+        rolling = [row for _, _, rows in self.activity_windows for row in rows]
+        ticks = sum(row["cpu_ticks"] for row in rolling)
+        possible_core_ticks = {}
+        for row in rolling:
+            # Affinity is permission, not actual placement. Count the FULL delta
+            # against every possible physical core to report a concentration upper
+            # bound; never attribute interval runtime to /proc's last-CPU field.
+            for core in {self.core_of_cpu[cpu] for cpu in row["overlapping_cpus"]}:
+                possible_core_ticks[core] = possible_core_ticks.get(core, 0) + row["cpu_ticks"]
+        peak_core_ticks = max(possible_core_ticks.values(), default=0)
+        if (self.peak_core_concentration is None or
+                peak_core_ticks * self.tick_seconds > self.peak_core_concentration["cpu_seconds"]):
+            self.peak_core_concentration = {"cpu_seconds": peak_core_ticks * self.tick_seconds,
+                "ended_monotonic": now, "possible_physical_cores": sorted(
+                    core for core, count in possible_core_ticks.items() if count == peak_core_ticks)}
+        if self.peak_rolling is None or ticks > self.peak_rolling["cpu_ticks"]:
+            self.peak_rolling = {"cpu_ticks": ticks, "cpu_seconds": ticks * self.tick_seconds,
+                "ended_monotonic": now, "oldest_sample_started_monotonic": self.activity_windows[0][0],
+                "busiest_possible_core_cpu_seconds": peak_core_ticks * self.tick_seconds,
+                "busiest_possible_physical_cores": sorted(core for core, count in possible_core_ticks.items()
+                                                         if count == peak_core_ticks)}
+        # Retain the whole oldest sample when it partially overlaps the window.
+        # The ceiling also applies to a single sample, even if sampling was delayed
+        # for longer than WINDOW: an observation gap cannot purchase extra budget.
+        sample_ticks = sum(row["cpu_ticks"] for row in activity)
+        if max(ticks, sample_ticks) * self.tick_seconds > self.cpu_budget_seconds:
+            offenders = rolling
         owned = owned_processes(current, self.root) | self.ancestors | self.helpers.keys()
         for row in current.values():
             prior = self.previous.get(row.pid)
@@ -267,17 +350,31 @@ class QuietMonitor:
                     "classification": "active experiment" if row.name in ACTIVE_EXPERIMENTS or
                     row.experiment_driver else "server presence; activity checked separately"}
         self.previous = current
+        self.previous_at = now
         self.samples += 1
         if offenders and self.failure is None:
-            self.failure = {"observed_at": time.time(), "processes": offenders}
+            self.failure = {"observed_at": time.time(), "processes": offenders,
+                "rolling_cpu_seconds": ticks * self.tick_seconds,
+                "sample_cpu_seconds": sample_ticks * self.tick_seconds,
+                "cpu_budget_seconds": self.cpu_budget_seconds}
 
     def evidence(self):
         return {"started_at": self.started, "sample_interval_seconds": self.interval,
                 "finished_at": self.finished, "complete": self.closed and self.failure is None,
-                "samples": self.samples, "tick_seconds": 1 / os.sysconf("SC_CLK_TCK"),
+                "samples": self.samples, "tick_seconds": self.tick_seconds,
                 "cpus": sorted(self.cpus), "requested_cpus": sorted(self.requested_cpus),
                 "interference": self.failure,
                 "known_programs": list(self.known_programs.values()),
+                "foreign_cpu_activity": list(self.foreign_activity.values()),
+                "generic_cpu_screening": {"server_physical_cores": self.server_physical_cores,
+                    "capacity_fraction": GENERIC_CPU_FRACTION, "window_seconds": self.window_seconds,
+                    "cpu_budget_seconds": self.cpu_budget_seconds, "peak_rolling": self.peak_rolling,
+                    "peak_possible_core_concentration": self.peak_core_concentration,
+                    "max_sample_interval_seconds": self.max_sample_interval,
+                    "samples_longer_than_window": self.samples_longer_than_window,
+                    "preflight_seconds": self.preflight_seconds,
+                    "accounting": "process CPU ticks; partial oldest samples charged in full",
+                    "limitation": "screening only; CPU fraction does not bound cache or tail effects"},
                 "excluded_controller_ancestors": list(self.excluded_activity.values()),
                 "excluded_controller_helpers": list(self.helpers.values()),
                 "limitation": "processes born and reaped between samples may be missed"}
@@ -287,14 +384,23 @@ class QuietMonitor:
             details = self.failure.get("processes", [])
             reason = "; ".join(f"PID {p['pid']} ({p['comm']}): {p['reason']}, "
                                f"{p['cpu_ticks']} CPU ticks" for p in details)
+            if self.failure.get("rolling_cpu_seconds", 0) > self.cpu_budget_seconds:
+                reason = (f"foreign CPU screening budget exceeded: "
+                          f"{self.failure['rolling_cpu_seconds']:.6f}s > {self.cpu_budget_seconds:.6f}s "
+                          f"per {self.window_seconds:g}s on {self.server_physical_cores} physical server cores; " + reason)
             raise QuietViolation("QUIET-BOX PRECONDITION FAILED: " + (reason or self.failure["error"]))
 
     def preflight(self):
         self.sample()  # Refuse known competing programs without waiting first.
         self.check()
-        time.sleep(self.interval)
-        self.sample()
-        self.check()
+        # Observe a full measurement window before any boot. Otherwise generic
+        # sustained work could borrow an unobserved past and pass a short preflight.
+        deadline = self.started_monotonic + self.window_seconds
+        while self.previous_at < deadline:
+            time.sleep(min(self.interval, deadline - self.previous_at))
+            self.sample()
+            self.check()
+        self.preflight_seconds = self.previous_at - self.started_monotonic
         return self.evidence()
 
     def start(self):
@@ -346,7 +452,7 @@ def self_test():
         def test_own_server_and_sleeping_services_are_allowed(self):
             self.assertEqual(self.check_rows(self.before), [])
 
-        def test_one_foreign_tick_is_contamination(self):
+        def test_one_foreign_tick_is_recorded(self):
             from dataclasses import replace
             bad = {**self.before, 20: replace(self.other, ticks=101)}
             self.assertEqual(self.check_rows(bad)[0]["pid"], 20)
@@ -361,7 +467,7 @@ def self_test():
             idle = {**self.before, 20: replace(self.other, name="memcached")}
             active = {**idle, 20: replace(idle[20], ticks=101)}
             with mock.patch(__name__ + ".snapshot", side_effect=[idle, idle, active]):
-                monitor = QuietMonitor([0], [1], own_root_pid=10)
+                monitor = QuietMonitor([0], [1], own_root_pid=10, window_seconds=1)
                 monitor.sample()
                 monitor.check()
                 self.assertEqual(monitor.evidence()["known_programs"][0]["comm"], "memcached")
@@ -414,7 +520,7 @@ def self_test():
             with mock.patch.dict(os.environ, {"GATE_QUIET_WATCHDOG": "30:42"}), \
                  mock.patch(__name__ + ".read_watchdog", return_value=metadata), \
                  mock.patch(__name__ + ".snapshot", side_effect=[before, after, busy]):
-                monitor = QuietMonitor([0], [1], own_root_pid=10)
+                monitor = QuietMonitor([0], [1], own_root_pid=10, window_seconds=1)
                 monitor.sample()
                 monitor.check()
                 helper = monitor.evidence()["excluded_controller_helpers"][0]
@@ -561,11 +667,87 @@ PY
             from dataclasses import replace
             bad = {**self.before, 20: replace(self.other, ticks=101)}
             with mock.patch(__name__ + ".snapshot", side_effect=[self.before, bad, bad]):
-                monitor = QuietMonitor([0], [1], own_root_pid=10)
+                monitor = QuietMonitor([0], [1], own_root_pid=10, window_seconds=1)
                 monitor.sample()
                 monitor.sample()
                 with self.assertRaisesRegex(RuntimeError, "PID 20"):
                     monitor.check()
+
+        def budget_fixture(self, server_count=32, window=20):
+            topology = {cpu: frozenset((cpu % 128, cpu % 128 + 128)) for cpu in range(256)}
+            with mock.patch(__name__ + ".read_topology", return_value=topology), \
+                 mock.patch(__name__ + ".snapshot", return_value=self.before), \
+                 mock.patch.object(time, "monotonic", return_value=0):
+                return QuietMonitor(list(range(server_count)), list(range(server_count, 256)),
+                                    own_root_pid=10, window_seconds=window)
+
+        def budget_sample(self, monitor, second, rows):
+            with mock.patch(__name__ + ".snapshot", return_value=rows), \
+                 mock.patch.object(time, "monotonic", return_value=second):
+                monitor.sample()
+
+        def test_background_ticks_pass_and_are_recorded_with_concentration_bound(self):
+            from dataclasses import replace
+            monitor = self.budget_fixture(window=1)
+            self.budget_sample(monitor, 1, {**self.before, 20: replace(self.other, ticks=102)})
+            monitor.check()
+            evidence = monitor.evidence()
+            self.assertEqual(evidence["foreign_cpu_activity"][0]["cpu_ticks"], 2)
+            budget = evidence["generic_cpu_screening"]
+            self.assertEqual(budget["server_physical_cores"], 32)
+            self.assertAlmostEqual(budget["cpu_budget_seconds"], .048)
+            self.assertAlmostEqual(budget["peak_rolling"]["busiest_possible_core_cpu_seconds"], .02)
+            small = self.budget_fixture(server_count=1, window=1)
+            self.budget_sample(small, 1, {**self.before, 20: replace(self.other, ticks=102)})
+            with self.assertRaisesRegex(QuietViolation, "1 physical server cores"):
+                small.check()
+
+        def test_hot_core_and_many_small_tasks_cannot_hide_in_256_cpu_geometry(self):
+            from dataclasses import replace
+            hot = self.budget_fixture()
+            self.budget_sample(hot, 1, {**self.before, 20: replace(self.other, ticks=200)})
+            with self.assertRaisesRegex(QuietViolation, "budget exceeded"):
+                hot.check()
+            many = self.budget_fixture()
+            rows = {**self.before, **{pid: Process(pid, pid, 1, "worker", 1, frozenset((0,)))
+                                     for pid in range(100, 200)}}
+            self.budget_sample(many, 1, rows)
+            with self.assertRaises(QuietViolation):
+                many.check()
+            self.assertEqual(sum(row["cpu_ticks"] for row in many.evidence()["foreign_cpu_activity"]), 100)
+
+        def test_sleeping_compiler_still_refused_without_spending_cpu_budget(self):
+            from dataclasses import replace
+            monitor = self.budget_fixture()
+            self.budget_sample(monitor, 0, {**self.before, 20: replace(self.other, name="cc1plus")})
+            with self.assertRaisesRegex(QuietViolation, "active foreign experiment"):
+                monitor.check()
+
+        def test_rolling_edge_and_long_sampling_gap_charge_complete_sample(self):
+            from dataclasses import replace
+            monitor = self.budget_fixture()
+            self.budget_sample(monitor, 19, {**self.before, 20: replace(self.other, ticks=190)})
+            monitor.check()
+            self.budget_sample(monitor, 21, {**self.before, 20: replace(self.other, ticks=200)})
+            with self.assertRaises(QuietViolation):
+                monitor.check()  # Full 0..19 sample overlaps the 1..21 window.
+            gap = self.budget_fixture()
+            self.budget_sample(gap, 100, {**self.before, 20: replace(self.other, ticks=200)})
+            with self.assertRaises(QuietViolation):
+                gap.check()  # 100 seconds of silence cannot buy 4.8 CPU seconds.
+            self.assertEqual(gap.evidence()["generic_cpu_screening"]["samples_longer_than_window"], 1)
+
+        def test_preflight_observes_full_window_without_real_sleep(self):
+            monitor = self.budget_fixture()
+            clock = [0.0]
+            def sleep(seconds):
+                clock[0] += seconds
+            with mock.patch(__name__ + ".snapshot", return_value=self.before), \
+                 mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(time, "sleep", side_effect=sleep):
+                evidence = monitor.preflight()
+            self.assertEqual(clock[0], 20)
+            self.assertEqual(evidence["generic_cpu_screening"]["preflight_seconds"], 20)
 
         def test_observer_error_latches_and_close_is_idempotent(self):
             with mock.patch(__name__ + ".snapshot", side_effect=[self.before, RuntimeError("lost /proc access")]):

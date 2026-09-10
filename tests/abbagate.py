@@ -1038,7 +1038,7 @@ def main(args):
             except (OSError, ValueError) as error:
                 control_error = f"standing null unavailable: {args.null_result}: {error}"
                 print("ABBA UNTRUSTED: " + control_error + "; all measurements still run", flush=True)
-        quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid())
+        quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid(), window_seconds=WINDOW)
         quiet.start()  # Fail before reference builds, capability probes, or server boots.
         report["quiet_box"] = quiet.evidence()
         if not args.candidate.is_file() or not os.access(args.candidate, os.X_OK):
@@ -1247,7 +1247,7 @@ def self_test():
             self.quiet.evidence.return_value = {"interference": None, "samples": 2}
             self.quiet.close.return_value = {"interference": None, "samples": 3, "complete": True}
             patcher = mock.patch(__name__ + ".QuietMonitor", return_value=self.quiet)
-            patcher.start()
+            self.quiet_factory = patcher.start()
             self.addCleanup(patcher.stop)
 
         def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
@@ -1637,6 +1637,13 @@ def self_test():
             self.assertEqual(self.support_calls, [])
             self.assertIn("foreign compiler", report["reason"])
             self.assertFalse(report["measurement_valid"])
+
+        def test_real_main_passes_actual_measurement_window_to_quiet_monitor(self):
+            for window in (10, 20):
+                with mock.patch(__name__ + ".WINDOW", window):
+                    _, measurements, _, _, _ = self.fake_main(pin=4)
+                self.assertEqual(len(measurements), 4)
+                self.assertEqual(self.quiet_factory.call_args.kwargs["window_seconds"], window)
 
         def test_final_observation_can_fail_completed_real_loop(self):
             def close():
