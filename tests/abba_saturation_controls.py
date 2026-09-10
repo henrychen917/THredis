@@ -97,6 +97,8 @@ def plan(args):
                 "--load-cores", args.load_cores, "--load-smt", args.load_smt,
                 "--port", str(args.port), "--memtier", args.memtier,
                 "--output", str((args.output / cell.id).resolve())]
+        if args.background_environment is not None:
+            argv += ["--background-environment", str(args.background_environment.resolve())]
         manifest["probes"].append(dict(source_cell=asdict(original), diagnostic_cell=asdict(cell),
                                         argv=argv, shell=shlex.join(argv)))
         print(shlex.join(argv))
@@ -155,7 +157,9 @@ def idle(args):
     pin_driver(args.server_cores, abba.cpu_string(load_cpus))
     fingerprint = harness_fingerprint(abba.ROOT)["sha256"]
     report["harness_sha256"] = fingerprint
-    quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid(), window_seconds=args.seconds)
+    quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid(), window_seconds=args.seconds,
+                         background_environment=args.background_environment,
+                         sample_artifact=args.output / "background-environment-samples.jsonl")
     try:
         quiet.start()
         knobs = ["--thread-mode", args.mode, "--read-local", "1", "--overlap", "0",
@@ -220,12 +224,23 @@ def self_test():
     from unittest import mock
 
     class Controls(unittest.TestCase):
+        def test_background_environment_cli_overrides_gate_environment(self):
+            for extra, expected in (([], "/reviewed/env.json"),
+                                    (["--background-environment", "/reviewed/explicit.json"], "/reviewed/explicit.json")):
+                with self.subTest(extra=extra), \
+                     mock.patch.dict(os.environ, {"GATE_ABBA_BACKGROUND_ENVIRONMENT": "/reviewed/env.json"}), \
+                     mock.patch.object(sys, "argv", ["abba_saturation_controls.py", "plan",
+                         "--candidate-binary", "/fixture/binary", "--output", "/fixture/output", *extra]), \
+                     mock.patch(__name__ + ".plan", return_value=0) as planned:
+                    self.assertEqual(main(), 0)
+                self.assertEqual(planned.call_args.args[0].background_environment, Path(expected))
+
         def test_plan_preserves_every_source_axis_and_uses_the_real_driver(self):
             with tempfile.TemporaryDirectory() as temporary:
                 args = argparse.Namespace(output=Path(temporary) / "plan",
                     cells=abba.ROOT / "tests/headline_cells.txt", candidate_binary=Path("/fixture/tomokv"),
                     server_cores="0-31", load_cores="32-127", load_smt="160-255",
-                    port=8700, memtier="memtier_benchmark")
+                    port=8700, memtier="memtier_benchmark", background_environment=Path("/reviewed/environment.json"))
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(plan(args), 0)
                 report = json.loads((args.output / "plan.json").read_text())
@@ -240,6 +255,8 @@ def self_test():
                     self.assertEqual(argv[argv.index("--collect-null") + 1], "1")
                     self.assertIn("--only", argv)
                     self.assertNotIn("--escalate", argv)
+                    self.assertEqual(argv[argv.index("--background-environment") + 1],
+                                     str(args.background_environment))
                     fixture = Path(argv[argv.index("--cells") + 1])
                     self.assertEqual(asdict(abba.read_cells(fixture)[0]), probe["diagnostic_cell"])
 
@@ -268,7 +285,8 @@ def self_test():
                     binary.write_bytes(b"fixture; never executed")
                     args = argparse.Namespace(output=output, candidate_binary=binary, seconds=20,
                         connections=0, mode="2s", spin_role=None, server_cores="0-31",
-                        load_cores="32-127", load_smt="160-255", port=8700)
+                        load_cores="32-127", load_smt="160-255", port=8700,
+                        background_environment=Path("/reviewed/environment.json"))
                     raw = []
                     for stamp, time_ns in ((1_000_000_000, 0), (21_000_000_000, 20_000_000_000)):
                         text = f"lbver 1 stamp_ns {stamp}\n"
@@ -285,7 +303,12 @@ def self_test():
                             return raw.pop(0)
                     class Quiet:
                         closed = False
-                        def __init__(self, *a, **kw): pass
+                        def __init__(self, *a, **kw):
+                            self_contract = kw["background_environment"]
+                            if self_contract != args.background_environment:
+                                raise AssertionError("idle control lost reviewed environment")
+                            if kw["sample_artifact"] != output / "background-environment-samples.jsonl":
+                                raise AssertionError("idle control lost its raw sample artifact")
                         def start(self): pass
                         def close(self): self.closed = True
                         def check(self):
@@ -333,6 +356,8 @@ def main():
     parser.add_argument("--load-smt", default="160-255")
     parser.add_argument("--port", type=int, default=8700)
     parser.add_argument("--memtier", default="memtier_benchmark")
+    parser.add_argument("--background-environment", type=Path,
+                        default=os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") or None)
     parser.add_argument("--mode", choices=("1s", "2s"), default="2s")
     parser.add_argument("--connections", type=int, default=0)
     parser.add_argument("--seconds", type=float, default=20)
