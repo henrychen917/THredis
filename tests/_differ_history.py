@@ -88,10 +88,17 @@ def allocate(history, run):
 def record_leg(history, args):
     with locked(history):
         path = history / 'seeds.json'
-        state = json.loads(path.read_text())
+        state = json.loads(path.read_text()) if path.exists() else dict(next=20, failed=[], runs={})
         if args.verdict == 'FAIL' and args.seed not in state['failed']:
             state['failed'].append(args.seed)
             state['failed'].sort()
+        if args.verdict == 'FAIL':
+            # A mode-equivalence counterexample must replay its ORIGINAL generator too, not only
+            # happen to share a seed number with a different Redis differential stream.
+            family = state.setdefault('failed_by_suite', {}).setdefault(args.suite, [])
+            if args.seed not in family:
+                family.append(args.seed)
+                family.sort()
             write_json(path, state)
         entry = dict(timestamp=utc(), run=args.run, seed=args.seed, suite=args.suite,
                      geometry=args.geometry, atomic=args.atomic, verdict=args.verdict,
@@ -100,6 +107,14 @@ def record_leg(history, args):
             file.write(json.dumps(entry) + '\n')
             file.flush()
             os.fsync(file.fileno())
+
+
+def failing_seeds(history, suite):
+    with locked(history):
+        path = history / 'seeds.json'
+        if not path.exists():
+            return []
+        return json.loads(path.read_text()).get('failed_by_suite', {}).get(suite, [])
 
 
 class ComparisonCoverage:
@@ -169,6 +184,8 @@ def self_test():
                    geometry='split', atomic=1, verdict='FAIL', log=history / 'failed.log'))
         second = allocate(history, 'run-b')
         assert second['seeds'] == [7, 19, 20, 21] and second['failed'] == [20]
+        assert failing_seeds(history, 'string') == [20]
+        assert failing_seeds(history, 'mode-equivalence') == []
         # Drive the REAL differ generator, sends, reads and comparison loop without a server.
         # Identical fake reply streams are enough to test coverage plumbing. In particular the
         # FLUSHALL setup reply is drained but never diffed, so it MUST NOT become command coverage.
