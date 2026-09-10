@@ -229,6 +229,7 @@ py(){
 }
 python3(){ return "$WIRE_ABBA_RC"; }
 quiet_wait(){ :; }
+row_begin(){ :; }
 ok(){ printf 'ok\\t%s\\t\\n' "$1" >> "$WIRE_LEDGER"; }
 bad(){ printf 'FAIL\\t%s\\t%s\\n' "$1" "${2:-}" >> "$WIRE_LEDGER"; }
 say(){ :; }
@@ -374,8 +375,13 @@ PASS=0; FAIL=0; TIER=full; CORES=0; LOAD_CORES=0; PORT=19000; GATE_RATIO=6:2; AL
 LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; ROW_T=$(date +%s.%N)
 : > "$LEDGER"; : > "$TIMINGS"
 mkdir -p "$RUN_DIR/jobs" "$RUN_DIR/started" "$RUN_DIR/completed"
+mkfifo "$RUN_DIR/pause"; exec 3<>"$RUN_DIR/pause"
+pause(){ read -r -t .02 -u 3 ignored || :; }
 phase(){ :; }
-cleanup(){ [ -z "${name:-}" ] || : > "$TMPDIR/cleaned"; }
+quiet_wait(){ :; }
+ROW_HISTORY="$RUN_DIR/history"; ROW_RUN_ID=test; ROW_PLAN="$RUN_DIR/plan.json"
+python3 tests/gate_history.py prepare --history "$ROW_HISTORY" --output "$ROW_PLAN"
+cleanup(){ row_unwatch; [ -z "${name:-}" ] || : > "$TMPDIR/cleaned"; }
 '''
         if delayed_completion:
             # Widen the real open-before-write window past the collector's polling interval.
@@ -396,15 +402,16 @@ job_body(){
   : > "$RUN_DIR/started/$current"
   if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
     for dependency in "${CANONICAL[@]}"; do
-      while [ ! -f "$RUN_DIR/started/$dependency" ]; do sleep .005; done
+      while [ ! -f "$RUN_DIR/started/$dependency" ]; do pause; done
     done
   fi
   if [ "$FORCE_ORDER" = 1 ]; then
     for dependency in "${COMPLETION_ORDER[@]}"; do
       [ "$dependency" != "$current" ] || break
-      while [ ! -f "$RUN_DIR/completed/$dependency" ]; do sleep .005; done
+      while [ ! -f "$RUN_DIR/completed/$dependency" ]; do pause; done
     done
   fi
+  row_begin "$(job_label "$current")"
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = crash ]; then exit 17; fi
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = red ]; then
     bad "$(job_label "$current")" 'deliberately broken mechanism'
@@ -441,7 +448,11 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                                      'bash', '-c', script], cwd=root, env=env,
                                     text=True, capture_output=True, timeout=20)
             self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-2000:])
-            return dict(ledger=(directory / 'ledger').read_bytes(),
+            timed_rows = [line.split('\t') for line in (directory / 'ledger').read_text().splitlines()]
+            for row in timed_rows:
+                self.assertEqual(len(row), 3)
+                self.assertGreaterEqual(float(row[1]), 0)
+            return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
                         counts=tuple(map(int, (directory / 'counts').read_text().split())),
                         completion=(directory / 'completion-order').read_text().splitlines(),
                         families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()],
