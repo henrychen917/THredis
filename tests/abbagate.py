@@ -806,6 +806,71 @@ def cpu_seconds(pid):
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
+def generator_cpu_endpoint(process):
+    """Read only this owned child's CPU counters, retaining identity and sampling bounds.
+
+    /proc utime+stime includes the whole process, including coordinator threads. It
+    is not a worker-only profile and CPU consumption is not proof of useful progress.
+    Missing/exited/reused processes cannot contribute invented zero CPU samples.
+    """
+    if process.poll() is not None:
+        raise RuntimeError(f"load generator PID {process.pid} exited before CPU endpoint")
+    read_started = time.monotonic()
+    try:
+        raw = Path(f"/proc/{process.pid}/stat").read_text()
+    except OSError as error:
+        raise RuntimeError(f"load generator PID {process.pid} CPU endpoint unavailable: {error}") from error
+    read_finished = time.monotonic()
+    try:
+        fields = raw.rsplit(")", 1)[1].split()
+        pid = int(raw.split(" (", 1)[0])
+        user, system, threads, start = (int(fields[index]) for index in (11, 12, 17, 19))
+        ticks = os.sysconf("SC_CLK_TCK")
+        if pid != process.pid or min(user, system, start) < 0 or threads <= 0 or ticks <= 0:
+            raise ValueError("invalid process identity or counters")
+        if fields[0] in ("Z", "X", "x") or process.poll() is not None:
+            raise RuntimeError(f"load generator PID {process.pid} exited during CPU endpoint")
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"load generator PID {process.pid} malformed CPU endpoint: {error}") from error
+    return dict(pid=pid, start_time_ticks=start, user_ticks=user, system_ticks=system,
+                clock_ticks_per_second=ticks, observed_process_threads=threads,
+                user_seconds=user / ticks, system_seconds=system / ticks,
+                cpu_seconds=(user + system) / ticks, raw_stat=raw,
+                read_started_monotonic=read_started, read_finished_monotonic=read_finished)
+
+
+def generator_cpu_between(before, after, workers, central_start, central_end):
+    """Diagnostic percentages use this process's own endpoint interval, never the wider run.
+
+    Samples sit immediately outside the existing central counter window. Retain the
+    sampling offsets rather than claiming exact simultaneous endpoints for all PIDs.
+    Values are not clamped: coordinator work may put worker-normalized CPU above 100%.
+    Neither this value nor a larger worker count certifies generator headroom.
+    """
+    if any(before[key] != after[key] for key in ("pid", "start_time_ticks", "clock_ticks_per_second")):
+        raise RuntimeError("load generator identity or CPU clock changed between endpoints")
+    user, system = after["user_ticks"] - before["user_ticks"], after["system_ticks"] - before["system_ticks"]
+    if min(user, system) < 0:
+        raise RuntimeError("load generator CPU counter reset between endpoints")
+    first = (before["read_started_monotonic"] + before["read_finished_monotonic"]) / 2
+    last = (after["read_started_monotonic"] + after["read_finished_monotonic"]) / 2
+    if (type(workers) is not int or workers <= 0 or last <= first or central_end <= central_start or
+            before["read_started_monotonic"] > before["read_finished_monotonic"] or
+            after["read_started_monotonic"] > after["read_finished_monotonic"] or
+            before["read_finished_monotonic"] > central_start or
+            after["read_started_monotonic"] < central_end):
+        raise RuntimeError("invalid load generator CPU sampling bounds or worker count")
+    ticks, interval = before["clock_ticks_per_second"], last - first
+    seconds = (user + system) / ticks
+    return dict(status="COMPLETE", user_ticks_delta=user, system_ticks_delta=system,
+                user_seconds_delta=user / ticks, system_seconds_delta=system / ticks,
+                cpu_seconds_delta=seconds, endpoint_window_seconds=interval,
+                cpu_pct_one_core=100 * seconds / interval,
+                cpu_pct_per_configured_worker=100 * seconds / (interval * workers),
+                before_offset_from_central_start_seconds=first - central_start,
+                after_offset_from_central_end_seconds=last - central_end)
+
+
 def memtier_totals(path, cell, connections):
     data = json.loads(path.read_text())
     totals = data["ALL STATS"]["Totals"]
@@ -994,11 +1059,29 @@ class Runner:
             result["thread_roles"] = roles
             before_mode = info(conn, "server") if cell.op == "REORDER" else {}
             before_commands = info(conn, "commandstats")
+            # The added /proc reads lie OUTSIDE the unchanged central stats/timer window.
+            # Save each raw endpoint immediately so an exit/reset preserves partial evidence.
+            generator_cpu = result["generator_cpu"] = {
+                "schema": 1, "decision_input": False, "generator_headroom": "UNPROVEN",
+                "scope": "whole-process CPU near central window, normalized by configured workers",
+                "status": "INCOMPLETE", "processes": []}
+            for index, (process, placement) in enumerate(zip(generators, layout)):
+                sample = dict(index=index, pid=process.pid, configured_worker_threads=placement["threads"],
+                              assigned_cpus=placement["cpus"], status="INCOMPLETE")
+                generator_cpu["processes"].append(sample)
+                sample["before"] = generator_cpu_endpoint(process)
             before = info(conn, "stats")
             before_cpu, t0 = cpu_seconds(srv.pid), time.monotonic()
             time.sleep(WINDOW)
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
+            generator_cpu.update(central_start_monotonic=t0, central_end_monotonic=t1,
+                                 central_window_seconds=t1 - t0)
+            for sample, process in zip(generator_cpu["processes"], generators):
+                sample["after"] = generator_cpu_endpoint(process)
+                sample.update(generator_cpu_between(sample["before"], sample["after"],
+                    sample["configured_worker_threads"], t0, t1))
+            generator_cpu["status"] = "COMPLETE"
             after_lb = lb_snapshot(conn, folder / "lb-after.txt")
             after_lb_at = time.monotonic()
             after_commands = info(conn, "commandstats")
@@ -1052,6 +1135,8 @@ class Runner:
                 # represented as a histogram of only WINDOW seconds.
                 result["histogram_window_seconds"] = WARMUP + WINDOW + TAIL
         except BaseException as e:
+            if result.get("generator_cpu", {}).get("status") == "INCOMPLETE":
+                result["generator_cpu"].update(status="INVALID", error=f"{type(e).__name__}: {e}")
             result["complete"] = False
             result["error"] = f"{type(e).__name__}: {e}"
             raise
@@ -1613,12 +1698,67 @@ def self_test():
                 path.write_text(json.dumps(base))
                 self.assertEqual(memtier_totals(path, self.cell, 2)["reported_counts"], {"GET": 5000})
 
+        def test_generator_cpu_endpoints_preserve_identity_seconds_and_worker_normalization(self):
+            from types import SimpleNamespace
+            process = SimpleNamespace(pid=321, poll=lambda: None)
+            def stat(user, system):
+                fields = ["0"] * 22
+                for index, value in ((0, "R"), (11, user), (12, system), (17, 17), (19, 9876)):
+                    fields[index] = str(value)
+                return "321 (memtier ) name) " + " ".join(fields)
+            with (mock.patch.object(Path, "read_text", side_effect=[stat(100, 20), stat(30100, 420)]),
+                  mock.patch.object(os, "sysconf", return_value=100),
+                  mock.patch.object(time, "monotonic", side_effect=[10, 10.002, 30, 30.002])):
+                before, after = generator_cpu_endpoint(process), generator_cpu_endpoint(process)
+            self.assertEqual(before["start_time_ticks"], 9876)
+            self.assertEqual(before["observed_process_threads"], 17)
+            self.assertEqual(before["cpu_seconds"], 1.2)
+            self.assertIn("memtier ) name", before["raw_stat"])
+            result = generator_cpu_between(before, after, 16, 10.01, 29.99)
+            self.assertEqual(result["user_seconds_delta"], 300)
+            self.assertEqual(result["system_seconds_delta"], 4)
+            self.assertAlmostEqual(result["endpoint_window_seconds"], 20)
+            self.assertAlmostEqual(result["cpu_pct_per_configured_worker"], 95)
+            self.assertLess(result["before_offset_from_central_start_seconds"], 0)
+            self.assertGreater(result["after_offset_from_central_end_seconds"], 0)
+            # Zero CPU is valid diagnostic evidence; coordinator overhead is never clamped.
+            idle = {**after, "user_ticks": before["user_ticks"], "system_ticks": before["system_ticks"]}
+            self.assertEqual(generator_cpu_between(before, idle, 16, 10.01, 29.99)["cpu_seconds_delta"], 0)
+            self.assertGreater(generator_cpu_between(before, after, 4, 10.01, 29.99)["cpu_pct_per_configured_worker"], 100)
+            for changed in ({"pid": 322}, {"start_time_ticks": 9877}, {"clock_ticks_per_second": 1000},
+                            {"user_ticks": 99}, {"system_ticks": 19}):
+                with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                    generator_cpu_between(before, {**after, **changed}, 16, 10.01, 29.99)
+            with self.assertRaisesRegex(RuntimeError, "sampling bounds"):
+                generator_cpu_between(before, after, 16, 10, 31)
+
+        def test_generator_cpu_endpoint_rejects_exit_missing_and_malformed_proc(self):
+            from types import SimpleNamespace
+            process = SimpleNamespace(pid=321, poll=mock.Mock(return_value=0))
+            with mock.patch.object(Path, "read_text") as read, self.assertRaisesRegex(RuntimeError, "exited before"):
+                generator_cpu_endpoint(process)
+            read.assert_not_called()
+            process.poll = mock.Mock(return_value=None)
+            with (mock.patch.object(Path, "read_text", side_effect=FileNotFoundError()),
+                  self.assertRaisesRegex(RuntimeError, "unavailable")):
+                generator_cpu_endpoint(process)
+            with (mock.patch.object(Path, "read_text", return_value="missing fields"),
+                  self.assertRaisesRegex(RuntimeError, "malformed")):
+                generator_cpu_endpoint(process)
+            fields = ["0"] * 22
+            fields[0], fields[17], fields[19] = "R", "1", "9876"
+            raw = "321 (memtier) " + " ".join(fields)
+            process.poll = mock.Mock(side_effect=[None, 0])
+            with (mock.patch.object(Path, "read_text", return_value=raw),
+                  self.assertRaisesRegex(RuntimeError, "exited during")):
+                generator_cpu_endpoint(process)
+
         def test_real_measure_brackets_all_generators_and_rejects_counter_mutants(self):
             from types import SimpleNamespace
             # Exercise Runner.measure itself, including argv production, generator
             # waits, JSON parsing, both endpoint reads and failure artifacts. Only
             # process/network/time boundaries are fake; the accounting is real.
-            for corruption in (0, -1, 10000):
+            for corruption in (0, -1, 10000, "cpu-reset", "cpu-exit"):
                 with self.subTest(corruption=corruption), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                     directory, events, generators = Path(tmp), [], []
                     phase = {"window": 0, "finished": 0}
@@ -1633,7 +1773,7 @@ def self_test():
                             phase["finished"] += 1
                             events.append("finish")
                             return 0
-                        process = SimpleNamespace(poll=lambda: None, wait=wait)
+                        process = SimpleNamespace(pid=124 + len(generators), poll=lambda: None, wait=wait)
                         generators.append(process)
                         return process
                     children = SimpleNamespace(start=start, stop=lambda process: None)
@@ -1651,6 +1791,15 @@ def self_test():
                         self.assertEqual(section, "stats")
                         return {"total_commands_processed": "6101" if phase["window"] == 2 else "2100",
                                 "keyspace_misses": "0"}
+                    def endpoint(process):
+                        events.append(("generator-cpu", phase["window"], process.pid))
+                        if corruption == "cpu-exit" and phase["window"] == 2:
+                            raise RuntimeError("load generator exited during CPU endpoint")
+                        now = time.monotonic()
+                        user = (0 if corruption == "cpu-reset" else 200) if phase["window"] == 2 else 100
+                        return dict(pid=process.pid, start_time_ticks=1000 + process.pid,
+                                    clock_ticks_per_second=100, user_ticks=user, system_ticks=0,
+                                    read_started_monotonic=now, read_finished_monotonic=now)
                     def sleep(seconds):
                         self.assertIn(seconds, (WARMUP, WINDOW))
                         phase["window"] += 1
@@ -1661,11 +1810,15 @@ def self_test():
                     lb = SimpleNamespace(threads={i: {"role": "fused", "busy": 10, "idle": 0} for i in (0, 1)})
                     with mock.patch.multiple(__name__, require_unbound_port=mock.Mock(), Conn=mock.Mock(return_value=conn),
                             info=mock.Mock(side_effect=snapshot), lb_snapshot=mock.Mock(return_value=lb),
-                            cpu_seconds=mock.Mock(return_value=0), busy_between=mock.Mock(return_value=(99, {})),
+                            cpu_seconds=mock.Mock(return_value=0), generator_cpu_endpoint=mock.Mock(side_effect=endpoint),
+                            busy_between=mock.Mock(return_value=(99, {})),
                             busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={})), \
                          mock.patch.object(runner, "populate", return_value=None), \
                          mock.patch.object(time, "sleep", side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
-                        if corruption:
+                        if isinstance(corruption, str):
+                            with self.assertRaisesRegex(RuntimeError, "CPU counter reset|exited during CPU endpoint"):
+                                runner.measure(cell, "A", 1, 2, {})
+                        elif corruption:
                             with self.assertRaisesRegex(RuntimeError, "accounting mismatch"):
                                 runner.measure(cell, "A", 1, 2, {})
                         else:
@@ -1673,11 +1826,29 @@ def self_test():
                             self.assertEqual(result["commands"], 4000)
                             self.assertEqual(result["whole_run_accounting"]["commands"]["GET"]["server_calls"], 10000)
                     self.assertEqual(events[0], ("commandstats", 0, 0))
-                    self.assertEqual(events[-1], ("commandstats", 2, 2))
                     retained = json.loads((directory / cell.id / "n2-1-A/measurement.json").read_text())
                     self.assertEqual(retained["complete"], not bool(corruption))
-                    self.assertIn("whole_run_commandstats_after", retained)
-                    self.assertEqual(len(retained["memtier"]), 2)
+                    cpu = retained["generator_cpu"]
+                    self.assertFalse(cpu["decision_input"])
+                    self.assertEqual(cpu["generator_headroom"], "UNPROVEN")
+                    self.assertEqual([row["pid"] for row in cpu["processes"]], [124, 125])
+                    self.assertTrue(all("before" in row for row in cpu["processes"]))
+                    if isinstance(corruption, str):
+                        self.assertEqual(cpu["status"], "INVALID")
+                        self.assertTrue(all("cpu_pct_per_configured_worker" not in row for row in cpu["processes"]))
+                        self.assertNotIn("whole_run_commandstats_after", retained)
+                    else:
+                        self.assertEqual(events[-1], ("commandstats", 2, 2))
+                        self.assertIn("whole_run_commandstats_after", retained)
+                        self.assertEqual(len(retained["memtier"]), 2)
+                        self.assertEqual(cpu["status"], "COMPLETE")
+                        self.assertEqual([event for event in events if isinstance(event, tuple) and event[0] == "generator-cpu"],
+                                         [("generator-cpu", 1, 124), ("generator-cpu", 1, 125),
+                                          ("generator-cpu", 2, 124), ("generator-cpu", 2, 125)])
+                        for row in cpu["processes"]:
+                            self.assertLessEqual(row["before"]["read_finished_monotonic"], cpu["central_start_monotonic"])
+                            self.assertGreaterEqual(row["after"]["read_started_monotonic"], cpu["central_end_monotonic"])
+                            self.assertEqual(row["cpu_seconds_delta"], 1)
 
         def test_legacy_control_requires_both_live_verdicts_and_caches_only_success(self):
             from types import SimpleNamespace
