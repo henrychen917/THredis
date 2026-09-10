@@ -64,6 +64,11 @@ def prepare_long_keys(conn):
     for number in (1, LONG_KEYS):
         if conn.must("BITCOUNT", f"blocker:memtier-{number}") != LONG_BYTES * 8:
             raise RuntimeError("long-blocker data does not have the requested service cost")
+    return {"keys": LONG_KEYS, "bytes_each": LONG_BYTES, "short_bytes": 64,
+            "sampled_handler_usec": sample_long_cost(conn)}
+
+
+def sample_long_cost(conn):
     # INFO COMMANDSTATS in this server counts calls but does not expose handler
     # time. Sample SLOWLOG before the benchmark, then restore its original setting
     # and clear the sample. No per-operation sampling is added to the scored run.
@@ -87,8 +92,7 @@ def prepare_long_keys(conn):
         conn.must("CONFIG", "SET", "slowlog-log-slower-than", original)
         conn.must("SLOWLOG", "RESET")
         time.sleep(0.2)
-    return {"keys": LONG_KEYS, "bytes_each": LONG_BYTES, "short_bytes": 64,
-            "sampled_handler_usec": cost}
+    return cost
 
 
 def command_stat(data, name):
