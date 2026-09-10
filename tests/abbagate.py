@@ -976,12 +976,18 @@ class Runner:
     def population_environment(self):
         return {"population_by_arm": {"A": "wire", "B": "wire"}}
 
-    def memtier(self, layout):
-        return ["taskset", "-c", cpu_string(layout["cpus"]), self.args.memtier,
+    def memtier(self, layout, *, cell=None):
+        argv = ["taskset", "-c", cpu_string(layout["cpus"]), self.args.memtier,
                 "-s", "127.0.0.1", "-p", str(self.args.port), "--protocol=redis",
                 "-t", str(layout["threads"]), "-c", str(layout["clients"]),
-                "--key-minimum=1", f"--key-maximum={KEYS}", "--key-pattern=P:P",
+                "--key-minimum=1", f"--key-maximum={KEYS}",
                 "-d", "64", "--distinct-client-seed", "--hide-histogram"]
+        # memtier rejects its built-in SET:GET pattern whenever --command is
+        # present. Those workloads carry a P pattern on EACH command instead;
+        # population and built-in GET/SET/MIX retain the original P:P geometry.
+        if cell is None or cell.op in ("GET", "SET", "MIX"):
+            argv += ["--key-pattern=P:P"]
+        return argv
 
     def prepare_data(self, cell, arm, folder):
         # Experiment hook, called before boot. Production retains wire population;
@@ -1085,7 +1091,7 @@ class Runner:
                     first_launch_monotonic=load_launch, requested_lifetime_seconds=load_lifetime,
                     fresh_warmup_seconds=WARMUP, central_window_seconds=WINDOW, tail_seconds=TAIL)
             for i, placement in enumerate(layout):
-                argv = self.memtier(placement) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
+                argv = self.memtier(placement, cell=cell) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
                         f"--test-time={load_lifetime}",
                         f"--json-out-file={folder / f'load-{i}.json'}"]
                 generators.append(self.children.start(argv, folder / f"load-{i}.log", folder))
@@ -1731,6 +1737,28 @@ def self_test():
             args = workload_arguments(replace(self.cell, op="REORDER", mix="95:5"))
             self.assertIn("--command=BITCOUNT blocker:__key__", args)
             self.assertFalse(any("BLPOP" in arg or "MGET" in arg for arg in args))
+
+            # Check the complete argv boundary: validating workload_arguments
+            # alone missed the conflicting --key-pattern supplied by Runner.
+            from types import SimpleNamespace
+            runner = Runner(SimpleNamespace(server_cores="0-1", server_smt="", load_cores="2-3",
+                            load_smt="", port=9090, memtier="never-executed-memtier"),
+                            Path("/unused"), {}, Children())
+            layout = {"cpus": [2, 3], "threads": 2, "clients": 2}
+            self.assertIn("--key-pattern=P:P", runner.memtier(layout))  # wire population
+            for op in ("GET", "SET", "MIX", "MGET", "MSET", "MIX8", "REORDER"):
+                cell = replace(self.cell, op=op, mix="7:1")
+                argv = runner.memtier(layout, cell=cell) + workload_arguments(cell)
+                commands = [arg for arg in argv if arg.startswith("--command=")]
+                native_patterns = [arg for arg in argv if arg.startswith("--key-pattern=")]
+                command_patterns = [arg for arg in argv if arg.startswith("--command-key-pattern=")]
+                with self.subTest(op=op):
+                    if commands:
+                        self.assertEqual(native_patterns, [])
+                        self.assertEqual(command_patterns, ["--command-key-pattern=P"] * len(commands))
+                    else:
+                        self.assertEqual(native_patterns, ["--key-pattern=P:P"])
+                        self.assertEqual(command_patterns, [])
 
         def test_missing_workload_or_scheduler_engagement_is_red(self):
             cell = replace(self.cell, op="REORDER", score="p999", mix="95:5", reorder=1)
