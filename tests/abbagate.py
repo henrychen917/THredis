@@ -1331,16 +1331,6 @@ def parse_args():
                    default=int(os.environ["GATE_ABBA_PORT"]) if os.getenv("GATE_ABBA_PORT") else None,
                    help="optional single port inside --ports; standalone default 8700")
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
-    # The strict quiet guard refuses ANY foreign CPU tick from a process whose AFFINITY includes a
-    # server core -- on a machine running a desktop session that is every process, since default
-    # affinity spans all cores. Four consecutive calibration attempts were each refused by a
-    # different service waking for a single 10ms tick (claude, dbus-daemon, user systemd), which
-    # makes maintenance runs impossible. This exposes the guard's own core-aware CPU BUDGET path
-    # (LEGACY_DIAGNOSTIC_CPU_FRACTION of the server cores over the window). Deliberately NOT the
-    # default: a run that produces a VERDICT should still demand a silent box.
-    p.add_argument("--quiet-cpu-budget", action="store_true",
-                   help="permit foreign CPU below a small budget scaled to the server cores instead "
-                        "of demanding zero ticks; for calibration/maintenance, never for a verdict")
     p.add_argument("--background-environment", type=Path,
                    default=Path(os.environ["GATE_ABBA_BACKGROUND_ENVIRONMENT"]) if os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") else None,
                    help="explicit reviewed idle identities; default refuses any observed foreign user CPU activity")
@@ -1452,8 +1442,6 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                 print("ABBA UNTRUSTED: " + control_error + "; all measurements still run", flush=True)
         quiet_options = {"own_root_pid": os.getpid(), "window_seconds": WINDOW}
         if diagnostic_monitor is None:
-            if args.quiet_cpu_budget:
-                quiet_options.update(_diagnostic_legacy_budget=True)
             quiet_options.update(background_environment=args.background_environment,
                                  sample_artifact=out / "background-environment-samples.jsonl")
         quiet = (diagnostic_monitor or QuietMonitor)(server_cpus, load_cpus, **quiet_options)
