@@ -33,7 +33,7 @@ from gateplan import read_topology
 ACTIVE_EXPERIMENTS = frozenset(("make", "gmake", "ninja", "cc1", "cc1plus", "clang", "clang++",
     "gcc", "g++", "ld", "ld.lld", "lto1", "rustc", "cargo", "memtier_benchma",
     "memtier_benchmar", "memtier_benchmark", "binary-A", "binary-B", "redis-benchmark"))
-SERVERS = frozenset(("redis-server", "tomokv", "dragonfly", "keydb-server", "memcached"))
+SERVERS = frozenset(("redis-server", "tomokv", "dragonfly", "keydb-server", "memcached", "GarnetServer"))
 COMPETING = ACTIVE_EXPERIMENTS | SERVERS
 
 # The first live preflight rejected two isolated 10ms desktop ticks. A subsequent
@@ -96,7 +96,8 @@ def experiment_driver(argv: list[bytes]) -> bool:
             return False
         if argument.startswith(b"-"):
             continue
-        return Path(os.fsdecode(argument)).name in ("abbagate.py", "abba_experiments.py", "legacy_reorder_witness.py")
+        return Path(os.fsdecode(argument)).name in ("abbagate.py", "abba_experiments.py", "legacy_reorder_witness.py",
+                                                    "background_qualification.py")
     return False
 
 

@@ -1018,7 +1018,7 @@ def parse_args():
     return p.parse_args()
 
 
-def main(args):
+def main(args, *, diagnostic_monitor=None):
     if args.list_cells:
         cells = selected_cells(read_cells(args.cells), args.subset, args.only)
         print(json.dumps({"subset": args.subset, **coverage(cells)}, indent=2))
@@ -1030,6 +1030,12 @@ def main(args):
               "window_seconds": WINDOW, "order": list(ORDER), "cells": [], "output": str(out),
               "subset": args.subset, "only": args.only,
               "run_kind": "null-control" if args.collect_null else "comparison", "comparison_trusted": False}
+    if diagnostic_monitor is not None:
+        # Internal-only background qualification may observe the real measurement loop while
+        # auditing an unvalidated quiet-screening rule. It must NEVER transiently publish a
+        # consumable null or receipt, even if every raw statistical assessment passes.
+        report.update(run_kind="background-qualification", normal_gate_eligible=False,
+                      measurement_valid=False)
     if args.collect_null:
         report["null_control"] = {"verdict": "FAIL", "reason": "control has not completed"}
     children = Children()
@@ -1087,7 +1093,8 @@ def main(args):
             except (OSError, ValueError) as error:
                 control_error = f"standing null unavailable: {args.null_result}: {error}"
                 print("ABBA UNTRUSTED: " + control_error + "; all measurements still run", flush=True)
-        quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid(), window_seconds=WINDOW)
+        quiet = (diagnostic_monitor or QuietMonitor)(server_cpus, load_cpus,
+                    own_root_pid=os.getpid(), window_seconds=WINDOW)
         quiet.start()  # Fail before reference builds, capability probes, or server boots.
         report["quiet_box"] = quiet.evidence()
         if not args.candidate.is_file() or not os.access(args.candidate, os.X_OK):
@@ -1186,7 +1193,11 @@ def main(args):
                     row["rounds"].append(round_)
                     for sequence, arm in enumerate(ORDER, 1):
                         quiet.check()
+                        if diagnostic_monitor is not None:
+                            quiet.set_phase(f"measurement:{cell.id}:n{n}:{sequence}:{arm}")
                         round_["runs"].append(runner.measure(cell, arm, sequence, n, plans[arm]))
+                        if diagnostic_monitor is not None:
+                            quiet.set_phase("between-measurements")
                         quiet.check()
                     row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
@@ -1218,13 +1229,17 @@ def main(args):
         if harness_fingerprint(ROOT)["sha256"] != report["receipt_harness_sha256"]:
             invalidate_instrument("measurement harness changed during the ABBA tier")
             raise RuntimeError(report["reason"])
-        report["measurement_valid"] = True
+        report["measurement_valid"] = diagnostic_monitor is None
         report["elapsed_seconds"] = time.monotonic() - start
         report["statistical_verdict"], report["worst_cell"] = overall(report["cells"])
         report["verdict"] = report["statistical_verdict"]
         if report["statistical_verdict"] == "PASS":
             report["verdict"] = "PARTIAL"
-            if args.collect_null:
+            if diagnostic_monitor is not None:
+                report["null_control"] = {"verdict": "UNTRUSTED", "reason":
+                    "background qualification is diagnostic only; not a standing null or a gate PASS"}
+                print("BACKGROUND QUALIFICATION: raw cells pass; instrument remains UNTRUSTED", flush=True)
+            elif args.collect_null:
                 report["null_control"] = null_result(report, now=time.time())
                 print("NULL CONTROL PASS: selected cells passed with byte-identical arms; not a code-comparison PASS", flush=True)
             else:
