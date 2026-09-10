@@ -213,7 +213,9 @@ def self_test():
             path = self.root / "tests/gate_history.py"
             original = path.read_bytes()
             path.unlink()
-            with self.assertRaises(FileNotFoundError):
+            # A removed root can be reached directly or through another module's
+            # import first; either route must reject the incomplete instrument.
+            with self.assertRaises((FileNotFoundError, ValueError)):
                 instrument_fingerprint(self.root)
             path.symlink_to(root / "tests/gate_history.py")
             with self.assertRaisesRegex(ValueError, "symlinked"):
