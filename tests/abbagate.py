@@ -72,6 +72,7 @@ from gate_quiet import QuietMonitor, QuietViolation
 from abba_saturation import parse_snapshot, productive_saturation, self_test as saturation_self_test
 from gate_receipt import harness_fingerprint, read_json
 from abba_evidence import match_null, null_result
+from abba_instrument import instrument_fingerprint
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
                             require_workload_witness, workload_command_names)
 
@@ -1084,6 +1085,7 @@ def main(args, *, diagnostic_monitor=None):
         # Capture before the quiet observer starts, and check again after its final sample so
         # fingerprinting itself never becomes foreign CPU work inside a measurement interval.
         report["receipt_harness_sha256"] = harness_fingerprint(ROOT)["sha256"]
+        report["instrument_fingerprint"] = instrument_fingerprint(ROOT)
         # Freeze the chosen artifact before measurements. A missing control does not remove any
         # authorized workload; successful raw observations remain explicitly untrusted instead.
         control, control_error = None, None
@@ -1130,7 +1132,9 @@ def main(args, *, diagnostic_monitor=None):
             raise RuntimeError("memtier_benchmark not available")
         args.memtier = str(Path(args.memtier).resolve())
         runner = Runner(args, out, binaries, children)
-        report["environment"] = {"uname": list(os.uname()), "server_cpus": server_cpus,
+        report["environment"] = {"uname": list(os.uname()),
+                                 "python_runtime": report["instrument_fingerprint"]["python"],
+                                 "server_cpus": server_cpus,
                                  "server_physical": server_physical, "server_smt": server_smt,
                                  "load_physical": load_physical, "load_smt": load_smt,
                                  "load_instance_ceiling": min(args.max_instances, len(load_physical)),
@@ -1228,6 +1232,9 @@ def main(args, *, diagnostic_monitor=None):
         quiet.check()
         if harness_fingerprint(ROOT)["sha256"] != report["receipt_harness_sha256"]:
             invalidate_instrument("measurement harness changed during the ABBA tier")
+            raise RuntimeError(report["reason"])
+        if instrument_fingerprint(ROOT) != report["instrument_fingerprint"]:
+            invalidate_instrument("measurement instrument changed during the ABBA tier")
             raise RuntimeError(report["reason"])
         report["measurement_valid"] = diagnostic_monitor is None
         report["elapsed_seconds"] = time.monotonic() - start
@@ -1737,6 +1744,15 @@ def self_test():
             self.assertFalse(report["cells"][0]["instrument_valid"])
             self.assertIn("harness changed", report["reason"])
 
+        def test_changed_instrument_invalidates_the_real_measurement_loop(self):
+            original = instrument_fingerprint(ROOT)
+            with mock.patch(__name__ + ".instrument_fingerprint", side_effect=[
+                    original, {**original, "sha256": "b" * 64}]):
+                rc, measurements, _, report, _ = self.fake_main(pin="4")
+            self.assertEqual((rc, len(measurements)), (1, 4))
+            self.assertFalse(report["measurement_valid"])
+            self.assertIn("instrument changed", report["reason"])
+
         def test_contended_preflight_never_reaches_support_or_measurement(self):
             self.quiet.start.side_effect = QuietViolation("foreign compiler is active")
             rc, order, _, report, _ = self.fake_main(pin=4)
@@ -2064,6 +2080,10 @@ def self_test():
                     self.assertNotEqual(report["candidate"]["sha256"], control["candidate"]["sha256"])
                     self.assertEqual(read_json(out / "null-control.json"), control)
                     validate_comparison(report, control, now=epoch + ticks[0])
+                changed_correctness = copy.deepcopy(control)
+                changed_correctness["receipt_harness_sha256"] = "f" * 64
+                rc, calls, report, _ = run(control=changed_correctness, subset="smoke")
+                self.assertEqual((rc, len(calls), report["comparison_trusted"]), (0, 4, True))
                 rc, calls, report, _ = run(control=control, only="n1")
                 self.assertEqual((rc, len(calls), report["verdict"], report["comparison_trusted"]),
                                  (3, 4, "PARTIAL", False))
@@ -2072,7 +2092,8 @@ def self_test():
                                  (3, 8, "PASS", "PARTIAL"))
                 defects = {
                     "failed unselected cell": lambda c: c["cells"][1].update(verdict="FAIL"),
-                    "harness": lambda c: c.update(receipt_harness_sha256="f" * 64),
+                    "instrument": lambda c: c["instrument_fingerprint"].update(sha256="f" * 64),
+                    "old hash only": lambda c: c.pop("instrument_fingerprint"),
                     "generator": lambda c: c["environment"].update(memtier_sha256="f" * 64),
                     "window": lambda c: c.update(window_seconds=10),
                     "different bytes": lambda c: c["candidate"].update(sha256="f" * 64),

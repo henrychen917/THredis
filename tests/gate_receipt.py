@@ -19,6 +19,7 @@ import tempfile
 import time
 
 from abba_evidence import validate_measurements, validate_null, validate_comparison, match_null, null_result
+from abba_instrument import instrument_fingerprint, validate_fingerprint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,9 +98,8 @@ def source_fingerprint(root):
 
 
 def harness_from_source(source):
-    # A standing null may use another server binary, but never another measurement harness.
-    # Include all test and driver helpers, not just abbagate.py; an imported helper is executable
-    # measurement code too. Server src/ changes are deliberately outside this reuse boundary.
+    # Keep the full release-test/driver binding, even for helpers outside the ABBA
+    # instrument. Standing null reuse now has its own transitive measurement scope.
     return fingerprint_entries([row for row in source["entries"] if
         row["path"] == "Makefile" or row["path"].startswith(HARNESS_DIRS)])
 
@@ -290,8 +290,12 @@ def begin(root, args):
         print("GATE RECEIPT PENDING: " + withheld + "; all gate work still runs; no push receipt will be issued", file=sys.stderr)
     count = expected_count(root, nic)
     source = source_fingerprint(root)
+    instrument = instrument_fingerprint(root)
+    require({row["path"] for row in instrument["entries"]} <= {row["path"] for row in source["entries"]},
+            "instrument imports an ignored/untracked dependency absent from the release source manifest")
     state = {"schema": SCHEMA, "kind": "gate-start", "run_id": args.run_id, "tier": args.tier,
              "started_at": time.time(), "source": source, "harness": harness_from_source(source),
+             "instrument": instrument,
              "inventory": inventory(root, args.cells.resolve()), "expected_checks": count,
              "expected_labels": [r["label"] for r in baseline], "nic": nic,
              "baseline": baseline_identity, "withheld_reason": withheld}
@@ -305,6 +309,8 @@ def load_start(root, path):
             "start manifest must be in this worktree's local receipt history")
     state = read_json(path)
     require(state.get("schema") == SCHEMA and state.get("kind") == "gate-start", "invalid start manifest")
+    require(validate_fingerprint(state.get("instrument")) == instrument_fingerprint(root)["sha256"],
+            "measurement instrument/runtime changed since gate start")
     require(source_fingerprint(root) == state["source"], "source contents/modes changed since gate start")
     require(inventory(root, root / state["inventory"]["path"]) == state["inventory"], "cell inventory changed")
     require(expected_count(root, state["nic"]) == state["expected_checks"], "gate row count changed")
@@ -329,6 +335,7 @@ def validate_abba(report, state, *, now, candidate=None, null=False):
     # Shared shape/null validation also guards standalone smoke. A push retains this stronger
     # wrapper: every cell in the current full inventory, including future additions, is required.
     require(report.get("subset") == "full", "only the full ABBA set can certify a push")
+    validate_fingerprint(state.get("instrument"))
     if null:
         validate_null(report, now=now)
     else:
@@ -336,7 +343,8 @@ def validate_abba(report, state, *, now, candidate=None, null=False):
                 report.get("run_kind") == "comparison" and not report.get("only"),
                 "only a complete trusted comparison PASS can certify a push")
     return validate_measurements(report, now=now, expected_source=state["inventory"],
-        expected_cells=state["inventory"]["cells"], harness=state["harness"]["sha256"], candidate=candidate)
+        expected_cells=state["inventory"]["cells"], harness=None if null else state["harness"]["sha256"],
+        candidate=candidate, expected_instrument=state["instrument"])
 
 
 def observations(path, state, actual, finished):
@@ -598,6 +606,8 @@ def self_test():
             (self.root / "tests/headline_cells.txt").write_text(fixture_cells())
             shutil.copyfile(__file__, self.root / "tests/gate_receipt.py")
             shutil.copyfile(ROOT / "tests/abba_evidence.py", self.root / "tests/abba_evidence.py")
+            for entry in instrument_fingerprint(ROOT)["entries"]:
+                shutil.copyfile(ROOT / entry["path"], self.root / entry["path"])
             shutil.copyfile(ROOT / ".githooks/pre-push", self.root / ".githooks/pre-push")
             (self.root / ".githooks/pre-push").chmod(0o755)
             (self.root / "source.cc").write_text("int original;\n")
@@ -656,11 +666,13 @@ def self_test():
                 statistical_verdict="PASS", comparison_trusted=not is_null, run_kind="null-control" if is_null else "comparison", only="",
                 started_utc=datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 elapsed_seconds=16000., window_seconds=20, receipt_harness_sha256=self.state["harness"]["sha256"],
+                instrument_fingerprint=copy.deepcopy(self.state["instrument"]),
                 cell_source=dict(sha256=self.state["inventory"]["sha256"], total_cells=178,
                                  text=(self.root / "tests/headline_cells.txt").read_text()),
                 coverage=dict(ids=[c["id"] for c in self.state["inventory"]["cells"]], count=178, pending_pins=[]),
                 candidate=dict(sha256=candidate), reference=dict(sha256=reference),
-                environment=dict(server_cpus=[0, 1], load_cpus=[2, 3], server_physical=[0, 1],
+                environment=dict(python_runtime=copy.deepcopy(self.state["instrument"]["python"]),
+                                 server_cpus=[0, 1], load_cpus=[2, 3], server_physical=[0, 1],
                                  load_physical=[2, 3], uname=["fixture"], memtier_sha256="d" * 64,
                                  memtier_version="fixture", keys=2000000, data_bytes=64, key_pattern="P:P", split_ratio="1:1",
                                  population_by_arm={"A": "wire", "B": "wire"}),
@@ -873,6 +885,17 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
             self.save_results()
             self.assertTrue(finish(self.root, self.finish_args).is_file())
 
+        def test_prior_null_may_have_other_correctness_harness_but_comparison_cannot(self):
+            self.control["receipt_harness_sha256"] = "c" * 64
+            self.report.pop("standing_null", None)
+            self.save_results()
+            self.assertTrue(finish(self.root, self.finish_args).is_file())
+            self.report["receipt_harness_sha256"] = "c" * 64
+            self.report.pop("standing_null", None)
+            self.save_results()
+            with self.assertRaisesRegex(ValueError, "ABBA harness differs"):
+                finish(self.root, self.finish_args)
+
         def test_smoke_partial_failed_unreached_quiet_and_null_controls(self):
             self.args.tier = "smoke"
             with self.assertRaisesRegex(ValueError, "smoke/iteration"):
@@ -885,7 +908,7 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
                 ("quiet incomplete", lambda: self.report["quiet_box"].update(complete=False)),
                 ("quiet failure", lambda: self.report["quiet_box"].update(interference={"pid": 123})),
                 ("null bytes", lambda: self.control["candidate"].update(sha256="c" * 64)),
-                ("null harness", lambda: self.control.update(receipt_harness_sha256="c" * 64)),
+                ("null instrument", lambda: self.control["instrument_fingerprint"].update(sha256="c" * 64)),
                 ("null geometry", lambda: self.control["environment"].update(data_bytes=32)),
                 ("null window", lambda: self.control.update(window_seconds=10)),
                 ("candidate identity", lambda: self.report["candidate"].update(sha256="c" * 64)),

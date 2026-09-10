@@ -6,6 +6,8 @@ import json
 import math
 import re
 
+from abba_instrument import validate_fingerprint
+
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
 
@@ -40,13 +42,17 @@ def utc_seconds(value):
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
 
 
-def validate_measurements(report, *, now, expected_source=None, expected_cells=None, harness=None, candidate=None):
+def validate_measurements(report, *, now, expected_source=None, expected_cells=None, harness=None, candidate=None,
+                          expected_instrument=None):
     require(isinstance(report, dict), "ABBA evidence must be a JSON object")
     require(report.get("schema") == 1 and report.get("statistical_verdict") == "PASS" and
             report.get("verdict") in ("PASS", "PARTIAL"), "ABBA measurements did not all pass")
     require(report.get("measurement_valid") is True, "ABBA measurement validity was not certified")
     require(re.fullmatch(r"[0-9a-f]{64}", report.get("receipt_harness_sha256", "")), "missing ABBA harness digest")
     require(harness is None or report["receipt_harness_sha256"] == harness, "ABBA harness differs")
+    instrument_sha = validate_fingerprint(report.get("instrument_fingerprint"))
+    require(expected_instrument is None or instrument_sha == validate_fingerprint(expected_instrument),
+            "ABBA measurement instrument differs")
     require(report.get("order") == ORDER, "ABBA sequence changed")
     started = utc_seconds(report.get("started_utc"))
     elapsed = number(report.get("elapsed_seconds"), "ABBA elapsed seconds", positive=True)
@@ -82,6 +88,8 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
     require(candidate is None or report["candidate"]["sha256"] == candidate["sha256"], "ABBA measured another candidate binary")
     environment = report.get("environment", {})
     require(isinstance(environment, dict), "invalid ABBA environment")
+    require(environment.get("python_runtime") == report["instrument_fingerprint"]["python"],
+            "Python measurement environment differs from the instrument identity")
     for key in ("server_cpus", "load_cpus", "server_physical", "load_physical"):
         value = environment.get(key)
         require(isinstance(value, list) and value and all(type(cpu) is int and cpu >= 0 for cpu in value)
@@ -177,7 +185,10 @@ def match_null(comparison, control, *, now):
             "standing null is from the future or more than 24 hours old")
     require(null_started + control["elapsed_seconds"] <= started + 1,
             "standing null did not finish before this comparison started")
-    require(comparison["receipt_harness_sha256"] == control["receipt_harness_sha256"], "null harness differs")
+    # Correctness tests/hooks may change between a null and a later comparison.
+    # Both reports still carry the broad release hash; only the actual instrument
+    # must match here. Old reports without scoped provenance fail validation above.
+    require(comparison["instrument_fingerprint"] == control["instrument_fingerprint"], "null instrument differs")
     require(comparison["cell_source"]["sha256"] == control["cell_source"]["sha256"] and
             comparison["cell_source"]["total_cells"] == control["cell_source"]["total_cells"],
             "null inventory differs")
