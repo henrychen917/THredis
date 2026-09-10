@@ -443,7 +443,7 @@ row_save_history(){
       --scored "$scored" "${identity[@]}" "${timed[@]}"
 }
 ledger(){
-  local verdict=$1 label=$2 identity duration
+  local verdict=$1 label=$2 scored=${3:-1} identity duration
   if [ -n "$ROW_ID" ]; then
     row_finish
     identity=$ROW_ID; duration=$ROW_SECONDS
@@ -452,7 +452,7 @@ ledger(){
       verdict=FAIL
       say "$identity" "FAIL (TIMEOUT ${ROW_TIMEOUT}s; median=${ROW_MEDIAN}s; $ROW_BASIS)"
     fi
-    row_save_history "$verdict" || exit 2
+    row_save_history "$verdict" "$scored" || exit 2
   else
     # Infrastructure failures (boot/worker/count) are red even without a normal row
     # scope. An unscoped SUCCESS is a harness defect, never manufactured zero timing.
@@ -796,6 +796,9 @@ job_label(){
     feature-armed-*) echo "fused+armed boot line (atomic ${1##*-})";;
     differ-split) echo 'Redis 7.4 differential matrix';;
     differ-armed) echo 'Redis 7.4 differential matrix (armed fused + read-local)';;
+    differ-split-[01]) echo "Redis 7.4 differential part (split, atomic ${1##*-})";;
+    differ-armed-[01]) echo "Redis 7.4 differential part (armed fused, atomic ${1##*-})";;
+    differ-equivalence) echo 'mode equivalence part (all execution modes and knobs)';;
     flipctl) echo 'flip controller: ramp gate, hold, surge + mix re-maneuvers';;
     evict-*) local kind section mode atomic
       IFS=- read -r kind section mode atomic <<< "$1"
@@ -818,10 +821,16 @@ job_body(){
     differ-*)
       export GATE_DIFFER_GEOMETRY=split
       export GATE_DIFFER_OUT="$TMPDIR/differ"
-      [ "$name" != differ-armed ] || export GATE_DIFFER_GEOMETRY=armed-fused
+      export GATE_DIFFER_PART="${name#differ-}" GATE_DIFFER_PLAN="$RUN_DIR/differ-plan.json"
+      [[ "$name" != differ-armed-* ]] || export GATE_DIFFER_GEOMETRY=armed-fused
       row_begin "$label"
-      tests/differ_gate.sh "$CANDIDATE_BINARY" "$PORT" "$((PORT+1))" "$CORES" "$GATE_RATIO" \
-          && ok "$label" || bad "$label";;
+      # Private rows retain their watchdog and verdict evidence. Only the two complete folds
+      # below are scored publicly; all atomic lifetimes and every equivalence stream are required.
+      if tests/differ_gate.sh "$CANDIDATE_BINARY" "$PORT" "$((PORT+1))" "$CORES" "$GATE_RATIO"; then
+        say "$label" ok; ledger ok "$label" 0
+      else
+        say "$label" FAIL; ledger FAIL "$label" 0
+      fi;;
     evict-*)
       local kind section mode atomic
       IFS=- read -r kind section mode atomic <<< "$name"
@@ -934,7 +943,15 @@ start_workers(){
   JOB_NAMES+=(config_unit flip_unit filter_unit ring_unit reorder_unit storage_units
               production_units acl_metadata cmd_metadata abba_selftest)
   # Start long waits and whole boot families early; short jobs occupy the slots they release.
-  [ "$TIER" != full ] || JOB_NAMES+=(differ-split differ-armed)
+  if [ "$TIER" = full ]; then
+    # Each target already rebooted between atomic modes. Those four independent lifetimes can
+    # occupy separate CPU/port/TMPDIR slots; seeds and the accumulated-state MULTI repeats cannot.
+    # Plan failure remains loud and makes every required differential fold red, while unrelated
+    # correctness jobs still run and retain their evidence.
+    python3 tests/differ_fanout.py plan --run "${ROW_RUN_ID:-$RUN_DIR}" --output "$RUN_DIR/differ-plan.json" \
+        --repeats "${GATE_DIFFER_MULTI_REPEATS:-4}" || true
+    JOB_NAMES+=(differ-split-0 differ-split-1 differ-armed-0 differ-armed-1 differ-equivalence)
+  fi
   local atomic mode section slot FM FR FO FQ FF
   for section in lruclock lfu; do
     for atomic in 0 1; do for mode in split armed; do JOB_NAMES+=("evict-$section-$mode-$atomic"); done; done
@@ -983,7 +1000,37 @@ start_workers(){
     WORKER_PIDS+=("$!")
   done
 }
+collect_differ_group(){
+  local group=$1 name dir p live row verdict duration label
+  local parts=("differ-$group-0" "differ-$group-1")
+  [ "$group" != split ] || parts+=(differ-equivalence)
+  label=$(job_label "differ-$group")
+  for name in "${parts[@]}"; do
+    dir="$RUN_DIR/jobs/$name"
+    while [ ! -f "$dir/done" ]; do
+      live=0
+      for p in "${WORKER_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && live=1; done
+      [ "$live" = 1 ] || break
+      sleep 0.2
+    done
+    [ ! -f "$dir/output.log" ] || cat "$dir/output.log"
+  done
+  # Fold only after every named child's normal finalizer has published its real exit and cleanup
+  # result. The helper revalidates ordered leg inventories and coverage, including failed-seed
+  # replays; a missing/unreached child is one failed original row, never a smaller passing matrix.
+  if ! row=$(python3 tests/differ_fanout.py fold --plan "$RUN_DIR/differ-plan.json" --group "$group" \
+      --run-directory "$RUN_DIR" --row-plan "$ROW_PLAN" --row-history "$ROW_HISTORY" --row-run "$ROW_RUN_ID"); then
+    bad "$label" "incomplete differential children; see $RUN_DIR/jobs/differ-*"
+    return
+  fi
+  IFS=$'\t' read -r verdict duration label <<< "$row"
+  printf '%s\n' "$row" >> "$LEDGER"
+  printf '%s\n' "$row" >> "$TIMINGS"
+  say "$label" "$verdict (${duration}s across concurrent children)"
+  if [ "$verdict" = ok ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); fi
+}
 collect_job(){
+  case "$1" in differ-split|differ-armed) collect_differ_group "${1#differ-}"; return;; esac
   local name=$1 dir="$RUN_DIR/jobs/$1" live p job_rc job_pass job_fail
   while [ ! -f "$dir/done" ]; do
     live=0
@@ -2677,8 +2724,8 @@ collect_job rldbg
 collect_job rlcache
 
 # ---- 4c. full tier: byte-exact differential matrix against pinned vanilla Redis 7.4 ----------
-# Each matrix retains its own serial target/oracle pair; the two geometries use disjoint slots.
-# Its ordinary suites and two special early-exit suites are unchanged.
+# The four atomic-mode lifetimes and mode-equivalence job use independent slots. Each lifetime
+# retains its entire ordered suite/seed chain and repeats; this fold still emits one original row.
 collect_job differ-split
 
 # ---- 4c-bis. the same matrix in the ARMED-FUSED geometry ---------------------------------------

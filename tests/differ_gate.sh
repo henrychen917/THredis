@@ -37,6 +37,14 @@ ORACLE_PID=0
 BOOT_PID=0
 PASS=0
 FAIL=0
+PART=${GATE_DIFFER_PART:-all}
+PART_PLAN=${GATE_DIFFER_PLAN:-}
+case "$PART" in
+  all) ATOMICS=(0 1);;
+  split-0|split-1|armed-0|armed-1) ATOMICS=("${PART##*-}");;
+  equivalence) ATOMICS=();;
+  *) echo "unknown differential part: $PART" >&2; exit 2;;
+esac
 
 say(){ printf '  %-58s %s\n' "$1" "$2"; }
 
@@ -178,17 +186,37 @@ mkdir -p "$OUT"
 # Rotation adds coverage; it never displaces permanent seeds 7/19 or a discovered counterexample.
 # The durable corpus is outside build/, so make clean cannot erase a failing seed. A root gate can
 # export one GATE_RUN_ID to give concurrent geometries the same newly allocated seed.
-SELECTED_SEEDS=$(python3 tests/_differ_history.py allocate --run "$SEED_RUN" \
-    --output "$OUT/seeds.json") || exit 2
+EQUIVALENCE_SEEDS=()
+MULTI_REPEATS=${GATE_DIFFER_MULTI_REPEATS:-4}
+if [ "$PART" = all ]; then
+  SELECTED_SEEDS=$(python3 tests/_differ_history.py allocate --run "$SEED_RUN" \
+      --output "$OUT/seeds.json") || exit 2
+else
+  # Freeze all seeds before dispatch; a newly discovered failure must not change the inventory
+  # of a child that starts later. The parent folds all five required parts into two public rows.
+  SELECTION=$(python3 tests/differ_fanout.py select --plan "$PART_PLAN" --part "$PART") || exit 2
+  readarray -t SELECTED <<< "$SELECTION"
+  SELECTED_SEEDS=${SELECTED[0]}
+  read -r -a EQUIVALENCE_SEEDS <<< "${SELECTED[1]}"
+  MULTI_REPEATS=${SELECTED[2]}
+  case "$PART:$TARGET_GEOMETRY" in
+    split-*:split|armed-*:armed-fused|equivalence:split) :;;
+    *) echo "differential part/geometry mismatch: $PART/$TARGET_GEOMETRY" >&2; exit 2;;
+  esac
+  [ ! -e "$OUT/legs.tsv" ] && [ ! -e "$OUT/complete.json" ] || {
+    echo "refusing stale differential child output: $OUT" >&2; exit 2;
+  }
+  : > "$OUT/legs.tsv"
+fi
 read -r -a SEEDS <<<"$SELECTED_SEEDS"
 [ "${#SEEDS[@]}" -ge 3 ] || { echo 'differ seed inventory lost a permanent or rotating seed' >&2; exit 2; }
 printf 'DIFFER suites (%d): %s\n' "${#SUITES[@]}" "${SUITES[*]}"
 printf 'DIFFER geometry: %s (%s)\n' "$TARGET_GEOMETRY" "${TARGET_SHAPE[*]}"
-printf 'DIFFER matrix: atomic={0,1} seeds={%s} legs=%d logs=%s\n' \
-    "${SEEDS[*]}" "$((2 * ${#SEEDS[@]} * ${#SUITES[@]}))" "$OUT"
+printf 'DIFFER matrix: atomic={%s} seeds={%s} legs=%d logs=%s\n' \
+    "${ATOMICS[*]}" "${SEEDS[*]}" "$((${#ATOMICS[@]} * ${#SEEDS[@]} * ${#SUITES[@]}))" "$OUT"
 
 run_differ_leg(){
-  local suite=$1 seed=$2 logfile=$3 rc=0 verdict=ok
+  local suite=$1 seed=$2 logfile=$3 repeat=${4:-0} rc=0 verdict=ok
   GATE_DIFFER_COVERAGE="$logfile.coverage.json" \
       taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
       127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" "$suite" "$seed" \
@@ -200,18 +228,24 @@ run_differ_leg(){
     [ "$rc" -ne 0 ] || rc=1
   fi
   [ "$rc" -eq 0 ] || verdict=FAIL
+  if [ "$PART" != all ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$suite" "$ATOMIC" "$seed" "$repeat" "$rc" "${logfile##*/}" \
+        >> "$OUT/legs.tsv" || return 2
+  fi
   python3 tests/_differ_history.py record --run "$SEED_RUN" --seed "$seed" --suite "$suite" \
       --geometry "$TARGET_GEOMETRY" --atomic "$ATOMIC" --verdict "$verdict" --log "$logfile" \
       || return 2
   return "$rc"
 }
 
+START_SECONDS=$SECONDS
+run_matrix(){
 mkdir -p "$OUT/oracle"
 ORACLE_LOG="$OUT/oracle.log"
 boot_owned "vanilla Redis oracle" "$ORACLE_PORT" "$ORACLE_CORES" "$ORACLE_LOG" \
     env LC_ALL=C "$ORACLE_BIN" --port "$ORACLE_PORT" --bind 127.0.0.1 \
     --dir "$OUT/oracle" --dbfilename dump.rdb --appendonly no --save '' \
-    --enable-debug-command yes || exit 1
+    --enable-debug-command yes "${ORACLE_ALIGNMENT[@]}" || return 1
 ORACLE_PID=$BOOT_PID
 
 ORACLE_INFO=$(
@@ -229,8 +263,7 @@ fi
 REDIS_VERSION=$(sed -n 's/^redis_version://p' <<<"$ORACLE_INFO" | head -1)
 say "oracle identity" "ok (vanilla redis_version=$REDIS_VERSION)"
 
-START_SECONDS=$SECONDS
-for ATOMIC in 0 1; do
+for ATOMIC in "${ATOMICS[@]}"; do
   TARGET_LOG="$OUT/target-atomic-$ATOMIC.log"
   # Default startup reads ./dump.rdb even with saving disabled. A private data directory keeps
   # concurrent matrices and persistence batteries from importing one another's state.
@@ -276,10 +309,10 @@ for ATOMIC in 0 1; do
   # earlier legs accumulated. Repeats are extra rolls of the SAME dice, not new coverage --
   # they intentionally do not appear in any expected-row ledger outside this script.
   if [ "$ATOMIC" -eq 1 ]; then
-    for REP in $(seq "${GATE_DIFFER_MULTI_REPEATS:-4}"); do
+    for REP in $(seq "$MULTI_REPEATS"); do
       LEG="differ multi (atomic=1 seed=19 rep $REP)"
       LEG_LOG="$OUT/multi-a1-s19-rep$REP.txt"
-      if run_differ_leg multi 19 "$LEG_LOG"; then
+      if run_differ_leg multi 19 "$LEG_LOG" "$REP"; then
         say "$LEG" "ok ($(tail -n 1 "$LEG_LOG"))"
         PASS=$((PASS+1))
       else
@@ -313,26 +346,50 @@ done
 stop_owned "oracle" "$ORACLE_PID" "$ORACLE_PORT" || FAIL=$((FAIL+1))
 ORACLE_PID=0
 python3 tests/_differ_history.py summary "$OUT" || FAIL=$((FAIL+1))
+}
+ORACLE_ALIGNMENT=()
+# The serial oracle carries edgeenc/servertail's sole non-default persistent CONFIG value into
+# atomic1: set-max-intset-entries=128 (Redis 7.4 defaults to512). Other encoding alignment values
+# equal its defaults; timeout/keepalive/notifications, ACL users and script/function state are
+# restored by their suites. Preserve this configuration in atomic1's independent oracle.
+case "$PART" in split-1|armed-1) ORACLE_ALIGNMENT=(--set-max-intset-entries 128);; esac
+if [ "$PART" != equivalence ]; then run_matrix || FAIL=$((FAIL+1)); fi
 # One existing differential gate row now also requires exact mode equivalence.
 # Keep every Redis leg above intact. The split job runs this once, after both
 # listeners close: its private target port is reused across all 32 fresh boots.
 # The armed job need not repeat the identical matrix. The new per-run seed also
 # rotates the equivalence stream; discovered counterexamples remain permanent.
-if [ "$TARGET_GEOMETRY" = split ]; then
-  EQUIVALENCE_SEED=$(python3 - "$OUT/seeds.json" <<'PY'
+if { [ "$PART" = all ] && [ "$TARGET_GEOMETRY" = split ]; } || [ "$PART" = equivalence ]; then
+  EQUIVALENCE_FLAGS=()
+  if [ "$PART" = all ]; then
+    EQUIVALENCE_SEED=$(python3 - "$OUT/seeds.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))['rotating'])
 PY
-  ) || exit 2
-  if python3 tests/mode_equivalence.py --binary "$TARGET_BIN" --server-cpus "$TARGET_CORES" \
+    ) || exit 2
+    EQUIVALENCE_SEEDS=("$EQUIVALENCE_SEED")
+  else
+    # The frozen list includes this run's rotating stream and every recorded failure of this
+    # generator. Every invocation still executes all32 cells; the fold rejects a missing stream.
+    EQUIVALENCE_FLAGS=(--_single-seed)
+  fi
+  for EQUIVALENCE_SEED in "${EQUIVALENCE_SEEDS[@]}"; do
+    EQ_OUT="$OUT/mode-equivalence"
+    [ "$PART" = all ] || EQ_OUT="$OUT/mode-equivalence-$EQUIVALENCE_SEED"
+  if python3 tests/mode_equivalence.py "${EQUIVALENCE_FLAGS[@]}" --binary "$TARGET_BIN" --server-cpus "$TARGET_CORES" \
       --load-cpus "$LOAD_CORES" --port "$TARGET_PORT" --seed "$EQUIVALENCE_SEED" \
-      --output "$OUT/mode-equivalence" >"$OUT/mode-equivalence.log" 2>&1; then
+      --output "$EQ_OUT" >"$EQ_OUT.log" 2>&1; then
     say 'mode equivalence: all 32 execution/knob combinations' 'ok (exact replies and mechanism witnesses)'
     PASS=$((PASS+1))
   else
-    say 'mode equivalence: all 32 execution/knob combinations' "FAIL (see $OUT/mode-equivalence.log)"
+    say 'mode equivalence: all 32 execution/knob combinations' "FAIL (see $EQ_OUT.log)"
     FAIL=$((FAIL+1))
   fi
+  done
+fi
+if [ "$PART" != all ]; then
+  python3 tests/differ_fanout.py finish --plan "$PART_PLAN" --part "$PART" \
+      --directory "$OUT" --failures "$FAIL" --passed "$PASS" || FAIL=$((FAIL+1))
 fi
 ELAPSED=$((SECONDS-START_SECONDS))
 printf 'DIFFER GATE: pass=%d fail=%d runtime=%dm%02ds\n' \

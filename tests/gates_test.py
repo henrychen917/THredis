@@ -438,7 +438,15 @@ class SchedulerWiring(unittest.TestCase):
         gate = (root / 'tests/gate.sh').read_text()
         quick = gate[gate.index('\nstart_workers\n'):gate.index('\nif [ "$TIER" = quick ]; then\n  join_workers')]
         full = gate[gate.index('\ncollect_job asan_batteries\n'):gate.index('\n# Every worker has reaped')]
-        stub = 'start_workers(){ :; }; collect_job(){ printf "%s\\n" "$1"; };\n'
+        stub = '''start_workers(){ :; }
+collect_job(){
+  case "$1" in
+    differ-split) printf '%s\\n' differ-split-0 differ-split-1 differ-equivalence;;
+    differ-armed) printf '%s\\n' differ-armed-0 differ-armed-1;;
+    *) printf '%s\\n' "$1";;
+  esac
+}
+'''
         result = subprocess.run(['bash', '-uc', stub + quick + full], cwd=root,
                                 text=True, capture_output=True, check=True)
         cls.canonical = result.stdout.splitlines()
@@ -465,6 +473,7 @@ pause(){ read -r -t .02 -u 3 ignored || :; }
 phase(){ :; }
 quiet_wait(){ :; }
 ROW_HISTORY="$RUN_DIR/history"; ROW_RUN_ID=test; ROW_PLAN="$RUN_DIR/plan.json"
+export GATE_DIFFER_HISTORY="$RUN_DIR/differ-history"
 python3 tests/gate_history.py prepare --history "$ROW_HISTORY" --output "$ROW_PLAN"
 cleanup(){ row_unwatch; [ -z "${name:-}" ] || : > "$TMPDIR/cleaned"; }
 reap_children(){ :; } # Real teardown is covered by gate_history's owned-process controls.
@@ -892,7 +901,14 @@ program_state(){ :; }
 quiet_wait(){ :; }
 row_begin(){ ROW_WATCHDOG=$BASHPID; }
 collect_job(){
-  case " ${JOB_NAMES[*]} " in *" $1 "*) ;; *) echo "unreached job $1" >&2; exit 71;; esac
+  local required=("$1") child
+  case "$1" in
+    differ-split) required=(differ-split-0 differ-split-1 differ-equivalence);;
+    differ-armed) required=(differ-armed-0 differ-armed-1);;
+  esac
+  for child in "${required[@]}"; do
+    case " ${JOB_NAMES[*]} " in *" $child "*) ;; *) echo "unreached job $child" >&2; exit 71;; esac
+  done
   printf 'COLLECT %s\n' "$1" >> "$EVENTS"
 }
 join_workers(){ JOINED=1; printf 'JOIN\n' >> "$EVENTS"; }
@@ -901,6 +917,7 @@ python3(){
   # resolve its destination before recording the one real background dispatch below.
   if [ "$1" = - ]; then command "$WIRE_PYTHON" "$@"; return; fi
   if [ "$1" = tests/gate_history.py ]; then printf "fixture-context\n"; return 0; fi
+  if [ "$1" = tests/differ_fanout.py ]; then return 0; fi
   [ "$1" = tests/abbagate.py ] || return 74
   [ "$JOINED" = 1 ] || { echo 'measurement before worker join' >&2; return 72; }
   case " ${JOB_NAMES[*]} " in *' abba '*|*' perf '*) return 73;; esac
