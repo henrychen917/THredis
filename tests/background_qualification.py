@@ -7,10 +7,13 @@ whose exe link is permission-denied may instead be explicitly reviewed with
 accept_incomplete_executable=true: only its observable PID/start/UID/comm/permission states
 and argv digest are then bound. Executable path and bytes remain UNKNOWN. This weaker option
 exists only for this permanently untrusted diagnostic; approval never includes descendants.
+An explicitly reviewed idle-server also needs listener_ports. Its exact identity and every
+observed TCP state on those ports are checked, and its CPU ticks retain the normal hard
+rolling budget. Periodic TCP snapshots cannot exclude brief traffic between observations.
 `run` captures 120 seconds before any boot, executes exactly one pinned ABBA block each for
 h01/h09/h12 through abbagate.main(), then captures 60 seconds after the last measurement.
 The normal generic CPU budget is only audited here; its crossings remain would-refuse events.
-Known competing experiments, foreign server work, changed/unreviewed active identities and
+Known competing experiments, unreviewed server work, changed/unreviewed active identities and
 observer errors still abort. No rate threshold, load pin or normal gate policy is relaxed.
 Even twelve successful measurements cannot certify this operating environment: a separate
 all-cell standing null is still required. These artifacts can never serve as that null.
@@ -18,6 +21,7 @@ all-cell standing null is still required. These artifacts can never serve as tha
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import os
@@ -31,7 +35,7 @@ import abbagate as abba
 import gate_quiet as quiet
 
 CELLS = ("h01", "h09", "h12")
-CLASSES = {"desktop", "interactive-frontend", "waiting-supervisor", "system-service"}
+CLASSES = {"desktop", "interactive-frontend", "waiting-supervisor", "system-service", "idle-server"}
 PREFLIGHT = 120
 POSTFLIGHT = 60
 _DIGESTS = {}
@@ -173,21 +177,33 @@ def inventory():
 def reviewed_inventory(document):
     if document.get("schema") != 1 or not isinstance(document.get("processes"), list):
         raise ValueError("invalid reviewed background inventory")
-    reviewed, pids = {}, set()
+    reviewed, pids, ports = {}, set(), set()
     for row in document["processes"]:
         if row.get("reviewed") is not True:
             continue
         value = row.get("identity")
+        idle_server = row.get("classification") == "idle-server"
+        if idle_server:
+            declared = row.get("listener_ports")
+            if (row.get("comm") not in quiet.SERVERS or not isinstance(declared, list) or not declared or
+                    any(type(port) is not int or not 0 < port < 65536 for port in declared) or
+                    len(set(declared)) != len(declared) or ports.intersection(declared) or
+                    type(row.get("parent_pid")) is not int or not isinstance(row.get("affinity"), list) or
+                    not row["affinity"] or any(type(cpu) is not int or cpu < 0 for cpu in row["affinity"])):
+                raise ValueError(f"PID {row.get('pid')} lacks distinct explicitly reviewed idle-server listener ports")
+            ports.update(declared)
+        elif "listener_ports" in row:
+            raise ValueError("listener_ports requires explicit idle-server classification")
         if isinstance(value, dict) and value.get("provenance") == "incomplete-executable":
             command = value.get("argv_observation", {})
-            if (row.get("classification") != "system-service" or row.get("accept_incomplete_executable") is not True or
+            if (row.get("classification") not in ("system-service", "idle-server") or row.get("accept_incomplete_executable") is not True or
                     value.get("pid") != row.get("pid") or value.get("start_ticks") != row.get("start_ticks") or
                     value.get("comm") != row.get("comm") or value.get("exe", "missing") is not None or
                     value.get("executable_observation", {}).get("status") != "permission-denied" or
                     len(value.get("status_uids", [])) != 4 or command.get("status") not in ("readable", "permission-denied") or
                     command["status"] == "readable" and not re.fullmatch(r"[0-9a-f]{64}", command.get("sha256", ""))):
                 raise ValueError(f"PID {row.get('pid')} lacks explicit review of complete observable service fields")
-            if row["pid"] in pids or row.get("comm") in quiet.COMPETING:
+            if row["pid"] in pids or row.get("comm") in quiet.COMPETING and not idle_server:
                 raise ValueError(f"duplicate or competing reviewed PID {row['pid']}")
             pids.add(row["pid"])
             reviewed[row["pid"], row["start_ticks"]] = value
@@ -202,13 +218,55 @@ def reviewed_inventory(document):
         if row["pid"] in pids:
             raise ValueError(f"duplicate reviewed PID {row['pid']}")
         names = {row.get("comm"), Path(value["exe"]["path"]).name}
-        if names & quiet.COMPETING:
+        if names & quiet.ACTIVE_EXPERIMENTS or names & quiet.SERVERS and not idle_server:
             raise ValueError(f"PID {row['pid']} is a server/compiler/generator, not idle background")
         pids.add(row["pid"])
         reviewed[row["pid"], row["start_ticks"]] = value
     if not reviewed:
         raise ValueError("no exact background identities have been explicitly reviewed")
     return reviewed
+
+
+def tcp_snapshot(ports, net_root=Path("/proc/net")):
+    """Read only: never connect to an unrelated listener to test its identity.
+
+    Retain IPv4/IPv6 rows whose local OR remote port is reviewed. TIME_WAIT and
+    CLOSED are recorded remnants, not live connections; every other non-LISTEN
+    state (including handshakes and draining connections) invalidates the run.
+    These namespace-wide records cannot bind an unreadable server fd to a port,
+    and two snapshots cannot prove that no short connection occurred between them.
+    """
+    result = {"started_monotonic": time.monotonic(), "namespace": os.readlink("/proc/self/ns/net"),
+              "ports": sorted(ports), "rows": []}
+    for protocol in ("tcp", "tcp6"):
+        lines = (net_root / protocol).read_text().splitlines()
+        if not lines or "local_address" not in lines[0]:
+            raise quiet.QuietViolation(f"unreadable TCP snapshot header: {protocol}")
+        for raw in lines[1:]:
+            fields = raw.split()
+            try:
+                local = int(fields[1].rsplit(":", 1)[1], 16)
+                remote = int(fields[2].rsplit(":", 1)[1], 16)
+                state = int(fields[3], 16)
+                inode, uid = int(fields[9]), int(fields[7])
+                if not 1 <= state <= 12:
+                    raise ValueError("unknown TCP state")
+            except (ValueError, IndexError) as error:
+                raise quiet.QuietViolation(f"malformed {protocol} socket record: {raw}") from error
+            if local in ports or remote in ports:
+                result["rows"].append({"protocol": protocol, "local_port": local, "remote_port": remote,
+                    "state": state, "uid": uid, "inode": inode, "raw": raw})
+    result["ended_monotonic"] = time.monotonic()
+    return result
+
+
+def check_idle_connections(snapshot, ports):
+    live = [row for row in snapshot["rows"] if row["state"] not in (10, 6, 7)]
+    if live:
+        raise quiet.QuietViolation(f"reviewed idle-server has observed non-listener live TCP connection: {live}")
+    listening = {row["local_port"] for row in snapshot["rows"] if row["state"] == 10}
+    if ports - listening:
+        raise quiet.QuietViolation(f"reviewed idle-server listener disappeared: {sorted(ports - listening)}")
 
 
 def summary(document):
@@ -243,6 +301,10 @@ class QualificationMonitor(quiet.QuietMonitor):
         self.phase = "preflight"
         self.lock = threading.RLock()
         self.would_refuse = []
+        self.idle_servers = {(row["pid"], row["start_ticks"]): row["listener_ports"]
+            for row in document["processes"] if row.get("reviewed") is True and row.get("classification") == "idle-server"}
+        self.idle_windows = deque()
+        self.idle_peak_seconds = 0.0
         self.preflight_complete = False
         self.postflight_seconds = None
         self.sample_path = output / "background-samples.jsonl"
@@ -273,6 +335,7 @@ class QualificationMonitor(quiet.QuietMonitor):
                 self.failure = None
             owned = quiet.owned_processes(after, self.root) | self.ancestors | self.helpers.keys()
             active = {(row["pid"], row["start_ticks"]) for row in activity if row["cpu_ticks"]}
+            sockets, server_activity = None, []
             try:
                 for key, expected in self.reviewed.items():
                     current = after.get(key[0])
@@ -281,10 +344,47 @@ class QualificationMonitor(quiet.QuietMonitor):
                     reader = incomplete_identity if expected.get("provenance") == "incomplete-executable" else identity
                     if reader(current.pid, current.start) != expected:
                         raise quiet.QuietViolation(f"reviewed PID {current.pid} observed identity changed")
+                if self.idle_servers:
+                    # Qualification02 refused one 10ms Garnet housekeeping tick
+                    # after four idle days. Only explicitly reviewed PID/start +
+                    # executable/argv (or declared incomplete provenance) + ports
+                    # get this diagnostic-only treatment. No name/UID exemption,
+                    # no descendants, and no server CPU budget relaxation follows.
+                    ports = {port for declared in self.idle_servers.values() for port in declared}
+                    sockets = tcp_snapshot(ports)
+                    for key in self.idle_servers:
+                        current, prior = after[key[0]], before.get(key[0])
+                        declaration = next(row for row in self.document["processes"]
+                                           if (row["pid"], row["start_ticks"]) == key)
+                        if (current.name != declaration["comm"] or current.parent != declaration["parent_pid"] or
+                                current.affinity != frozenset(declaration["affinity"])):
+                            raise quiet.QuietViolation(f"reviewed idle-server comm/parent/affinity changed: {key}")
+                        ticks = current.ticks - prior.ticks if prior and prior.identity == key else current.ticks
+                        if ticks < 0:
+                            raise quiet.QuietViolation(f"reviewed idle-server CPU counter regressed: {key}")
+                        server_activity.append({"pid": key[0], "start_ticks": key[1], "cpu_ticks": ticks})
+                        descendants = quiet.owned_processes(after, key) - {key}
+                        if descendants:
+                            raise quiet.QuietViolation(f"reviewed idle-server has unapproved descendants: {sorted(descendants)}")
+                    self.idle_windows.append((began, self.previous_at, server_activity))
+                    while self.idle_windows and self.idle_windows[0][1] <= self.previous_at - self.window_seconds:
+                        self.idle_windows.popleft()
+                    server_seconds = sum(row["cpu_ticks"] for _, _, rows in self.idle_windows
+                                         for row in rows) * self.tick_seconds
+                    sample_seconds = sum(row["cpu_ticks"] for row in server_activity) * self.tick_seconds
+                    self.idle_peak_seconds = max(self.idle_peak_seconds, server_seconds, sample_seconds)
+                    if max(server_seconds, sample_seconds) > self.cpu_budget_seconds:
+                        raise quiet.QuietViolation(f"reviewed idle-server CPU budget exceeded: "
+                            f"{max(server_seconds, sample_seconds):.6f}s > {self.cpu_budget_seconds:.6f}s per {self.window_seconds:g}s")
+                    check_idle_connections(sockets, ports)
                 for row in after.values():
-                    if row.kernel_thread or row.identity in owned or row.identity not in active:
+                    if row.kernel_thread or row.identity in owned:
                         continue
-                    if row.name in quiet.COMPETING or row.experiment_driver:
+                    if row.name in quiet.ACTIVE_EXPERIMENTS or row.experiment_driver:
+                        raise quiet.QuietViolation(f"active foreign experiment PID {row.pid} ({row.name})")
+                    if row.identity not in active:
+                        continue
+                    if row.name in quiet.SERVERS and row.identity not in self.idle_servers:
                         raise quiet.QuietViolation(f"foreign server/experiment PID {row.pid} is CPU-active")
                     if row.identity not in self.reviewed:
                         known = next((item for item in self.document["processes"]
@@ -299,6 +399,7 @@ class QualificationMonitor(quiet.QuietMonitor):
                      "rolling_cpu_seconds": sum(row["cpu_ticks"] for _, _, rows in self.activity_windows
                                                 for row in rows) * self.tick_seconds,
                      "cpu_budget_seconds": self.cpu_budget_seconds,
+                     "idle_server_cpu_activity": server_activity, "idle_server_tcp_snapshot": sockets,
                      "would_refuse": failure if generic else None, "hard_failure": self.failure}
             with self.sample_path.open("a") as stream:
                 stream.write(json.dumps(event, sort_keys=True) + "\n")
@@ -341,6 +442,11 @@ class QualificationMonitor(quiet.QuietMonitor):
                       scope="background-qualification; never eligible for a standing null or gate receipt",
                       postflight_seconds=self.postflight_seconds, would_refuse=self.would_refuse,
                       reviewed_inventory=self.document, sample_artifact=str(self.sample_path))
+        result["idle_server_screening"] = {"identities_and_ports": [
+            {"pid": key[0], "start_ticks": key[1], "listener_ports": ports} for key, ports in self.idle_servers.items()],
+            "peak_rolling_cpu_seconds": self.idle_peak_seconds, "cpu_budget_seconds": self.cpu_budget_seconds,
+            "window_seconds": self.window_seconds,
+            "limitation": "periodic namespace TCP snapshots cannot exclude brief traffic between samples or prove socket-to-PID attribution; incomplete executable identity remains unknown"}
         return result
 
 
@@ -455,6 +561,22 @@ def self_test():
                                       identity=weak_metadata())
         return value
 
+    def idle_document(weak=False):
+        value = weak_document() if weak else document()
+        row = value["processes"][0]
+        row.update(classification="idle-server", comm="memcached" if weak else "GarnetServer",
+                   listener_ports=[11211] if weak else [8590], parent_pid=1, affinity=list(range(64)))
+        if weak:
+            row["identity"]["comm"] = row["comm"]
+        else:
+            row["identity"]["exe"]["path"] = "/test/GarnetServer"
+        return value
+
+    def idle_sockets(ports=(8590,), state=10):
+        return {"started_monotonic": 0, "ended_monotonic": 0, "namespace": "net:[123]",
+                "ports": list(ports), "rows": [{"local_port": port, "remote_port": 0,
+                                                "state": state} for port in ports]}
+
     class Controls(unittest.TestCase):
         def test_incomplete_reader_records_denial_without_inventing_an_executable(self):
             with tempfile.TemporaryDirectory() as tmp:
@@ -559,18 +681,146 @@ def self_test():
                 self.assertNotEqual(before["script"]["sha256"], after["script"]["sha256"])
 
         @contextlib.contextmanager
-        def fixture(self):
+        def fixture(self, declaration=None):
+            declaration = declaration or document()
             clock = [0.0]
             rows = {10: quiet.Process(10, 1, 1, "python3", 10, frozenset(range(64))),
-                    20: quiet.Process(20, 3, 1, "frontend", 100, frozenset(range(64)))}
+                    20: quiet.Process(20, 3, 1, declaration["processes"][0]["comm"], 100, frozenset(range(64)))}
             with tempfile.TemporaryDirectory() as tmp, \
                  mock.patch.object(quiet, "snapshot", side_effect=lambda **kwargs: dict(rows)), \
                  mock.patch.object(quiet, "read_topology", side_effect=lambda cpus: {c: frozenset([c]) for c in cpus}), \
                  mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
-                 mock.patch(__name__ + ".identity", side_effect=lambda pid, start: metadata(pid, start)):
+                 mock.patch(__name__ + ".identity", side_effect=lambda pid, start:
+                            declaration["processes"][0]["identity"] if pid == 20 else metadata(pid, start)):
                 monitor = QualificationMonitor(list(range(32)), list(range(32, 64)), own_root_pid=10,
-                    reviewed=reviewed_inventory(document()), document=document(), output=Path(tmp))
+                    reviewed=reviewed_inventory(declaration), document=declaration, output=Path(tmp))
                 yield monitor, rows, clock
+
+        def test_idle_server_requires_explicit_ports_and_identity_review(self):
+            for weak in (False, True):
+                self.assertIn((20, 3), reviewed_inventory(idle_document(weak)))
+                for field, replacement in (("reviewed", False), ("listener_ports", []),
+                        ("listener_ports", [0]), ("listener_ports", [True]), ("listener_ports", [8590, 8590]),
+                        ("classification", "desktop"), ("comm", "cc1plus")):
+                    value = idle_document(weak)
+                    value["processes"][0][field] = replacement
+                    with self.subTest(weak=weak, field=field, replacement=replacement), self.assertRaises(ValueError):
+                        reviewed_inventory(value)
+            value = idle_document(True)
+            value["processes"][0]["accept_incomplete_executable"] = False
+            with self.assertRaises(ValueError):
+                reviewed_inventory(value)
+
+        def test_single_reviewed_server_tick_retained_full_and_incomplete(self):
+            for weak in (False, True):
+                value = idle_document(weak)
+                with self.subTest(weak=weak), self.fixture(value) as (monitor, rows, clock), \
+                     mock.patch(__name__ + ".incomplete_identity", return_value=value["processes"][0]["identity"]), \
+                     mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets(value["processes"][0]["listener_ports"])):
+                    rows[20] = replace(rows[20], ticks=101)
+                    clock[0] = 1
+                    monitor.sample()
+                    monitor.check()
+                    event = json.loads(monitor.sample_path.read_text())
+                    self.assertEqual(event["user_cpu_activity"][0]["cpu_ticks"], 1)
+                    self.assertEqual(event["idle_server_cpu_activity"][0]["cpu_ticks"], 1)
+                    self.assertEqual(event["idle_server_tcp_snapshot"]["rows"][0]["state"], 10)
+                    self.assertAlmostEqual(monitor.evidence()["idle_server_screening"]["peak_rolling_cpu_seconds"], .01)
+                    self.assertFalse(monitor.evidence()["complete"])
+
+        def test_idle_server_budget_is_hard_and_aggregates_partial_windows(self):
+            with self.fixture(idle_document()) as (monitor, rows, clock), \
+                 mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets()):
+                clock[0], rows[20] = 19, replace(rows[20], ticks=190)
+                monitor.sample()
+                monitor.check()
+                clock[0], rows[20] = 21, replace(rows[20], ticks=200)
+                monitor.sample()
+                with self.assertRaisesRegex(quiet.QuietViolation, "idle-server CPU budget exceeded"):
+                    monitor.check()
+                self.assertAlmostEqual(monitor.idle_peak_seconds, 1.0)
+                # Hard failure remains latched even after the offending window expires.
+                clock[0] = 100
+                monitor.sample()
+                with self.assertRaises(quiet.QuietViolation):
+                    monitor.check()
+
+        def test_two_idle_servers_share_one_budget(self):
+            value = idle_document()
+            second = {**value["processes"][0], "pid": 21, "start_ticks": 4,
+                      "listener_ports": [11211], "identity": metadata(21, 4)}
+            value["processes"].append(second)
+            with self.fixture(value) as (monitor, rows, clock), \
+                 mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets((8590, 11211))):
+                # Capture both existing servers before charging their CPU deltas.
+                rows[21] = quiet.Process(21, 4, 1, "GarnetServer", 0, frozenset(range(64)))
+                monitor.sample()
+                clock[0] = 1
+                rows[20], rows[21] = replace(rows[20], ticks=160), replace(rows[21], ticks=60)
+                monitor.sample()
+                with self.assertRaisesRegex(quiet.QuietViolation, "1.200000s > 0.960000s"):
+                    monitor.check()
+                events = [json.loads(line) for line in monitor.sample_path.read_text().splitlines()]
+                self.assertEqual([row["cpu_ticks"] for row in events[-1]["idle_server_cpu_activity"]], [60, 60])
+
+        def test_idle_server_port_states_descendants_and_identity_are_hard(self):
+            for state in (1, 2, 3, 4, 5, 8, 9, 11, 12):
+                with self.subTest(state=state), self.fixture(idle_document()) as (monitor, rows, clock), \
+                     mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets(state=state)):
+                    monitor.sample()
+                    with self.assertRaisesRegex(quiet.QuietViolation, "non-listener live TCP"):
+                        monitor.check()
+                    self.assertEqual(json.loads(monitor.sample_path.read_text())["idle_server_tcp_snapshot"]["rows"][0]["state"], state)
+            for change in ("child", "identity", "parent", "affinity", "comm", "compiler", "driver"):
+                with self.subTest(change=change), self.fixture(idle_document()) as (monitor, rows, clock), \
+                     mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets()):
+                    if change == "child":
+                        rows[30] = quiet.Process(30, 4, 20, "sleep", 0, frozenset([0]))
+                    elif change == "compiler":
+                        rows[30] = quiet.Process(30, 4, 1, "cc1plus", 0, frozenset([0]))
+                    elif change == "driver":
+                        rows[30] = quiet.Process(30, 4, 1, "python3", 0, frozenset([0]), experiment_driver=True)
+                    else:
+                        fields = {"identity": {"start": 99}, "parent": {"parent": 99},
+                                  "affinity": {"affinity": frozenset([1])}, "comm": {"name": "changed"}}
+                        rows[20] = replace(rows[20], **fields[change])
+                    monitor.sample()
+                    with self.assertRaises(quiet.QuietViolation):
+                        monitor.check()
+
+        def test_idle_listener_disappearance_snapshot_error_and_exec_change_are_hard(self):
+            for error in (False, True):
+                with self.subTest(error=error), self.fixture(idle_document()) as (monitor, rows, clock), \
+                     mock.patch(__name__ + ".tcp_snapshot", side_effect=PermissionError("TCP unobserved") if error else None,
+                                return_value={**idle_sockets(), "rows": []}):
+                    monitor.sample()
+                    with self.assertRaises(quiet.QuietViolation):
+                        monitor.check()
+            with self.fixture(idle_document()) as (monitor, rows, clock), \
+                 mock.patch(__name__ + ".identity", return_value=metadata()), \
+                 mock.patch(__name__ + ".tcp_snapshot", return_value=idle_sockets()):
+                monitor.sample()
+                with self.assertRaisesRegex(quiet.QuietViolation, "observed identity changed"):
+                    monitor.check()
+
+        def test_tcp_parser_reads_both_families_and_remote_ports_without_connecting(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                header = "  sl  local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n"
+                def record(local, remote, state, inode=123):
+                    return f"0: 00000000:{local:04X} 00000000:{remote:04X} {state:02X} 00000000:00000000 00:0 0 1000 0 {inode}\n"
+                (root / "tcp").write_text(header + record(8590, 0, 10) + record(8590, 42, 6))
+                (root / "tcp6").write_text(header + record(1234, 8590, 1) + record(4321, 999, 1))
+                observed = tcp_snapshot({8590}, root)
+                self.assertEqual(len(observed["rows"]), 3)
+                self.assertEqual({row["protocol"] for row in observed["rows"]}, {"tcp", "tcp6"})
+                with self.assertRaisesRegex(quiet.QuietViolation, "non-listener live TCP"):
+                    check_idle_connections(observed, {8590})
+                observed["rows"] = [row for row in observed["rows"] if row["state"] != 1]
+                check_idle_connections(observed, {8590})  # TIME_WAIT retained, not a live peer.
+                (root / "tcp6").write_text(header + "malformed\n")
+                with self.assertRaisesRegex(quiet.QuietViolation, "malformed tcp6"):
+                    tcp_snapshot({8590}, root)
 
         def test_reviewed_ticks_cross_budget_but_never_certify_quiet(self):
             with self.fixture() as (monitor, rows, clock):
@@ -687,6 +937,7 @@ def self_test():
                 def measure(runner, cell, arm, sequence, instances, knobs):
                     calls.append((cell.id, instances, sequence, arm))
                     return {"arm": arm, "rate": 100, "busy_pct": 99.9, "latency_ms": 1,
+                            "instances": instances, "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
                             "complete": True, "midpoint_monotonic": 20 + len(calls) * 30,
                             "window_seconds": 20, "artifacts": f"{cell.id}/n{instances}-{sequence}-{arm}"}
                 real_write = Path.write_text
