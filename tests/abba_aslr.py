@@ -125,7 +125,12 @@ class AddressCapture:
             row["executable"] = {"path": str(exe.resolve(strict=True)), "sha256": abba.sha256(exe)}
             if row["executable"]["sha256"] != self.executable:
                 raise RuntimeError("owned exec chain did not reach the frozen measurement binary")
-            row["exec_argv"] = [part.decode(errors="replace") for part in (root / "cmdline").read_bytes().split(b"\0") if part]
+            # Empty arguments are meaningful (the server uses --save ""). Drop
+            # only the terminating NUL, never empty fields within the argv vector.
+            raw_argv = (root / "cmdline").read_bytes()
+            if not raw_argv.endswith(b"\0"):
+                raise RuntimeError("owned executable argv is empty or incomplete")
+            row["exec_argv"] = [part.decode(errors="replace") for part in raw_argv[:-1].split(b"\0")]
             row["kernel_randomize_va_space"] = int(Path("/proc/sys/kernel/randomize_va_space").read_text())
             if row["kernel_randomize_va_space"] != 2:
                 raise RuntimeError("kernel ASLR policy is not 2; ON would not mean full ASLR")
@@ -458,7 +463,7 @@ def self_test():
                     destination = folder / str(len(list(folder.iterdir())))
                     destination.mkdir()
                     argv = server_command(["taskset", "-c", str(min(os.sched_getaffinity(0))),
-                        str(executable), "-u", "-c", "import sys; print('READY',flush=True); sys.stdin.read()"],
+                        str(executable), "-u", "-c", "import sys; print('READY',flush=True); sys.stdin.read()", ""],
                         posture, shutil.which("setarch"))
                     p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, start_new_session=True)
@@ -472,6 +477,7 @@ def self_test():
                         capture.begin(p, [object()])
                         capture.finish(10, 30, 1)
                         self.assertEqual(capture.record["status"], "COMPLETE")
+                        self.assertEqual(capture.record["captures"]["after-window"]["exec_argv"][-1], "")
                         self.assertEqual(capture.record["captures"]["after-window"]["personality_hex"],
                                          "00040000" if posture == "OFF" else "00000000")
                         with self.assertRaisesRegex(RuntimeError, "PID was reused"):
