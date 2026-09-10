@@ -5,8 +5,10 @@
 #                         matrix, smoke, torture, RYOW, atomic torn/mixed-write/window gates,
 #                         shutdown invariants, counter-fired feature matrix, idle-loop ceiling. Runs on
 #                         any machine.
-#   tests/gate.sh full    quick + mandatory loopback performance vs tests/gate_perf_refs.json
-#                         (UNARMED is red) + torture-under-ASAN + the Redis 7.4 differential matrix
+#   tests/gate.sh full    quick + the mandatory headline ABBA tier (the last pushed binary against
+#                         the candidate, same session, same box, threshold derived from the
+#                         reference's own spread; a missing reference SKIPS LOUDLY and stays red)
+#                         + torture-under-ASAN + the Redis 7.4 differential matrix
 #                         + NIC regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
 #                         netns rig and its scratchpad binaries/procsafe helper).
 #
@@ -26,6 +28,12 @@
 set -u
 cd "$(dirname "$0")/.."
 TIER=${1:-quick}
+if [ "$TIER" = perf ]; then
+  # Only the ABBA tier, against an already-built candidate. Used while iterating on a change so a
+  # lane can check its own merit without paying for the full correctness gate first.
+  shift
+  exec python3 tests/abbagate.py "$@"
+fi
 PORT=${GATE_PORT:-7899}
 CORES=${GATE_CORES:-0-7}
 NCORES=$(taskset -c "$CORES" nproc)
@@ -139,8 +147,12 @@ ROW_T=$(date +%s.%N)
 # Merged 2026-09-07: the ring unit is one row in BOTH tiers (server-less, under two seconds), so
 # quick is 326 + 1 = 327 and full is 343 + 1 = 344. Counted by line: the ring row is emitted with
 # the static rows, far above the quick-tier exit, and the P0 rows stay below it.
-EXPECT_QUICK=383
-EXPECT_FULL=400                 # full without the optional NIC row.
+# Measured on the 2026-09-10 full run: 418 rows before the quick-tier exit, 467 total. This run
+# then removed the 32-row stored-reference loopback tier and added two ABBA rows -- the serverless
+# negative control BEFORE the quick exit (quick +1, full +1) and the mandatory headline result
+# AFTER it (full +1). 418+1 = 419 quick; 467-32+2 = 437 full.
+EXPECT_QUICK=419
+EXPECT_FULL=437                 # full without the optional NIC row.
 say(){ printf '  %-52s %s\n' "$1" "$2"; }
 ledger(){ # verdict label -> one ledger line; the elapsed column is wall time since the last row
   local now; now=$(date +%s.%N)
@@ -1396,40 +1408,34 @@ for FEATURE_CELL in split-home-min fused-home-max-nopin split-shards-auto; do
       || bad "feature $FEATURE_CELL" "see $FEATURE_OUTPUT/$FEATURE_CELL.log"
 done
 
+# The ABBA tier's own decision logic, saturation rules and rejection paths, exercised serverless so
+# a broken comparator is caught on any machine and before any measurement is trusted.
+py tests/abbagate.py --self-test > /tmp/gate-abbagate-unit.txt 2>&1 \
+    && ok "ABBA comparison + saturation negative controls" \
+    || bad "ABBA comparison + saturation negative controls" "see /tmp/gate-abbagate-unit.txt"
+
 if [ "$TIER" = quick ]; then
   program_state "$EXPECT_QUICK"
   echo; echo "GATE(quick): $PASS ok, $FAIL FAIL"; [ $FAIL -eq 0 ] || exit 1; exit 0
 fi
 
-# ---- B. mandatory loopback performance (32 rows, AFTER the quick-tier exit) -------------------
-# Unlike the optional NIC battery, this is always invoked. No reference means a LOUD UNARMED
-# skip and a counted failure: a correctness-only release must never call itself a clean full gate.
-# p32 requires >=98% busy on EACH executing thread and a measured generator plateau. p1 scores
-# fixed-concurrency round trips, with generator headroom, and never uses that saturation rule.
-# Pins are only read here. Missing telemetry, population, lane hits, or a null-derived bound is
-# a failure. Re-pinning is a separate, reviewed maintainer action documented in GATES.md.
-PERF_OUTPUT=${GATE_PERF_OUTPUT:-$(mktemp -d "$PWD/build/gate-perf.XXXXXX")}
-PERF_UNARMED=0
-for PC in GET SET MGET MSET; do for PP in 1 32; do for PM in 1s 2s; do for PR in 0 1; do
-  PERF_CELL=$PC-p$PP-$PM-rl$PR
-  quiet_wait
-  timeout --foreground "${GATE_PERF_TIMEOUT:-600}" taskset -c "${GATE_PERF_LOAD_CORES:-64-127,192-255}" \
-      python3 tests/perf_gate.py check --cell "$PERF_CELL" --binary ./build/tomokv \
-      --server-cpus "${GATE_PERF_CORES:-$CORES}" --load-cpus "${GATE_PERF_LOAD_CORES:-64-127,192-255}" \
-      --ratio "$GATE_RATIO" --port "${GATE_PERF_PORT:-8621}" \
-      --window "${GATE_PERF_WINDOW:-3}" --warmup "${GATE_PERF_WARMUP:-1}" \
-      --keymax "${GATE_PERF_KEYMAX:-200000}" --max-instances "${GATE_PERF_INSTANCES:-4}" \
-      --refs "${GATE_PERF_REFS:-tests/gate_perf_refs.json}" --output "$PERF_OUTPUT/$PERF_CELL" \
-      >"$PERF_OUTPUT/$PERF_CELL.log" 2>&1
-  PERF_RC=$?
-  case $PERF_RC in
-    0) ok "loopback performance $PERF_CELL";;
-    3) PERF_UNARMED=1
-       say "loopback performance $PERF_CELL" "SKIPPED (UNARMED: no reviewed reference numbers)"
-       bad "loopback performance $PERF_CELL" "mandatory tier UNARMED; see $PERF_OUTPUT/$PERF_CELL.log";;
-    *) bad "loopback performance $PERF_CELL" "exit $PERF_RC; see $PERF_OUTPUT/$PERF_CELL.log";;
-  esac
-done; done; done; done
+# ---- B. mandatory headline performance: ABBA vs the LAST PUSHED BINARY ------------------------
+# Replaces the stored-reference tier that stood here. A stored rate goes stale the moment the
+# kernel, compiler, microcode or machine changes, and this tree's reference file was pinned to a
+# kernel that no longer runs -- which made every verdict it produced provisional and left the tier
+# permanently UNARMED, i.e. a guaranteed red row carrying no information. The reference is now the
+# last pushed build itself, measured in THIS session on THIS box, interleaved A/B/B/A, with the
+# failure threshold derived from the reference's own observed spread rather than a fixed
+# percentage. A missing reference is a loud SKIP that still cannot exit green.
+# Rationale and the full contract: the module docstring in tests/abbagate.py.
+quiet_wait
+python3 tests/abbagate.py
+ABBA_RC=$?
+case "$ABBA_RC" in
+  0) ok "headline ABBA vs last pushed binary";;
+  3) bad "headline ABBA vs last pushed binary" "SKIPPED -- NOT A PASS; see ABBA output";;
+  *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
+esac
 
 # ---- 4. full tier: torture under ASAN ---------------------------------------------------------
 boot $ASAN --atomic 1 --enable-debug-command yes || bad "ASAN boot"
@@ -1658,5 +1664,5 @@ fi
 
 program_state "$((EXPECT_FULL+NIC_CHECKED))"
 echo
-echo "GATE(full): $PASS ok, $FAIL FAIL (loopback unarmed=$PERF_UNARMED, NIC checked=$NIC_CHECKED)"
+echo "GATE(full): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED)"
 [ $FAIL -eq 0 ] || exit 1
