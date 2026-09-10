@@ -69,6 +69,7 @@ import time
 from _lib import Conn
 from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
 from gate_quiet import QuietMonitor, QuietViolation
+from abba_saturation import parse_snapshot, productive_saturation, self_test as saturation_self_test
 from gate_receipt import harness_fingerprint, read_json
 from abba_evidence import match_null, null_result
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
@@ -672,15 +673,7 @@ def lb_snapshot(conn, path):
     if not isinstance(raw, bytes):
         raise RuntimeError("DEBUG LBSIGNALS returned no telemetry")
     path.write_bytes(raw)
-    rows = {}
-    for line in raw.decode().splitlines():
-        f = line.split()
-        if f and f[0] == "thread":
-            # Schema 1 stable prefix: tid role domain clients iters ops busy_ns idle_ns cpu_ns.
-            rows[int(f[1])] = {"role": f[2], "busy": int(f[7]), "idle": int(f[8])}
-    if not rows:
-        raise RuntimeError("LBSIGNALS has no thread counters; cannot prove saturation")
-    return rows
+    return parse_snapshot(raw)
 
 
 def busy_between(start, end):
@@ -833,10 +826,10 @@ class Runner:
                 raise RuntimeError("not all requested load connections are active")
             before_lb = lb_snapshot(conn, folder / "lb-before.txt")
             before_lb_at = time.monotonic()
-            if len(before_lb) != len(self.server_cpus):
+            if len(before_lb.threads) != len(self.server_cpus):
                 raise RuntimeError("server thread count differs from requested CPU geometry")
-            roles = {role: sum(row["role"] == role for row in before_lb.values())
-                     for role in {row["role"] for row in before_lb.values()}}
+            roles = {role: sum(row["role"] == role for row in before_lb.threads.values())
+                     for role in {row["role"] for row in before_lb.threads.values()}}
             expected_roles = ({"fused": len(self.server_cpus)} if cell.mode == "1s"
                               else {"io": len(self.server_cpus) - ex, "ex": ex})
             if roles != expected_roles:
@@ -863,11 +856,15 @@ class Runner:
             misses = int(after["keyspace_misses"]) - int(before["keyspace_misses"])
             if misses != 0:
                 raise RuntimeError(f"GETs missed prepopulated keys: {misses}")
-            busy, per_thread = busy_between(before_lb, after_lb)
+            busy, per_thread = busy_between(before_lb.threads, after_lb.threads)
             result.update(rate=commands / (t1 - t0), commands=commands, window_seconds=t1 - t0,
                           midpoint_monotonic=(t0 + t1) / 2, busy_pct=busy, thread_busy_pct=per_thread,
-                          thread_activity_deltas=busy_deltas(before_lb, after_lb),
+                          thread_activity_deltas=busy_deltas(before_lb.threads, after_lb.threads),
                           lb_snapshot_window_seconds=after_lb_at - before_lb_at,
+                          # Preparation only: the old busy_pct still controls assess()
+                          # and pin failure. This field can never validate its own rule.
+                          diagnostic_saturation=productive_saturation(
+                              before_lb, after_lb, floor_pct=BUSY_FLOOR),
                           cpu_pct=100 * (after_cpu - before_cpu) / ((t1 - t0) * len(self.server_cpus)),
                           info_before=before, info_after=after)
             result["workload_witness"] = require_workload_witness(
@@ -2056,4 +2053,4 @@ def self_test():
 
 if __name__ == "__main__":
     args = parse_args()
-    sys.exit(self_test() if args.self_test else main(args))
+    sys.exit(max(self_test(), saturation_self_test()) if args.self_test else main(args))
