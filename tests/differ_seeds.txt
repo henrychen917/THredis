@@ -2,3 +2,4 @@
 7
 19
 20 # CLIENT TRACKINGINFO optout/caching-no and overlapping PREFIX error precedence.
+23 # Re-enabling CLIENT TRACKING BCAST adds the implicit empty prefix to held prefixes.

@@ -213,6 +213,27 @@ try:
     expect(g.command("CLIENT", "TRACKING", "off"), b"OK", "clear collision probe")
     checks += 5
 
+    # Seed 23: an omitted PREFIX extends a live BCAST registration with one empty prefix.
+    # Preserve the explicit prefixes, then prove both error precedence and idempotence; merely
+    # accepting the command would miss the registration defect found by the rotating matrix.
+    prefix_baseline = stats()["tracking_total_prefixes"]
+    expect(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "b", "PREFIX", "user:1"),
+           b"OK", "seed 23 explicit prefixes")
+    for _ in range(2):
+        expect(g.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "add implicit empty prefix")
+        expect(g.command("CLIENT", "TRACKINGINFO"),
+               [b"flags", [b"on", b"bcast"], b"redirect", 0, b"prefixes", [b"", b"b", b"user:1"]],
+               "implicit prefix is retained once alongside explicit prefixes")
+    expect(stats()["tracking_total_prefixes"], prefix_baseline + 3, "implicit prefix registered once")
+    for prefixes in (("user:", "ab"), ("ab", "ab")):
+        expect_err(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", prefixes[0],
+                             "PREFIX", prefixes[1]),
+                   f"ERR Prefix '{prefixes[0]}' overlaps with an existing prefix ''. "
+                   "Prefixes for a single client must not overlap.", "seed 23 empty-prefix precedence")
+    expect(g.command("CLIENT", "TRACKING", "off"), b"OK", "clear implicit prefix probe")
+    expect(stats()["tracking_total_prefixes"], prefix_baseline, "implicit prefix accounting disarmed")
+    checks += 10
+
     # mode switching is refused while on
     expect(g.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "TRACKING on BCAST")
     expect_err(g.command("CLIENT", "TRACKING", "on"),
@@ -312,6 +333,15 @@ try:
     expect(b.command("CLIENT", "TRACKINGINFO"),
            [b"flags", [b"on", b"bcast"], b"redirect", 0, b"prefixes", [b"bc:"]],
            "BCAST TRACKINGINFO")
+    # The implicit empty subscription widens delivery, and Redis emits a separate frame for
+    # each matching prefix. Repeating the command must neither lose nor multiply those frames.
+    for _ in range(2):
+        expect(b.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "extend BCAST to all keys")
+        writer.command("SET", "other:implicit", "x")
+        expect(b.drain(), push(b"other:implicit"), "implicit prefix covers previously excluded key")
+        writer.command("SET", "bc:implicit", "x")
+        expect(b.drain(), push(b"bc:implicit") * 2, "one invalidation per held matching prefix")
+    checks += 6
     b.command("CLIENT", "TRACKING", "off")
     b.drain(0.2)
     writer.command("SET", "bc:2", "x")

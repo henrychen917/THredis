@@ -59,16 +59,18 @@ void track_filter_clear() {
         g_track_filter[i].store(0, std::memory_order_relaxed);
 }
 
-bool track_prefix_matches(const std::vector<std::string>& prefixes, Slice key) {
-    if (prefixes.empty()) return true;   // BCAST with no PREFIX tracks the whole keyspace
+size_t track_prefix_match_count(const std::vector<std::string>& prefixes, Slice key) {
+    if (prefixes.empty()) return 1;   // BCAST with no PREFIX tracks the whole keyspace
+    size_t matches = 0;
     for (const std::string& prefix : prefixes) {
         if (prefix.size() > key.n) continue;
-        if (std::memcmp(prefix.data(), key.p, prefix.size()) == 0) return true;
+        if (std::memcmp(prefix.data(), key.p, prefix.size()) == 0) matches++;
     }
-    return false;
+    return matches;
 }
 
-// Redis refuses overlapping BCAST prefixes so a key can never be reported twice.
+// Explicit BCAST prefixes cannot overlap; adding the implicit empty prefix later is Redis's
+// exception, handled after validation below and with per-prefix delivery above.
 bool track_prefix_overlaps(const std::string& a, const std::string& b) {
     const size_t shortest = std::min(a.size(), b.size());
     return std::memcmp(a.data(), b.data(), shortest) == 0;
@@ -332,8 +334,11 @@ void IoLoop::tracking_invalidate_local(Slice key, uint64_t writer_id) {
         ClimonConn& state = entry.second;
         if (!state.tracking_on || !state.bcast) continue;
         if (state.noloop && entry.first == writer_id) continue;
-        if (!track_prefix_matches(state.prefixes, key)) continue;
-        tracking_deliver_frame(state, entry.first, key, false);
+        // Re-enabling BCAST without PREFIX adds the implicit empty prefix even when an
+        // explicit prefix is held. Redis delivers once per matching subscription in that
+        // case; coalescing the two matches would silently change its invalidation stream.
+        for (size_t matches = track_prefix_match_count(state.prefixes, key); matches; matches--)
+            tracking_deliver_frame(state, entry.first, key, false);
     }
     // 2. Per-key remembering. Redis forgets the key once it has reported it.
     if (climon_track_keys_.empty()) return;
@@ -721,9 +726,13 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
     // `CLIENT TRACKING on` after `on OPTIN`/`on NOLOOP` clears optin/noloop (differ-pinned).
     // Only an explicit contradiction (OPTIN while OPTOUT is held) is refused, above.
     state.bcast = bcast;
-    // Oracle-confirmed: `CLIENT TRACKING on BCAST` with no PREFIX registers the EMPTY prefix,
-    // which TRACKINGINFO reports as one zero-length entry and which matches every key.
-    if (bcast && prefixes.empty() && state.prefixes.empty()) prefixes.emplace_back();
+    // Seed 23: omitting PREFIX adds the implicit empty prefix even to an existing explicit
+    // prefix set. It bypasses the supplied-prefix collision checks above, is registered once,
+    // and sorts first for TRACKINGINFO and later overlap errors. Repeated ON BCAST must not
+    // duplicate either the subscription or its allocation/accounting.
+    if (bcast && prefixes.empty() &&
+        std::find(state.prefixes.begin(), state.prefixes.end(), std::string{}) == state.prefixes.end())
+        prefixes.emplace_back();
     state.optin = optin;
     state.optout = optout;
     state.noloop = noloop;
