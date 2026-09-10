@@ -149,6 +149,39 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
     return started, environment
 
 
+def null_resolution(report):
+    """A byte-identical gain is instrument error just as a loss is.
+
+    Comparison assessments deliberately reject only regressions. A null instead
+    requires BOTH signs of the paired delta to fit the same measured reference
+    spread. Recompute from every raw block, including unselected escalation probes:
+    neither a cached PASS nor selecting another rung may hide a failed control.
+    There is no new floor, multiplier, or change to a code comparison's threshold.
+    """
+    evidence = []
+    for row in report["cells"]:
+        cell = row["cell"]
+        metric = {"auto": "latency_ms" if cell["depth"] == 1 else "rate",
+                  "rate": "rate", "latency": "latency_ms", "p999": "p999_ms"}.get(cell.get("score", "auto"))
+        require(metric is not None, f"unknown scored null metric: {cell['id']}")
+        metrics = [metric] + (["long_p999_ms"] if metric == "p999_ms" else [])
+        for block in row["rounds"]:
+            runs = block["runs"]
+            require([run.get("arm") for run in runs] == ORDER, "incomplete or reordered null block")
+            for scored in metrics:
+                a1, b1, b2, a2 = [number(run.get(scored), "null " + scored, positive=True) for run in runs]
+                denominator = number(a1 + a2, "null reference sum", positive=True)
+                delta = signed_number(100 * ((b1 - a1) + (b2 - a2)) / denominator, "null paired delta")
+                threshold = number(200 * abs(a1 - a2) / denominator, "null reference spread")
+                require(abs(delta) <= threshold,
+                        f"{cell['id']} n={block['instances']} {scored} null resolution failed: "
+                        f"absolute paired delta {abs(delta):.6g}% (signed {delta:+.6g}%) "
+                        f"exceeds measured reference spread {threshold:.6g}%")
+                evidence.append(dict(cell=cell["id"], instances=block["instances"], metric=scored,
+                                     delta_pct=delta, absolute_delta_pct=abs(delta), reference_spread_pct=threshold))
+    return evidence
+
+
 def null_result(report, *, now):
     validate_measurements(report, now=now)
     require(report.get("run_kind") == "null-control" and report.get("comparison_trusted") is False and
@@ -159,7 +192,7 @@ def null_result(report, *, now):
             all(isinstance(value, str) and value for value in population.values()) and
             population["A"] == population["B"], "null arms used different population methods")
     return {"verdict": "PASS", "binary_sha256": report["candidate"]["sha256"],
-            "ids": report["coverage"]["ids"]}
+            "ids": report["coverage"]["ids"], "resolution": null_resolution(report)}
 
 
 def validate_null(report, *, now):

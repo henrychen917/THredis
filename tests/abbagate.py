@@ -1372,7 +1372,13 @@ def main(args, *, diagnostic_monitor=None):
                     "background qualification is diagnostic only; not a standing null or a gate PASS"}
                 print("BACKGROUND QUALIFICATION: raw cells pass; instrument remains UNTRUSTED", flush=True)
             elif args.collect_null:
-                report["null_control"] = null_result(report, now=time.time())
+                try:
+                    report["null_control"] = null_result(report, now=time.time())
+                except ValueError as error:
+                    # A favorable code-comparison verdict can still fail the null's
+                    # two-sided instrument check. Retain that distinct failure.
+                    report["null_control"] = {"verdict": "FAIL", "reason": str(error)}
+                    raise
                 print("NULL CONTROL PASS: selected cells passed with byte-identical arms; not a code-comparison PASS", flush=True)
             else:
                 try:
@@ -1780,6 +1786,42 @@ def self_test():
             self.assertAlmostEqual(p["threshold_pct"], 100 * .3 / 100.15)
             self.assertGreater(p["pair_deltas_pct"][0], 0)
             self.assertLess(p["pair_deltas_pct"][1], 0)
+
+        def test_null_resolution_rejects_equal_gain_and_loss_for_every_scored_metric(self):
+            from abba_evidence import null_resolution
+            for score, depth, metric in (("rate", 32, "rate"), ("latency", 1, "latency_ms"),
+                                         ("p999", 32, "p999_ms"), ("p999", 32, "long_p999_ms")):
+                cell = replace(self.cell, score=score, depth=depth,
+                               op="REORDER" if score == "p999" else "GET")
+                for error in (-1.01, -1., 0., 1., 1.01):
+                    with self.subTest(metric=metric, error=error):
+                        runs = [dict(arm=arm, rate=100., latency_ms=100., p999_ms=100., long_p999_ms=100.)
+                                for arm in ORDER]
+                        for run, value in zip(runs, (99.5, 100 + error, 100 + error, 100.5)):
+                            run[metric] = value
+                        # Cached summaries deliberately claim success and a huge
+                        # allowance; only raw observations establish null resolution.
+                        report = {"cells": [dict(cell=asdict(cell), assessment={"verdict": "PASS", "threshold_pct": 99},
+                                                 rounds=[dict(instances=4, runs=runs)])]}
+                        if abs(error) > 1:
+                            with self.assertRaisesRegex(ValueError, metric + " null resolution failed"):
+                                null_resolution(report)
+                        else:
+                            checks = null_resolution(report)
+                            scored = next(row for row in checks if row["metric"] == metric)
+                            self.assertAlmostEqual(scored["absolute_delta_pct"], abs(error))
+                            self.assertEqual(scored["reference_spread_pct"], 1.)
+                            self.assertEqual(len(checks), 2 if score == "p999" else 1)
+
+        def test_null_resolution_cannot_discard_a_failing_escalation_probe(self):
+            from abba_evidence import null_resolution
+            cell = replace(self.cell, score="rate")
+            good = self.round([100] * 4, n=1)
+            bad = self.round([100, 101, 101, 100], n=2)
+            report = {"cells": [dict(cell=asdict(cell), rounds=[good, bad],
+                                     assessment={"instances": 1, "verdict": "PASS"})]}
+            with self.assertRaisesRegex(ValueError, "n=2 rate null resolution failed"):
+                null_resolution(report)
 
         def test_aabb_is_rejected(self):
             runs = self.round([100] * 4)["runs"]
@@ -2436,6 +2478,18 @@ def self_test():
                                  (3, 8, "PARTIAL", "PASS"))
                 self.assertFalse(control["comparison_trusted"])
                 self.assertEqual((control_out / "binary-A").read_bytes(), (control_out / "binary-B").read_bytes())
+                # The same magnitude in either direction fails an identical-arm
+                # collection. The favorable direction still passes a normal code
+                # comparison: this changes null validity, not regression thresholds.
+                for rate in (99, 101):
+                    rc, calls, failed_null, _ = run(collect=True, candidate_rate=rate)
+                    self.assertEqual((rc, len(calls), failed_null["verdict"]), (1, 8, "FAIL"))
+                    self.assertNotEqual(failed_null.get("null_control", {}).get("verdict"), "PASS")
+                    if rate == 101:
+                        self.assertEqual(failed_null["statistical_verdict"], "PASS")
+                        self.assertIn("null resolution failed", failed_null["null_control"]["reason"])
+                rc, calls, improvement, _ = run(control=control, candidate_rate=101)
+                self.assertEqual((rc, len(calls), improvement["verdict"]), (0, 8, "PASS"))
                 binary.write_bytes(b"a later candidate may reuse this instrument control")
                 rc, calls, report, _ = run()
                 self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
@@ -2470,6 +2524,8 @@ def self_test():
                     "missing cell": lambda c: c["cells"].pop(),
                     "population": lambda c: c["environment"]["population_by_arm"].update(B="snapshot"),
                     "changed pin": lambda c: c["cells"][0]["cell"].update(instances=8),
+                    "favorable null error": lambda c: [run.update(rate=101) for run in c["cells"][0]["rounds"][0]["runs"]
+                                                        if run["arm"] == "B"],
                 }
                 for name, defect in defects.items():
                     broken = copy.deepcopy(control)
