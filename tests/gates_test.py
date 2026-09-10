@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import sys
 import time
@@ -282,7 +283,7 @@ class ABBATermination(unittest.TestCase):
     def test_terminating_gate_reaps_driver_and_owned_child_but_not_foreign_process(self):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
-        cleanup = gate[gate.index('cleanup(){ # EXIT/INT/TERM:'):gate.index('\nport_listeners(){')]
+        cleanup = gate[gate.index('reap_children(){'):gate.index('\nport_listeners(){')]
         marker = gate.index('# ---- B. mandatory headline performance')
         start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
         launch = gate[start:gate.index('\nesac', start) + len('\nesac')]
@@ -310,9 +311,13 @@ finally:
     (out/'cleaned').write_text('owned child reaped')
 ''')
             prelude = '''set -u
-SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0; ABBA_PID=0; ABBA_ARGS=()
+SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0; ABBA_PID=0; ABBA_ARGS=(); WORKER_PIDS=()
 stop_workers(){ :; }
-python3(){ exec "$WIRE_PYTHON" "$WIRE_DRIVER" "$WIRE_TESTS" "$WIRE_OUTPUT"; }
+row_unwatch(){ :; }
+python3(){
+  if [ "$1" = tests/abbagate.py ]; then exec "$WIRE_PYTHON" "$WIRE_DRIVER" "$WIRE_TESTS" "$WIRE_OUTPUT"
+  else command "$WIRE_PYTHON" "$@"; fi
+}
 ok(){ printf 'ok\\n' >> "$WIRE_OUTPUT/verdict"; }
 bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
 '''
@@ -400,6 +405,7 @@ quiet_wait(){ :; }
 ROW_HISTORY="$RUN_DIR/history"; ROW_RUN_ID=test; ROW_PLAN="$RUN_DIR/plan.json"
 python3 tests/gate_history.py prepare --history "$ROW_HISTORY" --output "$ROW_PLAN"
 cleanup(){ row_unwatch; [ -z "${name:-}" ] || : > "$TMPDIR/cleaned"; }
+reap_children(){ :; } # Real teardown is covered by gate_history's owned-process controls.
 '''
         if delayed_completion:
             # Widen the real open-before-write window past the collector's polling interval.
@@ -480,16 +486,32 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             ])
             script = '\n'.join((prelude, arrays, ledger_functions, placement, scheduler,
                                 'trap stop_workers EXIT', stub))
+            def preserve_failure(stdout='', stderr=''):
+                saved = Path(tempfile.mkdtemp(prefix='scheduler-failure-', dir=root / 'build'))
+                shutil.copytree(directory, saved, dirs_exist_ok=True)
+                (saved / 'fixture.sh').write_text(script)
+                (saved / 'command.stdout').write_text(stdout)
+                (saved / 'command.stderr').write_text(stderr)
+                return f'\nScheduler failure artifacts: {saved}\n'
             result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu,
                                      'bash', '-c', script], cwd=root, env=env,
                                     text=True, capture_output=True, timeout=50)
-            self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-2000:])
+            output = result.stdout + result.stderr
+            if result.returncode:
+                output += preserve_failure(result.stdout, result.stderr)
+            self.assertEqual(result.returncode, 0, output)
             timed_rows = [line.split('\t') for line in (directory / 'ledger').read_text().splitlines()]
             for row in timed_rows:
                 self.assertEqual(len(row), 3)
                 self.assertGreaterEqual(float(row[1]), 0)
+            counts = tuple(map(int, (directory / 'counts').read_text().split()))
+            expected = ((len(self.canonical), 1) if behavior == 'return' else
+                        (len(self.canonical) - 1, 1) if behavior in ('empty', 'red', 'crash') else
+                        (len(self.canonical), 0))
+            if counts != expected:
+                output += preserve_failure(result.stdout, result.stderr)
             return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
-                        counts=tuple(map(int, (directory / 'counts').read_text().split())),
+                        output=output, counts=counts,
                         completion=(directory / 'completion-order').read_text().splitlines(),
                         families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()
                                   if line.split('\t')[0] not in ('production_units', 'core_tsan_build', 'waits_tsan_build')],
@@ -503,7 +525,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         reverse = self.run_scheduler(reverse=True)
         self.assertEqual(forward['completion'], self.canonical)
         self.assertEqual(reverse['completion'], self.canonical[::-1])
-        self.assertEqual(forward['ledger'], reverse['ledger'])
+        self.assertEqual(forward['ledger'], reverse['ledger'], forward['output'] + reverse['output'])
         self.assertEqual(forward['counts'], (len(self.canonical), 0))
         self.assertEqual({row[0] for row in reverse['families']}, set(self.canonical))
         self.assertEqual(reverse['cleaned'], set(self.canonical))
@@ -523,7 +545,10 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
 
     def test_nonzero_worker_return_cannot_be_hidden_by_a_pass_fragment(self):
         result = self.run_scheduler(failure='flipctl', behavior='return')
-        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        # The observed green row remains evidence; the abnormal return adds its own
+        # infrastructure failure instead of silently deleting the partial fragment.
+        self.assertEqual(result['counts'], (len(self.canonical), 1))
+        self.assertIn(b'ok\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
         self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
 
     def test_completion_is_not_visible_before_its_record_is_written(self):
@@ -571,6 +596,8 @@ class TSANWiring(unittest.TestCase):
         stub = r'''set -u
 CORE_TSAN=/unused-core-tsan; WAITS_TSAN=/unused-waits-tsan; CORES=0-7
 quiet_wait(){ :; }
+row_begin(){ :; }
+taskset(){ timeout "$@"; }
 unit_ready(){ return 0; }
 ok(){ printf 'ok\t%s\n' "$1" >> "$RUN_DIR/rows"; }
 bad(){ printf 'FAIL\t%s\n' "$1" >> "$RUN_DIR/rows"; }
@@ -687,12 +714,14 @@ LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; : > "$LEDGER"; : > "$TIMIN
 phase(){ printf 'PHASE %s\n' "$1" >> "$EVENTS"; }
 program_state(){ :; }
 quiet_wait(){ :; }
+row_begin(){ :; }
 collect_job(){
   case " ${JOB_NAMES[*]} " in *" $1 "*) ;; *) echo "unreached job $1" >&2; exit 71;; esac
   printf 'COLLECT %s\n' "$1" >> "$EVENTS"
 }
 join_workers(){ JOINED=1; printf 'JOIN\n' >> "$EVENTS"; }
 python3(){
+  if [ "$1" = tests/gate_history.py ]; then printf "fixture-context\n"; return 0; fi
   [ "$JOINED" = 1 ] || { echo 'measurement before worker join' >&2; return 72; }
   case " ${JOB_NAMES[*]} " in *' abba '*|*' perf '*) return 73;; esac
   printf 'ABBA\n' >> "$EVENTS"

@@ -43,6 +43,62 @@ DEFAULT_MULTIPLIER = 4.0
 DEFAULT_FLOOR = 30.0
 DEFAULT_FALLBACK = 900.0
 
+# These rows can relink from cache in a second and compile from scratch after a header
+# change. Fast history alone says nothing about the first cold run (parbuild's recorded
+# cold cost is 58 s). Keep the established 900 s fallback until cache state is an explicit
+# timing context. Always-fresh standalone compiler rows do not need this exception.
+CACHED_BUILD_ROWS = frozenset(("release build (+footprint locks)", "ASAN build",
+    "read-local ownership-invariant build", "atomic survivors unit build",
+    "netcmd regression build", "waits config publication + admission unit",
+    "reads never wait for retirement quiescence", "storage flags regression",
+    "storage deadline-sidecar regression"))
+
+
+def protect_mechanism_budget(label: str, row: dict) -> dict:
+    row = dict(row)
+    minimum, reason = 0, ""
+    if "lruclock" in label:
+        # This battery waits for the next production bucket, so a healthy 6 s row can
+        # need a full 256 s on the next run. Twice the bucket guards the unobserved phase.
+        minimum, reason = 512, "two production 256s clock buckets"
+    elif label in CACHED_BUILD_ROWS or label.startswith("build dependency: "):
+        minimum, reason = DEFAULT_FALLBACK, "cold cache state not distinguished"
+    if minimum:
+        row["timeout_seconds"] = max(row["timeout_seconds"], minimum)
+        row["mechanism_floor_seconds"] = minimum
+        row["basis"] += f"; mechanism-floor={minimum:g}s ({reason})"
+    return row
+
+
+def dependency_label(argv: list[str]) -> str:
+    """Stable build output/target identity, independent of source lines or worker slots."""
+    for index, argument in enumerate(argv):
+        if Path(argument).name == "parbuild.sh" and index + 1 < len(argv):
+            return canonical_label("build dependency: " + Path(argv[index + 1]).name)
+        if Path(argument).name == "make":
+            targets = sorted(value for value in argv[index + 1:] if value.startswith("build/"))
+            return canonical_label("build dependency: make " + (",".join(targets) or "default"))
+    raise ValueError("hidden build has no recognized make target or parbuild output")
+
+
+def abba_context(argv: list[str]) -> str:
+    # Parse the actual measurement argv; importing the module and its parser starts no
+    # server. Include the source digest so adding cells cannot inherit a short old matrix.
+    import abbagate
+    previous = sys.argv
+    try:
+        sys.argv = ["abbagate.py", *argv]
+        args = abbagate.parse_args()
+    finally:
+        sys.argv = previous
+    context = {"subset": getattr(args, "subset", "full"),
+               "window": getattr(args, "window", abbagate.WINDOW),
+               "cells-sha256": hashlib.sha256(Path(args.cells).read_bytes()).hexdigest()}
+    context.update({axis: getattr(args, axis) for axis in
+                    ("server_cores", "server_smt", "load_cores", "load_smt")})
+    context.update(only=args.only, escalate=int(args.escalate), max_instances=args.max_instances)
+    return "; ".join(f"{key}={value}" for key, value in context.items())
+
 
 def canonical_label(label: str) -> str:
     """The same limited normalization as gate.sh; knob geometry stays significant."""
@@ -81,6 +137,17 @@ def validate_observation(row: object) -> dict:
         raise ValueError("invalid verdict/timed_out")
     if row["timed_out"] and row["verdict"] != "FAIL":
         raise ValueError("an expired row cannot pass")
+    # Old observations remain readable; newly appended evidence always states whether it
+    # produced a ledger row. Receipts can then compare exact multisets without stripping
+    # timeout contexts heuristically or mistaking hidden build timings for gate coverage.
+    if "scored" in row or "ledger_label" in row:
+        if type(row.get("scored")) is not bool:
+            raise ValueError("invalid scored marker")
+        if row["scored"]:
+            if canonical_label(row.get("ledger_label")) != row["ledger_label"]:
+                raise ValueError("stored ledger identity is not canonical")
+        elif row.get("ledger_label") is not None:
+            raise ValueError("unscored observation cannot name a ledger row")
     return row
 
 
@@ -111,11 +178,13 @@ def read_history(directory: Path) -> list[dict]:
 
 
 def record(directory: Path, *, run_id: str, label: str, seconds: float,
-           verdict: str, timed_out: bool = False, observation_id: str | None = None) -> None:
+           verdict: str, timed_out: bool = False, observation_id: str | None = None,
+           scored: bool = True, ledger_label: str | None = None) -> None:
     row = validate_observation({"schema": SCHEMA, "timing": "own-row",
         "run_id": run_id, "observation_id": observation_id or uuid.uuid4().hex,
         "label": canonical_label(label), "seconds": seconds, "verdict": verdict,
-        "timed_out": timed_out, "recorded_at": time.time()})
+        "timed_out": timed_out, "recorded_at": time.time(), "scored": scored,
+        "ledger_label": canonical_label(ledger_label or label) if scored else None})
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / HISTORY_FILE
     # A single locked append protects parallel workers. Verify the complete existing file
@@ -278,7 +347,7 @@ def prepare(directory: Path, imports: list[Path], *, multiplier: float = DEFAULT
             limit = max(limit, 2 * old["max_seconds"])
             item["legacy_interval"] = old
         item.update(timeout_seconds=math.ceil(limit), basis=basis)
-        rows[label] = item
+        rows[label] = protect_mechanism_budget(label, item)
     return {"schema": SCHEMA, "created_at": time.time(),
             "defaults": {"multiplier": multiplier, "floor_seconds": floor,
                          "fallback_seconds": math.ceil(fallback)},
@@ -298,6 +367,8 @@ def budget(plan: dict, label: str) -> dict:
         finite_number(row["median_seconds"], "plan median")
     if not isinstance(row.get("basis"), str) or any(c in row["basis"] for c in "\t\r\n"):
         raise ValueError("invalid timeout basis")
+    if "mechanism_floor_seconds" not in row:
+        row = protect_mechanism_budget(canonical_label(label), row)
     return row
 
 
@@ -373,6 +444,60 @@ def signal_identity(pid: int, start: int, sig: int) -> bool:
         os.close(descriptor)
 
 
+def process_alive(pid: int, start: int) -> bool:
+    """A zombie is stopped work awaiting its direct parent's wait(), not a live server."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19]) == start and fields[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def reap_tree(pid: int, parent_start: int, *, grace: float = 5.0) -> dict:
+    """Bound teardown of this caller's children, identified by ancestry and start ticks.
+
+    The shell waits its direct children after this returns. Never wait indefinitely for an
+    uninterruptible child: report the surviving identity and let the gate stay red instead.
+    """
+    grace = finite_number(grace, "grace", positive=True)
+    if pid != os.getppid() or pid <= 1 or parent_start <= 0:
+        raise ValueError("reap-tree can only clean up its own direct parent")
+    identity = process_identity(pid)
+    if identity is None or identity[1] != parent_start:
+        raise ValueError("reap-tree parent PID/start identity is no longer live")
+    owned = {}
+
+    def capture():
+        for child, born in descendants(pid, parent_start).items():
+            if owned.get(child) == born:
+                continue
+            owned[child] = born
+            # A paused compiler/server must run before TERM can invoke its cleanup.
+            signal_identity(child, born, signal.SIGCONT)
+            signal_identity(child, born, signal.SIGTERM)
+
+    capture()
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        capture()  # Cleanup handlers may launch children; include them while still owned.
+        if not any(process_alive(child, born) for child, born in owned.items()):
+            return {"owned": owned, "survivors": {}, "forced": {}}
+        time.sleep(min(0.05, max(0.0, end - time.monotonic())))
+    forced = {child: born for child, born in owned.items() if process_alive(child, born)}
+    for child, born in forced.items():
+        signal_identity(child, born, signal.SIGKILL)
+    # SIGKILL is asynchronous. Give the kernel a bounded interval to leave runnable state
+    # before permitting ABBA; a D-state survivor is a loud teardown failure, never a wait hang.
+    end = time.monotonic() + min(grace, 1.0)
+    while time.monotonic() < end:
+        survivors = {child: born for child, born in owned.items() if process_alive(child, born)}
+        if not survivors:
+            return {"owned": owned, "survivors": {}, "forced": forced}
+        time.sleep(min(0.01, max(0.0, end - time.monotonic())))
+    return {"owned": owned, "forced": forced,
+            "survivors": {child: born for child, born in owned.items() if process_alive(child, born)}}
+
+
 def watch(pid: int, parent_start: int, marker: Path, *, seconds: float | None = None,
           deadline: float | None = None, grace: float = 5.0) -> None:
     grace = finite_number(grace, "grace", positive=True)
@@ -411,8 +536,7 @@ def watch(pid: int, parent_start: int, marker: Path, *, seconds: float | None = 
     while time.monotonic() < end:
         remaining = False
         for child, born in owned.items():
-            identity = process_identity(child)
-            if identity is not None and identity[1] == born:
+            if process_alive(child, born):
                 remaining = True
                 break
         if not remaining:
@@ -424,7 +548,9 @@ def watch(pid: int, parent_start: int, marker: Path, *, seconds: float | None = 
 
 class HistoryTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        build = Path(__file__).resolve().parents[1] / "build"
+        build.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=build)
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
 
@@ -446,6 +572,55 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(budget(prepare(self.directory, []), "test")["timeout_seconds"], 98)
         self.add(0.001, label="tiny")
         self.assertEqual(budget(prepare(self.directory, []), "tiny")["timeout_seconds"], 30)
+
+    def test_first_cold_cache_and_unseen_clock_phase_keep_mechanism_floors(self):
+        for label in ("ASAN build", "release build (+footprint locks)",
+                      "build dependency: core-concurrency-tsan"):
+            self.add(.1, label=label)
+            row = budget(prepare(self.directory, []), label)
+            self.assertEqual(row["timeout_seconds"], 900)
+            self.assertIn("cold cache state not distinguished", row["basis"])
+        self.add(6, label="eviction lruclock (split, atomic 0)")
+        row = budget(prepare(self.directory, []), "eviction lruclock (split, atomic 0)")
+        self.assertEqual(row["timeout_seconds"], 512)
+        self.assertIn("two production 256s clock buckets", row["basis"])
+        self.add(.1, label="flip controller model unit")
+        self.assertEqual(budget(prepare(self.directory, []), "flip controller model unit")["timeout_seconds"], 30)
+
+    def test_hidden_build_names_are_independent_of_cpu_slot_and_source_line(self):
+        a = ["taskset", "-c", "0-9", "tests/parbuild.sh", "/tree/build/core-tsan", "/tree/objects"]
+        b = ["taskset", "-c", "80-95", "tests/parbuild.sh", "/other/build/core-tsan", "/other/objects"]
+        self.assertEqual(dependency_label(a), dependency_label(b))
+        self.assertEqual(dependency_label(a), "build dependency: core-tsan")
+        self.assertNotEqual(dependency_label(a), dependency_label(b[:4] + ["/other/build/waits-tsan"] + b[5:]))
+        self.assertEqual(dependency_label(["taskset", "-c", "0-9", "make", "-j10", "build/a", "build/b"]),
+                         dependency_label(["make", "-j128", "build/b", "build/a"]))
+
+    def test_abba_context_uses_actual_geometry_window_and_cell_bytes(self):
+        import abbagate
+        from unittest import mock
+        cells = self.directory / "cells.txt"
+        cells.write_text("first cell source\n")
+        argv = ["--cells", str(cells), "--server-cores", "0-7", "--load-cores", "8-15"]
+        original = abba_context(argv)
+        self.assertIn("subset=full", original)
+        self.assertIn("server_cores=0-7", original)
+        self.assertIn(f"window={abbagate.WINDOW}", original)
+        self.assertNotEqual(original, abba_context(argv + ["--server-smt", "128-135"]))
+        with mock.patch.object(abbagate, "WINDOW", abbagate.WINDOW / 2):
+            self.assertNotEqual(original, abba_context(argv))
+        cells.write_text("second cell source\n")
+        self.assertNotEqual(original, abba_context(argv))
+        # The pre-subset ABBA parser still exists until its independent commit lands.
+        # Preserve that parser's real argv handling while exercising the new subset field.
+        parse = abbagate.parse_args
+        def smoke():
+            args = parse()
+            args.subset = "smoke"
+            return args
+        full = abba_context(argv)
+        with mock.patch.object(abbagate, "parse_args", smoke):
+            self.assertNotEqual(full, abba_context(argv))
 
     def test_no_history_says_default(self):
         row = budget(prepare(self.directory, []), "unseen")
@@ -544,7 +719,7 @@ eval "$4"
             outsider.wait(timeout=5)
 
 
-    def shell_row(self, body, timeout=1.0):
+    def shell_row(self, body, timeout=1.0, extra_functions=""):
         import subprocess
         root = Path(__file__).resolve().parents[1]
         gate = (root / 'tests/gate.sh').read_text()
@@ -558,8 +733,9 @@ TMPDIR="$FIXTURE"; LEDGER="$FIXTURE/ledger"; TIMINGS="$FIXTURE/timings"
 ROW_PLAN="$FIXTURE/plan.json"; ROW_HISTORY="$FIXTURE/history"; ROW_RUN_ID=fixture
 PASS=0; FAIL=0
 quiet_wait(){ :; }
+: > "$LEDGER"; : > "$TIMINGS"
 '''
-        result = subprocess.run(['bash', '-c', setup + helpers + '\n' + body], cwd=root,
+        result = subprocess.run(['bash', '-c', setup + helpers + '\n' + extra_functions + '\n' + body], cwd=root,
             env=dict(os.environ, FIXTURE=str(directory)), capture_output=True, text=True, timeout=10)
         rows = (directory / 'ledger').read_text().splitlines()
         return result, [row.split('\t') for row in rows], read_history(directory / 'history')
@@ -586,6 +762,142 @@ quiet_wait(){ :; }
         self.assertGreaterEqual(float(rows[0][1]), .03)
         self.assertLess(float(rows[0][1]), 1)
         self.assertEqual(float(rows[0][1]), history[0]['seconds'])
+
+    def test_real_hidden_build_scope_records_success_and_failure_without_gate_rows(self):
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / "tests/gate.sh").read_text()
+        functions = gate[gate.index("pausable(){"):gate.index("\npy(){")]
+        body = '''QUIET_FILE=""
+make(){ sleep .02; return "$BUILD_RC"; }
+BUILD_RC=0; pausable make -j8 build/example || exit 81
+BUILD_RC=7; pausable make -j2 build/example; [ "$?" = 7 ] || exit 82
+'''
+        result, rows, history = self.shell_row(body, extra_functions=functions)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(rows, [])
+        self.assertEqual([(row["label"], row["verdict"]) for row in history],
+                         [("build dependency: make build/example", verdict) for verdict in ("ok", "FAIL")])
+        self.assertTrue(all(row["seconds"] >= .02 for row in history))
+        self.assertTrue(all(row["scored"] is False and row["ledger_label"] is None for row in history))
+
+    def run_real_job(self, behavior):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / "tests/gate.sh").read_text()
+        helpers = gate[gate.index("say(){"):gate.index("\nledger_labels(){")]
+        cleanup = gate[gate.index("reap_children(){"):gate.index("\ntrap 'cleanup")]
+        jobs = gate[gate.index("job_finalize(){"):gate.index("\nstart_workers(){")]
+        directory = self.directory
+        plan = prepare(directory / "history", [])
+        plan["rows"]["expires"] = dict(timeout_seconds=.4, median_seconds=.1, basis="fixture")
+        atomic_json(directory / "plan.json", plan)
+        setup = r'''set -u
+ROW_PLAN="$RUN_DIR/plan.json"; ROW_HISTORY="$RUN_DIR/history"; ROW_RUN_ID=fixture
+PASS=0; FAIL=0; WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; ABBA_PID=0; PAUSABLE_PID=0
+quiet_wait(){ :; }
+set_slot(){ CORES="$FIXTURE_CPU"; LOAD_CORES="$FIXTURE_CPU"; }
+job_label(){ printf 'fixture family\n'; }
+job_body(){
+  row_begin first; sleep .02; ok first
+  if [ "$BEHAVIOR" = timeout ]; then
+    row_begin expires
+    sleep 60
+    ok expires
+  else
+    python3 -c 'import os,signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,signal.SIG_IGN); Path(os.environ["RUN_DIR"]+"/child").write_text(str(os.getpid())); time.sleep(60)' &
+    SRV=$!
+    while [ ! -s "$RUN_DIR/child" ]; do sleep .01; done
+  fi
+}
+'''
+        outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            result = subprocess.run(["bash", "-c", "\n".join((setup, helpers, cleanup, jobs,
+                                     'run_job fixture 0'))], cwd=root,
+                env=dict(os.environ, RUN_DIR=str(directory), BEHAVIOR=behavior,
+                         FIXTURE_CPU=str(min(os.sched_getaffinity(0)))),
+                capture_output=True, text=True, timeout=12)
+            self.assertIsNone(outsider.poll(), "teardown signalled a process outside its ancestry")
+        finally:
+            outsider.terminate()
+            outsider.wait(timeout=5)
+        job = directory / "jobs/fixture"
+        self.assertTrue((job / "ledger").exists(), result.stdout + result.stderr)
+        return result, job, [line.split("\t") for line in (job / "ledger").read_text().splitlines()]
+
+    def test_actual_job_timeout_preserves_partial_ledger_and_publishes_done(self):
+        result, job, rows = self.run_real_job("timeout")
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr + (job / "output.log").read_text())
+        self.assertEqual([(row[0], row[2]) for row in rows], [("ok", "first"), ("FAIL", "expires")])
+        self.assertTrue(all(len(row) == 3 for row in rows))
+        self.assertGreaterEqual(float(rows[1][1]), .4)
+        self.assertEqual((job / "done").read_text().strip().split("\t"), ["124", "1", "1"])
+        history = read_history(self.directory / "history")
+        self.assertEqual(len(history), 2)
+        self.assertTrue(history[1]["timed_out"])
+        self.assertEqual([(row["scored"], row["ledger_label"], row["run_id"]) for row in history],
+                         [(True, label, "fixture") for label in ("first", "expires")])
+        self.assertTrue((job / "family.tsv").is_file())
+
+    def test_recovery_never_overwrites_partial_rows_or_writes_old_two_columns(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / "tests/gate.sh").read_text()
+        recover = gate[gate.index("job_recover(){"):gate.index("\njob_finalize(){")]
+        directory = self.directory / "jobs/fixture"
+        directory.mkdir(parents=True)
+        for name in ("ledger", "timings"):
+            (directory / name).write_text("ok\t0.123\tfirst\n")
+        body = '\njob_label(){ printf "fixture family\\n"; }\njob_recover fixture 0 137\njob_recover fixture 0 137\n'
+        result = subprocess.run(["bash", "-uc", recover + body], cwd=root,
+            env=dict(os.environ, RUN_DIR=str(self.directory)), capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((directory / "ledger").read_text(),
+                         "ok\t0.123\tfirst\nFAIL\t0\tfixture family\n")
+        self.assertEqual((directory / "done").read_text(), "137\t1\t1\n")
+
+    def test_actual_job_term_ignoring_teardown_is_bounded_and_reaped(self):
+        started = time.monotonic()
+        result, job, rows = self.run_real_job("teardown")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr + (job / "output.log").read_text())
+        self.assertLess(time.monotonic() - started, 9)
+        self.assertEqual([(row[0], row[2]) for row in rows], [("ok", "first"), ("FAIL", "fixture family")])
+        self.assertEqual((job / "done").read_text().strip().split("\t"), ["1", "1", "1"])
+        self.assertIn("forced SIGKILL", (job / "output.log").read_text())
+        self.assertIsNone(process_identity(int((self.directory / "child").read_text())))
+
+    def test_actual_abba_timeout_publishes_fragment_at_its_original_position(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / "tests/gate.sh").read_text()
+        helpers = gate[gate.index("say(){"):gate.index("\nledger_labels(){")]
+        cleanup = gate[gate.index("reap_children(){"):gate.index("\ntrap 'cleanup")]
+        directory = self.directory
+        plan = prepare(directory / "history", [])
+        label = "headline ABBA vs last pushed binary"
+        plan["rows"][label + " [smoke fixture]"] = dict(timeout_seconds=.3, median_seconds=.1, basis="fixture")
+        atomic_json(directory / "plan.json", plan)
+        (directory / "ledger").write_text("ok\t.1\tbefore\nok\t.2\tafter\n")
+        (directory / "timings").write_text("")
+        setup = r'''set -u
+PASS=0; FAIL=0; WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; ABBA_PID=0; PAUSABLE_PID=0
+ROW_PLAN="$RUN_DIR/plan.json"; ROW_HISTORY="$RUN_DIR/history"; ROW_RUN_ID=fixture; TMPDIR="$RUN_DIR"
+ABBA_LEDGER="$RUN_DIR/ledger"; ABBA_TIMINGS="$RUN_DIR/timings"; ABBA_PREFIX_ROWS=1; ABBA_PENDING=1
+LEDGER="$RUN_DIR/abba.ledger"; TIMINGS="$RUN_DIR/abba.timings"; : > "$LEDGER"; : > "$TIMINGS"
+quiet_wait(){ :; }
+'''
+        body = '''trap 'cleanup || exit 1' EXIT
+row_begin "headline ABBA vs last pushed binary" "smoke fixture"
+sleep 60
+ok "headline ABBA vs last pushed binary"
+'''
+        result = subprocess.run(["bash", "-c", "\n".join((setup, helpers, cleanup, body))], cwd=root,
+            env=dict(os.environ, RUN_DIR=str(directory)), capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        rows = [row.split("\t") for row in (directory / "ledger").read_text().splitlines()]
+        self.assertEqual([(row[0], row[2]) for row in rows],
+                         [("ok", "before"), ("FAIL", label), ("ok", "after")])
+        self.assertGreaterEqual(float(rows[1][1]), .3)
 
 
 class FlakeHistoryTests(unittest.TestCase):
@@ -761,6 +1073,8 @@ def main() -> int:
     p.add_argument("--verdict", choices=("ok", "FAIL"), required=True)
     p.add_argument("--timed-out", action="store_true")
     p.add_argument("--observation-id")
+    p.add_argument("--scored", type=int, choices=(0, 1), default=1)
+    p.add_argument("--ledger-label")
     p = sub.add_parser("budget")
     p.add_argument("--plan", type=Path, required=True)
     p.add_argument("--label", required=True)
@@ -776,6 +1090,14 @@ def main() -> int:
     p.add_argument("--grace", type=float, default=5.0)
     p = sub.add_parser("identity")
     p.add_argument("--pid", type=int, required=True)
+    p = sub.add_parser("reap-tree")
+    p.add_argument("--pid", type=int, required=True)
+    p.add_argument("--parent-start", type=int, required=True)
+    p.add_argument("--grace", type=float, default=5.0)
+    p = sub.add_parser("dependency-label")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p = sub.add_parser("abba-context")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
     sub.add_parser("self-test")
     args = parser.parse_args()
     try:
@@ -792,7 +1114,8 @@ def main() -> int:
                   if args.json else format_verdict_history(result))
         elif args.command == "record":
             record(args.history, run_id=args.run_id, label=args.label, seconds=args.seconds,
-                   verdict=args.verdict, timed_out=args.timed_out, observation_id=args.observation_id)
+                   verdict=args.verdict, timed_out=args.timed_out, observation_id=args.observation_id,
+                   scored=bool(args.scored), ledger_label=args.ledger_label)
         elif args.command == "budget":
             row = budget(json.loads(args.plan.read_text()), args.label)
             median = "-" if row["median_seconds"] is None else f"{row['median_seconds']:g}"
@@ -807,6 +1130,19 @@ def main() -> int:
             if identity is None:
                 raise ValueError("PID does not exist")
             print(identity[1])
+        elif args.command == "reap-tree":
+            result = reap_tree(args.pid, args.parent_start, grace=args.grace)
+            if result["survivors"]:
+                print(f"GATE TEARDOWN ERROR: owned PID/start survivors after KILL: {result['survivors']}",
+                      file=sys.stderr)
+                return 1
+            if result["forced"]:
+                print(f"GATE TEARDOWN ERROR: forced SIGKILL after {args.grace:g}s for owned PID/start: {result['forced']}",
+                      file=sys.stderr)
+                return 3 # Everything stopped: the shell can reap, but must keep the verdict red.
+        elif args.command in ("dependency-label", "abba-context"):
+            arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+            print(dependency_label(arguments) if args.command == "dependency-label" else abba_context(arguments))
         else:
             suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
                                        for case in (HistoryTests, FlakeHistoryTests))

@@ -241,12 +241,19 @@ canonical_label(){ sed -E \
 # shell loops and waits all count. On expiry the family stops red; later rows are visibly
 # unreached through the existing completion/count checks. No timeout becomes a skip.
 ROW_ID=; ROW_WATCHDOG=0; ROW_EXPIRED=0; ROW_START=0; ROW_PAUSED=0
+row_clock(){
+  # Kernel uptime is monotonic and has 10 ms resolution. A wall-clock/NTP step
+  # must neither manufacture an expiry nor extend a hung row's measured history.
+  # Bash reads it directly, avoiding another Python startup for every endpoint.
+  read -r ROW_NOW row_idle < /proc/uptime || exit 2
+}
 row_watch(){
   local parent_stat parent_start remaining parent_pid=$BASHPID
   read -r parent_stat < "/proc/$BASHPID/stat"
   parent_stat=${parent_stat##*) }; read -ra parent_fields <<< "$parent_stat"
   parent_start=${parent_fields[19]}
-  remaining=$(awk -v budget="$ROW_TIMEOUT" -v start="$ROW_START" -v now="$EPOCHREALTIME" -v paused="$ROW_PAUSED" \
+  row_clock
+  remaining=$(awk -v budget="$ROW_TIMEOUT" -v start="$ROW_START" -v now="$ROW_NOW" -v paused="$ROW_PAUSED" \
       'BEGIN {v=budget-(now-start-paused); print (v>0?v:0.001)}')
   python3 tests/gate_history.py watch --pid "$parent_pid" --parent-start "$parent_start" \
       --seconds "$remaining" --marker "$ROW_MARKER" &
@@ -285,7 +292,8 @@ row_begin(){
   fi
   ROW_MARKER="$TMPDIR/row-timeout-$BASHPID.json"
   rm -f "$ROW_MARKER"
-  ROW_EXPIRED=0; ROW_MONITOR_FAILED=0; ROW_PAUSED=0; ROW_START=$EPOCHREALTIME
+  row_clock
+  ROW_EXPIRED=0; ROW_MONITOR_FAILED=0; ROW_PAUSED=0; ROW_START=$ROW_NOW
   trap row_timeout USR1
   row_watch
   printf '  row budget: %ss; median=%ss; %s; %s\n' "$ROW_TIMEOUT" "$ROW_MEDIAN" "$ROW_BASIS" "$ROW_ID"
@@ -297,7 +305,8 @@ row_timeout(){
   exit 124
 }
 row_finish(){
-  local now=$EPOCHREALTIME
+  row_clock
+  local now=$ROW_NOW
   row_unwatch
   ROW_SECONDS=$(awk -v start="$ROW_START" -v now="$now" -v paused="$ROW_PAUSED" \
       'BEGIN {v=now-start-paused; printf "%.6f", (v>0?v:0)}')
@@ -305,18 +314,26 @@ row_finish(){
     ROW_EXPIRED=1
   fi
 }
+row_save_history(){
+  local verdict=$1 scored=${2:-1} timed=() identity=()
+  [ "$ROW_EXPIRED" != 1 ] || { verdict=FAIL; timed=(--timed-out); }
+  [ "${ROW_MONITOR_FAILED:-0}" = 0 ] || verdict=FAIL
+  [ "$scored" != 1 ] || identity=(--ledger-label "$ROW_ID")
+  python3 tests/gate_history.py record --history "$ROW_HISTORY" --run-id "$ROW_RUN_ID" \
+      --label "$ROW_HISTORY_ID" --seconds "$ROW_SECONDS" --verdict "$verdict" \
+      --scored "$scored" "${identity[@]}" "${timed[@]}"
+}
 ledger(){
-  local verdict=$1 label=$2 identity duration timed=()
+  local verdict=$1 label=$2 identity duration
   if [ -n "$ROW_ID" ]; then
     row_finish
     identity=$ROW_ID; duration=$ROW_SECONDS
     [ "${ROW_MONITOR_FAILED:-0}" = 0 ] || verdict=FAIL
     if [ "$ROW_EXPIRED" = 1 ]; then
-      verdict=FAIL; timed=(--timed-out)
+      verdict=FAIL
       say "$identity" "FAIL (TIMEOUT ${ROW_TIMEOUT}s; median=${ROW_MEDIAN}s; $ROW_BASIS)"
     fi
-    python3 tests/gate_history.py record --history "$ROW_HISTORY" --run-id "$ROW_RUN_ID" \
-        --label "$ROW_HISTORY_ID" --seconds "$duration" --verdict "$verdict" "${timed[@]}" || exit 2
+    row_save_history "$verdict" || exit 2
   else
     # Infrastructure failures (boot/worker/count) are red even without a normal row
     # scope. An unscoped SUCCESS is a harness defect, never manufactured zero timing.
@@ -378,7 +395,7 @@ quiet_wait(){ # block until quiet_ok. The live server is SIGSTOPped meanwhile (a
   quiet_ok && return 0
   local t0 now stopped=0 row_was_active=0
   if [ -n "$ROW_ID" ]; then row_unwatch; row_was_active=1; fi
-  t0=$(date +%s.%N)
+  row_clock; t0=$ROW_NOW
   if [ "$SRV" -gt 0 ] 2>/dev/null && kill -0 "$SRV" 2>/dev/null; then
     kill -STOP "$SRV" 2>/dev/null && stopped=1
   fi
@@ -386,7 +403,7 @@ quiet_wait(){ # block until quiet_ok. The live server is SIGSTOPped meanwhile (a
       "($([ "$stopped" = 1 ] && echo "server $SRV stopped" || echo "no server up"))"
   until quiet_ok; do sleep 5; done
   [ "$stopped" = 1 ] && kill -CONT "$SRV" 2>/dev/null
-  now=$(date +%s.%N)
+  row_clock; now=$ROW_NOW
   ROW_T=$(awk -v a="$ROW_T" -v b="$t0" -v c="$now" 'BEGIN{printf "%.9f", a + (c - b)}')
   if [ "$row_was_active" = 1 ]; then
     ROW_PAUSED=$(awk -v p="$ROW_PAUSED" -v b="$t0" -v c="$now" 'BEGIN{print p+c-b}')
@@ -419,9 +436,10 @@ for pid in sorted(owned, reverse=signum != signal.SIGCONT):
 PY
 }
 pausable(){
-  local dependency_scope=0 dependency_rc
+  local dependency_scope=0 dependency_rc dependency_identity
   if [ -z "$ROW_ID" ]; then
-    row_begin "unscored build dependency: ${name:-gate.sh:${BASH_LINENO[0]}}"
+    dependency_identity=$(python3 tests/gate_history.py dependency-label -- "$@") || return 2
+    row_begin "$dependency_identity"
     dependency_scope=1
   fi
   pausable_body "$@"; dependency_rc=$?
@@ -431,6 +449,10 @@ pausable(){
       bad "$ROW_ID" 'build dependency deadline/monitor failed'
       exit 124
     fi
+    # Hidden prerequisite work is timed evidence too, but adds no passing gate row. Its
+    # dependent rows retain their original build/readiness assertions and expected counts.
+    if [ "$dependency_rc" = 0 ]; then row_save_history ok 0 || exit 2
+    else row_save_history FAIL 0 || exit 2; fi
     ROW_ID=; trap - USR1
   fi
   return "$dependency_rc"
@@ -438,24 +460,25 @@ pausable(){
 pausable_body(){ # run "$@" to completion; pause/resume its owned descendant PIDs for quiet-file waits
   [ -n "$QUIET_FILE" ] || { "$@"; return $?; }
   quiet_wait
-  local pid stopped=0 t0=0 paused=0 rc
+  local pid stopped=0 t0=0 paused=0 rc now
   setsid "$@" &
   pid=$!; PAUSABLE_PID=$pid
   while kill -0 "$pid" 2>/dev/null; do
     if quiet_ok; then
       if [ "$stopped" = 1 ]; then
         signal_owned_tree CONT "$pid"; stopped=0
+        row_clock; now=$ROW_NOW
         if [ -n "$ROW_ID" ]; then
-          ROW_PAUSED=$(awk -v p="$ROW_PAUSED" -v b="$t0" -v c="$EPOCHREALTIME" 'BEGIN{print p+c-b}')
+          ROW_PAUSED=$(awk -v p="$ROW_PAUSED" -v b="$t0" -v c="$now" 'BEGIN{print p+c-b}')
           row_watch
         fi
-        paused=$(awk -v p="$paused" -v b="$t0" -v c="$(date +%s.%N)" \
+        paused=$(awk -v p="$paused" -v b="$t0" -v c="$now" \
                      'BEGIN{printf "%.3f", p + (c - b)}')
         quiet_note "quiet: build resumed"
       fi
     elif [ "$stopped" = 0 ]; then
       [ -z "$ROW_ID" ] || row_unwatch
-      signal_owned_tree STOP "$pid"; stopped=1; t0=$(date +%s.%N)
+      signal_owned_tree STOP "$pid"; stopped=1; row_clock; t0=$ROW_NOW
       quiet_note "quiet: build paused until $QUIET_FILE is >$QUIET_MIN min old"
     fi
     sleep 2
@@ -473,24 +496,38 @@ py(){ # All callers belong to an explicit whole-row watchdog scope.
   return "$rc"
 }
 
-cleanup(){ # EXIT/INT/TERM: reap our ABBA driver and its children, servers, oracle, and memtier
-  local p
-  row_unwatch
-  stop_workers
-  if [ "$PAUSABLE_PID" -gt 0 ] 2>/dev/null; then   # a build parked by pausable
-    signal_owned_tree CONT "$PAUSABLE_PID"; signal_owned_tree TERM "$PAUSABLE_PID"
-  fi
-  [ "$SRV" -gt 0 ] 2>/dev/null && kill -CONT "$SRV" 2>/dev/null   # TERM needs a running target
-  # ABBA owns private-session servers and load generators. Signal its exact driver PID and wait
-  # for its existing finally/Children.close path to reap them before this gate exits.
-  for p in "$ABBA_PID" "$SRV" "$GLOBCASE_ORACLE" "$MMPID"; do
-    if [ "$p" -gt 0 ] 2>/dev/null && kill -0 "$p" 2>/dev/null; then
-      kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null
-    fi
+reap_children(){
+  local owner_pid=$BASHPID owner_start p rc=0
+  owner_start=$(python3 tests/gate_history.py identity --pid "$owner_pid") || return 1
+  # The helper is a direct child and validates parent PID/start identity before walking
+  # descendants. CONT/TERM/grace/KILL bounds paused builds and TERM-ignoring teardown.
+  # Only after every owned process has stopped can wait() safely reap direct children.
+  python3 tests/gate_history.py reap-tree --pid "$owner_pid" --parent-start "$owner_start" || rc=$?
+  # Exit3 means all processes stopped only after forced KILL: reap them, then fail loudly.
+  # Other failures may retain a live D-state child, so an unbounded wait is forbidden.
+  [ "$rc" = 0 ] || [ "$rc" = 3 ] || return "$rc"
+  for p in "${WORKER_PIDS[@]}" "${PAUSABLE_PID:-0}" "${ABBA_PID:-0}" \
+           "${SRV:-0}" "${GLOBCASE_ORACLE:-0}" "${MMPID:-0}"; do
+    [ "$p" -le 0 ] || wait "$p" 2>/dev/null || :
   done
-  ABBA_PID=0
+  WORKER_PIDS=( ); PAUSABLE_PID=0; ABBA_PID=0; SRV=0; GLOBCASE_ORACLE=0; MMPID=0
+  return "$rc"
 }
-trap cleanup EXIT
+publish_abba(){
+  [ "${ABBA_PENDING:-0}" = 1 ] || return 0
+  LEDGER=$ABBA_LEDGER; TIMINGS=$ABBA_TIMINGS
+  { head -n "$ABBA_PREFIX_ROWS" "$LEDGER"; cat "$RUN_DIR/abba.ledger";
+    tail -n +"$((ABBA_PREFIX_ROWS+1))" "$LEDGER"; } > "$RUN_DIR/assembled.ledger" || return 1
+  mv "$RUN_DIR/assembled.ledger" "$LEDGER" || return 1
+  cat "$RUN_DIR/abba.timings" >> "$TIMINGS" || return 1
+  ABBA_PENDING=0
+}
+cleanup(){ # EXIT/INT/TERM: publication and teardown remain bounded outside normal row scopes.
+  row_unwatch
+  publish_abba || return 1
+  reap_children
+}
+trap 'cleanup || exit 1' EXIT
 trap 'exit 130' INT TERM
 
 port_listeners(){ # pids bound to a port, listening or not yet accepting (ss names the owner)
@@ -688,15 +725,61 @@ job_body(){
     *) "job_$name";;
   esac
 }
+job_recover(){
+  local name=$1 slot=$2 rc=$3 dir="$RUN_DIR/jobs/$1" label now
+  [ ! -f "$dir/done" ] || return 0
+  mkdir -p "$dir"
+  touch "$dir/ledger" "$dir/timings" # Preserve earlier verdicts if the finalizer was interrupted.
+  label=$(job_label "$name")
+  if ! grep -q $'^FAIL\t' "$dir/ledger"; then
+    # Unreached infrastructure has no measured row scope; zero is explicit, and must
+    # never enter exact timing history. Both ledger formats retain their three columns.
+    printf 'FAIL\t0\t%s\n' "$label" >> "$dir/ledger"
+    printf 'FAIL\t0\t%s\n' "$label" >> "$dir/timings"
+  fi
+  printf 'GATE: family %s did not publish completion (exit %s); partial rows retained\n' \
+      "$name" "$rc" >> "$dir/output.log"
+  [ "$rc" != 0 ] || rc=1
+  now=$(date +%s.%N)
+  [ -f "$dir/family.tsv" ] || printf '%s\t%s\t%s\t%s\n' "$name" "$slot" "$now" "$now" > "$dir/family.tsv"
+  printf '%s\t%s\t%s\n' "$rc" \
+      "$(awk -F '\t' '$1=="ok"{n++} END{print n+0}' "$dir/ledger")" \
+      "$(awk -F '\t' '$1=="FAIL"{n++} END{print n+0}' "$dir/ledger")" > "$dir/done.tmp"
+  mv "$dir/done.tmp" "$dir/done"
+}
+job_finalize(){
+  local rc=$1 ended
+  trap - EXIT INT TERM
+  if [ -n "$ROW_ID" ]; then
+    bad "$ROW_ID" "family exited $rc before this row produced a verdict"
+    [ "$rc" != 0 ] || rc=1
+  fi
+  if ! cleanup; then
+    bad "$(job_label "$name")" "owned process teardown did not complete"
+    rc=1
+  fi
+  if [ "$rc" != 0 ] && ! grep -q $'^FAIL\t' "$LEDGER"; then
+    bad "$(job_label "$name")" "worker exited $rc after its rows"
+  fi
+  # EXIT is the publication point even for row_timeout's exit124. Preserve every partial
+  # row (including its own duration) and publish the actual counts after bounded cleanup.
+  PASS=$(awk -F '\t' '$1=="ok"{n++} END{print n+0}' "$LEDGER")
+  FAIL=$(awk -F '\t' '$1=="FAIL"{n++} END{print n+0}' "$LEDGER")
+  ended=$(date +%s.%N)
+  printf '%s\t%s\t%s\t%s\n' "$name" "$slot" "$started" "$ended" > "$TMPDIR/family.tsv"
+  printf '%s\t%s\t%s\n' "$rc" "$PASS" "$FAIL" > "$TMPDIR/done.tmp"
+  mv "$TMPDIR/done.tmp" "$TMPDIR/done"
+  exit "$rc"
+}
 run_job(){ (
-  local name=$1 slot=$2 started ended rc
+  local name=$1 slot=$2 started=$EPOCHREALTIME ended rc
   WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0
   PASS=0; FAIL=0; ROW_ID=; ROW_WATCHDOG=0; ROW_EXPIRED=0
   export TMPDIR="$RUN_DIR/jobs/$name"
   mkdir -p "$TMPDIR"
   LEDGER="$TMPDIR/ledger"; TIMINGS="$TMPDIR/timings"
   : > "$LEDGER"; : > "$TIMINGS"
-  trap cleanup EXIT
+  trap 'job_finalize "$?" >>"$TMPDIR/output.log" 2>&1' EXIT
   trap 'exit 130' INT TERM
   set_slot "$slot"
   BUILD_CORES="$CORES,$LOAD_CORES"
@@ -706,14 +789,7 @@ run_job(){ (
   started=$(date +%s.%N); ROW_T=$started
   job_body "$name" >"$TMPDIR/output.log" 2>&1
   rc=$?
-  # Reaping is part of completion. ABBA cannot start while a background child's server survives.
-  cleanup
-  ended=$(date +%s.%N)
-  printf '%s\t%s\t%s\t%s\n' "$name" "$slot" "$started" "$ended" > "$TMPDIR/family.tsv"
-  # The collector must never observe a newly created but still empty completion marker.
-  # Rename publishes the complete record only after logs, rows and owned children are settled.
-  printf '%s\t%s\t%s\n' "$rc" "$PASS" "$FAIL" > "$TMPDIR/done.tmp"
-  mv "$TMPDIR/done.tmp" "$TMPDIR/done"
+  exit "$rc"
 ); }
 start_workers(){
   phase parallel-begin
@@ -771,20 +847,7 @@ start_workers(){
         flock -u "$queue_fd"; exec {queue_fd}>&-
         if [ -n "$selected" ]; then
           run_job "$selected" "$slot"
-          job_rc=$?
-          if [ ! -f "$RUN_DIR/jobs/$selected/done" ]; then
-            # A shell exiting before run_job can publish is an unreached family, never an
-            # indefinitely pending dependency. Its cleanup trap has run; publish a red fragment
-            # so collectors and dependent rows proceed and the expected-row guard names losses.
-            failed_dir="$RUN_DIR/jobs/$selected"
-            mkdir -p "$failed_dir"
-            failure_label=$(job_label "$selected")
-            printf 'FAIL\t%s\n' "$failure_label" > "$failed_dir/ledger"
-            printf 'FAIL\t0.0\t%s\n' "$failure_label" > "$failed_dir/timings"
-            printf 'GATE: family %s did not complete (exit %s)\n' "$selected" "$job_rc" >> "$failed_dir/output.log"
-            printf '%s\t0\t1\n' "$job_rc" > "$failed_dir/done.tmp"
-            mv "$failed_dir/done.tmp" "$failed_dir/done"
-          fi
+          job_recover "$selected" "$slot" "$?"
         elif [ "$pending" = 0 ]; then break
         else sleep 0.2
         fi
@@ -830,31 +893,7 @@ join_workers(){
   BUILD_CORES=$ALL_BUILD_CORES
   cat "$RUN_DIR"/jobs/*/family.tsv > "$RUN_DIR/families.tsv"
 }
-stop_workers(){
-  # Workers/servers are descendants started by this gate. Stop children first, by PID, and allow
-  # their traps to reap servers. Never match process argv or stop a pre-existing listener.
-  [ "${#WORKER_PIDS[@]}" -gt 0 ] || return 0
-  python3 - "${WORKER_PIDS[@]}" <<'PY'
-import os, signal, sys
-roots=set(map(int,sys.argv[1:])); parents={}
-for entry in os.scandir('/proc'):
-    if not entry.name.isdigit(): continue
-    try:
-        raw=open(entry.path+'/stat').read().rsplit(')',1)[1].split()
-        parents[int(entry.name)]=int(raw[1])
-    except (OSError,ValueError): pass
-owned=set(roots)
-while True:
-    more={p for p,pp in parents.items() if pp in owned}-owned
-    if not more: break
-    owned.update(more)
-for pid in sorted(owned,reverse=True):
-    try: os.kill(pid,signal.SIGTERM)
-    except ProcessLookupError: pass
-PY
-  for p in "${WORKER_PIDS[@]}"; do wait "$p" 2>/dev/null; done
-  WORKER_PIDS=()
-}
+stop_workers(){ reap_children; }
 
 
 # The bodies below preserve every same-server sequence and persistence recovery chain. Only
@@ -2509,12 +2548,14 @@ join_workers
 phase abba-begin
 ABBA_LEDGER=$LEDGER
 ABBA_TIMINGS=$TIMINGS
+ABBA_PENDING=1
 LEDGER="$RUN_DIR/abba.ledger"; TIMINGS="$RUN_DIR/abba.timings"; : > "$LEDGER"; : > "$TIMINGS"
 ROW_T=$(date +%s.%N)
 quiet_wait
 # Bash defers a TERM trap while waiting for a foreground external command. An explicit wait on
 # our tracked background child is interruptible, so stopping the gate reaches ABBA's cleanup.
-row_begin "headline ABBA vs last pushed binary"
+ABBA_HISTORY_CONTEXT=$(python3 tests/gate_history.py abba-context -- "${ABBA_ARGS[@]}") || exit 2
+row_begin "headline ABBA vs last pushed binary" "$ABBA_HISTORY_CONTEXT"
 python3 tests/abbagate.py "${ABBA_ARGS[@]}" &
 ABBA_PID=$!
 wait "$ABBA_PID"
@@ -2527,11 +2568,7 @@ case "$ABBA_RC" in
 esac
 
 phase abba-end
-LEDGER=$ABBA_LEDGER; TIMINGS=$ABBA_TIMINGS
-{ head -n "$ABBA_PREFIX_ROWS" "$LEDGER"; cat "$RUN_DIR/abba.ledger";
-  tail -n +"$((ABBA_PREFIX_ROWS+1))" "$LEDGER"; } > "$RUN_DIR/assembled.ledger"
-mv "$RUN_DIR/assembled.ledger" "$LEDGER"
-cat "$RUN_DIR/abba.timings" >> "$TIMINGS"
+publish_abba || exit 2
 ROW_T=$(date +%s.%N)
 
 # ---- 5. full tier: NIC regression cells vs pinned refs ----------------------------------------
