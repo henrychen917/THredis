@@ -179,12 +179,21 @@ def self_test():
         history = Path(temporary)
         first = allocate(history, 'run-a')
         repeated = allocate(history, 'run-a')
-        assert first['seeds'] == repeated['seeds'] == [7, 19, 20]
-        record_leg(history, argparse.Namespace(run='run-a', seed=20, suite='string',
+        fixed = permanent_seeds()
+        rotating = 20
+        while rotating in fixed:
+            rotating += 1
+        # Pinning a discovered seed must keep this control meaningful: test the next fresh seed,
+        # then prove its failure becomes permanent without replacing any source-pinned seed.
+        assert first['seeds'] == repeated['seeds'] == [*fixed, rotating]
+        record_leg(history, argparse.Namespace(run='run-a', seed=rotating, suite='string',
                    geometry='split', atomic=1, verdict='FAIL', log=history / 'failed.log'))
         second = allocate(history, 'run-b')
-        assert second['seeds'] == [7, 19, 20, 21] and second['failed'] == [20]
-        assert failing_seeds(history, 'string') == [20]
+        next_rotating = rotating + 1
+        while next_rotating in fixed:
+            next_rotating += 1
+        assert second['seeds'] == [*fixed, rotating, next_rotating] and second['failed'] == [rotating]
+        assert failing_seeds(history, 'string') == [rotating]
         assert failing_seeds(history, 'mode-equivalence') == []
         # Drive the REAL differ generator, sends, reads and comparison loop without a server.
         # Identical fake reply streams are enough to test coverage plumbing. In particular the
