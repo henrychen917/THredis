@@ -76,7 +76,9 @@ printf '%s\n' "$PLAN" > "$RUN_DIR/plan.sh"
 export TMPDIR="$RUN_DIR/main"
 mkdir -p "$TMPDIR" "$RUN_DIR/jobs" "$PWD/build/gate-cache"
 CORES=${SLOT_CORES[0]}; LOAD_CORES=${SLOT_LOAD_CORES[0]}; PORT=${SLOT_PORTS[0]}
-GATE_RATIO=${GATE_RATIO:-6:2}; NCORES=8
+# The planner supplies the measured correctness geometry. A caller's core allocation
+# must not derive or override its io/ex shape after that geometry was validated.
+NCORES=8
 export GATE_CANDIDATE_BINARY="$CANDIDATE_BINARY"
 # Pin the coordinator so every otherwise unpinned Python/CLI child inherits the load allocation.
 # Server boot helpers explicitly replace this affinity with their eight physical server cores.
