@@ -2280,6 +2280,7 @@ job_abba_selftest(){
 # a broken comparator is caught on any machine and before any measurement is trusted.
 row_begin "ABBA comparison + saturation negative controls"
 py tests/abbagate.py --self-test > $TMPDIR/gate-abbagate-unit.txt 2>&1 \
+    && py tests/background_environment_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_history.py self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && ok "ABBA comparison + saturation negative controls" \
     || bad "ABBA comparison + saturation negative controls" "see $TMPDIR/gate-abbagate-unit.txt"
@@ -2776,6 +2777,7 @@ if read -r ABBA_WATCH_STAT < "/proc/$ROW_WATCHDOG/stat"; then
   ABBA_WATCH_START=${ABBA_WATCH_FIELDS[19]}
 fi
 GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START" \
+  GATE_ABBA_BACKGROUND_ENVIRONMENT="${GATE_ABBA_BACKGROUND_ENVIRONMENT:-}" \
   python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &
 ABBA_PID=$!
 wait "$ABBA_PID"

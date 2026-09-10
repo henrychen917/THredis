@@ -35,249 +35,16 @@ import abbagate as abba
 import gate_quiet as quiet
 
 CELLS = ("h01", "h09", "h12")
-CLASSES = {"desktop", "interactive-frontend", "waiting-supervisor", "system-service", "idle-server"}
 PREFLIGHT = 120
 POSTFLIGHT = 60
-_DIGESTS = {}
 
 
-def file_identity(path):
-    before = path.stat()
-    fields = {"device": before.st_dev, "inode": before.st_ino, "size": before.st_size,
-              "mtime_ns": before.st_mtime_ns, "ctime_ns": before.st_ctime_ns}
-    key = tuple(fields.values())
-    if key not in _DIGESTS:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-            after = os.fstat(stream.fileno())
-        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != key:
-            raise quiet.QuietViolation(f"identity file changed while hashing: {path}")
-        _DIGESTS[key] = digest.hexdigest()
-    return {**fields, "sha256": _DIGESTS[key]}
-
-
-def script_identity(entry, executable, argv):
-    name = Path(executable).name
-    python = re.fullmatch(r"python[0-9.]*", name)
-    shell = name in ("bash", "sh", "dash", "zsh", "ksh")
-    if not python and not shell:
-        return None
-    arguments = [os.fsdecode(value) for value in argv.split(b"\0") if value][1:]
-    while arguments:
-        argument = arguments.pop(0)
-        if argument == "--":
-            break
-        if argument == "-c" or shell and re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", argument):
-            return None  # The complete inline body is already bound by the argv digest.
-        if python and argument in ("-m", "-"):
-            raise quiet.QuietViolation("reviewed interpreter module/stdin source cannot be resolved exactly")
-        if python and argument in ("-W", "-X"):
-            if not arguments:
-                raise quiet.QuietViolation("incomplete interpreter option")
-            arguments.pop(0)
-            continue
-        if not argument.startswith("-"):
-            arguments.insert(0, argument)
-            break
-        allowed = (re.fullmatch(r"-[uBEIOPsSvq]+|-W.+|-X.+", argument) if python else
-                   re.fullmatch(r"-[a-zA-Z]+|--noprofile|--norc", argument))
-        if not allowed:
-            raise quiet.QuietViolation(f"cannot resolve reviewed interpreter option {argument}")
-    if not arguments:
-        return None  # Interactive/waiting interpreter without a script argument.
-    script = Path(arguments[0])
-    path = entry / "root" / str(script).lstrip("/") if script.is_absolute() else entry / "cwd" / script
-    return {"path": str(path.resolve()), **file_identity(path)}
-
-
-def identity(pid, expected_start=None, proc_root=Path("/proc")):
-    entry = proc_root / str(pid)
-    def start():
-        return int((entry / "stat").read_text().rsplit(")", 1)[1].split()[19])
-    before = start()
-    target = os.readlink(entry / "exe")
-    executable = file_identity(entry / "exe")
-    argv = (entry / "cmdline").read_bytes()
-    script = script_identity(entry, target, argv)
-    if start() != before or (expected_start is not None and before != expected_start):
-        raise quiet.QuietViolation(f"PID {pid} changed while reading its identity")
-    return {"pid": pid, "start_ticks": before, "uid": entry.stat().st_uid,
-            "exe": {"path": target, **executable}, "script": script,
-            "argv_sha256": hashlib.sha256(argv).hexdigest()}
-
-
-def denied(error):
-    return {"status": "permission-denied", "error_type": type(error).__name__, "errno": error.errno}
-
-
-def incomplete_identity(pid, expected_start=None, proc_root=Path("/proc")):
-    entry = proc_root / str(pid)
-    def state():
-        raw = (entry / "stat").read_text()
-        comm, fields = raw.split("(", 1)[1].rsplit(")", 1)
-        return comm, int(fields.split()[19])
-    comm, start = state()
-    uids = [line.split()[1:] for line in (entry / "status").read_text().splitlines() if line.startswith("Uid:")]
-    if len(uids) != 1 or len(uids[0]) != 4:
-        raise quiet.QuietViolation(f"PID {pid} UID fields are not observable")
-    try:
-        os.readlink(entry / "exe")
-    except PermissionError as error:
-        observation = denied(error)
-    else:
-        raise quiet.QuietViolation(f"PID {pid} executable link is now readable; incomplete identity changed")
-    try:
-        argv = (entry / "cmdline").read_bytes()
-        command = {"status": "readable", "bytes": len(argv), "sha256": hashlib.sha256(argv).hexdigest()}
-    except PermissionError as error:
-        command = denied(error)
-    result = {"provenance": "incomplete-executable", "pid": pid, "start_ticks": start,
-              "comm": comm, "proc_directory_uid": entry.stat().st_uid, "status_uids": list(map(int, uids[0])),
-              "exe": None, "executable_observation": observation, "argv_observation": command,
-              "limitation": "executable path, bytes and script provenance are unobserved"}
-    if state() != (comm, start) or expected_start is not None and expected_start != start:
-        raise quiet.QuietViolation(f"PID {pid} changed while reading its incomplete identity")
-    return result
-
-
-def inventory_cmdline(entry, start):
-    try:
-        return (entry / "cmdline").read_bytes()
-    except PermissionError:
-        # Capture only: no approval or activity exemption follows from missing argv.
-        # The incomplete identity explicitly records this permission failure.
-        return b""
-
-
-def inventory():
-    rows = []
-    for row in sorted(quiet.snapshot(cmdline_reader=inventory_cmdline).values(), key=lambda row: row.pid):
-        if row.kernel_thread:
-            continue  # PF_KTHREAD accounting remains separately visible in every run.
-        record = {"pid": row.pid, "start_ticks": row.start, "parent_pid": row.parent,
-                  "comm": row.name, "cpu_ticks": row.ticks, "affinity": sorted(row.affinity),
-                  "reviewed": False, "classification": None, "identity": None}
-        try:
-            record["identity"] = identity(row.pid, row.start)
-        except PermissionError as error:
-            record["identity_error"] = str(error)
-            try:
-                record["identity"] = incomplete_identity(row.pid, row.start)
-                record["accept_incomplete_executable"] = False
-            except (OSError, quiet.QuietViolation) as observed_error:
-                record["incomplete_identity_error"] = str(observed_error)
-        except (OSError, quiet.QuietViolation) as error:
-            record["identity_error"] = str(error)
-        rows.append(record)
-    return {"schema": 1, "captured_at": time.time(), "processes": rows}
-
-
-def reviewed_inventory(document):
-    if document.get("schema") != 1 or not isinstance(document.get("processes"), list):
-        raise ValueError("invalid reviewed background inventory")
-    reviewed, pids, ports = {}, set(), set()
-    for row in document["processes"]:
-        if row.get("reviewed") is not True:
-            continue
-        value = row.get("identity")
-        idle_server = row.get("classification") == "idle-server"
-        if idle_server:
-            declared = row.get("listener_ports")
-            if (row.get("comm") not in quiet.SERVERS or not isinstance(declared, list) or not declared or
-                    any(type(port) is not int or not 0 < port < 65536 for port in declared) or
-                    len(set(declared)) != len(declared) or ports.intersection(declared) or
-                    type(row.get("parent_pid")) is not int or not isinstance(row.get("affinity"), list) or
-                    not row["affinity"] or any(type(cpu) is not int or cpu < 0 for cpu in row["affinity"])):
-                raise ValueError(f"PID {row.get('pid')} lacks distinct explicitly reviewed idle-server listener ports")
-            ports.update(declared)
-        elif "listener_ports" in row:
-            raise ValueError("listener_ports requires explicit idle-server classification")
-        if isinstance(value, dict) and value.get("provenance") == "incomplete-executable":
-            command = value.get("argv_observation", {})
-            if (row.get("classification") not in ("system-service", "idle-server") or row.get("accept_incomplete_executable") is not True or
-                    value.get("pid") != row.get("pid") or value.get("start_ticks") != row.get("start_ticks") or
-                    value.get("comm") != row.get("comm") or value.get("exe", "missing") is not None or
-                    value.get("executable_observation", {}).get("status") != "permission-denied" or
-                    len(value.get("status_uids", [])) != 4 or command.get("status") not in ("readable", "permission-denied") or
-                    command["status"] == "readable" and not re.fullmatch(r"[0-9a-f]{64}", command.get("sha256", ""))):
-                raise ValueError(f"PID {row.get('pid')} lacks explicit review of complete observable service fields")
-            if row["pid"] in pids or row.get("comm") in quiet.COMPETING and not idle_server:
-                raise ValueError(f"duplicate or competing reviewed PID {row['pid']}")
-            pids.add(row["pid"])
-            reviewed[row["pid"], row["start_ticks"]] = value
-            continue
-        if (row.get("classification") not in CLASSES or not isinstance(value, dict) or
-                value.get("pid") != row.get("pid") or value.get("start_ticks") != row.get("start_ticks") or
-                not isinstance(value.get("exe"), dict) or not value["exe"].get("path") or
-                not isinstance(value["exe"].get("ctime_ns"), int) or
-                not re.fullmatch(r"[0-9a-f]{64}", value["exe"].get("sha256", "")) or
-                not re.fullmatch(r"[0-9a-f]{64}", value.get("argv_sha256", ""))):
-            raise ValueError(f"reviewed PID {row.get('pid')} lacks an exact readable identity/classification")
-        if row["pid"] in pids:
-            raise ValueError(f"duplicate reviewed PID {row['pid']}")
-        names = {row.get("comm"), Path(value["exe"]["path"]).name}
-        if names & quiet.ACTIVE_EXPERIMENTS or names & quiet.SERVERS and not idle_server:
-            raise ValueError(f"PID {row['pid']} is a server/compiler/generator, not idle background")
-        pids.add(row["pid"])
-        reviewed[row["pid"], row["start_ticks"]] = value
-    if not reviewed:
-        raise ValueError("no exact background identities have been explicitly reviewed")
-    return reviewed
-
-
-def tcp_snapshot(ports, net_root=Path("/proc/net")):
-    """Read only: never connect to an unrelated listener to test its identity.
-
-    Retain IPv4/IPv6 rows whose local OR remote port is reviewed. TIME_WAIT and
-    CLOSED are recorded remnants, not live connections; every other non-LISTEN
-    state (including handshakes and draining connections) invalidates the run.
-    These namespace-wide records cannot bind an unreadable server fd to a port,
-    and two snapshots cannot prove that no short connection occurred between them.
-    """
-    result = {"started_monotonic": time.monotonic(), "namespace": os.readlink("/proc/self/ns/net"),
-              "ports": sorted(ports), "rows": []}
-    for protocol in ("tcp", "tcp6"):
-        lines = (net_root / protocol).read_text().splitlines()
-        if not lines or "local_address" not in lines[0]:
-            raise quiet.QuietViolation(f"unreadable TCP snapshot header: {protocol}")
-        for raw in lines[1:]:
-            fields = raw.split()
-            try:
-                local = int(fields[1].rsplit(":", 1)[1], 16)
-                remote = int(fields[2].rsplit(":", 1)[1], 16)
-                state = int(fields[3], 16)
-                inode, uid = int(fields[9]), int(fields[7])
-                if not 1 <= state <= 12:
-                    raise ValueError("unknown TCP state")
-            except (ValueError, IndexError) as error:
-                raise quiet.QuietViolation(f"malformed {protocol} socket record: {raw}") from error
-            if local in ports or remote in ports:
-                result["rows"].append({"protocol": protocol, "local_port": local, "remote_port": remote,
-                    "state": state, "uid": uid, "inode": inode, "raw": raw})
-    result["ended_monotonic"] = time.monotonic()
-    return result
-
-
-def check_idle_connections(snapshot, ports):
-    live = [row for row in snapshot["rows"] if row["state"] not in (10, 6, 7)]
-    if live:
-        raise quiet.QuietViolation(f"reviewed idle-server has observed non-listener live TCP connection: {live}")
-    listening = {row["local_port"] for row in snapshot["rows"] if row["state"] == 10}
-    if ports - listening:
-        raise quiet.QuietViolation(f"reviewed idle-server listener disappeared: {sorted(ports - listening)}")
-
-
-def summary(document):
-    for row in document["processes"]:
-        value = row.get("identity")
-        description = ("INCOMPLETE executable provenance; " + str(value["executable_observation"])
-                       if value and value.get("provenance") == "incomplete-executable" else
-                       value["exe"]["path"] if value else "UNKNOWN: " + row.get("identity_error", "unreadable"))
-        print(f"{'REVIEWED' if row.get('reviewed') else 'unreviewed':10} "
-              f"{row['pid']}:{row['start_ticks']} {row['comm']} ticks={row['cpu_ticks']} "
-              f"{description}")
+# Identity and passive TCP review have one implementation shared with the normal
+# observer. This driver alone retains its historical, explicitly unsupported CPU
+# budget experiment; its results are permanently ineligible for gate/null receipts.
+from background_environment import (file_identity, script_identity, identity, denied,
+    incomplete_identity, inventory_cmdline, inventory, reviewed_inventory, summary,
+    tcp_snapshot, check_idle_connections)
 
 
 class QualificationMonitor(quiet.QuietMonitor):
@@ -309,6 +76,7 @@ class QualificationMonitor(quiet.QuietMonitor):
         self.postflight_seconds = None
         self.sample_path = output / "background-samples.jsonl"
         self.sample_path.touch(exist_ok=False)
+        kwargs["_diagnostic_legacy_budget"] = True
         super().__init__(*args, **kwargs)
 
     def set_phase(self, phase):
@@ -880,7 +648,8 @@ def self_test():
         def test_inventory_retains_unknown_system_identity_without_approving_it(self):
             process = quiet.Process(33, 4, 1, "system-service", 1, frozenset([0]))
             with mock.patch.object(quiet, "snapshot", return_value={33: process}), \
-                 mock.patch(__name__ + ".identity", side_effect=PermissionError("exe unreadable")):
+                 mock.patch("background_environment.identity", side_effect=PermissionError("exe unreadable")), \
+                 mock.patch("background_environment.incomplete_identity", side_effect=PermissionError("identity unreadable")):
                 capture = inventory()
             self.assertEqual(len(capture["processes"]), 1)
             self.assertFalse(capture["processes"][0]["reviewed"])

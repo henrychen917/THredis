@@ -4,15 +4,15 @@
 This observer never stops a process. /proc identities, not argv patterns, distinguish
 the driver's children from foreign work. Ordinary sleeping services are harmless;
 known compilers, load generators and ABBA drivers are competing experiments even
-while temporarily asleep between phases. An idle unrelated server is recorded,
-then subject to the same bounded CPU screening as other generic foreign processes.
-Every observed foreign CPU tick is recorded, including activity below the budget.
+while temporarily asleep between phases. Every observed foreign CPU tick is
+recorded. Without an explicit reviewed-environment contract, any foreign user
+activity refuses the run. A contract permits only its declared ordinary background.
 PF_KTHREAD identifies kernel threads; their CPU activity is recorded separately
 and cannot be mistaken for a foreign user workload because exe access is denied.
 The gate's declared row watchdog is controller housekeeping only after its exact
 PID/start identity, script and captured controller parent are independently verified.
-The screening budget is not a regression tolerance or a bound on cache/tail effects;
-the standing identical-binary null must still validate the comparison instrument.
+CPU time is never converted to performance error; the standing identical-binary
+null must independently validate the comparison instrument.
 The sample cannot see a process born and reaped entirely between observations; the
 exclusive-box rule remains necessary, and the evidence records this limitation.
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
 import math
+import json
 import os
 from pathlib import Path
 import re
@@ -36,19 +37,12 @@ ACTIVE_EXPERIMENTS = frozenset(("make", "gmake", "ninja", "cc1", "cc1plus", "cla
 SERVERS = frozenset(("redis-server", "tomokv", "dragonfly", "keydb-server", "memcached", "GarnetServer"))
 COMPETING = ACTIVE_EXPERIMENTS | SERVERS
 
-# The first live preflight rejected two isolated 10ms desktop ticks. A subsequent
-# idle-box capture (2026-09-10, quiet-background-60s.json) recorded ~2.6 CPU seconds
-# in 68.77 wall seconds, with 0.16-second bursts but every rolling20s below 0.96s.
-# This screening heuristic uses the owner's recorded 0.15% quiet benchmark
-# resolution as its capacity scale: 0.0015 * SERVER physical cores * measurement
-# seconds. The owner did not specify a CPU-time bound.
-# Load cores and SMT threads never enlarge it. This is not evidence that CPU time
-# bounds cache displacement or tail latency. The all-cell null remains mandatory.
-# Test the full rolling budget at every sample; a strict per-second rate cap would
-# reject ten samples of that same idle capture. No measured burst factor is added.
-# Replaying that capture gives 0.92s/0.96s at20s (PASS), 0.53s/0.48s at10s (FAIL).
-# Shortening the measurement does not preserve this precondition automatically.
-GENERIC_CPU_FRACTION = 0.0015
+# Historical diagnostics borrowed the owner's throughput resolution to construct
+# a CPU budget. The 68.757s idle capture established only2.53 CPU-s and a rolling
+# 20s peak of.92s, not a CPU-time→performance-error relationship. Preserve this
+# number solely to interpret those permanently untrusted diagnostic experiments.
+# It is not a normal gate precondition and cannot confer measurement trust.
+LEGACY_DIAGNOSTIC_CPU_FRACTION = 0.0015
 
 # Verified against the installed Linux 7.0.0-31 include/linux/sched.h:1781.
 # /proc/PID/stat field9 exports task flags. Neither comm nor an unreadable exe
@@ -238,12 +232,21 @@ def interference(before: dict[int, Process], after: dict[int, Process],
 class QuietMonitor:
     """Latch the first interference; checking never retries a bad sample into green."""
     def _snapshot(self):
-        # The normal observer always requires its original complete /proc view.
-        # A permanently untrusted diagnostic subclass may supply its reviewed observation policy.
-        return snapshot()
+        return snapshot(cmdline_reader=self.background.cmdline) if self.background else snapshot()
 
     def __init__(self, server_cpus, load_cpus, *, own_root_pid=None, interval=1.0,
-                 window_seconds=20):
+                 window_seconds=20, background_environment=None, sample_artifact=None,
+                 _diagnostic_legacy_budget=False):
+        self.legacy_diagnostic = _diagnostic_legacy_budget
+        # Lazy import keeps capture/review helpers usable without a circular
+        # module initialization dependency. The explicit file is authorization
+        # for this observed environment, never a name/UID exemption.
+        from background_environment import EnvironmentObserver
+        self.background = None if self.legacy_diagnostic else EnvironmentObserver(background_environment)
+        self.sample_artifact = Path(sample_artifact) if sample_artifact else None
+        self.sample_events = []
+        if self.sample_artifact:
+            self.sample_artifact.touch(exist_ok=False)
         requested = set(server_cpus) | set(load_cpus)
         if (not requested or not server_cpus or not math.isfinite(interval) or interval <= 0 or
                 not math.isfinite(window_seconds) or window_seconds <= 0):
@@ -257,7 +260,8 @@ class QuietMonitor:
         self.core_of_cpu = {sibling: min(topology[cpu]) for cpu in requested
                             for sibling in topology[cpu]}
         self.window_seconds = window_seconds
-        self.cpu_budget_seconds = GENERIC_CPU_FRACTION * self.server_physical_cores * window_seconds
+        self.cpu_budget_seconds = (LEGACY_DIAGNOSTIC_CPU_FRACTION * self.server_physical_cores * window_seconds
+                                   if self.legacy_diagnostic else None)
         self.tick_seconds = 1 / os.sysconf("SC_CLK_TCK")
         self.previous = self._snapshot()
         self.previous_at = time.monotonic()
@@ -351,9 +355,18 @@ class QuietMonitor:
         # The ceiling also applies to a single sample, even if sampling was delayed
         # for longer than WINDOW: an observation gap cannot purchase extra budget.
         sample_ticks = sum(row["cpu_ticks"] for row in activity)
-        if max(ticks, sample_ticks) * self.tick_seconds > self.cpu_budget_seconds:
+        if self.legacy_diagnostic and max(ticks, sample_ticks) * self.tick_seconds > self.cpu_budget_seconds:
             offenders = rolling
         owned = owned_processes(current, self.root) | self.ancestors | self.helpers.keys()
+        inspection = None
+        if self.background:
+            offenders += [row for row in activity if (row["pid"], row["start_ticks"]) not in self.background.reviewed
+                          and row not in offenders]
+            try:
+                inspection = self.background.inspect(self.previous, current, owned)
+            except (OSError, ValueError, QuietViolation) as error:
+                inspection = self.background.last_inspection
+                self.failure = self.failure or {"observed_at": time.time(), "error": str(error)}
         for row in current.values():
             prior = self.previous.get(row.pid)
             if row.identity in self.ancestors and prior and prior.identity == row.identity:
@@ -375,9 +388,18 @@ class QuietMonitor:
                 "rolling_cpu_seconds": ticks * self.tick_seconds,
                 "sample_cpu_seconds": sample_ticks * self.tick_seconds,
                 "cpu_budget_seconds": self.cpu_budget_seconds}
+        if self.background:
+            event = {"started_monotonic": now - elapsed, "ended_monotonic": now,
+                     "user_cpu_activity": activity, "kernel_cpu_activity": kernel_activity,
+                     "environment": inspection, "hard_failure": self.failure}
+            if self.sample_artifact:
+                with self.sample_artifact.open("a") as stream:
+                    stream.write(json.dumps(event, sort_keys=True) + "\n")
+            else:
+                self.sample_events.append(event)
 
     def evidence(self):
-        return {"started_at": self.started, "sample_interval_seconds": self.interval,
+        result = {"started_at": self.started, "sample_interval_seconds": self.interval,
                 "finished_at": self.finished, "complete": self.closed and self.failure is None,
                 "samples": self.samples, "tick_seconds": self.tick_seconds,
                 "cpus": sorted(self.cpus), "requested_cpus": sorted(self.requested_cpus),
@@ -386,7 +408,9 @@ class QuietMonitor:
                 "foreign_cpu_activity": list(self.foreign_activity.values()),
                 "kernel_cpu_activity": list(self.kernel_activity.values()),
                 "generic_cpu_screening": {"server_physical_cores": self.server_physical_cores,
-                    "capacity_fraction": GENERIC_CPU_FRACTION, "window_seconds": self.window_seconds,
+                    "capacity_fraction": LEGACY_DIAGNOSTIC_CPU_FRACTION if self.legacy_diagnostic else None,
+                    "status": "unsupported historical diagnostic heuristic" if self.legacy_diagnostic else "observations only; no CPU budget",
+                    "window_seconds": self.window_seconds,
                     "cpu_budget_seconds": self.cpu_budget_seconds, "peak_rolling": self.peak_rolling,
                     "peak_possible_core_concentration": self.peak_core_concentration,
                     "max_sample_interval_seconds": self.max_sample_interval,
@@ -398,16 +422,24 @@ class QuietMonitor:
                 "excluded_controller_ancestors": list(self.excluded_activity.values()),
                 "excluded_controller_helpers": list(self.helpers.values()),
                 "limitation": "processes born and reaped between samples may be missed"}
+        result["policy"] = "legacy-diagnostic-budget-unsupported" if self.legacy_diagnostic else "operational-environment-v1"
+        if self.background:
+            result["background_environment"] = self.background.evidence(self.sample_artifact)
+            if not self.sample_artifact:
+                result["background_environment"]["samples"] = self.sample_events
+        return result
 
     def check(self):
         if self.failure:
             details = self.failure.get("processes", [])
             reason = "; ".join(f"PID {p['pid']} ({p['comm']}): {p['reason']}, "
                                f"{p['cpu_ticks']} CPU ticks" for p in details)
-            if self.failure.get("rolling_cpu_seconds", 0) > self.cpu_budget_seconds:
+            if self.legacy_diagnostic and self.failure.get("rolling_cpu_seconds", 0) > self.cpu_budget_seconds:
                 reason = (f"foreign CPU screening budget exceeded: "
                           f"{self.failure['rolling_cpu_seconds']:.6f}s > {self.cpu_budget_seconds:.6f}s "
                           f"per {self.window_seconds:g}s on {self.server_physical_cores} physical server cores; " + reason)
+            if not self.legacy_diagnostic and reason:
+                reason += "; no permission to compute concurrently; ordinary idle background needs an explicit --background-environment review"
             raise QuietViolation("QUIET-BOX PRECONDITION FAILED: " + (reason or self.failure["error"]))
 
     def preflight(self):
@@ -738,7 +770,7 @@ PY
                  mock.patch(__name__ + ".snapshot", return_value=self.before), \
                  mock.patch.object(time, "monotonic", return_value=0):
                 return QuietMonitor(list(range(server_count)), list(range(server_count, 256)),
-                                    own_root_pid=10, window_seconds=window)
+                                    own_root_pid=10, window_seconds=window, _diagnostic_legacy_budget=True)
 
         def budget_sample(self, monitor, second, rows):
             with mock.patch(__name__ + ".snapshot", return_value=rows), \

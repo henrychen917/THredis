@@ -561,6 +561,7 @@ def install(root, *, uninstall=False):
 
 
 def self_test():
+    from background_environment import canonical_contract
     import copy
     import shutil
     import unittest
@@ -654,6 +655,7 @@ def self_test():
             self.save_results()
 
         def make_report(self, started, candidate, reference, *, is_null=False):
+            background = canonical_contract(None)
             rows = []
             for cell in self.state["inventory"]["cells"]:
                 runs = [dict(arm=arm, complete=True, artifacts=f"{cell['id']}/n1-{i}-{arm}", pid=100 + i,
@@ -672,11 +674,17 @@ def self_test():
                 coverage=dict(ids=[c["id"] for c in self.state["inventory"]["cells"]], count=178, pending_pins=[]),
                 candidate=dict(sha256=candidate), reference=dict(sha256=reference),
                 environment=dict(python_runtime=copy.deepcopy(self.state["instrument"]["python"]),
+                                 background_environment=copy.deepcopy(background),
                                  server_cpus=[0, 1], load_cpus=[2, 3], server_physical=[0, 1],
                                  load_physical=[2, 3], uname=["fixture"], memtier_sha256="d" * 64,
                                  memtier_version="fixture", keys=2000000, data_bytes=64, key_pattern="P:P", split_ratio="1:1",
                                  population_by_arm={"A": "wire", "B": "wire"}),
-                quiet_box=dict(complete=True, interference=None, started_at=started + 1, finished_at=started + 15999,
+                quiet_box=dict(policy="operational-environment-v1",
+                               background_environment=dict(contract=copy.deepcopy(background),
+                                   source=dict(path=None, sha256=None), reviewed_inventory=None,
+                                   sample_artifact="background-samples.jsonl", sample_count=15998,
+                                   listener_snapshots=0, limitation="fixture"),
+                               complete=True, interference=None, started_at=started + 1, finished_at=started + 15999,
                                sample_interval_seconds=1, samples=15998, cpus=[0, 1, 2, 3], requested_cpus=[0, 1, 2, 3]),
                 cells=rows)
             if is_null:
@@ -895,6 +903,95 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
             self.save_results()
             with self.assertRaisesRegex(ValueError, "ABBA harness differs"):
                 finish(self.root, self.finish_args)
+
+        def reviewed_background_document(self):
+            return dict(schema=1, captured_at=self.start_time - 20000, processes=[dict(
+                pid=91000, start_ticks=123, parent_pid=1, comm="fixture-daemon", affinity=[0, 1, 2, 3],
+                cpu_ticks=17, reviewed=True, classification="system-service", identity=dict(
+                    pid=91000, start_ticks=123, uid=1000, argv_sha256="e" * 64, script=None,
+                    exe=dict(path="/usr/bin/fixture-daemon", device=1, inode=2, size=3,
+                             mtime_ns=4, ctime_ns=5, sha256="f" * 64)))])
+
+        def test_reviewed_background_contract_binds_null_but_not_capture_observations(self):
+            document = self.reviewed_background_document()
+            control_contract = canonical_contract(document)
+            document["captured_at"] += 100
+            document["processes"][0]["cpu_ticks"] += 2
+            comparison_contract = canonical_contract(document)
+            self.assertEqual(control_contract, comparison_contract)
+            for report, contract, captured in ((self.control, control_contract, 1),
+                                                (self.report, comparison_contract, 2)):
+                report["environment"]["background_environment"] = copy.deepcopy(contract)
+                report["quiet_box"]["background_environment"] = dict(
+                    contract=copy.deepcopy(contract), source=dict(path=f"/reviewed/capture-{captured}.json",
+                        sha256=str(captured) * 64), reviewed_inventory=copy.deepcopy(document),
+                    sample_count=15998, sample_artifact=f"capture-{captured}/background-samples.jsonl",
+                    listener_snapshots=0, limitation="fixture",
+                    snapshots=[dict(captured_at=captured, cpu_ticks=17 + captured)])
+            self.report.pop("standing_null", None)
+            self.save_results()
+            self.assertTrue(finish(self.root, self.finish_args).is_file())
+            quiet_contract = self.report["quiet_box"]["background_environment"]["contract"]
+            self.report["quiet_box"]["background_environment"]["contract"] = canonical_contract(None)
+            with self.assertRaisesRegex(ValueError, "quiet-box background environment differs"):
+                validate_measurements(self.report, now=time.time())
+            self.report["quiet_box"]["background_environment"]["contract"] = quiet_contract
+            document["processes"][0]["identity"]["argv_sha256"] = "d" * 64
+            changed = canonical_contract(document)
+            self.report["environment"]["background_environment"] = changed
+            self.report["quiet_box"]["background_environment"]["contract"] = copy.deepcopy(changed)
+            self.report["quiet_box"]["background_environment"]["reviewed_inventory"] = document
+            self.report.pop("standing_null", None)
+            self.save_results()
+            with self.assertRaisesRegex(ValueError, "null used another geometry or measurement environment"):
+                finish(self.root, self.finish_args)
+
+        def test_reviewed_idle_server_needs_listener_coverage_and_inventory_provenance(self):
+            document = self.reviewed_background_document()
+            row = document["processes"][0]
+            row.update(classification="idle-server", comm="redis-server", listener_ports=[9064])
+            row["identity"]["exe"]["path"] = "/usr/bin/redis-server"
+            contract = canonical_contract(document)
+            self.report["environment"]["background_environment"] = copy.deepcopy(contract)
+            background = self.report["quiet_box"]["background_environment"]
+            background.update(contract=copy.deepcopy(contract), source=dict(path="/reviewed/idle.json", sha256="a" * 64),
+                              reviewed_inventory=copy.deepcopy(document))
+            with self.assertRaisesRegex(ValueError, "listeners were not observed at every quiet sample"):
+                validate_measurements(self.report, now=time.time())
+            background["listener_snapshots"] = self.report["quiet_box"]["samples"]
+            validate_measurements(self.report, now=time.time())
+            background["source"]["sha256"] = None
+            with self.assertRaisesRegex(ValueError, "missing reviewed background inventory provenance"):
+                validate_measurements(self.report, now=time.time())
+            background["source"]["sha256"] = "a" * 64
+            background["reviewed_inventory"]["processes"][0]["listener_ports"] = [9065]
+            with self.assertRaisesRegex(ValueError, "inventory differs from its environment contract"):
+                validate_measurements(self.report, now=time.time())
+
+        def test_operational_background_contract_and_diagnostic_poison_controls(self):
+            baseline = copy.deepcopy(self.report)
+            cases = [
+                ("missing quiet policy", lambda: self.report["quiet_box"].pop("policy")),
+                ("diagnostic quiet policy", lambda: self.report["quiet_box"].update(policy="background-qualification")),
+                ("missing quiet contract", lambda: self.report["quiet_box"].pop("background_environment")),
+                ("missing background samples", lambda: self.report["quiet_box"]["background_environment"].pop("sample_artifact")),
+                ("incomplete background samples", lambda: self.report["quiet_box"]["background_environment"].update(sample_count=1)),
+                ("missing source provenance", lambda: self.report["quiet_box"]["background_environment"].pop("source")),
+                ("strict with inventory", lambda: self.report["quiet_box"]["background_environment"].update(reviewed_inventory={})),
+                ("missing environment contract", lambda: self.report["environment"].pop("background_environment")),
+                ("bad quiet contract digest", lambda: self.report["quiet_box"]["background_environment"]["contract"].update(sha256="0" * 64)),
+                ("bad environment contract digest", lambda: self.report["environment"]["background_environment"].update(sha256="0" * 64)),
+                ("unknown contract policy", lambda: self.report["environment"]["background_environment"].update(policy="allow-background")),
+                ("old diagnostic run", lambda: self.report.update(run_kind="background-qualification")),
+                ("ineligible diagnostic run", lambda: self.report.update(normal_gate_eligible=False)),
+            ]
+            for name, change in cases:
+                with self.subTest(name=name):
+                    self.report = copy.deepcopy(baseline)
+                    change()
+                    self.save_results()
+                    with self.assertRaises(ValueError):
+                        finish(self.root, self.finish_args)
 
         def test_smoke_partial_failed_unreached_quiet_and_null_controls(self):
             self.args.tier = "smoke"

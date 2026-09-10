@@ -7,6 +7,7 @@ import math
 import re
 
 from abba_instrument import validate_fingerprint
+from background_environment import canonical_contract, validate_contract
 
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
@@ -48,6 +49,9 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
     require(report.get("schema") == 1 and report.get("statistical_verdict") == "PASS" and
             report.get("verdict") in ("PASS", "PARTIAL"), "ABBA measurements did not all pass")
     require(report.get("measurement_valid") is True, "ABBA measurement validity was not certified")
+    require(report.get("run_kind") in ("comparison", "null-control") and
+            report.get("normal_gate_eligible", True) is True,
+            "diagnostic background qualification cannot certify ABBA measurements")
     require(re.fullmatch(r"[0-9a-f]{64}", report.get("receipt_harness_sha256", "")), "missing ABBA harness digest")
     require(harness is None or report["receipt_harness_sha256"] == harness, "ABBA harness differs")
     instrument_sha = validate_fingerprint(report.get("instrument_fingerprint"))
@@ -100,6 +104,16 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         require(environment.get(key), f"missing measurement environment: {key}")
     quiet = report.get("quiet_box", {})
     require(isinstance(quiet, dict), "invalid quiet-box evidence")
+    require(quiet.get("policy") == "operational-environment-v1",
+            "missing or unsupported operational quiet-box policy")
+    background = quiet.get("background_environment")
+    require(isinstance(background, dict), "missing quiet-box background environment evidence")
+    # Bind the exact reviewed identities (or the explicit strict policy), not the
+    # inventory capture time or its changing CPU counters. Both arms and any reused
+    # null must run under this same contract; observation provenance stays in quiet.
+    contract = validate_contract(environment.get("background_environment"))
+    require(validate_contract(background.get("contract")) == contract,
+            "quiet-box background environment differs from measurement environment")
     require(quiet.get("complete") is True and quiet.get("interference", "missing") is None,
             "quiet-box evidence missing, incomplete, or contended")
     qstart = number(quiet.get("started_at"), "quiet start", positive=True)
@@ -107,6 +121,28 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
     number(quiet.get("sample_interval_seconds"), "quiet sample interval", positive=True)
     require(type(quiet.get("samples")) is int and quiet["samples"] >= 2 and qstart < qend <= now + 1,
             "quiet observer did not complete its sampling interval")
+    require(type(background.get("sample_count")) is int and background["sample_count"] == quiet["samples"] and
+            isinstance(background.get("sample_artifact"), str) and background["sample_artifact"] and
+            type(background.get("listener_snapshots")) is int and
+            0 <= background["listener_snapshots"] <= quiet["samples"],
+            "background environment observations did not cover every quiet sample")
+    provenance = background.get("source")
+    require(isinstance(provenance, dict) and set(provenance) == {"path", "sha256"},
+            "missing background environment source provenance")
+    if contract["policy"] == "strict-foreign-activity-v1":
+        require(provenance == {"path": None, "sha256": None} and
+                background.get("reviewed_inventory", "missing") is None,
+                "strict background policy unexpectedly carries reviewed identities")
+    else:
+        require(isinstance(provenance["path"], str) and provenance["path"] and
+                isinstance(provenance["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", provenance["sha256"]) and
+                isinstance(background.get("reviewed_inventory"), dict),
+                "missing reviewed background inventory provenance")
+        require(canonical_contract(background["reviewed_inventory"]) == contract,
+                "reviewed background inventory differs from its environment contract")
+    if any(row.get("listener_ports") for row in contract["reviewed_identities"]):
+        require(background["listener_snapshots"] == quiet["samples"],
+                "reviewed idle-server listeners were not observed at every quiet sample")
     monitored = quiet.get("cpus", [])
     requested = quiet.get("requested_cpus", [])
     require(set(requested) == set(environment["server_cpus"] + environment["load_cpus"]) and
@@ -157,6 +193,10 @@ def null_resolution(report):
     spread. Recompute from every raw block, including unselected escalation probes:
     neither a cached PASS nor selecting another rung may hide a failed control.
     There is no new floor, multiplier, or change to a code comparison's threshold.
+    The range of two reference samples is not a confidence or prediction bound:
+    even small, zero-bias Gaussian noise can fail this check. Repeated all-cell
+    certification still needs measured calibration with independent validation,
+    or an improved instrument; passing one null does not establish its resolution.
     """
     evidence = []
     for row in report["cells"]:
