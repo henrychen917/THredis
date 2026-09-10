@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import sqlite3
 import statistics
 import sys
 import tempfile
@@ -29,6 +30,9 @@ import uuid
 
 SCHEMA = 1
 HISTORY_FILE = "row-observations.jsonl"
+INDEX_FILE = "row-observations.index.sqlite3"
+INDEX_CHECKPOINT = "row-observations.index.json"
+INDEX_SCHEMA = 1
 # Recorded 2026-09-10, cx-gatefast/build/gate-run.*/jobs/*/family.tsv: completed
 # one-row families have differential medians 358.31/357.98 s (max/median 1.003),
 # lruclock median 155.25 s (126.44..200.14, max/median 1.289), and flipctl median
@@ -177,6 +181,110 @@ def read_history(directory: Path) -> list[dict]:
         return decode_history(stream.read(), path)
 
 
+def file_identity(info: os.stat_result) -> dict[str, int]:
+    # ctime catches an in-place edit even when a caller restores the old mtime; inode/device
+    # catch replacement. These are cache invalidation evidence, never substitutes for validating
+    # an unfamiliar JSONL file. Readers/prepare always decode every authoritative observation.
+    return {name: getattr(info, "st_" + name) for name in
+            ("dev", "ino", "size", "mtime_ns", "ctime_ns")}
+
+
+def fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_index_checkpoint(directory: Path, stream) -> None:
+    atomic_json(directory / INDEX_CHECKPOINT, {"schema": INDEX_SCHEMA,
+        "history": file_identity(os.fstat(stream.fileno())),
+        "index": file_identity((directory / INDEX_FILE).stat())})
+    fsync_directory(directory)
+
+
+def connect_index(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    # A single-file DELETE journal keeps the checkpoint's index identity meaningful. Writers
+    # already serialize on the authoritative JSONL flock; WAL would add another publication log.
+    try:
+        if connection.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
+            raise ValueError("unsupported history index journal mode")
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def index_key(observation_id: str) -> str:
+    # JSON permits escaped surrogates. The cache must preserve every ID accepted by the
+    # authoritative schema rather than narrow it to SQLite's UTF-8 TEXT binding grammar.
+    # The ASCII JSON representation also equates surrogate pairs with their decoded scalar.
+    return json.dumps(observation_id, ensure_ascii=True)
+
+
+def rebuild_index(directory: Path, stream, path: Path) -> sqlite3.Connection:
+    stream.seek(0)
+    rows = decode_history(stream.read(), path) # Corrupt history is never repaired or discarded.
+    source = file_identity(os.fstat(stream.fileno()))
+    with tempfile.NamedTemporaryFile(dir=directory, prefix="history-index.", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+    connection = None
+    try:
+        connection = connect_index(temporary_path)
+        connection.executescript("""
+            CREATE TABLE observation_ids (id TEXT PRIMARY KEY) WITHOUT ROWID;
+            CREATE TABLE checkpoint (singleton INTEGER PRIMARY KEY CHECK(singleton=1), source TEXT NOT NULL);
+        """)
+        connection.executemany("INSERT INTO observation_ids VALUES (?)",
+                               ((index_key(row["observation_id"]),) for row in rows))
+        connection.execute("INSERT INTO checkpoint VALUES (1, ?)", (json.dumps(source, sort_keys=True),))
+        connection.commit()
+        connection.close()
+        connection = None
+        # Derived cache only: a stale SQLite journal must not be replayed onto the replacement.
+        for suffix in ("-journal", "-wal", "-shm"):
+            Path(str(directory / INDEX_FILE) + suffix).unlink(missing_ok=True)
+        os.replace(temporary_path, directory / INDEX_FILE)
+        publish_index_checkpoint(directory, stream)
+        return connect_index(directory / INDEX_FILE)
+    finally:
+        if connection is not None:
+            connection.close()
+        temporary_path.unlink(missing_ok=True)
+        Path(str(temporary_path) + "-journal").unlink(missing_ok=True)
+
+
+def verified_index(directory: Path, stream, path: Path) -> sqlite3.Connection:
+    source = file_identity(os.fstat(stream.fileno()))
+    connection = None
+    try:
+        checkpoint = json.loads((directory / INDEX_CHECKPOINT).read_text())
+        if checkpoint != {"schema": INDEX_SCHEMA, "history": source,
+                           "index": file_identity((directory / INDEX_FILE).stat())}:
+            raise ValueError("history/index checkpoint changed")
+        connection = connect_index(directory / INDEX_FILE)
+        stored = connection.execute("SELECT source FROM checkpoint WHERE singleton=1").fetchone()
+        if stored is None or json.loads(stored[0]) != source:
+            raise ValueError("index transaction and JSONL checkpoint differ")
+        return connection
+    except (OSError, ValueError, sqlite3.Error):
+        if connection is not None:
+            connection.close()
+    # Missing/cache-corrupt/stale state includes a crash after the durable JSONL append but
+    # before either index commit or checkpoint rename. Revalidate the entire authoritative file
+    # before replacing this disposable index, so middle corruption and duplicate IDs still fail.
+    return rebuild_index(directory, stream, path)
+
+
+def commit_index(connection: sqlite3.Connection, stream) -> None:
+    connection.execute("UPDATE checkpoint SET source=? WHERE singleton=1",
+                       (json.dumps(file_identity(os.fstat(stream.fileno())), sort_keys=True),))
+    connection.commit()
+
+
 def record(directory: Path, *, run_id: str, label: str, seconds: float,
            verdict: str, timed_out: bool = False, observation_id: str | None = None,
            scored: bool = True, ledger_label: str | None = None) -> None:
@@ -187,17 +295,29 @@ def record(directory: Path, *, run_id: str, label: str, seconds: float,
         "ledger_label": canonical_label(ledger_label or label) if scored else None})
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / HISTORY_FILE
-    # A single locked append protects parallel workers. Verify the complete existing file
-    # before mutation: corrupt history must fail visibly, never silently disappear.
+    # JSONL remains the durable audit and the lock. Its stat-bound, disposable ID index avoids
+    # decoding all previous runs once per row. Any unfamiliar file/index forces full validation.
+    # 2026-09-10 file-only timing, 5,000 prior rows + 100 fsynced appends (median of three):
+    # PRE 6.117 s; POST 0.178 s including index creation, 0.109 s with an existing index.
+    # This excludes Python startup and is not a measurement of end-to-end gate duration.
     with path.open("a+", encoding="utf-8") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
-        stream.seek(0)
-        existing = decode_history(stream.read(), path)
-        if any(old["observation_id"] == row["observation_id"] for old in existing):
-            raise ValueError(f"{path}: duplicate observation_id {row['observation_id']}")
-        stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
+        connection = verified_index(directory, stream, path)
+        try:
+            key = index_key(row["observation_id"])
+            if connection.execute("SELECT 1 FROM observation_ids WHERE id=?", (key,)).fetchone():
+                raise ValueError(f"{path}: duplicate observation_id {row['observation_id']}")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO observation_ids VALUES (?)", (key,))
+            stream.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            # Never commit the ID before its JSONL record is durable. A failure from here on
+            # leaves the old checkpoint, so recovery finds (and cannot duplicate) this record.
+            commit_index(connection, stream)
+        finally:
+            connection.close()
+        publish_index_checkpoint(directory, stream)
 
 
 def verdict_history(directory: Path) -> dict:
@@ -645,6 +765,154 @@ class HistoryTests(unittest.TestCase):
             prepare(self.directory, [])
         with self.assertRaisesRegex(ValueError, "incomplete"):
             self.add(1)
+
+    def test_healthy_index_appends_and_deduplicates_without_decoding_old_history(self):
+        from unittest import mock
+        record(self.directory, run_id="old", label="first", seconds=1, verdict="ok", observation_id="first")
+        before = (self.directory / HISTORY_FILE).read_bytes()
+        with mock.patch(__name__ + ".decode_history", side_effect=AssertionError("old JSONL was reread")):
+            with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+                record(self.directory, run_id="new", label="other", seconds=2, verdict="ok", observation_id="first")
+            self.assertEqual((self.directory / HISTORY_FILE).read_bytes(), before)
+            for number in range(10):
+                record(self.directory, run_id="new", label="new", seconds=2, verdict="ok",
+                       observation_id=f"new-{number}")
+        with mock.patch(__name__ + ".decode_history", wraps=decode_history) as decode:
+            self.assertEqual(len(read_history(self.directory)), 11)
+            prepare(self.directory, [])
+            self.assertEqual(decode.call_count, 2, "read/prepare must still validate the complete audit")
+
+    def test_corrupt_middle_with_restored_mtime_and_truncated_tail_are_never_appended(self):
+        for number in range(3):
+            record(self.directory, run_id="old", label="first", seconds=1, verdict="ok", observation_id=str(number))
+        path = self.directory / HISTORY_FILE
+        original = path.read_bytes()
+        info = path.stat()
+        lines = original.splitlines(keepends=True)
+        lines[1] = lines[1].replace(b'"schema": 1', b'"schema": 9')
+        changed = b"".join(lines)
+        self.assertEqual(len(changed), len(original))
+        path.write_bytes(changed)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        with self.assertRaisesRegex(ValueError, "schema"):
+            self.add(1)
+        self.assertEqual(path.read_bytes(), changed)
+        path.write_bytes(original[:-2])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.add(1)
+        self.assertEqual(path.read_bytes(), original[:-2])
+
+    def test_index_preserves_all_json_string_ids_including_escaped_surrogates(self):
+        identities = ("測定", "\U00010000", "\ud800", "\udc00")
+        for identity in identities:
+            record(self.directory, run_id="old", label="row", seconds=1,
+                   verdict="ok", observation_id=identity)
+        (self.directory / INDEX_CHECKPOINT).unlink()
+        for identity in identities:
+            with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+                record(self.directory, run_id="new", label="row", seconds=1,
+                       verdict="ok", observation_id=identity)
+        with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+            record(self.directory, run_id="new", label="row", seconds=1,
+                   verdict="ok", observation_id="\ud800\udc00")
+        self.assertEqual([row["observation_id"] for row in read_history(self.directory)], list(identities))
+
+    def test_duplicate_in_external_history_edit_fails_before_rebuilding_index(self):
+        record(self.directory, run_id="old", label="first", seconds=1, verdict="ok", observation_id="first")
+        path = self.directory / HISTORY_FILE
+        duplicated = path.read_bytes() * 2
+        path.write_bytes(duplicated)
+        with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+            self.add(1)
+        self.assertEqual(path.read_bytes(), duplicated)
+
+    def test_replaced_history_file_forces_full_validation(self):
+        from unittest import mock
+        self.add(1)
+        path = self.directory / HISTORY_FILE
+        previous = path.stat()
+        replacement = self.directory / "replacement"
+        replacement.write_bytes(path.read_bytes())
+        os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        os.replace(replacement, path)
+        with mock.patch(__name__ + ".decode_history", wraps=decode_history) as decode:
+            self.add(2)
+            self.assertEqual(decode.call_count, 1)
+        self.assertEqual(len(read_history(self.directory)), 2)
+
+    def test_modified_missing_and_corrupt_indexes_rebuild_without_losing_duplicate_checks(self):
+        from unittest import mock
+        record(self.directory, run_id="old", label="first", seconds=1, verdict="ok", observation_id="first")
+        original = (self.directory / HISTORY_FILE).read_bytes()
+        for damage in ("delete-id", "corrupt-database", "missing-checkpoint", "corrupt-checkpoint"):
+            with self.subTest(damage=damage):
+                if damage == "delete-id":
+                    with sqlite3.connect(self.directory / INDEX_FILE) as connection:
+                        connection.execute("DELETE FROM observation_ids")
+                elif damage == "corrupt-database":
+                    (self.directory / INDEX_FILE).write_bytes(b"not a database")
+                elif damage == "missing-checkpoint":
+                    (self.directory / INDEX_CHECKPOINT).unlink()
+                else:
+                    (self.directory / INDEX_CHECKPOINT).write_text("{")
+                with mock.patch(__name__ + ".decode_history", wraps=decode_history) as decode:
+                    with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+                        record(self.directory, run_id="new", label="first", seconds=1,
+                               verdict="ok", observation_id="first")
+                    self.assertEqual(decode.call_count, 1)
+                self.assertEqual((self.directory / HISTORY_FILE).read_bytes(), original)
+
+    def test_crash_after_append_or_index_commit_recovers_authoritative_record(self):
+        import subprocess
+        root = Path(__file__).resolve().parent
+        for boundary in ("commit_index", "publish_index_checkpoint"):
+            with self.subTest(boundary=boundary):
+                directory = self.directory / boundary
+                record(directory, run_id="old", label="first", seconds=1, verdict="ok", observation_id="first")
+                code = '''import os, sys
+sys.path.insert(0, sys.argv[1])
+import gate_history as history
+from pathlib import Path
+setattr(history, sys.argv[3], lambda *args: os._exit(71))
+history.record(Path(sys.argv[2]), run_id="interrupted", label="crashed", seconds=2,
+               verdict="ok", observation_id="crashed")
+'''
+                result = subprocess.run([sys.executable, "-c", code, str(root), str(directory), boundary], timeout=5)
+                self.assertEqual(result.returncode, 71)
+                self.assertEqual([row["observation_id"] for row in read_history(directory)], ["first", "crashed"])
+                preserved = (directory / HISTORY_FILE).read_bytes()
+                with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+                    record(directory, run_id="recovery", label="crashed", seconds=2,
+                           verdict="ok", observation_id="crashed")
+                self.assertEqual((directory / HISTORY_FILE).read_bytes(), preserved)
+                record(directory, run_id="recovery", label="last", seconds=3, verdict="ok", observation_id="last")
+                self.assertEqual(len(read_history(directory)), 3)
+
+    def test_parallel_indexed_appends_preserve_every_observation(self):
+        import subprocess
+        root = Path(__file__).resolve().parent
+        code = '''import sys
+sys.path.insert(0, sys.argv[1])
+from pathlib import Path
+from gate_history import record
+for index in range(8):
+    record(Path(sys.argv[2]), run_id="parallel", label="row", seconds=index,
+           verdict="ok", observation_id=f"{sys.argv[3]}-{index}")
+'''
+        children = [subprocess.Popen([sys.executable, "-c", code, str(root), str(self.directory), str(worker)])
+                    for worker in range(8)]
+        try:
+            for child in children:
+                self.assertEqual(child.wait(timeout=10), 0)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+        rows = read_history(self.directory)
+        self.assertEqual({row["observation_id"] for row in rows},
+                         {f"{worker}-{index}" for worker in range(8) for index in range(8)})
+        self.assertEqual(len(rows), 64)
 
     def test_invalid_duration_or_expired_pass_rejected(self):
         for value in (-1, float("nan"), float("inf"), True):
@@ -1147,7 +1415,7 @@ def main() -> int:
             suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
                                        for case in (HistoryTests, FlakeHistoryTests))
             return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
         print(f"GATE HISTORY ERROR: {exc}", file=sys.stderr)
         return 2
     return 0
