@@ -65,6 +65,18 @@ ROWS = {
                        target='build/atomic-survivors-unit', arguments=['instruction_limit'],
                        gate_loop=('defect', 'atomic survivor: $defect'),
                        success='PASS instruction_limit', timeout=60),
+    'receive-lifetime': dict(label='netcmd receive regression',
+                             target='build/netcmd-unit', arguments=['receive'],
+                             gate_loop=('NETCMD_CASE', 'netcmd $NETCMD_CASE regression'),
+                             success='ok: netcmd receive', timeout=60),
+    'deferred-output': dict(label='netcmd output regression',
+                            target='build/netcmd-unit', arguments=['output'],
+                            gate_loop=('NETCMD_CASE', 'netcmd $NETCMD_CASE regression'),
+                            success='ok: netcmd output', timeout=60),
+    'notification-reservation': dict(label='netcmd notify-oom regression',
+                                    target='build/netcmd-unit', arguments=['notify-oom'],
+                                    gate_loop=('NETCMD_CASE', 'netcmd $NETCMD_CASE regression'),
+                                    success='ok: netcmd notify-oom', timeout=60),
 }
 
 
@@ -567,8 +579,9 @@ def self_test():
         if status != expected:
             raise AssertionError((expected, status))
     gate = (ROOT / 'tests/gate.sh').read_text()
-    for key in ('hash-ttl-bytes', 'multi-arity', 'lua-budget'):
-        row = ROWS[key]
+    for key, row in ROWS.items():
+        if 'gate_loop' not in row:
+            continue
         if not named_row_declared(row, gate):
             raise AssertionError(f'{key}: actual gate declaration not reached')
         # Neither an omitted loop member nor an unrelated matching label establishes

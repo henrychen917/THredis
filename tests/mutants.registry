@@ -149,6 +149,42 @@
           "failure": "FAIL: caught instruction-limit error still fails the activation"
         }
       ]
+    },
+    {
+      "name": "receive-ignore-argv-lifetime",
+      "file": "src/net/conn.h",
+      "find": "if (avail < want && may_grow && rcap_ < cap) {",
+      "replace": "if (avail < want && rcap_ < cap) { // throwaway mutant: move storage beneath outstanding argv",
+      "rows": [
+        {
+          "row": "receive-lifetime",
+          "failure": "FAIL: receive growth remains forbidden with outstanding argv slices"
+        }
+      ]
+    },
+    {
+      "name": "deferred-output-accounting",
+      "file": "src/core/io_loop.h",
+      "find": "uint64_t used = c->obuf_bytes() + wb_.deferred_output_bytes(*c);",
+      "replace": "uint64_t used = c->obuf_bytes(); // throwaway mutant: omit queued out-of-band bytes",
+      "rows": [
+        {
+          "row": "deferred-output",
+          "failure": "FAIL: hard limit fired before Done"
+        }
+      ]
+    },
+    {
+      "name": "notification-reservation-release",
+      "file": "src/cmd/notify.inc",
+      "find": "delete owned;\n            server.pubsub_notification_retire(count);",
+      "replace": "delete owned;\n            // throwaway mutant: do not release the notification reservation",
+      "rows": [
+        {
+          "row": "notification-reservation",
+          "failure": "FAIL: reservation released exactly once on failure"
+        }
+      ]
     }
   ]
 }
