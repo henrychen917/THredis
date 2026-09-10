@@ -1,12 +1,13 @@
 #!/bin/bash
-# PRE-PUSH GATE for tomokv-cpp (pure 2s baseline).
+# RELEASE GATE for tomokv-cpp (split/fused correctness and performance).
 #
 #   tests/gate.sh quick   loopback only: build (release+ASAN), footprint locks, boot
 #                         matrix, smoke, torture, RYOW, atomic torn/mixed-write/window gates,
-#                         shutdown invariants, counter-fired assertions, idle-loop ceiling. Runs on
+#                         shutdown invariants, counter-fired feature matrix, idle-loop ceiling. Runs on
 #                         any machine.
-#   tests/gate.sh full    quick + torture-under-ASAN + the Redis 7.4 differential matrix + NIC
-#                         regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
+#   tests/gate.sh full    quick + mandatory loopback performance vs tests/gate_perf_refs.json
+#                         (UNARMED is red) + torture-under-ASAN + the Redis 7.4 differential matrix
+#                         + NIC regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
 #                         netns rig and its scratchpad binaries/procsafe helper).
 #
 #   Every feature battery runs on three boots: split (both atomic modes), fused, and fused with the
@@ -1367,10 +1368,68 @@ TLS_ZC=$(shutdown_value tls.zc_suppressed)
 [ -n "$TLS_ZC" ] && [ "$TLS_ZC" -gt 0 ] \
     && ok "TLS zc borrow gates fired (suppressed=$TLS_ZC)" || bad "TLS zc borrow gates fired"
 
+# ---- A. mandatory feature matrix (35 rows, BEFORE the quick-tier exit) -----------------------
+# No inherited feature defaults: feature_gate.py sets --thread-mode {1s,2s}, --read-local {0,1},
+# --overlap {0,1}, --reorder {0,1}, --flip-auto {0,1} in the full 32-way product, and explicitly
+# sets both values of --atomic, --key-lb, --client-lb across it. The last three rows exercise
+# --shards {-1,1,16,256}, --ratio, --place, --shard-home (including empty owners), and --no-pin.
+# Unsupported combinations are FAIL, never expected rejections. Every boot has fired-mechanism
+# assertions; the Python inventory assertion refuses a missing value/product entry. See GATES.md.
+FEATURE_OUTPUT=${GATE_FEATURE_OUTPUT:-$(mktemp -d "$PWD/build/gate-feature.XXXXXX")}
+for FM in 1s 2s; do
+  for FR in 0 1; do for FO in 0 1; do for FQ in 0 1; do for FF in 0 1; do
+    FEATURE_CELL=$FM-$FR-$FO-$FQ-$FF
+    py tests/feature_gate.py --cell "$FEATURE_CELL" --binary ./build/tomokv \
+        --server-cpus "$CORES" --load-cpus "${GATE_LOAD_CORES:-96-127}" --ratio "$GATE_RATIO" \
+        --port "${GATE_FEATURE_PORT:-8620}" --output "$FEATURE_OUTPUT" \
+        >"$FEATURE_OUTPUT/$FEATURE_CELL.log" 2>&1 \
+        && ok "feature $FEATURE_CELL" \
+        || bad "feature $FEATURE_CELL" "see $FEATURE_OUTPUT/$FEATURE_CELL.log"
+  done; done; done; done
+done
+for FEATURE_CELL in split-home-min fused-home-max-nopin split-shards-auto; do
+  py tests/feature_gate.py --cell "$FEATURE_CELL" --binary ./build/tomokv \
+      --server-cpus "$CORES" --load-cpus "${GATE_LOAD_CORES:-96-127}" --ratio "$GATE_RATIO" \
+      --port "${GATE_FEATURE_PORT:-8620}" --output "$FEATURE_OUTPUT" \
+      >"$FEATURE_OUTPUT/$FEATURE_CELL.log" 2>&1 \
+      && ok "feature $FEATURE_CELL" \
+      || bad "feature $FEATURE_CELL" "see $FEATURE_OUTPUT/$FEATURE_CELL.log"
+done
+
 if [ "$TIER" = quick ]; then
   program_state "$EXPECT_QUICK"
   echo; echo "GATE(quick): $PASS ok, $FAIL FAIL"; [ $FAIL -eq 0 ] || exit 1; exit 0
 fi
+
+# ---- B. mandatory loopback performance (32 rows, AFTER the quick-tier exit) -------------------
+# Unlike the optional NIC battery, this is always invoked. No reference means a LOUD UNARMED
+# skip and a counted failure: a correctness-only release must never call itself a clean full gate.
+# p32 requires >=98% busy on EACH executing thread and a measured generator plateau. p1 scores
+# fixed-concurrency round trips, with generator headroom, and never uses that saturation rule.
+# Pins are only read here. Missing telemetry, population, lane hits, or a null-derived bound is
+# a failure. Re-pinning is a separate, reviewed maintainer action documented in GATES.md.
+PERF_OUTPUT=${GATE_PERF_OUTPUT:-$(mktemp -d "$PWD/build/gate-perf.XXXXXX")}
+PERF_UNARMED=0
+for PC in GET SET MGET MSET; do for PP in 1 32; do for PM in 1s 2s; do for PR in 0 1; do
+  PERF_CELL=$PC-p$PP-$PM-rl$PR
+  quiet_wait
+  timeout --foreground "${GATE_PERF_TIMEOUT:-600}" taskset -c "${GATE_PERF_LOAD_CORES:-64-127,192-255}" \
+      python3 tests/perf_gate.py check --cell "$PERF_CELL" --binary ./build/tomokv \
+      --server-cpus "${GATE_PERF_CORES:-$CORES}" --load-cpus "${GATE_PERF_LOAD_CORES:-64-127,192-255}" \
+      --ratio "$GATE_RATIO" --port "${GATE_PERF_PORT:-8621}" \
+      --window "${GATE_PERF_WINDOW:-3}" --warmup "${GATE_PERF_WARMUP:-1}" \
+      --keymax "${GATE_PERF_KEYMAX:-200000}" --max-instances "${GATE_PERF_INSTANCES:-4}" \
+      --refs "${GATE_PERF_REFS:-tests/gate_perf_refs.json}" --output "$PERF_OUTPUT/$PERF_CELL" \
+      >"$PERF_OUTPUT/$PERF_CELL.log" 2>&1
+  PERF_RC=$?
+  case $PERF_RC in
+    0) ok "loopback performance $PERF_CELL";;
+    3) PERF_UNARMED=1
+       say "loopback performance $PERF_CELL" "SKIPPED (UNARMED: no reviewed reference numbers)"
+       bad "loopback performance $PERF_CELL" "mandatory tier UNARMED; see $PERF_OUTPUT/$PERF_CELL.log";;
+    *) bad "loopback performance $PERF_CELL" "exit $PERF_RC; see $PERF_OUTPUT/$PERF_CELL.log";;
+  esac
+done; done; done; done
 
 # ---- 4. full tier: torture under ASAN ---------------------------------------------------------
 boot $ASAN --atomic 1 --enable-debug-command yes || bad "ASAN boot"
@@ -1599,7 +1658,5 @@ fi
 
 program_state "$((EXPECT_FULL+NIC_CHECKED))"
 echo
-[ "$NIC_CHECKED" -eq 1 ] \
-    && echo "GATE(full): $PASS ok, $FAIL FAIL" \
-    || echo "GATE(full, no perf tier): $PASS ok, $FAIL FAIL"
+echo "GATE(full): $PASS ok, $FAIL FAIL (loopback unarmed=$PERF_UNARMED, NIC checked=$NIC_CHECKED)"
 [ $FAIL -eq 0 ] || exit 1
