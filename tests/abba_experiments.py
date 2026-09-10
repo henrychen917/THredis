@@ -183,6 +183,8 @@ def describe_block(cell, specification, report, attempts, rc):
     runs = rounds[0].get("runs", []) if len(rounds) == 1 else []
     result["attempted_measurements"] = len(attempts)
     result["completed_measurements"] = len(runs)
+    if report.get("measurement_valid") is False or report.get("quiet_box", {}).get("interference"):
+        result["reasons"].append("quiet-box contention invalidated this comparison")
     expected_n = cell.instances if cell.depth > 1 else 1
     if len(attempts) != 4 or [a["arm"] for a in attempts] != list(abba.ORDER):
         result["reasons"].append("real measurement loop did not attempt exactly one ABBA block")
@@ -338,6 +340,9 @@ def self_test():
                                                 "sha256": abba.sha256(a.reference_binary)}
                 geometry = {"server_cores": "0-31", "server_smt": "",
                             "load_cores": "32-127", "load_smt": "160-255"}
+                monitor = mock.Mock()
+                monitor.evidence.return_value = {"interference": None, "samples": 2}
+                monitor.close.return_value = {"interference": None, "samples": 3, "complete": True}
                 original_window = abba.WINDOW
                 with mock.patch.object(BASE_RUNNER, "measure", measure), \
                      mock.patch(__name__ + ".prime_snapshot", side_effect=prime), \
@@ -345,6 +350,7 @@ def self_test():
                      mock.patch.object(abba, "check_placement"), \
                      mock.patch.object(abba, "accepted", return_value=True), \
                      mock.patch.object(abba, "resolve_reference", side_effect=reference), \
+                     mock.patch.object(abba, "QuietMonitor", return_value=monitor), \
                      mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(sys.modules, {"gate_quiet": SimpleNamespace(
                          assert_quiet=mock.Mock(return_value={"status": "quiet"}))}), \
@@ -453,6 +459,13 @@ def self_test():
             block = describe_block(cell, BLOCKS[0], report, attempts, 0)
             self.assertEqual(block["status"], "UNTESTABLE")
             self.assertTrue(any("window" in why for why in block["reasons"]))
+            for run in runs:
+                run["window_seconds"] = 20
+            report["measurement_valid"] = False
+            report["quiet_box"] = {"interference": {"processes": [{"pid": 123}]}}
+            block = describe_block(cell, BLOCKS[0], report, attempts, 1)
+            self.assertEqual(block["status"], "UNTESTABLE")
+            self.assertTrue(any("quiet-box" in why for why in block["reasons"]))
 
         def test_failed_null_prevents_adoption(self):
             blocks = [{"name": spec[0], "status": "FAIL" if index == 0 else "PASS",

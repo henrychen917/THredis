@@ -64,7 +64,8 @@ import tempfile
 import time
 
 from _lib import Conn
-from gateplan import validate_axes
+from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
+from gate_quiet import QuietMonitor, QuietViolation
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
                             require_workload_witness, workload_command_names)
 
@@ -240,6 +241,38 @@ def check_placement(server_cpus, load_cpus, server_smt=(), load_smt=()):
     validate_axes(server_cpus, server_smt, load_cpus, load_smt)
     if not 2 <= len(server_cpus) <= 32:
         raise ValueError("ABBA requires 2-32 physical server cores; the headline geometry caps at 32")
+
+
+def resolve_geometry(args):
+    """Default to 32 real server cores and lend every other permitted core to load."""
+    if all(getattr(args, key) is not None for key in ("server_cores", "load_cores", "load_smt")):
+        return
+    topology = read_topology()
+    available = permitted_cpus(topology)
+    physical = default_physical(available, topology)
+    server = None if args.server_cores is None else cpus(args.server_cores)
+    load = None if args.load_cores is None else cpus(args.load_cores)
+    if server is None and load is None:
+        if len(physical) <= 32:
+            raise ValueError("ABBA default needs 32 physical server cores plus separate load cores; "
+                             "supply explicit CPU axes for a smaller diagnostic geometry")
+        server, load = physical[:32], physical[32:]
+    elif server is None or load is None:
+        supplied = load if server is None else server
+        occupied = {topology[cpu] for cpu in supplied}
+        remaining = [cpu for cpu in physical if topology[cpu] not in occupied]
+        if server is None:
+            server = remaining[:32]
+        else:
+            load = remaining
+    args.server_cores, args.load_cores = cpu_string(server), cpu_string(load)
+    if args.load_smt is None:
+        # Omission enables generator headroom; an explicitly empty --load-smt
+        # reserves those siblings. Server siblings can never be assigned to load.
+        occupied = {topology[cpu] for cpu in server}
+        args.load_smt = cpu_string(sorted({sibling for cpu in load for sibling in topology[cpu]
+                                           if sibling in available and sibling not in load
+                                           and topology[cpu] not in occupied}))
 
 
 def select_port(ports, port):
@@ -659,6 +692,18 @@ def busy_between(start, end):
     return 100 * busy / (busy + idle), per_thread
 
 
+def busy_deltas(start, end):
+    busy_between(start, end)  # Keep the same role/topology/reset validation.
+    # Raw role-specific counters are diagnostic evidence, not a new saturation
+    # rule. Read-local can leave split executors idle; flipctl.cc also documents
+    # io submit/reap work absent from busy_ns. Retain both counters plus the
+    # observed snapshot interval so live results can distinguish those cases
+    # from insufficient generator capacity before anyone changes the instrument.
+    return {tid: {"role": start[tid]["role"],
+                  "busy_ns": end[tid]["busy"] - start[tid]["busy"],
+                  "idle_ns": end[tid]["idle"] - start[tid]["idle"]} for tid in start}
+
+
 def info(conn, section):
     raw = conn.must("INFO", section)
     return dict(line.split(":", 1) for line in raw.decode().splitlines() if ":" in line)
@@ -779,6 +824,7 @@ class Runner:
             if int(info(conn, "clients")["connected_clients"]) != cell.conns + 1:
                 raise RuntimeError("not all requested load connections are active")
             before_lb = lb_snapshot(conn, folder / "lb-before.txt")
+            before_lb_at = time.monotonic()
             if len(before_lb) != len(self.server_cpus):
                 raise RuntimeError("server thread count differs from requested CPU geometry")
             roles = {role: sum(row["role"] == role for row in before_lb.values())
@@ -796,6 +842,7 @@ class Runner:
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
             after_lb = lb_snapshot(conn, folder / "lb-after.txt")
+            after_lb_at = time.monotonic()
             after_commands = info(conn, "commandstats")
             after_mode = info(conn, "server") if cell.op == "REORDER" else {}
             if any(p.poll() is not None for p in generators):
@@ -811,6 +858,8 @@ class Runner:
             busy, per_thread = busy_between(before_lb, after_lb)
             result.update(rate=commands / (t1 - t0), commands=commands, window_seconds=t1 - t0,
                           midpoint_monotonic=(t0 + t1) / 2, busy_pct=busy, thread_busy_pct=per_thread,
+                          thread_activity_deltas=busy_deltas(before_lb, after_lb),
+                          lb_snapshot_window_seconds=after_lb_at - before_lb_at,
                           cpu_pct=100 * (after_cpu - before_cpu) / ((t1 - t0) * len(self.server_cpus)),
                           info_before=before, info_after=after)
             result["workload_witness"] = require_workload_witness(
@@ -884,12 +933,13 @@ def parse_args():
     p.add_argument("--bench-bins", type=Path, default=Path(os.getenv("GATE_ABBA_BINS", "/home/user/Projects/bench-bins")))
     p.add_argument("--build-reference", type=int, choices=(0, 1), default=int(os.getenv("GATE_ABBA_BUILD_REFERENCE", "1")))
     # The gate supplies its planned highest-budget geometry, capped at 32 physical server cores.
-    # Standalone defaults retain that headline placement. SMT is a separate caller choice: an
-    # omitted range reserves the siblings, and never silently lends server siblings to load.
-    p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES", "0-31"))
+    # Standalone derives the same 32-real-core limit from topology, with all
+    # remaining cores and their permitted SMT siblings assigned to generators.
+    # Explicit --load-smt '' reserves those siblings; server siblings stay reserved.
+    p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES"))
     p.add_argument("--server-smt", default=os.getenv("GATE_ABBA_SERVER_SMT", ""))
-    p.add_argument("--load-cores", default=os.getenv("GATE_ABBA_LOAD_CORES", "32-127"))
-    p.add_argument("--load-smt", default=os.getenv("GATE_ABBA_LOAD_SMT", ""))
+    p.add_argument("--load-cores", default=os.getenv("GATE_ABBA_LOAD_CORES"))
+    p.add_argument("--load-smt", default=os.getenv("GATE_ABBA_LOAD_SMT"))
     p.add_argument("--ports", default=os.getenv("GATE_ABBA_PORTS"),
                    help="permitted first-last bind range; only its first port is needed")
     p.add_argument("--port", type=int,
@@ -918,6 +968,15 @@ def main(args):
               "window_seconds": WINDOW, "order": ORDER, "cells": [], "output": str(out),
               "subset": args.subset}
     children = Children()
+    quiet = None
+    rc = 1
+    original_affinity = os.sched_getaffinity(0)
+
+    def invalidate_instrument(reason):
+        report.update(verdict="FAIL", reason=reason, measurement_valid=False)
+        for row in report["cells"]:
+            row["instrument_valid"] = False
+            row["instrument_failure"] = "quiet-box contention invalidated the whole tier"
 
     def interrupted(signum, _frame):
         raise InterruptedError(f"interrupted by signal {signum}")
@@ -928,10 +987,11 @@ def main(args):
     try:
         quiet_file = os.getenv("GATE_QUIET_FILE")
         if quiet_file:
-            quiet = Path(quiet_file)
-            age = time.time() - quiet.stat().st_mtime if quiet.exists() else -1
+            quiet_path = Path(quiet_file)
+            age = time.time() - quiet_path.stat().st_mtime if quiet_path.exists() else -1
             if age < 60 * float(os.getenv("GATE_QUIET_MINUTES", "3")):
-                raise Skip(f"quiet file {quiet} is absent or too recent; no CPU work started")
+                raise QuietViolation(f"quiet file {quiet_path} is absent or too recent; no CPU work started")
+        resolve_geometry(args)
         server_physical, load_physical = cpus(args.server_cores), cpus(args.load_cores)
         server_smt, load_smt = cpus(args.server_smt), cpus(args.load_smt)
         check_placement(server_physical, load_physical, server_smt, load_smt)
@@ -949,6 +1009,9 @@ def main(args):
         if pending and not args.escalate:
             raise ValueError("unmeasured load floors for " + ",".join(pending) +
                              "; calibrate with --escalate and record the validated pins before gating")
+        quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid())
+        quiet.start()  # Fail before reference builds, capability probes, or server boots.
+        report["quiet_box"] = quiet.evidence()
         reference, provenance = resolve_reference(args, out)
         report["reference"] = provenance
         if not args.candidate.is_file() or not os.access(args.candidate, os.X_OK):
@@ -986,10 +1049,12 @@ def main(args):
               f"port={args.port} allowed={permitted_ports[0]}-{permitted_ports[1]}; "
               "source headline file records 32 server cores; actual geometry recorded above. "
               "Cell connections are TOTAL, shared across load instances. Split uses fixed even ratio, flip=0.", flush=True)
+        quiet.check()
         support = {arm: {name: accepted(binary, name, value) for name, value in
                         (("thread-mode", "1s"), ("read-local", 0), ("overlap", 0), ("reorder", 0),
                          ("x-overlap", 0), ("x-ex-sched", 0))}
                    for arm, binary in binaries.items()}
+        quiet.check()
         report["accepted_knobs"] = support
         runner = Runner(args, out, binaries, children)
         for cell in cells:
@@ -1029,13 +1094,15 @@ def main(args):
                     round_ = {"instances": n, "runs": []}
                     row["rounds"].append(round_)
                     for sequence, arm in enumerate(ORDER, 1):
+                        quiet.check()
                         round_["runs"].append(runner.measure(cell, arm, sequence, n, plans[arm]))
+                        quiet.check()
                     row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
                     if saturation_done(assessed_cell, row["rounds"]):
                         break
-            except InterruptedError:
+            except (InterruptedError, QuietViolation):
                 raise
             except NotComparable as e:
                 # Distinct from a measurement error: nothing went wrong with the box, the cell just
@@ -1050,32 +1117,54 @@ def main(args):
                 print_cell(row)
             finally:
                 children.close()
+                report["quiet_box"] = quiet.evidence()
                 report["elapsed_seconds"] = time.monotonic() - start
                 (out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+        # Join and take one final sample before producing a PASS/exit code. A
+        # cleanup-only check in finally would run after Python chose that code.
+        report["quiet_box"] = quiet.close()
+        quiet.check()
+        report["measurement_valid"] = True
         report["verdict"], report["worst_cell"] = overall(report["cells"])
         if args.only and report["verdict"] == "PASS":
             report["verdict"] = "PARTIAL"
         print(f"ABBA {args.subset} {report['verdict']} worst={report['worst_cell']} "
               f"({len(cells)}/{report['cell_source']['total_cells']} cells); results={out / 'results.json'}", flush=True)
-        return 1 if report["verdict"] == "FAIL" else 3 if report["verdict"] == "PARTIAL" else 0
+        rc = 1 if report["verdict"] == "FAIL" else 3 if report["verdict"] == "PARTIAL" else 0
     except Skip as e:
         report.update(verdict="SKIP", reason=str(e))
         print(f"ABBA SKIP — NOT A PASS: {e}", file=sys.stderr, flush=True)
-        return 3
+        rc = 3
     except (Exception, KeyboardInterrupt) as e:
         report.update(verdict="FAIL", reason=f"{type(e).__name__}: {e}")
+        if isinstance(e, QuietViolation):
+            invalidate_instrument(report["reason"])
         print(f"ABBA FAIL: {report['reason']}", file=sys.stderr, flush=True)
-        return 1
+        rc = 1
     finally:
         # Complete reaping even if the user presses Ctrl-C again during teardown.
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         children.close()
+        if quiet is not None:
+            report["quiet_box"] = quiet.close()
+            # A reference-resolution SKIP or other error can finish before the
+            # normal final check. Contention still outranks that outcome, including
+            # interference first discovered by the observer's cleanup sample.
+            try:
+                quiet.check()
+            except QuietViolation as exc:
+                if report.get("measurement_valid") is not False:
+                    print(f"ABBA FAIL: {exc}", file=sys.stderr, flush=True)
+                invalidate_instrument(f"QuietViolation: {exc}")
+                rc = 1
         report["elapsed_seconds"] = time.monotonic() - start
         (out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"ABBA elapsed={report['elapsed_seconds']:.1f}s; {out / 'results.json'}", flush=True)
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
+        os.sched_setaffinity(0, original_affinity)
+    return rc
 
 
 def self_test():
@@ -1088,6 +1177,14 @@ def self_test():
     class ABBA(unittest.TestCase):
         def setUp(self):
             self.cell = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
+            # Serverless loop tests replace the process observer too. Dedicated
+            # negative controls below inject failures through the same main path.
+            self.quiet = mock.Mock()
+            self.quiet.evidence.return_value = {"interference": None, "samples": 2}
+            self.quiet.close.return_value = {"interference": None, "samples": 3, "complete": True}
+            patcher = mock.patch(__name__ + ".QuietMonitor", return_value=self.quiet)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
             from itertools import product
@@ -1375,6 +1472,16 @@ def self_test():
             with self.assertRaises(RuntimeError):
                 busy_between(start, start)
 
+        def test_raw_role_deltas_preserve_idle_executor_evidence(self):
+            start = {0: {"role": "io", "busy": 10, "idle": 20},
+                     1: {"role": "ex", "busy": 30, "idle": 40}}
+            end = {0: {"role": "io", "busy": 108, "idle": 22},
+                   1: {"role": "ex", "busy": 30, "idle": 140}}
+            self.assertEqual(busy_deltas(start, end), {
+                0: {"role": "io", "busy_ns": 98, "idle_ns": 2},
+                1: {"role": "ex", "busy_ns": 0, "idle_ns": 100}})
+            self.assertEqual(busy_between(start, end), (49, {0: 98, 1: 0}))
+
         def test_load_escalation_preserves_total_connections(self):
             load = list(range(64, 128)) + list(range(192, 256))
             for n in (1, 2, 3, 4, 8):
@@ -1385,7 +1492,7 @@ def self_test():
                 self.assertEqual(len(assigned), len(set(assigned)))
 
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
-                      climbing=False, ceiling=16):
+                      climbing=False, ceiling=16, contend_after=None, reference_error=None):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
             # pin=3/512 fixture also catches silently skipping a non-doubling pin.
@@ -1404,24 +1511,81 @@ def self_test():
                 with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                     args = parse_args()
                 order, layouts = [], []
+                self.support_calls = []
+
+                def support_probe(*args):
+                    self.support_calls.append(args)
+                    return True
 
                 def measure(runner, cell, arm, sequence, instances, knobs):
                     order.append((instances, arm))
                     layouts.append(load_layout(runner.load_cpus, instances, cell.conns))
+                    if contend_after == len(order):
+                        self.quiet.check.side_effect = QuietViolation("PID 123 (foreign): one CPU tick")
+                        witness = {"interference": {"processes": [{"pid": 123, "cpu_ticks": 1}]},
+                                   "samples": 4, "complete": False}
+                        self.quiet.evidence.return_value = witness
+                        self.quiet.close.return_value = witness
                     return dict(arm=arm, rate=instances * 100 if climbing else 100,
                                 busy_pct=busy, latency_ms=1)
 
                 provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
                 stream = io.StringIO()
                 with mock.patch.object(Runner, "measure", measure), \
-                     mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)), \
-                     mock.patch(__name__ + ".accepted", return_value=True), \
+                     mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance),
+                                side_effect=reference_error), \
+                     mock.patch(__name__ + ".accepted", side_effect=support_probe), \
                      mock.patch(__name__ + ".check_placement"), \
                      mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(stream):
                     rc = main(args)
                 return rc, order, layouts, json.loads((output / "results.json").read_text()), stream.getvalue()
+
+        def test_contender_invalidates_real_loop_without_retry_or_threshold_change(self):
+            threshold_before = paired(self.round([100, 100, 100, 100])["runs"])["threshold_pct"]
+            rc, order, _, report, _ = self.fake_main(pin=4, contend_after=2)
+            self.assertEqual(rc, 1)
+            self.assertEqual(order, [(4, "A"), (4, "B")])
+            self.assertFalse(report["measurement_valid"])
+            self.assertEqual(report["quiet_box"]["interference"]["processes"][0]["pid"], 123)
+            self.assertEqual(len(report["cells"][0]["rounds"][0]["runs"]), 2)
+            self.assertFalse(report["cells"][0]["instrument_valid"])
+            self.assertIn("QuietViolation", report["reason"])
+            self.assertEqual(paired(self.round([100, 100, 100, 100])["runs"])["threshold_pct"], threshold_before)
+
+        def test_contended_preflight_never_reaches_support_or_measurement(self):
+            self.quiet.start.side_effect = QuietViolation("foreign compiler is active")
+            rc, order, _, report, _ = self.fake_main(pin=4)
+            self.assertEqual(rc, 1)
+            self.assertEqual(order, [])
+            self.assertEqual(report["cells"], [])
+            self.assertEqual(self.support_calls, [])
+            self.assertIn("foreign compiler", report["reason"])
+            self.assertFalse(report["measurement_valid"])
+
+        def test_final_observation_can_fail_completed_real_loop(self):
+            def close():
+                self.quiet.check.side_effect = QuietViolation("foreign activity at final sample")
+                return {"interference": {"error": "final sample"}, "samples": 5, "complete": False}
+            self.quiet.close.side_effect = close
+            rc, order, _, report, _ = self.fake_main(pin=4)
+            self.assertEqual(rc, 1)
+            self.assertEqual(len(order), 4)
+            self.assertEqual(report["verdict"], "FAIL")
+            self.assertFalse(report["measurement_valid"])
+            self.assertFalse(report["cells"][0]["instrument_valid"])
+
+        def test_contamination_during_reference_skip_still_fails_whole_tier(self):
+            def close():
+                self.quiet.check.side_effect = QuietViolation("foreign work during reference lookup")
+                return {"interference": {"error": "foreign work"}, "complete": False}
+            self.quiet.close.side_effect = close
+            rc, order, _, report, _ = self.fake_main(pin=4, reference_error=Skip("reference missing"))
+            self.assertEqual(rc, 1)
+            self.assertEqual(order, [])
+            self.assertEqual(report["verdict"], "FAIL")
+            self.assertFalse(report["measurement_valid"])
 
         def test_pin_drives_real_loop_to_exactly_four_measurements(self):
             for pin in (3, 4):
@@ -1493,7 +1657,19 @@ def self_test():
             with mock.patch.object(sys, "argv", ["abbagate.py"]), \
                  mock.patch.dict(os.environ, {}, clear=True):
                 defaults = parse_args()
-            self.assertEqual((defaults.server_smt, defaults.load_smt), ("", ""))
+            self.assertEqual((defaults.server_smt, defaults.load_smt), ("", None))
+
+        def test_standalone_defaults_use_all_other_physical_and_smt_load_cores(self):
+            topology = {cpu: frozenset((cpu % 128, cpu % 128 + 128)) for cpu in range(256)}
+            for explicit_smt in (None, ""):
+                with self.subTest(load_smt=explicit_smt):
+                    args = argparse.Namespace(server_cores=None, server_smt="", load_cores=None, load_smt=explicit_smt)
+                    with mock.patch(__name__ + ".read_topology", return_value=topology), \
+                         mock.patch(__name__ + ".permitted_cpus", return_value=set(range(256))):
+                        resolve_geometry(args)
+                    self.assertEqual(cpus(args.server_cores), list(range(32)))
+                    self.assertEqual(cpus(args.load_cores), list(range(32, 128)))
+                    self.assertEqual(cpus(args.load_smt), list(range(160, 256)) if explicit_smt is None else [])
 
         def test_port_boundaries_reject_any_bind_outside_the_budget(self):
             self.assertEqual(select_port("7899-7899", None), (7899, (7899, 7899)))
