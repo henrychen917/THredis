@@ -924,7 +924,8 @@ start_workers(){
   # by independent batteries are private TMPDIR/mktemp paths; the coordinator alone owns ledgers.
   # TLS uses PORT+1, nested servertail uses PORT+2, and oracle boots use these same reserved ports.
   # NIC's global namespace/interface changes and every regression measurement follow the final
-  # join barrier. Existing correctness rate/counter assertions retain their full contents.
+  # join barrier. atomic_batteries also waits for every other family: its RYOW row contains
+  # a performance assertion, so it is an explicit exception to parallel correctness work.
   # Correctness traffic is modest and stays on each slot's two or more physical load cores.
   # Compilers use that slot's server+load cores. The release build alone unlocks release jobs;
   # ASAN and standalone units do not delay boots, and full-only builds start immediately too.
@@ -2466,7 +2467,16 @@ unit_ready(){
 }
 
 job_dependencies(){
+  local dependency
   case "$1" in
+    atomic_batteries)
+      # A measured 3 ms scheduling pause alone flips atomic_ryow's unchanged 24-command
+      # rate assertion. Preserve the entire boot/battery chain and every assertion, but
+      # finish all other gate-owned correctness work before this performance check boots.
+      # JOB_NAMES is complete before dispatch and no other family depends on this one.
+      for dependency in "${JOB_NAMES[@]}"; do
+        [ "$dependency" = atomic_batteries ] || printf '%s\n' "$dependency"
+      done;;
     release|asan|rldbg|core_tsan_build|waits_tsan_build|config_unit|flip_unit|filter_unit|ring_unit|reorder_unit|storage_units|acl_metadata|cmd_metadata|abba_selftest) ;;
     core_units) echo 'production_units core_tsan_build';;
     wait_units) echo 'production_units waits_tsan_build';;

@@ -446,13 +446,15 @@ class SchedulerWiring(unittest.TestCase):
             raise AssertionError('collector inventory repeats a job')
 
     def run_scheduler(self, *, reverse=False, slots=None, failure='', behavior='', ordered=True,
-                      delayed_completion=False, dependency_probe=False):
+                      delayed_completion=False, dependency_probe=False,
+                      remove_atomic_dependency=False):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         ledger_functions = gate[gate.index('say(){'):gate.index('\nledger_labels(){')]
         placement = gate[gate.index('set_slot(){'):gate.index('\nset_slot 0')]
         scheduler = gate[gate.index('WORKER_PIDS=()'):gate.index('# ---- 0. preflight:')]
         order = self.canonical[::-1] if reverse else self.canonical
+        order = [name for name in order if name != 'atomic_batteries'] + ['atomic_batteries']
         prelude = '''set -u
 PASS=0; FAIL=0; TIER=full; CORES=0; LOAD_CORES=0; PORT=19000; GATE_RATIO=6:2; ALL_BUILD_CORES=0
 LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; ROW_T=$(date +%s.%N)
@@ -500,6 +502,20 @@ job_body(){
   local current=$1 dependency
   : > "$RUN_DIR/started/$current"
   if ! job_ready "$current"; then echo "started $current before dependency completed" >&2; exit 18; fi
+  if [ "$current" = atomic_batteries ]; then
+    # This is the first operation of the unchanged production family: before its boot,
+    # every other family must have published completion AFTER its owned-process cleanup.
+    for dependency in "${JOB_NAMES[@]}"; do
+      [ "$dependency" != "$current" ] || continue
+      if [ ! -f "$RUN_DIR/jobs/$dependency/done" ] ||
+          [ ! -f "$RUN_DIR/jobs/$dependency/cleaned" ]; then
+        printf 'atomic boot preceded completion of %s\n' "$dependency" > "$RUN_DIR/exclusivity-failure"
+        cat "$RUN_DIR/exclusivity-failure" >&2
+        exit 19
+      fi
+    done
+    : > "$RUN_DIR/atomic-boot-reached"
+  fi
   case "$current" in
     production_units|core_tsan_build|waits_tsan_build)
       : > "$RUN_DIR/completed/$current"
@@ -515,14 +531,18 @@ job_body(){
   fi
   if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
     for dependency in "${CANONICAL[@]}"; do
+      [ "$dependency" != atomic_batteries ] || continue
       while [ ! -f "$RUN_DIR/started/$dependency" ]; do pause; done
     done
   fi
-  if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
-    for dependency in "${COMPLETION_ORDER[@]}"; do
-      [ "$dependency" != "$current" ] || break
-      while [ ! -f "$RUN_DIR/completed/$dependency" ]; do pause; done
-    done
+  if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ] && [ "$current" != atomic_batteries ]; then
+    # A single predecessor token enforces the same total order transitively. Polling
+    # every unfinished predecessor from 97 shells consumed the fixture's 45s budget
+    # on one CPU (retained controls reached 92--94 families before timeout).
+    if [ "$current" != "${COMPLETION_ORDER[0]}" ]; then
+      read -r dependency < "$RUN_DIR/order/$current" || exit 20
+      [ "$dependency" = completed ] || exit 21
+    fi
   fi
   row_begin "$(job_label "$current")"
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = crash ]; then exit 17; fi
@@ -533,12 +553,36 @@ job_body(){
   fi
   printf '%s\\n' "$current" >> "$RUN_DIR/completion-order"
   : > "$RUN_DIR/completed/$current"
+  if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ] && [ "$current" != atomic_batteries ]; then
+    local found=0
+    for dependency in "${COMPLETION_ORDER[@]}"; do
+      [ "$dependency" != atomic_batteries ] || break
+      if [ "$found" = 1 ]; then
+        printf 'completed\\n' > "$RUN_DIR/order/$dependency"
+        break
+      fi
+      [ "$dependency" != "$current" ] || found=1
+    done
+  fi
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = return ]; then return 17; fi
   return 0
 }
-# Completion-order probes deliberately remove dependency edges; the separate two-slot probe
-# exercises the real readiness graph and proves release work does not wait for ASAN.
-if [ "$FORCE_ORDER" = 1 ]; then job_dependencies(){ :; }; fi
+# Completion-order probes remove ordinary dependency edges but retain real atomic exclusivity.
+# The separate two-slot probe exercises the complete graph. A negative control removes ONLY
+# the new edge, proving the pre-boot assertion catches a dispatch overlap on the actual queue.
+if [ "$FORCE_ORDER" = 1 ] || [ "$REMOVE_ATOMIC_DEPENDENCY" = 1 ]; then
+  original_dependencies=$(declare -f job_dependencies)
+  eval "${original_dependencies/job_dependencies/real_job_dependencies}"
+  job_dependencies(){
+    if [ "$1" = atomic_batteries ]; then
+      if [ "$REMOVE_ATOMIC_DEPENDENCY" = 1 ]; then echo release
+      else real_job_dependencies "$1"; fi
+    elif [ "$FORCE_ORDER" != 1 ]; then real_job_dependencies "$1"
+    fi
+  }
+fi
+mkdir "$RUN_DIR/order"
+for requested in "${CANONICAL[@]}"; do mkfifo "$RUN_DIR/order/$requested"; done
 start_workers
 for requested in "${CANONICAL[@]}"; do collect_job "$requested"; done
 join_workers
@@ -548,6 +592,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             directory = Path(tmp)
             env = dict(os.environ, RUN_DIR=tmp, FAILED_JOB=failure, FAILURE_BEHAVIOR=behavior,
                        FORCE_ORDER=str(int(ordered)), DEPENDENCY_PROBE=str(int(dependency_probe)),
+                       REMOVE_ATOMIC_DEPENDENCY=str(int(remove_atomic_dependency)),
                        GATE_FEATURE_OUTPUT=str(directory / 'features'))
             count = slots or len(self.canonical) + 1
             cpu = str(min(os.sched_getaffinity(0)))
@@ -596,12 +641,15 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                 self.assertGreaterEqual(float(row[1]), 0)
             counts = tuple(map(int, (directory / 'counts').read_text().split()))
             expected = ((len(self.canonical), 1) if behavior == 'return' else
-                        (len(self.canonical) - 1, 1) if behavior in ('empty', 'red', 'crash') else
+                        (len(self.canonical) - 1, 1) if behavior in ('empty', 'red', 'crash') or remove_atomic_dependency else
                         (len(self.canonical), 0))
             if counts != expected:
                 output += preserve_failure(result.stdout, result.stderr)
             return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
                         output=output, counts=counts,
+                        atomic_boot_reached=(directory / 'atomic-boot-reached').exists(),
+                        exclusivity_failure=((directory / 'exclusivity-failure').read_text()
+                                             if (directory / 'exclusivity-failure').exists() else ''),
                         completion=(directory / 'completion-order').read_text().splitlines(),
                         families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()
                                   if line.split('\t')[0] not in ('production_units', 'core_tsan_build', 'waits_tsan_build')],
@@ -628,8 +676,10 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
     def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
         forward = self.run_scheduler()
         reverse = self.run_scheduler(reverse=True)
-        self.assertEqual(forward['completion'], self.canonical)
-        self.assertEqual(reverse['completion'], self.canonical[::-1])
+        self.assertEqual(forward['completion'],
+                         [name for name in self.canonical if name != 'atomic_batteries'] + ['atomic_batteries'])
+        self.assertEqual(reverse['completion'],
+                         [name for name in self.canonical[::-1] if name != 'atomic_batteries'] + ['atomic_batteries'])
         self.assertEqual(forward['ledger'], reverse['ledger'], forward['output'] + reverse['output'])
         self.assertEqual(forward['counts'], (len(self.canonical), 0))
         self.assertEqual({row[0] for row in reverse['families']}, set(self.canonical))
@@ -669,6 +719,24 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertEqual(result['counts'], (len(self.canonical), 0))
         self.assertEqual(len(result['families']), len(self.canonical))
         self.assertLessEqual({row[1] for row in result['families']}, {'0', '1', '2'})
+
+    def test_atomic_boot_waits_for_all_other_families_and_their_cleanup(self):
+        result = self.run_scheduler(slots=3, ordered=False)
+        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertTrue(result['atomic_boot_reached'])
+        self.assertEqual(result['exclusivity_failure'], '')
+        self.assertEqual(result['completion'][-1], 'atomic_batteries')
+        families = {row[0]: row for row in result['families']}
+        atomic_start = float(families['atomic_batteries'][2])
+        self.assertTrue(all(float(row[3]) <= atomic_start for name, row in families.items()
+                            if name != 'atomic_batteries'))
+
+    def test_removing_atomic_exclusivity_fails_before_its_boot(self):
+        result = self.run_scheduler(slots=2, ordered=False, remove_atomic_dependency=True)
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertFalse(result['atomic_boot_reached'])
+        self.assertIn('atomic boot preceded completion of ', result['exclusivity_failure'])
+        self.assertIn(b'FAIL\tcorrectness family atomic_batteries\n', result['ledger'])
 
     def test_one_slot_uses_the_same_queue_without_losing_coverage(self):
         result = self.run_scheduler(slots=1)
