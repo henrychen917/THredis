@@ -1,5 +1,5 @@
 #!/bin/bash
-# Complete rewrite/recovery matrix. Every running-server signal targets the unique listening PID.
+# Complete rewrite/recovery matrix. Every running-server signal targets our recorded child PID.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -9,8 +9,11 @@ NCORES=$(taskset -c "$CORES" nproc)
 if [ "$NCORES" -ge 8 ]; then RATIO=4:4
 else RATIO=$(((NCORES+1)/2)):$((NCORES-(NCORES+1)/2)); fi
 CLI=${REDIS_CLI:-redis-cli}
+BIN=${GATE_CANDIDATE_BINARY:-${TOMO_BIN:-./build/tomokv}}
 NET_IO=${NET_IO:-uring}
 ACTIVE_PID=
+# Shell clients and Python drivers inherit the assigned load CPUs; server boots override them.
+[ -z "${GATE_LOAD_CORES:-}" ] || taskset -pc "$GATE_LOAD_CORES" "$$" >/dev/null
 
 cleanup() {
   local stopped=0
@@ -41,17 +44,18 @@ boot_server() {
   local boot_pid socket_pid
   local debug_args=()
   [ "$debug" = yes ] && debug_args=(--enable-debug-command yes)
-  taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
+  [ -z "$(listener_pid)" ] || { echo "AOF rewrite: port $PORT already listening" >&2; return 1; }
+  taskset -c "$CORES" "$BIN" --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --atomic "$atomic" \
     --net-io "$NET_IO" --appendonly yes --appendfsync everysec \
     --dir "$directory" "${debug_args[@]}" \
     >"$log" 2>&1 &
   boot_pid=$!
+  ACTIVE_PID=$boot_pid
   for _ in $(seq 1 100); do
     if "$CLI" -h 127.0.0.1 -p "$PORT" ping >/dev/null 2>&1; then
       socket_pid=$(listener_pid)
-      [ "$(printf '%s\n' "$socket_pid" | sed '/^$/d' | wc -l)" -eq 1 ] || return 1
-      ACTIVE_PID=$socket_pid
+      [ "$socket_pid" = "$boot_pid" ] || return 1
       return 0
     fi
     if ! kill -0 "$boot_pid" 2>/dev/null; then wait "$boot_pid" || true; return 1; fi
@@ -76,7 +80,7 @@ stop_now() {
 
 normal_atomic1=
 for atomic in 0 1; do
-  directory=$(mktemp -d "/tmp/gate-aof-rewrite-${atomic}.XXXXXX")
+  directory=$(mktemp -d "${TMPDIR:-/tmp}/gate-aof-rewrite-${atomic}.XXXXXX")
   state="$directory/state.json"
   boot_server "$directory" "$atomic" yes "$directory/server-1.log"
   python3 tests/aof_rewrite.py 127.0.0.1 "$PORT" populate "$state" 512 >/dev/null
@@ -110,7 +114,7 @@ done
 
 before_manifest_dir=
 for stage in before-mark before-manifest after-manifest; do
-  directory=$(mktemp -d "/tmp/gate-aof-rewrite-${stage}.XXXXXX")
+  directory=$(mktemp -d "${TMPDIR:-/tmp}/gate-aof-rewrite-${stage}.XXXXXX")
   state="$directory/state.json"
   boot_server "$directory" 1 yes "$directory/server-1.log"
   python3 tests/aof_rewrite.py 127.0.0.1 "$PORT" populate "$state" 256 >/dev/null
@@ -133,10 +137,10 @@ for stage in before-mark before-manifest after-manifest; do
 done
 
 for kind in manifest base record-length group-vector; do
-  directory=$(mktemp -d "/tmp/gate-aof-rewrite-corrupt-${kind}.XXXXXX")
+  directory=$(mktemp -d "${TMPDIR:-/tmp}/gate-aof-rewrite-corrupt-${kind}.XXXXXX")
   cp -a "$normal_atomic1"/. "$directory"/
   python3 tests/aof_rewrite.py 127.0.0.1 "$PORT" corrupt "$directory" "$kind" >/dev/null
-  if taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
+  if taskset -c "$CORES" "$BIN" --port "$PORT" --bind 127.0.0.1 \
       --shards 16 --ratio "$RATIO" --protected-mode no --appendonly yes \
       --net-io "$NET_IO" --appendfsync everysec \
       --dir "$directory" >"$directory/refusal.log" 2>&1; then
@@ -145,14 +149,14 @@ for kind in manifest base record-length group-vector; do
   grep -q "AOF load plan failed" "$directory/refusal.log"
 done
 
-interior=$(mktemp -d /tmp/gate-aof-rewrite-corrupt-interior.XXXXXX)
+interior=$(mktemp -d "${TMPDIR:-/tmp}/gate-aof-rewrite-corrupt-interior.XXXXXX")
 cp -a "$before_manifest_dir"/. "$interior"/
 manifest="$interior/appendonlydir/appendonly.aof.manifest"
 first_incr=$(sed -n 's/^file \([^ ]*\).*type i.*/\1/p' "$manifest" | head -1)
 first_path="$interior/appendonlydir/$first_incr"
 first_size=$(stat -c %s "$first_path")
 truncate -s $((first_size-7)) "$first_path"
-if taskset -c "$CORES" ./build/tomokv --port "$PORT" --bind 127.0.0.1 \
+if taskset -c "$CORES" "$BIN" --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --appendonly yes \
     --net-io "$NET_IO" --appendfsync everysec \
     --dir "$interior" >"$interior/refusal.log" 2>&1; then

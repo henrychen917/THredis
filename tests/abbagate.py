@@ -7,8 +7,9 @@ longer runs, and the gate's own comments then called every verdict provisional. 
 in ONE session on ONE box removes drift, thermal state and machine configuration as variables. The
 only difference left between the arms is the code.
 
-THE REFERENCE is the last pushed build: origin/cpp resolved to a full commit id, then matched by
-that exact commit against /home/user/Projects/bench-bins/MANIFEST.md. A filename containing
+THE REFERENCE is the caller's --reference-binary, whose digest is recorded and matched against a
+last-push manifest pin when available. Without that argument, origin/cpp is resolved to a full
+commit id, then matched against /home/user/Projects/bench-bins/MANIFEST.md. A filename containing
 "headline" is NOT evidence of identity; two different digests for one commit are ambiguous and skip.
 Missing or unbuildable reference => loud SKIP, never a pass: a correctness-only run must not be able
 to call itself a clean gate.
@@ -62,6 +63,7 @@ import tempfile
 import time
 
 from _lib import Conn
+from gateplan import validate_axes
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW = 20
@@ -162,6 +164,8 @@ def git(*args):
 
 
 def cpus(spec):
+    if not spec:
+        return []
     result = set()
     for part in spec.split(","):
         if not re.fullmatch(r"[0-9]+(-[0-9]+)?", part):
@@ -178,16 +182,25 @@ def cpu_string(values):
     return ",".join(str(c) for c in values)
 
 
-def check_placement(server_cpus, load_cpus):
-    if set(server_cpus) & set(load_cpus) or len(server_cpus) < 2:
-        raise RuntimeError("CPU sets must be disjoint, with >=2 server cores")
-    # The invoking shell can itself be taskset-pinned. Its current affinity is NOT the
-    # machine/cgroup limit: validate the exact affinity the children will receive instead.
-    requested = sorted(server_cpus + load_cpus)
-    p = capture(["taskset", "-c", cpu_string(requested), sys.executable, "-c",
-                 "import os; print(','.join(map(str, sorted(os.sched_getaffinity(0)))))"])
-    if p.returncode or p.stdout.strip() != cpu_string(requested):
-        raise RuntimeError(f"requested CPU sets are unavailable: {p.stdout.strip()}")
+def check_placement(server_cpus, load_cpus, server_smt=(), load_smt=()):
+    validate_axes(server_cpus, server_smt, load_cpus, load_smt)
+    if not 2 <= len(server_cpus) <= 32:
+        raise ValueError("ABBA requires 2-32 physical server cores; the headline geometry caps at 32")
+
+
+def select_port(ports, port):
+    if ports is None:
+        first = last = 8700 if port is None else port
+    else:
+        if not re.fullmatch(r"[0-9]+-[0-9]+", ports):
+            raise ValueError("--ports must be first-last")
+        first, last = map(int, ports.split("-"))
+    if not 1 <= first <= last <= 65535:
+        raise ValueError("--ports must be an ascending range within 1-65535")
+    chosen = first if port is None else port
+    if not first <= chosen <= last:
+        raise ValueError(f"--port {chosen} lies outside --ports {first}-{last}")
+    return chosen, (first, last)
 
 
 def load_layout(load_cpus, n, conns):
@@ -377,7 +390,50 @@ class Children:
             self.stop(p)
 
 
+def stop_build(process):
+    if process.poll() is not None:
+        return
+    # make and its compiler children have a private session. Find that session's members and
+    # signal their exact PIDs; command-line matching can match the gate's own invoking shell.
+    process.send_signal(signal.SIGSTOP)
+    owned = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) in (os.getpid(), os.getppid()):
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[3]) == process.pid and int(entry.name) != process.pid:
+                owned.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    for pid in owned:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.kill()
+    process.wait()
+
+
 def resolve_reference(args, out):
+    if args.reference_binary is not None:
+        binary = args.reference_binary.resolve()
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise Skip(f"reference executable unavailable: {binary}")
+        # An explicit path is the caller's identity assertion. Record its digest and any matching
+        # pin, without inventing a source commit when the supplied binary has no manifest entry.
+        provenance = {"source": "explicit --reference-binary", "path": str(binary),
+                      "sha256": sha256(binary), "commit": "caller-supplied, unverified"}
+        try:
+            commit = git("rev-parse", "--verify", "origin/cpp^{commit}")
+            provenance["last_pushed_commit"] = commit
+            pinned = manifest_reference(args.bench_bins, commit)
+            if pinned and sha256(pinned) == provenance["sha256"]:
+                provenance.update(commit=commit, ref="origin/cpp",
+                                  manifest=str(args.bench_bins / "MANIFEST.md"))
+        except (RuntimeError, Skip):
+            pass
+        return binary, provenance
     try:
         commit = git("rev-parse", "--verify", "origin/cpp^{commit}")
     except RuntimeError as e:
@@ -395,9 +451,13 @@ def resolve_reference(args, out):
             raise Skip(f"reference archive unavailable: {p.stdout}")
         with tarfile.open(archive) as tar:
             tar.extractall(src, filter="data")
-        argv = ["taskset", "-c", args.server_cores, "make", "-j8"]
+        build_cpus = sorted(set(cpus(args.server_cores) + cpus(args.server_smt)
+                                + cpus(args.load_cores) + cpus(args.load_smt)))
+        # The reference Makefile already compiles separate objects in parallel and carries its
+        # own per-TU flags. Keep that build grammar, using the supplied budget before measuring.
+        argv = ["taskset", "-c", cpu_string(build_cpus), "make", f"-j{len(build_cpus)}"]
         print(f"REFERENCE: no matching pin; building {commit}; log {out / 'reference-build.log'}", flush=True)
-        # make owns compiler descendants: its private process group is killed only on abort.
+        # Compiler descendants are owned by this make invocation and are reaped only on abort.
         with (out / "reference-build.log").open("w") as log:
             p = subprocess.Popen(argv, cwd=src, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True)
@@ -407,8 +467,7 @@ def resolve_reference(args, out):
                 raise Skip("reference build timed out; see reference-build.log") from e
             finally:
                 if p.poll() is None:
-                    os.killpg(p.pid, signal.SIGKILL)
-                    p.wait()
+                    stop_build(p)
         if rc:
             raise Skip(f"could not build reference {commit}; see reference-build.log")
         binary = src / "build/tomokv"
@@ -546,7 +605,8 @@ def memtier_totals(path):
 class Runner:
     def __init__(self, args, out, binaries, children):
         self.args, self.out, self.binaries, self.children = args, out, binaries, children
-        self.server_cpus, self.load_cpus = cpus(args.server_cores), cpus(args.load_cores)
+        self.server_cpus = sorted(cpus(args.server_cores) + cpus(args.server_smt))
+        self.load_cpus = sorted(cpus(args.load_cores) + cpus(args.load_smt))
 
     def memtier(self, layout):
         return ["taskset", "-c", cpu_string(layout["cpus"]), self.args.memtier,
@@ -562,7 +622,7 @@ class Runner:
         # Never connect to or terminate an existing listener, even if it speaks TomoKV.
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", self.args.port))
-        command = ["taskset", "-c", self.args.server_cores, self.binaries[arm],
+        command = ["taskset", "-c", cpu_string(self.server_cpus), self.binaries[arm],
                    "--port", str(self.args.port), "--bind", "127.0.0.1", "--atomic", "1",
                    "--enable-debug-command", "yes", "--save", "", "--appendonly", "no",
                    "--dir", str(folder)]
@@ -707,18 +767,25 @@ def print_cell(row):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
-    p.add_argument("--candidate", type=Path, default=Path(os.getenv("GATE_ABBA_CANDIDATE", ROOT / "build/tomokv")))
+    p.add_argument("--candidate-binary", "--candidate", dest="candidate", type=Path,
+                   default=Path(os.getenv("GATE_ABBA_CANDIDATE", ROOT / "build/tomokv")))
+    p.add_argument("--reference-binary", type=Path,
+                   default=Path(os.environ["GATE_ABBA_REFERENCE"]) if os.getenv("GATE_ABBA_REFERENCE") else None)
     p.add_argument("--cells", type=Path, default=Path(os.getenv("GATE_ABBA_CELLS", ROOT / "tests" / "headline_cells.txt")))
     p.add_argument("--bench-bins", type=Path, default=Path(os.getenv("GATE_ABBA_BINS", "/home/user/Projects/bench-bins")))
     p.add_argument("--build-reference", type=int, choices=(0, 1), default=int(os.getenv("GATE_ABBA_BUILD_REFERENCE", "1")))
-    # Validated geometry (2026-09-10): 32 server cores, matching what the headline cells record,
-    # and EVERY remaining thread as load except the server cores' own SMT siblings (128-159).
-    # A smaller load pool could not pin the faster arm: with 64-127,192-255 alone the candidate
-    # stalled at 97.1% busy and the tier read that as an unsaturated cell.
+    # The gate supplies its planned highest-budget geometry, capped at 32 physical server cores.
+    # Standalone defaults retain that headline placement. SMT is a separate caller choice: an
+    # omitted range reserves the siblings, and never silently lends server siblings to load.
     p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES", "0-31"))
-    p.add_argument("--load-cores",
-                   default=os.getenv("GATE_ABBA_LOAD_CORES", "32-63,64-127,160-191,192-255"))
-    p.add_argument("--port", type=int, default=int(os.getenv("GATE_ABBA_PORT", "8700")))
+    p.add_argument("--server-smt", default=os.getenv("GATE_ABBA_SERVER_SMT", ""))
+    p.add_argument("--load-cores", default=os.getenv("GATE_ABBA_LOAD_CORES", "32-127"))
+    p.add_argument("--load-smt", default=os.getenv("GATE_ABBA_LOAD_SMT", ""))
+    p.add_argument("--ports", default=os.getenv("GATE_ABBA_PORTS"),
+                   help="permitted first-last bind range; only its first port is needed")
+    p.add_argument("--port", type=int,
+                   default=int(os.environ["GATE_ABBA_PORT"]) if os.getenv("GATE_ABBA_PORT") else None,
+                   help="optional single port inside --ports; standalone default 8700")
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--escalate", action="store_true",
@@ -751,10 +818,14 @@ def main(args):
             age = time.time() - quiet.stat().st_mtime if quiet.exists() else -1
             if age < 60 * float(os.getenv("GATE_QUIET_MINUTES", "3")):
                 raise Skip(f"quiet file {quiet} is absent or too recent; no CPU work started")
-        server_cpus, load_cpus = cpus(args.server_cores), cpus(args.load_cores)
-        check_placement(server_cpus, load_cpus)
-        if not 8700 <= args.port <= 8739:
-            raise ValueError("ABBA port must be within 8700-8739")
+        server_physical, load_physical = cpus(args.server_cores), cpus(args.load_cores)
+        server_smt, load_smt = cpus(args.server_smt), cpus(args.load_smt)
+        check_placement(server_physical, load_physical, server_smt, load_smt)
+        server_cpus, load_cpus = sorted(server_physical + server_smt), sorted(load_physical + load_smt)
+        args.port, permitted_ports = select_port(args.ports, args.port)
+        # The driver also generates control traffic and collects counters. Keep it on load CPUs
+        # even when invoked from a shell that was pinned to a correctness worker's server slot.
+        os.sched_setaffinity(0, load_cpus)
         cells = read_cells(args.cells)
         report["cell_source"] = {"path": str(args.cells.resolve()), "sha256": sha256(args.cells),
                                  "text": args.cells.read_text(), "total_cells": len(cells)}
@@ -784,13 +855,20 @@ def main(args):
             raise RuntimeError("memtier_benchmark not available")
         args.memtier = str(Path(args.memtier).resolve())
         report["environment"] = {"uname": list(os.uname()), "server_cpus": server_cpus,
-                                 "load_cpus": load_cpus, "port": args.port, "keys": KEYS,
+                                 "server_physical": server_physical, "server_smt": server_smt,
+                                 "load_physical": load_physical, "load_smt": load_smt,
+                                 "load_instance_ceiling": min(args.max_instances, len(load_physical)),
+                                 "load_cpus": load_cpus, "port": args.port,
+                                 "permitted_ports": permitted_ports, "keys": KEYS,
                                  "data_bytes": 64, "key_pattern": "P:P", "atomic": 1,
                                  "split_ratio": f"{len(server_cpus)-len(server_cpus)//2}:{len(server_cpus)//2}",
                                  "split_flip_auto": 0, "memtier_path": args.memtier,
                                  "memtier_sha256": sha256(Path(args.memtier)),
                                  "memtier_version": capture([args.memtier, "--version"]).stdout.strip()}
-        print(f"GEOMETRY server={args.server_cores} ({len(server_cpus)} cores) load={args.load_cores}; "
+        print(f"GEOMETRY server={args.server_cores} ({len(server_physical)} physical cores) "
+              f"server-smt={args.server_smt or '(reserved)'} ({len(server_cpus)} threads) "
+              f"load={args.load_cores} load-smt={args.load_smt or '(reserved)'} "
+              f"port={args.port} allowed={permitted_ports[0]}-{permitted_ports[1]}; "
               "source headline file records 32 server cores; actual geometry recorded above. "
               "Cell connections are TOTAL, shared across load instances. Split uses fixed even ratio, flip=0.", flush=True)
         support = {arm: {name: accepted(binary, name, value) for name, value in
@@ -808,7 +886,11 @@ def main(args):
                 for note in row["notes"]:
                     print(f"  {cell.id} COMPATIBILITY: {note}", flush=True)
                 for n in LADDER:
-                    if n > args.max_instances or n > cell.conns:
+                    # Each generator owns at least one physical load core; its explicitly
+                    # enabled SMT siblings travel with that core, not as another instance.
+                    # At a small budget, assess the last possible block normally: an unproven
+                    # plateau remains FAIL instead of attempting an impossible placement.
+                    if n > args.max_instances or n > cell.conns or n > len(load_physical):
                         break
                     if cell.conns % n:
                         continue
@@ -1047,6 +1129,54 @@ def self_test():
                 self.assertEqual(sorted(assigned), load)
                 self.assertEqual(len(assigned), len(set(assigned)))
 
+        def test_explicit_axes_and_binary_arguments(self):
+            argv = ["abbagate.py", "--candidate-binary", "/candidate", "--reference-binary", "/reference",
+                    "--server-cores", "0-7", "--server-smt", "128-135", "--load-cores", "8-15",
+                    "--load-smt", "136-143", "--ports", "19000-19009"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
+                args = parse_args()
+            self.assertEqual(args.candidate, Path("/candidate"))
+            self.assertEqual(args.reference_binary, Path("/reference"))
+            runner = Runner(args, Path("/unused"), {}, Children())
+            self.assertEqual(runner.server_cpus, list(range(8)) + list(range(128, 136)))
+            self.assertEqual(runner.load_cpus, list(range(8, 16)) + list(range(136, 144)))
+            self.assertEqual(select_port(args.ports, args.port), (19000, (19000, 19009)))
+            with mock.patch.object(sys, "argv", ["abbagate.py"]), \
+                 mock.patch.dict(os.environ, {}, clear=True):
+                defaults = parse_args()
+            self.assertEqual((defaults.server_smt, defaults.load_smt), ("", ""))
+
+        def test_port_boundaries_reject_any_bind_outside_the_budget(self):
+            self.assertEqual(select_port("7899-7899", None), (7899, (7899, 7899)))
+            self.assertEqual(select_port("1-65535", 65535)[0], 65535)
+            for permitted, selected in (("9000-9001", 8999), ("9000-9001", 9002),
+                                        ("0-10", None), ("10-9", None), ("9-65536", None),
+                                        ("9", None), ("9,10", None)):
+                with self.subTest(permitted=permitted, selected=selected), self.assertRaises(ValueError):
+                    select_port(permitted, selected)
+
+        def test_placement_caps_physical_cores_and_preserves_explicit_smt(self):
+            with mock.patch(__name__ + ".validate_axes") as validate:
+                check_placement(list(range(32)), list(range(32, 64)), list(range(128, 160)), [])
+                validate.assert_called_once_with(list(range(32)), list(range(128, 160)),
+                                                 list(range(32, 64)), [])
+                with self.assertRaises(ValueError):
+                    check_placement(list(range(33)), [40])
+
+        def test_explicit_reference_records_digest_without_fabricating_a_commit(self):
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                directory = Path(tmp)
+                binary = directory / "reference"
+                binary.write_bytes(b"caller identified reference")
+                binary.chmod(0o700)
+                with mock.patch.object(sys, "argv", ["abbagate.py", "--reference-binary", str(binary)]):
+                    args = parse_args()
+                with mock.patch(__name__ + ".git", side_effect=RuntimeError("no remote")):
+                    actual, provenance = resolve_reference(args, directory)
+                self.assertEqual(actual, binary)
+                self.assertEqual(provenance["sha256"], sha256(binary))
+                self.assertEqual(provenance["commit"], "caller-supplied, unverified")
+
         def test_real_orchestration_order_and_negative_control(self):
             # Exercise the actual driver loop and JSON/exit verdict, replacing only the
             # expensive measurement boundary. Removing comparison or reordering AABB fails.
@@ -1075,6 +1205,7 @@ def self_test():
                          mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)), \
                          mock.patch(__name__ + ".accepted", return_value=True), \
                          mock.patch(__name__ + ".check_placement"), \
+                         mock.patch.object(os, "sched_setaffinity"), \
                          mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                          contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(main(args), expected)
@@ -1082,6 +1213,46 @@ def self_test():
                     result = json.loads((output / "results.json").read_text())
                     self.assertEqual(result["worst_cell"], "h01")
                     self.assertEqual(result["verdict"], "PASS" if expected == 0 else "FAIL")
+
+        def test_physical_load_ceiling_keeps_unproven_saturation_red(self):
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                directory = Path(tmp)
+                binary = directory / "candidate"
+                binary.write_bytes(b"test executable identity; never executed")
+                binary.chmod(0o700)
+                source = directory / "cells"
+                source.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | -\n")
+                output = directory / "out"
+                argv = ["abbagate.py", "--candidate-binary", str(binary), "--cells", str(source),
+                        "--output", str(output), "--memtier", sys.executable,
+                        "--server-cores", "0-7", "--load-cores", "8-15", "--load-smt", "136-143"]
+                with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
+                    args = parse_args()
+                order = []
+
+                def measure(_self, cell, arm, sequence, instances, knobs):
+                    order.append((instances, arm))
+                    if instances > 8:
+                        raise RuntimeError("SMT cannot manufacture a ninth physical load group")
+                    return dict(arm=arm, rate=instances * 100, busy_pct=99.9, latency_ms=1)
+
+                provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
+                with mock.patch.object(Runner, "measure", measure), \
+                     mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)), \
+                     mock.patch(__name__ + ".accepted", return_value=True), \
+                     mock.patch(__name__ + ".check_placement"), \
+                     mock.patch.object(os, "sched_setaffinity"), \
+                     mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(args), 1)
+                self.assertEqual(order, [(n, arm) for n in (1, 2, 4, 8) for arm in ORDER])
+                result = json.loads((output / "results.json").read_text())
+                row = result["cells"][0]
+                self.assertEqual(result["verdict"], "FAIL")
+                self.assertEqual(result["environment"]["load_instance_ceiling"], 8)
+                self.assertNotIn("reason", row)  # no placement exception replaces measurement evidence
+                self.assertIn("no higher-instance saturation probe above the peak block",
+                              row["assessment"]["reasons"])
 
         def test_only_owned_children_are_stopped(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
@@ -1098,6 +1269,43 @@ def self_test():
                     children.close()
                     outsider.terminate()
                     outsider.wait(timeout=10)
+
+        def test_build_abort_stops_only_pids_in_its_owned_session(self):
+            children = Children()
+            outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            build = None
+            try:
+                with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                    directory = Path(tmp)
+                    pidfile = directory / "compiler.pid"
+                    script = ("import subprocess,sys,time; from pathlib import Path; "
+                              "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                              f"Path({str(pidfile)!r}).write_text(str(p.pid)); time.sleep(60)")
+                    build = children.start([sys.executable, "-c", script], directory / "make.log", directory)
+                    deadline = time.monotonic() + 5
+                    while not pidfile.exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(pidfile.exists())
+                    compiler_pid = int(pidfile.read_text())
+                    stop_build(build)
+                    self.assertIsNotNone(build.poll())
+                    self.assertIsNone(outsider.poll())
+                    # A killed grandchild may remain a zombie until PID 1 reaps it; it cannot do
+                    # CPU work. Check that state without ever discovering a process by its argv.
+                    status = Path(f"/proc/{compiler_pid}/stat")
+                    deadline = time.monotonic() + 5
+                    while status.exists() and time.monotonic() < deadline:
+                        if status.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                            break
+                        time.sleep(.01)
+                    if status.exists():
+                        self.assertEqual(status.read_text().rsplit(")", 1)[1].split()[0], "Z")
+            finally:
+                if build and build.poll() is None:
+                    stop_build(build)
+                children.close()
+                outsider.terminate()
+                outsider.wait(timeout=10)
 
     return 0 if unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(ABBA)).wasSuccessful() else 1
 

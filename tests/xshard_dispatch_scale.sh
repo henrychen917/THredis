@@ -21,7 +21,7 @@
 set -u
 PORT=${XDS_PORT:-7200}
 CPUS=${XDS_CPUS:-48-59}
-BIN=${XDS_BIN:-./build/tomokv}
+BIN=${XDS_BIN:-${GATE_CANDIDATE_BINARY:-./build/tomokv}}
 OPS=${XDS_OPS:-400000}
 ROUNDS=${XDS_ROUNDS:-7}
 SMALL=${XDS_SMALL:-4}
@@ -35,7 +35,9 @@ BIG=${XDS_BIG:-128}
 # The raw cross-only ratio is printed too but is NOT the assertion: it does not clear box noise.
 LIMIT=${XDS_LIMIT:-1.20}
 HERE=$(cd "$(dirname "$0")" && pwd)
-DATA_DIR=$(mktemp -d /tmp/xds-data.XXXXXX) || exit 1
+DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xds-data.XXXXXX") || exit 1
+ACTIVE_PID=
+[ -z "${GATE_LOAD_CORES:-}" ] || taskset -pc "$GATE_LOAD_CORES" "$$" >/dev/null
 
 read -r -a CPULIST <<< "$(python3 - "$CPUS" <<'EOF'
 import sys
@@ -57,25 +59,36 @@ HOMES=$(python3 -c "print(','.join('%d:%d' % (s, 2 + s % 2) for s in range(16)))
 listener_pid() { ss -lntpH 2>/dev/null | grep -F ":$1 " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2; }
 
 stop_arm() {
-  local pid; pid=$(listener_pid "$PORT")
+  local pid=$ACTIVE_PID
   [ -z "$pid" ] && return 0
   kill -TERM "$pid" 2>/dev/null
   for _ in $(seq 1 200); do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
   kill -0 "$pid" 2>/dev/null && kill -KILL "$pid"
+  wait "$pid" 2>/dev/null || true
+  ACTIVE_PID=
   for _ in $(seq 1 200); do [ -z "$(listener_pid "$PORT")" ] && return 0; sleep 0.05; done
   echo "XDS: port $PORT never released"; exit 1
 }
+trap stop_arm EXIT
 
 run_arm() {   # $1 = total thread count
   local t=$1 nfill=$(( $1 - 4 )) place
   place=$(python3 -c "print(','.join(['ifid@$IO_A','ifid@$IO_B','ex@$EX_A','ex@$EX_B']+['ex@$FILL']*$nfill))")
   stop_arm
-  ( taskset -c "$CPUS" "$BIN" --port "$PORT" --bind 127.0.0.1 --enable-debug-command yes \
+  [ -z "$(listener_pid "$PORT")" ] || { echo "XDS: port $PORT already listening"; return 1; }
+  taskset -c "$CPUS" "$BIN" --port "$PORT" --bind 127.0.0.1 --enable-debug-command yes \
       --key-lb 0 --client-lb 0 --flip-auto 0 --save '' --dir "$DATA_DIR" \
-      --place "$place" --shards 16 --shard-home "$HOMES" >/tmp/xds-$t.log 2>&1 & )
-  for _ in $(seq 1 400); do [ -n "$(listener_pid "$PORT")" ] && break; sleep 0.05; done
-  if [ -z "$(listener_pid "$PORT")" ]; then echo "XDS: arm $t never listened"; tail -3 /tmp/xds-$t.log; exit 1; fi
-  python3 "$HERE/xshard_dispatch_scale.py" 127.0.0.1 "$PORT" "$OPS" 32 "$ROUNDS"
+      --place "$place" --shards 16 --shard-home "$HOMES" >"$DATA_DIR/server-$t.log" 2>&1 &
+  ACTIVE_PID=$!
+  for _ in $(seq 1 400); do
+    [ "$(listener_pid "$PORT")" = "$ACTIVE_PID" ] && break
+    kill -0 "$ACTIVE_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [ "$(listener_pid "$PORT")" != "$ACTIVE_PID" ]; then
+    echo "XDS: arm $t never owned its listener"; tail -3 "$DATA_DIR/server-$t.log"; return 1
+  fi
+  python3 "$HERE/xshard_dispatch_scale.py" 127.0.0.1 "$PORT" "$OPS" 32 "$ROUNDS" >"$DATA_DIR/arm.out"
 }
 
 # Two independent small/big PAIRS, and the verdict is the BETTER (lower) of the two ratios. The
@@ -84,8 +97,12 @@ run_arm() {   # $1 = total thread count
 # pair without hiding a real regression (the pre-fix ratio was >= 1.13 in every pair measured).
 PAIRS=""
 for _ in $(seq 1 "${XDS_PAIRS:-2}"); do
-  SMALL_OUT=$(run_arm "$SMALL") || { echo "XDS: small arm failed"; stop_arm; exit 1; }
-  BIG_OUT=$(run_arm "$BIG")     || { echo "XDS: big arm failed"; stop_arm; exit 1; }
+  # Run in this shell so $! remains an owned, waitable child across both arms. Command
+  # substitution used to discard that ownership and forced teardown to kill a discovered PID.
+  run_arm "$SMALL" || { echo "XDS: small arm failed"; stop_arm; exit 1; }
+  SMALL_OUT=$(cat "$DATA_DIR/arm.out")
+  run_arm "$BIG" || { echo "XDS: big arm failed"; stop_arm; exit 1; }
+  BIG_OUT=$(cat "$DATA_DIR/arm.out")
   echo "  small $SMALL_OUT"
   echo "  big   $BIG_OUT"
   PAIRS="$PAIRS|$SMALL_OUT;$BIG_OUT"

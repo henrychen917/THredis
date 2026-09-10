@@ -218,7 +218,17 @@ def main():
                "maxclients live raise")
 
         # A simultaneous burst may overshoot only by the number of independent IO acceptors.
-        # The process affinity is a conservative upper bound on n_io for this purpose-booted test.
+        # The server's thread inventory is a conservative upper bound on n_io. The driver
+        # now has its own CPU allocation; its affinity says nothing about server acceptors.
+        server_info = admin.command("INFO", "SERVER")
+        if not isinstance(server_info, bytes):
+            raise AssertionError(f"INFO SERVER returned {server_info!r}")
+        server_fields = dict(line.split(":", 1) for line in server_info.decode().splitlines()
+                             if ":" in line)
+        server_threads = server_fields.get("thread_cpus", "").split(",")
+        if not server_threads or any(":" not in thread for thread in server_threads):
+            raise AssertionError(f"missing server thread inventory: {server_info!r}")
+        affinity_width = len(server_threads)
         expect(admin.command("CONFIG", "SET", "maxclients", "20"), b"OK",
                "maxclients storm setup")
         storm_before = int(stats(admin)["rejected_connections"])
@@ -258,11 +268,10 @@ def main():
         for thread in storm_threads:
             thread.join(timeout=10)
         alive = sum(thread.is_alive() for thread in storm_threads)
-        affinity_width = len(os.sched_getaffinity(0))
         if (alive or storm_errors or not (19 <= len(storm_admitted) <= 19 + affinity_width)):
             raise AssertionError(
                 f"maxclients storm bound: admitted={len(storm_admitted)} "
-                f"affinity={affinity_width} alive={alive} errors={storm_errors!r}")
+                f"server_threads={affinity_width} alive={alive} errors={storm_errors!r}")
         print(f"  ok   maxclients storm slop bound (admitted={len(storm_admitted)})",
               flush=True)
         expect_stat(admin, "rejected_connections",

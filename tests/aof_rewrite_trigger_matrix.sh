@@ -9,9 +9,10 @@ NCORES=$(taskset -c "$CORES" nproc)
 if [ "$NCORES" -ge 8 ]; then RATIO=4:4
 else RATIO=$(((NCORES+1)/2)):$((NCORES-(NCORES+1)/2)); fi
 CLI=${REDIS_CLI:-redis-cli}
-BIN=${TOMO_BIN:-./build/tomokv}
+BIN=${GATE_CANDIDATE_BINARY:-${TOMO_BIN:-./build/tomokv}}
 NET_IO=${NET_IO:-uring}
 ACTIVE_PID=
+[ -z "${GATE_LOAD_CORES:-}" ] || taskset -pc "$GATE_LOAD_CORES" "$$" >/dev/null
 
 cleanup() {
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
@@ -37,12 +38,14 @@ wait_for_release() {
 boot_server() {
   local directory=$1 atomic=$2 log=$3
   local boot_pid socket_pid
+  [ -z "$(listener_pid)" ] || { echo "AOF rewrite triggers: port $PORT already listening" >&2; return 1; }
   taskset -c "$CORES" "$BIN" --port "$PORT" --bind 127.0.0.1 \
     --shards 16 --ratio "$RATIO" --protected-mode no --atomic "$atomic" \
     --net-io "$NET_IO" --appendonly yes --appendfsync everysec \
     --auto-aof-rewrite-percentage 0 \
     --enable-debug-command yes --dir "$directory" >"$log" 2>&1 &
   boot_pid=$!
+  ACTIVE_PID=$boot_pid
   for _ in $(seq 1 100); do
     if ! kill -0 "$boot_pid" 2>/dev/null; then
       wait "$boot_pid" 2>/dev/null || true
@@ -51,8 +54,7 @@ boot_server() {
     fi
     if "$CLI" -h 127.0.0.1 -p "$PORT" ping >/dev/null 2>&1; then
       socket_pid=$(listener_pid)
-      [ "$(printf '%s\n' "$socket_pid" | sed '/^$/d' | wc -l)" -eq 1 ] || return 1
-      ACTIVE_PID=$socket_pid
+      [ "$socket_pid" = "$boot_pid" ] || return 1
       return 0
     fi
     sleep 0.1
@@ -68,7 +70,7 @@ stop_server() {
 }
 
 for atomic in 0 1; do
-  directory=$(mktemp -d "/tmp/gate-aof-trigger-${atomic}.XXXXXX")
+  directory=$(mktemp -d "${TMPDIR:-/tmp}/gate-aof-trigger-${atomic}.XXXXXX")
   state="$directory/state.json"
   boot_server "$directory" "$atomic" "$directory/server-1.log"
   python3 tests/aof_rewrite_triggers.py 127.0.0.1 "$PORT" run \

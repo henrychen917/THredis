@@ -114,9 +114,14 @@ def server(binary, server_cpus, port, directory, args):
     directory.mkdir(parents=True, exist_ok=False)
     data = directory / 'data'
     data.mkdir()
-    # A bind probe rejects even a listener that does not yet answer PING. No SO_REUSEPORT here.
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', port))
+    # Successive cells reuse the gate's allocated port, including immediately after TLS and
+    # io_uring teardown. A bind-only probe mistakes retained TCP state for a live server.
+    # Reject every live listener (even one that cannot answer PING), then require INFO below
+    # to identify the exact child we launched before exercising the cell.
+    listeners = subprocess.check_output(
+        ['ss', '-H', '-ltnp', f'sport = :{port}'], stderr=subprocess.STDOUT, text=True)
+    (directory / 'port-guard.txt').write_text(listeners)
+    require(not listeners.strip(), f'port {port} already has a live listener: {listeners.strip()}')
     argv = ['taskset', '-c', server_cpus, str(Path(binary).resolve()), '--port', str(port),
             '--bind', '127.0.0.1', '--dir', str(data), '--save', '', '--appendonly', 'no',
             '--enable-debug-command', 'yes', *map(str, args)]

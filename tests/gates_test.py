@@ -10,6 +10,10 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import signal
+import sys
+import time
 import tempfile
 import subprocess
 import unittest
@@ -200,44 +204,361 @@ class PerformanceFailures(unittest.TestCase):
 
 
 class LedgerWiring(unittest.TestCase):
-    def run_block(self, kind, rc=0):
+    def run_block(self, kind, rc=0, abba_rc=0):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         if kind == 'feature':
             start = gate.index('# ---- A. mandatory feature')
             end = gate.index('if [ "$TIER" = quick ]; then', start)
         else:
-            start = gate.index('# ---- B. mandatory loopback')
-            end = gate.index('# ---- 4. full tier:', start)
-        # Exercise ONLY the newly added shell loops, with all CPU work stubbed. This never
-        # invokes gate.sh, starts a server, builds, or runs any pre-existing battery.
+            marker = gate.index('# ---- B. mandatory headline performance')
+            start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
+            end = gate.index('\nesac', start) + len('\nesac')
+        # Execute the production shell verdict branches, replacing only the CPU-work boundary.
+        # In the quick block the 35 feature rows and ABBA self-test remain separate assertions.
         prelude = '''PASS=0
 FAIL=0
 CORES=8-15
+PORT=19000
+CANDIDATE_BINARY=/unused
 GATE_RATIO=6:2
-py(){ return "$WIRE_RC"; }
-timeout(){ return "$WIRE_RC"; }
+ABBA_ARGS=()
+py(){
+  if [ "$1" = tests/abbagate.py ]; then return "$WIRE_ABBA_RC"; fi
+  return "$WIRE_RC"
+}
+python3(){ return "$WIRE_ABBA_RC"; }
 quiet_wait(){ :; }
-ok(){ PASS=$((PASS+1)); }
-bad(){ FAIL=$((FAIL+1)); }
+ok(){ printf 'ok\\t%s\\t\\n' "$1" >> "$WIRE_LEDGER"; }
+bad(){ printf 'FAIL\\t%s\\t%s\\n' "$1" "${2:-}" >> "$WIRE_LEDGER"; }
 say(){ :; }
 '''
-        tail = '\nprintf "%s %s %s\\n" "$PASS" "$FAIL" "${PERF_UNARMED:-0}"\n'
         with tempfile.TemporaryDirectory(dir=root / 'build') as directory:
-            env = dict(os.environ, WIRE_RC=str(rc), GATE_FEATURE_OUTPUT=directory, GATE_PERF_OUTPUT=directory)
-            result = subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-c',
-                                     prelude + gate[start:end] + tail], cwd=root, env=env,
-                                    text=True, capture_output=True, check=True)
-        return result.stdout.strip()
+            ledger = Path(directory) / 'rows.tsv'
+            env = dict(os.environ, WIRE_RC=str(rc), WIRE_ABBA_RC=str(abba_rc),
+                       WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory)
+            subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
+                            prelude + gate[start:end]], cwd=root, env=env,
+                           text=True, capture_output=True, check=True, timeout=10)
+            return [line.split('\t') for line in ledger.read_text().splitlines()]
 
     def test_feature_rows_precede_quick_exit(self):
-        self.assertEqual(self.run_block('feature'), '35 0 0')
-        self.assertEqual(self.run_block('feature', 1), '0 35 0')
+        for rc in (0, 1, 3):
+            with self.subTest(rc=rc):
+                rows = self.run_block('feature', rc)
+                self.assertEqual([row[1] for row in rows[:-1]], ['feature ' + cell for cell in feature.CELLS])
+                self.assertEqual([row[0] for row in rows[:-1]], ['FAIL' if rc else 'ok'] * 35)
+                self.assertEqual(rows[-1][:2], ['ok', 'ABBA comparison + saturation negative controls'])
 
-    def test_full_perf_counts_missing_refs_as_failures(self):
-        self.assertEqual(self.run_block('performance'), '32 0 0')
-        self.assertEqual(self.run_block('performance', 3), '0 32 1')
-        self.assertEqual(self.run_block('performance', 1), '0 32 0')
+    def test_quick_abba_self_test_is_one_independent_failure_row(self):
+        for rc in (1, 3):
+            rows = self.run_block('feature', abba_rc=rc)
+            self.assertEqual([row[0] for row in rows], ['ok'] * 35 + ['FAIL'])
+            self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
+
+    def test_full_abba_counts_missing_refs_and_measurement_errors_as_failures(self):
+        for rc in (0, 1, 3):
+            with self.subTest(rc=rc):
+                rows = self.run_block('performance', abba_rc=rc)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][:2], ['FAIL' if rc else 'ok', 'headline ABBA vs last pushed binary'])
+                if rc == 3:
+                    self.assertIn('SKIPPED -- NOT A PASS', rows[0][2])
+
+
+class ABBATermination(unittest.TestCase):
+    def test_terminating_gate_reaps_driver_and_owned_child_but_not_foreign_process(self):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        cleanup = gate[gate.index('cleanup(){ # EXIT/INT/TERM:'):gate.index('\nport_listeners(){')]
+        marker = gate.index('# ---- B. mandatory headline performance')
+        start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
+        launch = gate[start:gate.index('\nesac', start) + len('\nesac')]
+        with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
+            directory = Path(tmp)
+            driver = directory / 'mock-driver.py'
+            # Only the measuring boundary is fake. The real ABBA Children class starts and
+            # reaps a harmless sleeping child in its private session, exactly like a server.
+            driver.write_text('''import json, os, signal, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from abbagate import Children
+out=Path(sys.argv[2]); children=Children()
+def interrupted(signum, frame):
+    raise InterruptedError(signum)
+signal.signal(signal.SIGTERM, interrupted)
+try:
+    child=children.start([sys.executable, '-c', 'import time; time.sleep(60)'], out/'child.log', out)
+    (out/'ready.json').write_text(json.dumps({'driver':os.getpid(), 'child':child.pid}))
+    while True: signal.pause()
+except InterruptedError:
+    pass
+finally:
+    children.close()
+    (out/'cleaned').write_text('owned child reaped')
+''')
+            prelude = '''set -u
+SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0; ABBA_PID=0; ABBA_ARGS=()
+stop_workers(){ :; }
+python3(){ exec "$WIRE_PYTHON" "$WIRE_DRIVER" "$WIRE_TESTS" "$WIRE_OUTPUT"; }
+ok(){ printf 'ok\\n' >> "$WIRE_OUTPUT/verdict"; }
+bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
+'''
+            env = dict(os.environ, WIRE_PYTHON=sys.executable, WIRE_DRIVER=str(driver),
+                       WIRE_TESTS=str(root / 'tests'), WIRE_OUTPUT=str(directory))
+            foreign = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+            process = subprocess.Popen(['bash', '-c', prelude + '\n' + cleanup + '\n' + launch],
+                                       cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            pids = {}
+            try:
+                deadline = time.monotonic() + 5
+                ready = directory / 'ready.json'
+                while time.monotonic() < deadline and process.poll() is None:
+                    try:
+                        pids = json.loads(ready.read_text())
+                        break
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        time.sleep(.01)
+                self.assertTrue(pids, 'mock ABBA never reached its measurement boundary')
+                process.terminate()  # Only the gate PID receives TERM from the caller.
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, (stdout, stderr))
+                self.assertTrue((directory / 'cleaned').exists(), 'gate left its ABBA driver running')
+                self.assertFalse(Path(f"/proc/{pids['child']}").exists(), 'owned child was not reaped')
+                self.assertFalse(Path(f"/proc/{pids['driver']}").exists(), 'owned driver was not reaped')
+                self.assertIsNone(foreign.poll(), 'unrelated process received a signal')
+                self.assertFalse((directory / 'verdict').exists(), 'interrupted measurement emitted a verdict')
+            finally:
+                # The negative version of this test leaves a driver behind. Reap only the PIDs
+                # this fixture recorded, so a failed cleanup assertion cannot contaminate a run.
+                if process.poll() is None:
+                    process.kill()
+                if pids and not (directory / 'cleaned').exists():
+                    try:
+                        os.kill(pids['driver'], signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 5
+                    while not (directory / 'cleaned').exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    if not (directory / 'cleaned').exists():
+                        for pid in pids.values():
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                process.communicate(timeout=5)
+                foreign.terminate()
+                foreign.wait(timeout=5)
+
+
+class SchedulerWiring(unittest.TestCase):
+    # This is the existing canonical ledger order, deliberately different from the queue's
+    # longest-first order. The actual scheduler still chooses and dispatches its own inventory.
+    canonical = (['core-watch']
+                 + [f'feature-{mode}-{atomic}' for mode in ('split', 'armed') for atomic in (0, 1)]
+                 + [f'evict-{section}-{mode}-{atomic}' for atomic in (0, 1)
+                    for section in ('lfu', 'lruclock') for mode in ('split', 'armed')]
+                 + ['flipctl', 'differ-split', 'differ-armed'])
+
+    def run_scheduler(self, *, reverse=False, slots=None, failure='', behavior='', ordered=True,
+                      delayed_completion=False):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        ledger_functions = gate[gate.index('say(){'):gate.index('\nledger_labels(){')]
+        placement = gate[gate.index('set_slot(){'):gate.index('\nset_slot 0')]
+        scheduler = gate[gate.index('WORKER_PIDS=()'):gate.index('# ---- 0. preflight:')]
+        order = self.canonical[::-1] if reverse else self.canonical
+        prelude = '''set -u
+PASS=0; FAIL=0; TIER=full; CORES=0; LOAD_CORES=0; PORT=19000; GATE_RATIO=6:2; ALL_BUILD_CORES=0
+LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; ROW_T=$(date +%s.%N)
+: > "$LEDGER"; : > "$TIMINGS"
+mkdir -p "$RUN_DIR/jobs" "$RUN_DIR/started" "$RUN_DIR/completed"
+phase(){ :; }
+cleanup(){ [ -z "${name:-}" ] || : > "$TMPDIR/cleaned"; }
+'''
+        if delayed_completion:
+            # Widen the real open-before-write window past the collector's polling interval.
+            # Readers must wait for publication even when the writer is descheduled here.
+            prelude += '''
+printf(){
+  local writer_pid=$BASHPID target
+  target=$(readlink "/proc/$writer_pid/fd/1")
+  case "$target" in */done|*/done.tmp) sleep .6;; esac
+  builtin printf "$@"
+}
+'''
+        # File barriers force the opposite completion order without relying on sleep durations
+        # or machine scheduling. No stub opens a socket or invokes a server/build/benchmark.
+        stub = '''
+job_body(){
+  local current=$1 dependency
+  : > "$RUN_DIR/started/$current"
+  if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
+    for dependency in "${CANONICAL[@]}"; do
+      while [ ! -f "$RUN_DIR/started/$dependency" ]; do sleep .005; done
+    done
+  fi
+  if [ "$FORCE_ORDER" = 1 ]; then
+    for dependency in "${COMPLETION_ORDER[@]}"; do
+      [ "$dependency" != "$current" ] || break
+      while [ ! -f "$RUN_DIR/completed/$dependency" ]; do sleep .005; done
+    done
+  fi
+  if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = crash ]; then exit 17; fi
+  if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = red ]; then
+    bad "$(job_label "$current")" 'deliberately broken mechanism'
+  elif [ "$current" != "$FAILED_JOB" ] || [ "$FAILURE_BEHAVIOR" != empty ]; then
+    ok "$(job_label "$current")"
+  fi
+  printf '%s\\n' "$current" >> "$RUN_DIR/completion-order"
+  : > "$RUN_DIR/completed/$current"
+  if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = return ]; then return 17; fi
+  return 0
+}
+start_workers
+for requested in "${CANONICAL[@]}"; do collect_job "$requested"; done
+join_workers
+printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
+'''
+        with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
+            directory = Path(tmp)
+            env = dict(os.environ, RUN_DIR=tmp, FAILED_JOB=failure, FAILURE_BEHAVIOR=behavior,
+                       FORCE_ORDER=str(int(ordered)))
+            count = slots or len(self.canonical) + 1
+            cpu = str(min(os.sched_getaffinity(0)))
+            arrays = '\n'.join([
+                f'GATE_SLOTS={count}',
+                'CANONICAL=(' + ' '.join(map(shlex.quote, self.canonical)) + ')',
+                'COMPLETION_ORDER=(' + ' '.join(map(shlex.quote, order)) + ')',
+                'SLOT_CORES=(' + ' '.join([cpu] * count) + ')',
+                'SLOT_LOAD_CORES=(' + ' '.join([cpu] * count) + ')',
+                'SLOT_PORTS=(' + ' '.join(str(19000 + 3 * index) for index in range(count)) + ')',
+            ])
+            script = '\n'.join((prelude, arrays, ledger_functions, placement, scheduler,
+                                'trap stop_workers EXIT', stub))
+            result = subprocess.run(['timeout', '--kill-after=2', '15', 'taskset', '-c', cpu,
+                                     'bash', '-c', script], cwd=root, env=env,
+                                    text=True, capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-2000:])
+            return dict(ledger=(directory / 'ledger').read_bytes(),
+                        counts=tuple(map(int, (directory / 'counts').read_text().split())),
+                        completion=(directory / 'completion-order').read_text().splitlines(),
+                        families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()],
+                        cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')})
+
+    def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
+        forward = self.run_scheduler()
+        reverse = self.run_scheduler(reverse=True)
+        self.assertEqual(forward['completion'], self.canonical)
+        self.assertEqual(reverse['completion'], self.canonical[::-1])
+        self.assertEqual(forward['ledger'], reverse['ledger'])
+        self.assertEqual(forward['counts'], (len(self.canonical), 0))
+        self.assertEqual({row[0] for row in reverse['families']}, set(self.canonical))
+        self.assertEqual(reverse['cleaned'], set(self.canonical))
+
+    def test_empty_fragment_and_explicit_failure_cannot_turn_green(self):
+        for behavior in ('empty', 'red'):
+            with self.subTest(behavior=behavior):
+                result = self.run_scheduler(failure='flipctl', behavior=behavior)
+                self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+                self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
+
+    def test_worker_exit_before_done_is_a_failure(self):
+        # Last in completion order, so its deliberate exit cannot block another stub's barrier.
+        result = self.run_scheduler(failure=self.canonical[-1], behavior='crash')
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertIn(b'FAIL\tRedis 7.4 differential matrix (armed fused + read-local)\n', result['ledger'])
+
+    def test_nonzero_worker_return_cannot_be_hidden_by_a_pass_fragment(self):
+        result = self.run_scheduler(failure='flipctl', behavior='return')
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
+
+    def test_completion_is_not_visible_before_its_record_is_written(self):
+        result = self.run_scheduler(delayed_completion=True)
+        self.assertEqual(result['counts'], (len(self.canonical), 0))
+
+    def test_limited_workers_reuse_slots_without_losing_or_repeating_jobs(self):
+        result = self.run_scheduler(slots=3, ordered=False)
+        self.assertCountEqual(result['completion'], self.canonical)
+        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(len(result['families']), len(self.canonical))
+        self.assertLessEqual({row[1] for row in result['families']}, {'1', '2'})
+
+    def test_one_slot_executes_every_family_synchronously(self):
+        result = self.run_scheduler(slots=1)
+        self.assertEqual(result['completion'], self.canonical)
+        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual({row[1] for row in result['families']}, {'0'})
+        self.assertEqual(result['cleaned'], set(self.canonical))
+
+
+class PerfCandidateDispatch(unittest.TestCase):
+    def dispatch(self, build_candidate, build_rc=0, unquiet=False):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        start = gate.index('if [ "$TIER" = perf ]; then')
+        branch = gate[start:gate.index('\nPASS=0; FAIL=0', start)]
+        # Exercise the real branch with shell stubs: neither make, taskset, nor ABBA executes.
+        stub = '''set -u
+TIER=perf; BUILD_CORES=0-15; BUILD_JOBS=16
+ABBA_ARGS=(--candidate-binary "$RUN_DIR/candidate")
+taskset(){ printf 'BUILD %s\\n' "$*" >> "$EVENTS"; return "$BUILD_RC"; }
+exec(){ printf 'ABBA %s\\n' "$*" >> "$EVENTS"; }
+'''
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            events = directory / 'events'
+            env = dict(os.environ, RUN_DIR=temporary, EVENTS=str(events),
+                       BUILD_CANDIDATE=str(build_candidate), BUILD_RC=str(build_rc),
+                       GATE_QUIET_FILE=str(directory / 'missing-quiet') if unquiet else '')
+            result = subprocess.run(['bash', '-c', stub + branch], cwd=root, env=env,
+                                    text=True, capture_output=True, timeout=5)
+            return result, events.read_text().splitlines() if events.exists() else []
+
+    def test_omitted_candidate_builds_before_abba(self):
+        result, events = self.dispatch(1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0], 'BUILD -c 0-15 make -j16')
+        self.assertTrue(events[1].startswith('ABBA python3 tests/abbagate.py --candidate-binary '))
+
+    def test_explicit_candidate_bypasses_build(self):
+        result, events = self.dispatch(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].startswith('ABBA '))
+
+    def test_failed_build_cannot_measure_stale_candidate(self):
+        result, events = self.dispatch(1, 17)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(events, ['BUILD -c 0-15 make -j16'])
+        self.assertIn('candidate build failed', result.stderr)
+
+    def test_unquiet_box_cannot_start_candidate_build(self):
+        result, events = self.dispatch(1, unquiet=True)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(events, [])
+        self.assertIn('candidate build not started', result.stderr)
+
+
+class EarlyGateDispatch(unittest.TestCase):
+    def test_perf_self_test_reaches_abba_and_common_options_reach_planner(self):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        branch = gate[gate.index('GATE_SELF_TEST=0'):gate.index('GATE_STARTED=$SECONDS')]
+        stub = 'exec(){ printf "%s\\n" "$*"; exit 0; }\n'
+        cases = [(['perf', '--self-test'], 'python3 tests/abbagate.py --self-test'),
+                 (['quick', '--self-test'], 'python3 tests/gateplan.py quick --self-test'),
+                 (['perf', '--help'], 'python3 tests/gateplan.py perf --help'),
+                 (['perf', '--json'], 'python3 tests/gateplan.py perf --json')]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                result = subprocess.run(['bash', '-c', stub + branch, 'gate.sh', *argv],
+                                        cwd=root, text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
 
 
 if __name__ == '__main__':

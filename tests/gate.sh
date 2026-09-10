@@ -4,13 +4,22 @@
 #   tests/gate.sh quick   loopback only: build (release+ASAN), footprint locks, boot
 #                         matrix, smoke, torture, RYOW, atomic torn/mixed-write/window gates,
 #                         shutdown invariants, counter-fired feature matrix, idle-loop ceiling. Runs on
-#                         any machine.
+#                         any machine with at least 16 physical cores.
 #   tests/gate.sh full    quick + the mandatory headline ABBA tier (the last pushed binary against
 #                         the candidate, same session, same box, threshold derived from the
 #                         reference's own spread; a missing reference SKIPS LOUDLY and stays red)
 #                         + torture-under-ASAN + the Redis 7.4 differential matrix
 #                         + NIC regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
 #                         netns rig and its scratchpad binaries/procsafe helper).
+#
+#   Resource options (CPU lists accept ranges and commas):
+#     --server-cores LIST  --server-smt LIST  --load-cores LIST  --load-smt LIST
+#     --ports FIRST-LAST  --reference-binary PATH  --candidate-binary PATH
+#   Omitted physical ranges use the available topology (at most 128 physical cores); omitted
+#   SMT ranges reserve those siblings unused. Correctness uses eight physical server cores per
+#   slot and at least two separate physical load cores. ABBA runs after all correctness children
+#   are reaped, keeps at most 32 physical server cores, and moves surplus server cores to load.
+#   --candidate-binary bypasses only the release build; instrumented source builds still run.
 #
 #   Every feature battery runs on three boots: split (both atomic modes), fused, and fused with the
 #   read-local lane ARMED (--read-local 1, the recommended read-heavy production posture; that leg
@@ -27,21 +36,75 @@
 # testing nothing is worse than no gate.
 set -u
 cd "$(dirname "$0")/.."
-TIER=${1:-quick}
-if [ "$TIER" = perf ]; then
-  # Only the ABBA tier, against an already-built candidate. Used while iterating on a change so a
-  # lane can check its own merit without paying for the full correctness gate first.
-  shift
-  exec python3 tests/abbagate.py "$@"
+GATE_SELF_TEST=0
+for gate_arg in "$@"; do
+  case "$gate_arg" in
+    -h|--help|--json) exec python3 tests/gateplan.py "$@";;
+    --self-test) GATE_SELF_TEST=1;;
+  esac
+done
+if [ "$GATE_SELF_TEST" = 1 ]; then
+  if [ "${1:-quick}" = perf ]; then
+    shift
+    exec python3 tests/abbagate.py "$@"
+  fi
+  exec python3 tests/gateplan.py "$@"
 fi
-PORT=${GATE_PORT:-7899}
-CORES=${GATE_CORES:-0-7}
-NCORES=$(taskset -c "$CORES" nproc)
-if [ "$NCORES" -ge 8 ]; then GATE_RATIO=6:$((NCORES-6))
-else GATE_RATIO=$(((NCORES+1)/2)):$((NCORES-(NCORES+1)/2)); fi
+GATE_STARTED=$SECONDS
+PLAN=$(python3 tests/gateplan.py "$@") || exit $?
+eval "$PLAN"
+ALL_BUILD_CORES=$BUILD_CORES
+mkdir -p "$PWD/build" || exit 2
+RUN_DIR=$(mktemp -d "$PWD/build/gate-run.XXXXXX") || exit 2
+phase(){ printf '%s\t%s\n' "$1" "$(date +%s.%N)" >> "$RUN_DIR/phases.tsv"; }
+phase begin
+printf '%s\n' "$PLAN" > "$RUN_DIR/plan.sh"
+export TMPDIR="$RUN_DIR/main"
+mkdir -p "$TMPDIR" "$RUN_DIR/jobs" "$PWD/build/gate-cache"
+CORES=${SLOT_CORES[0]}; LOAD_CORES=${SLOT_LOAD_CORES[0]}; PORT=${SLOT_PORTS[0]}
+GATE_RATIO=${GATE_RATIO:-6:2}; NCORES=8
+export GATE_CANDIDATE_BINARY="$CANDIDATE_BINARY"
+# Pin the coordinator so every otherwise unpinned Python/CLI child inherits the load allocation.
+# Server boot helpers explicitly replace this affinity with their eight physical server cores.
+set_slot(){
+  local slot=$1
+  CORES=${SLOT_CORES[$slot]}; LOAD_CORES=${SLOT_LOAD_CORES[$slot]}; PORT=${SLOT_PORTS[$slot]}
+  export GATE_CORES="$CORES" GATE_LOAD_CORES="$LOAD_CORES" GATE_PORT="$PORT"
+  export GATE_FEATURE_PORT="$PORT" GATE_SPARE_PORT="$((PORT+2))"
+  export GATE_DIFFER_ORACLE_PORT="$((PORT+1))" GATE_GLOBCASE_ORACLE_PORT="$((PORT+2))"
+  export GATE_DIFFER_ORACLE_CORES="$CORES"
+  taskset -pc "$LOAD_CORES" "$BASHPID" >/dev/null
+}
+set_slot 0
+printf 'GATE(%s): %s\n  artifacts: %s\n' "$TIER" "$PLAN_HEADER" "$RUN_DIR"
+if [ "$TIER" = perf ]; then
+  # An omitted candidate means the current tree in every tier. Otherwise a perf-only invocation
+  # could measure stale release objects after a source edit and still label them the candidate.
+  if [ "$BUILD_CANDIDATE" = 1 ]; then
+    # ABBA checks this opt-in sharing signal itself, but compilation now precedes that check.
+    # Keep its same absent/recent-file rejection before any compiler starts.
+    if [ -n "${GATE_QUIET_FILE:-}" ]; then
+      python3 - "$GATE_QUIET_FILE" "${GATE_QUIET_MINUTES:-3}" <<'PY' || exit 3
+from pathlib import Path
+import sys, time
+quiet = Path(sys.argv[1])
+age = time.time() - quiet.stat().st_mtime if quiet.exists() else -1
+if age < 60 * float(sys.argv[2]):
+    print(f'GATE(perf): quiet file {quiet} is absent or too recent; candidate build not started', file=sys.stderr)
+    sys.exit(3)
+PY
+    fi
+    if ! taskset -c "$BUILD_CORES" make -j"$BUILD_JOBS" >"$RUN_DIR/release-build.log" 2>&1; then
+      cat "$RUN_DIR/release-build.log" >&2
+      echo "GATE(perf): candidate build failed" >&2
+      exit 1
+    fi
+  fi
+  exec python3 tests/abbagate.py "${ABBA_ARGS[@]}"
+fi
 PASS=0; FAIL=0
 SRV=0; SRVLOG=/dev/null
-GLOBCASE_ORACLE=0; MMPID=0
+GLOBCASE_ORACLE=0; MMPID=0; ABBA_PID=0
 # The pinned vanilla Redis 7.4 tree (source + built src/redis-server). The ACL-category generator
 # reads its SOURCE in both tiers; the differential and globcase rows boot its BINARY in the full
 # tier. The preflight below says exactly what is missing instead of a traceback in row 4.
@@ -53,12 +116,13 @@ GATE_TEST_TIMEOUT=${GATE_TEST_TIMEOUT:-900}
 # A battery that records a STRICT skip (a DEBUG hook it needed was denied) fails under the gate:
 # a gate row must run the arm it exists for, never turn green by skipping it (tests/_lib.py).
 export TOMO_GATE_STRICT=1
-# Machine-readable ledger, one line per row: verdict, seconds since the previous row, label.
-# It is the runtime-distribution instrument (which rows own the 45 minutes) and, when the count
-# drifts, the diff against the previous run's ledger names the row that vanished or appeared.
-LEDGER=${GATE_LEDGER:-/tmp/gate-ledger-$TIER.txt}
+# The canonical ledger stores verdict and stable row identity in source order. Runtime counters
+# and elapsed seconds stay in the .timings sidecar with each original label verbatim; otherwise
+# even a serial repeat cannot be byte-identical. Per-job start/end times are in families.tsv.
+LEDGER=${GATE_LEDGER:-$PWD/build/gate-ledger-$TIER.txt}
 [ -f "$LEDGER" ] && mv -f "$LEDGER" "$LEDGER.prev"
-: > "$LEDGER"
+TIMINGS="$LEDGER.timings"
+: > "$LEDGER"; : > "$TIMINGS"
 ROW_T=$(date +%s.%N)
 # Expected check counts. These are the whole point of the ledger row: a battery that silently
 # stops running drops the count and turns the gate red instead of quietly shrinking coverage.
@@ -154,15 +218,28 @@ ROW_T=$(date +%s.%N)
 EXPECT_QUICK=419
 EXPECT_FULL=437                 # full without the optional NIC row.
 say(){ printf '  %-52s %s\n' "$1" "$2"; }
-ledger(){ # verdict label -> one ledger line; the elapsed column is wall time since the last row
-  local now; now=$(date +%s.%N)
-  printf '%s\t%s\t%s\n' "$1" "$(awk -v a="$ROW_T" -v b="$now" 'BEGIN{printf "%.1f", b-a}')" "$2" \
-      >> "$LEDGER"
+canonical_label(){ sed -E \
+      -e 's/(direct|hits|records|skipped|suppressed|zc_sends)=[0-9]+/\1=N/g' \
+      -e 's/(dispatched==executed) \([0-9]+\)/\1 (N)/' \
+      -e 's/(atomic MGET\/MSET floor) \([0-9]+\/s/\1 (N\/s/' \
+      -e 's/(TLS connection slots all freed) \([0-9]+\/[0-9]+\)/\1 (N\/N)/'; }
+ledger(){
+  local now identity
+  now=$(date +%s.%N)
+  # Timings and observed counters are diagnostics, not row identities. Keep the original label
+  # verbatim in .timings and on stdout; only replace the runtime observations in the diff ledger.
+  # Geometry (atomic 0/1, p32, etc.) is never normalized, so coverage changes remain visible.
+  identity=$(printf '%s\n' "$2" | canonical_label)
+  printf '%s\t%s\n' "$1" "$identity" >> "$LEDGER"
+  printf '%s\t%s\t%s\n' "$1" "$(awk -v a="$ROW_T" -v b="$now" 'BEGIN{printf "%.1f", b-a}')" "$2" >> "$TIMINGS"
   ROW_T=$now
 }
 ok(){ say "$1" "ok"; PASS=$((PASS+1)); ledger ok "$1"; }
 bad(){ say "$1" "FAIL${2:+ ($2)}"; FAIL=$((FAIL+1)); ledger FAIL "$1"; }
-ledger_labels(){ cut -f3 "$1" | sed 's/[0-9][0-9]*/N/g' | sort; }
+ledger_labels(){
+  # Read the previous three-column format too when a caller keeps its old GATE_LEDGER path.
+  awk -F '\t' 'NF >= 3 {print $3; next} {print $2}' "$1" | canonical_label
+}
 program_state(){
   local expect=$1 actual=$((PASS+FAIL))
   if [ "$actual" -eq "$expect" ]; then
@@ -174,8 +251,8 @@ program_state(){
       diff <(ledger_labels "$LEDGER.prev") <(ledger_labels "$LEDGER") | grep '^[<>]' | sed 's/^/    /'
     fi
   fi
-  echo "  ledger: $LEDGER (verdict / seconds since previous row / label); slowest rows:"
-  sort -t "$(printf '\t')" -k2,2 -rn "$LEDGER" | head -12 \
+  echo "  ledger: $LEDGER (canonical verdict / label); timings: $TIMINGS; slowest rows:"
+  sort -t "$(printf '\t')" -k2,2 -rn "$TIMINGS" | head -12 \
       | awk -F '\t' '{printf "    %7.1fs  %-4s %s\n", $2, $1, $3}'
 }
 redis_cli_expect_ok(){
@@ -208,8 +285,31 @@ quiet_wait(){ # block until quiet_ok. The live server is SIGSTOPped meanwhile (a
   ROW_T=$(awk -v a="$ROW_T" -v b="$t0" -v c="$now" 'BEGIN{printf "%.9f", a + (c - b)}')
   quiet_note "quiet: resumed after $(awk -v b="$t0" -v c="$now" 'BEGIN{printf "%.0f", c - b}')s"
 }
-pausable(){ # run "$@" to completion (its exit status is ours); SIGSTOP its whole process group
-            # whenever quiet_ok turns false and SIGCONT it when the file is back. Builds only.
+signal_owned_tree(){ # signal only the recorded build PID and its descendants, never an argv match
+  python3 - "$@" <<'PY'
+import os, signal, sys
+signum=getattr(signal, 'SIG'+sys.argv[1]); root=int(sys.argv[2]); processes={}
+for entry in os.scandir('/proc'):
+    if not entry.name.isdigit(): continue
+    try:
+        fields=open(entry.path+'/stat').read().rsplit(')',1)[1].split()
+        processes[int(entry.name)]=(int(fields[1]), fields[19])
+    except (OSError,ValueError): pass
+owned={root} if root in processes else set()
+while True:
+    more={pid for pid,(parent,_) in processes.items() if parent in owned}-owned
+    if not more: break
+    owned.update(more)
+for pid in sorted(owned, reverse=signum != signal.SIGCONT):
+    if pid in (os.getpid(),os.getppid()): continue
+    try:
+        # PID reuse after the snapshot never grants ownership of the replacement process.
+        current=open(f'/proc/{pid}/stat').read().rsplit(')',1)[1].split()
+        if current[19] == processes[pid][1]: os.kill(pid,signum)
+    except (OSError,ValueError): pass
+PY
+}
+pausable(){ # run "$@" to completion; pause/resume its owned descendant PIDs for quiet-file waits
   [ -n "$QUIET_FILE" ] || { "$@"; return $?; }
   quiet_wait
   local pid stopped=0 t0=0 paused=0 rc
@@ -218,13 +318,13 @@ pausable(){ # run "$@" to completion (its exit status is ours); SIGSTOP its whol
   while kill -0 "$pid" 2>/dev/null; do
     if quiet_ok; then
       if [ "$stopped" = 1 ]; then
-        kill -CONT -- "-$pid" 2>/dev/null; stopped=0
+        signal_owned_tree CONT "$pid"; stopped=0
         paused=$(awk -v p="$paused" -v b="$t0" -v c="$(date +%s.%N)" \
                      'BEGIN{printf "%.3f", p + (c - b)}')
         quiet_note "quiet: build resumed"
       fi
     elif [ "$stopped" = 0 ]; then
-      kill -STOP -- "-$pid" 2>/dev/null; stopped=1; t0=$(date +%s.%N)
+      signal_owned_tree STOP "$pid"; stopped=1; t0=$(date +%s.%N)
       quiet_note "quiet: build paused until $QUIET_FILE is >$QUIET_MIN min old"
     fi
     sleep 2
@@ -247,24 +347,332 @@ py(){ # python3 battery wrapper: bounded wall time. A timeout or a self-skip (ex
   esac
   return $rc
 }
-cleanup(){ # EXIT/INT/TERM: never leave the server on $PORT, the globcase oracle, or memtier behind
+cleanup(){ # EXIT/INT/TERM: reap our ABBA driver and its children, servers, oracle, and memtier
   local p
+  stop_workers
   if [ "$PAUSABLE_PID" -gt 0 ] 2>/dev/null; then   # a build parked by pausable
-    kill -CONT -- "-$PAUSABLE_PID" 2>/dev/null; kill -TERM -- "-$PAUSABLE_PID" 2>/dev/null
+    signal_owned_tree CONT "$PAUSABLE_PID"; signal_owned_tree TERM "$PAUSABLE_PID"
   fi
   [ "$SRV" -gt 0 ] 2>/dev/null && kill -CONT "$SRV" 2>/dev/null   # TERM needs a running target
-  for p in "$SRV" "$GLOBCASE_ORACLE" "$MMPID"; do
+  # ABBA owns private-session servers and load generators. Signal its exact driver PID and wait
+  # for its existing finally/Children.close path to reap them before this gate exits.
+  for p in "$ABBA_PID" "$SRV" "$GLOBCASE_ORACLE" "$MMPID"; do
     if [ "$p" -gt 0 ] 2>/dev/null && kill -0 "$p" 2>/dev/null; then
       kill -TERM "$p" 2>/dev/null; wait "$p" 2>/dev/null
     fi
   done
+  ABBA_PID=0
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+port_listeners(){ # pids bound to a port, listening or not yet accepting (ss names the owner)
+  ss -H -ltnp "sport = :$1" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u \
+      | paste -sd, -
+}
+guard_port(){ # a bound listener OR an accepting peer on the port ends the gate, naming the pid
+  local owners; owners=$(port_listeners "$1")
+  if [ -n "$owners" ] || (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; then
+    say "port $1 pre-boot guard" \
+        "FAIL (already listening${owners:+; pid=$owners} -- a leftover server; kill it and re-run)"
+    exit 1
+  fi
+}
+settle(){ # after a server is gone: wait for $PORT to stop accepting, then a short settle.
+  # Replaces a fixed `sleep 5` (x55 per run, ~4.6 min). Not load-bearing: the listener sets
+  # SO_REUSEADDR+SO_REUSEPORT (src/core/io_loop.h:167) and `wait` already reaped the process.
+  # GATE_STOP_SETTLE=5 restores the old timing if a row ever turns out to depend on it -- which
+  # would itself be a finding worth a NOTES line.
+  for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null || break; sleep 0.1; done
+  sleep "${GATE_STOP_SETTLE:-1}"
+}
+launch(){ # logtag binary args... -> pid in $SRV, log in $SRVLOG; waits up to 30 s for the port
+  local tag=$1 bin=$2; shift 2
+  quiet_wait
+  SRV=0; SRVLOG=/dev/null
+  guard_port "$PORT"
+  [ -x "$bin" ] || { say "boot ($tag)" "FAIL ($bin is not an executable)"; return 1; }
+  SRVLOG=$(mktemp "$TMPDIR/gate-srv-$tag.XXXXXX")
+  # Every ordinary boot gets an empty persistence directory. Explicit recovery arms override it
+  # through their later --dir argument; a previous battery's SAVE must not become this one's input.
+  local boot_dir
+  boot_dir=$(mktemp -d "$TMPDIR/gate-data-$tag.XXXXXX") || return 1
+  taskset -c $CORES "$bin" --port $PORT --bind 127.0.0.1 --shards 16 --dir "$boot_dir" "$@" > "$SRVLOG" 2>&1 &
+  SRV=$!
+  # 30s, not 10s: the AOF replay boot replays its file BEFORE it listens, and on a box shared
+  # with other lanes that overran a 10s deadline and turned six AOF rows red with no defect behind
+  # them. A generous deadline costs nothing when the server is quick — the loop exits on connect.
+  for _ in $(seq 150); do
+    if ! kill -0 "$SRV" 2>/dev/null; then
+      wait "$SRV" 2>/dev/null; boot_log_tail "$tag" "exited before it listened"; return 1
+    fi
+    (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null && return 0; sleep 0.2; done
+  boot_log_tail "$tag" "never accepted on $PORT within 30s"
+  return 1
+}
+boot_log_tail(){ # a boot that failed is a defect report, not a filename: SHOW the server's words.
+                 # Tonight three boot failures were triaged twice over because the row said only
+                 # "see $SRVLOG" and the log was rotated by the next row's mktemp before anyone
+                 # opened it.
+  printf 'GATE: boot (%s) %s -- last 25 lines of %s:\n' "$1" "$2" "$SRVLOG" >&2
+  tail -n 25 "$SRVLOG" 2>/dev/null | sed 's/^/GATE|   /' >&2
+}
+boot(){ local bin=$1; shift; launch main "$bin" --ratio $GATE_RATIO "$@"; }
+boot_fused(){ # deliberately omits --ratio, which fused mode rejects
+  local bin=$1; shift; launch fused "$bin" --thread-mode fused "$@"; }
+stop(){
+  if [ "$SRV" -gt 0 ]; then kill -TERM "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=0; fi
+  settle
+}
+shutdown_clean(){ python3 tests/shutdown_report.py "$SRVLOG" clean; }
+shutdown_present(){ python3 tests/shutdown_report.py "$SRVLOG" present; }
+shutdown_value(){ python3 tests/shutdown_report.py "$SRVLOG" get "$1"; }
+
+
+# Each worker owns a server/load/port slot for its entire lifetime. A locked queue chooses the
+# next job; completion never writes the shared ledger. collect_job emits fragments in the source
+# order below, including on failure. With one slot, collection executes the job synchronously.
+WORKER_PIDS=()
+JOB_NAMES=()
+# ---- feature batteries: every shipped feature's directed test, BOTH atomic settings -----------
+# The gate accumulates a section per landed feature (owner rule). Each test is directed and
+# asserts its own mechanisms fired; the boot covers multi/blocking/pubsub+sharded/lua/limits.
+# ONE list, shared with the fused+armed leg below, so the two legs cannot drift apart: a battery
+# added here runs on the armed lane too, and the ledger arithmetic counts it twice per atomic mode.
+FEATURE_BATTERIES="s6 multi_exec blocking blockmulti stream streamgroups pubsub lua_scripting scriptsurf limits resp3 bitfield dumprestore zsetops geo climon climon2 tracking hexpire servertail lcs concur edgeproto edgeenc edgetime arity contarity cmdgap aclsel expwide infofix pushtear netcmd"
+feature_split_job(){
+  local AT=$1 t FEATURE_ARGS
+  boot "$CANDIDATE_BINARY" --atomic $AT --enable-debug-command yes \
+      || bad "feature battery boot (atomic $AT)"
+  for t in $FEATURE_BATTERIES; do
+    FEATURE_ARGS=()
+    [ "$t" = stream ] && FEATURE_ARGS+=(--release-build)
+    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >$TMPDIR/gate-$t-$AT.txt 2>&1 \
+        && ok "$t battery (atomic $AT)" || bad "$t battery (atomic $AT)" "see $TMPDIR/gate-$t-$AT.txt"
+  done
+  stop
+  shutdown_clean \
+      && ok "feature shutdown invariants (atomic $AT)" || bad "feature shutdown invariants (atomic $AT)"
+}
+
+# ---- FUSED + read-local ARMED: the recommended read-heavy posture runs the whole feature list ----
+# The fused boots above never arm the local read lane, so until this leg no gate row had run a
+# feature battery on the path that serves every clean GET/MGET in that posture. The boot row asserts
+# the WIRE says so: INFO server thread_mode:1s AND read_local:1 -- the effective lane state, not the
+# knob, which CONFIG GET also echoes on a split boot where it is inert. The shutdown row is the
+# leg's vacuity guard: the lane's own hit counters must have moved during the batteries, or the 32
+# rows between ran on the owner path and proved nothing about the armed one.
+feature_armed_job(){
+  local AT=$1 t FEATURE_ARGS ARMED_INFO ARMED_MODE ARMED_RL ARMED_HITS ARMED_REPORT_MODE ARMED_REPORT_KIND
+  if boot_fused "$CANDIDATE_BINARY" --atomic "$AT" --read-local 1 --enable-debug-command yes; then
+    ARMED_INFO=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO server 2>/dev/null | tr -d '\r')
+    ARMED_MODE=$(printf '%s\n' "$ARMED_INFO" | sed -n 's/^thread_mode://p')
+    ARMED_RL=$(printf '%s\n' "$ARMED_INFO" | sed -n 's/^read_local://p')
+    [ "$ARMED_MODE" = 1s ] && [ "$ARMED_RL" = 1 ] \
+        && ok "fused+armed boot line (atomic $AT)" \
+        || bad "fused+armed boot line (atomic $AT)" "wire mode=$ARMED_MODE read_local=$ARMED_RL"
+  else
+    bad "fused+armed boot line (atomic $AT)" "server did not boot; see $SRVLOG"
+  fi
+  for t in $FEATURE_BATTERIES; do
+    FEATURE_ARGS=()
+    [ "$t" = stream ] && FEATURE_ARGS+=(--release-build)
+    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >$TMPDIR/gate-fusedarmed-$t-$AT.txt 2>&1 \
+        && ok "fused+armed $t battery (atomic $AT)" \
+        || bad "fused+armed $t battery (atomic $AT)" "see $TMPDIR/gate-fusedarmed-$t-$AT.txt"
+  done
+  ARMED_HITS=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO stats 2>/dev/null | tr -d '\r' \
+      | awk -F: '/^read_local_keyspace_hits:|^read_local_mget_local_hits:/{s+=$2} END{print s+0}')
+  stop
+  ARMED_REPORT_MODE=$(shutdown_value thread_mode)
+  ARMED_REPORT_KIND=$(shutdown_value work.kind)
+  shutdown_clean && [ "$ARMED_REPORT_MODE" = 1s ] && [ "$ARMED_REPORT_KIND" = fused ] \
+      && [ -n "$ARMED_HITS" ] && [ "$ARMED_HITS" -gt 0 ] \
+      && ok "fused+armed shutdown report + lane fired (hits=$ARMED_HITS, atomic $AT)" \
+      || bad "fused+armed shutdown report + lane fired (atomic $AT)" \
+             "mode=$ARMED_REPORT_MODE kind=$ARMED_REPORT_KIND hits=$ARMED_HITS; see $SRVLOG"
+}
+
+job_label(){
+  case "$1" in
+    core-watch) echo 'core concurrency watch';;
+    feature-split-*) echo "s6 battery (atomic ${1##*-})";;
+    feature-armed-*) echo "fused+armed boot line (atomic ${1##*-})";;
+    differ-split) echo 'Redis 7.4 differential matrix';;
+    differ-armed) echo 'Redis 7.4 differential matrix (armed fused + read-local)';;
+    flipctl) echo 'flip controller: ramp gate, hold, surge + mix re-maneuvers';;
+    evict-*) local kind section mode atomic
+      IFS=- read -r kind section mode atomic <<< "$1"
+      [ "$mode" != armed ] || mode=fused+armed
+      echo "eviction $section battery ($mode, atomic $atomic)";;
+  esac
+}
+job_body(){
+  local name=$1 label; label=$(job_label "$name")
+  case "$name" in
+    feature-split-*) feature_split_job "${name##*-}";;
+    feature-armed-*) feature_armed_job "${name##*-}";;
+    core-watch)
+      if [ "$CORE_UNIT_READY" = 1 ] && ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+          timeout --foreground 60 taskset -c "$CORES" ./build/core-concurrency-unit watch \
+              >"$TMPDIR/core-watch.log" 2>&1; then ok "$label"
+      else bad "$label" "see $TMPDIR/core-watch.log and build/gate-core-concurrency-build.txt"; fi;;
+    differ-*)
+      export GATE_DIFFER_GEOMETRY=split
+      export GATE_DIFFER_OUT="$TMPDIR/differ"
+      [ "$name" != differ-armed ] || export GATE_DIFFER_GEOMETRY=armed-fused
+      tests/differ_gate.sh "$CANDIDATE_BINARY" "$PORT" "$((PORT+1))" "$CORES" "$GATE_RATIO" \
+          && ok "$label" || bad "$label";;
+    evict-*)
+      local kind section mode atomic
+      IFS=- read -r kind section mode atomic <<< "$name"
+      if [ "$mode" = split ]; then
+        boot "$CANDIDATE_BINARY" --atomic "$atomic" || bad "eviction $section boot (split, atomic $atomic)"
+      else
+        boot_fused "$CANDIDATE_BINARY" --atomic "$atomic" --read-local 1 \
+            || bad "eviction $section boot (fused+armed, atomic $atomic)"
+      fi
+      py tests/evict_battery.py "$PORT" "$section" >"$TMPDIR/battery.log" 2>&1 \
+          && ok "$label" || bad "$label" "see $TMPDIR/battery.log"
+      stop;;
+    flipctl)
+      boot "$CANDIDATE_BINARY" --ratio 6:2 --atomic 0 --enable-debug-command yes --flip-auto 1 \
+          || bad 'flipctl boot'
+      # Retain the original bounded stationary-hold re-rolls and every directed assertion.
+      timeout 600 python3 tests/flipctl.py --host 127.0.0.1 --port "$PORT" --stable-seconds 30 \
+          >"$TMPDIR/battery.log" 2>&1 && ok "$label" || bad "$label" "see $TMPDIR/battery.log"
+      stop;;
+  esac
+}
+run_job(){ (
+  local name=$1 slot=$2 started ended rc
+  WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0
+  PASS=0; FAIL=0
+  export TMPDIR="$RUN_DIR/jobs/$name"
+  mkdir -p "$TMPDIR"
+  LEDGER="$TMPDIR/ledger"; TIMINGS="$TMPDIR/timings"
+  : > "$LEDGER"; : > "$TIMINGS"
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM
+  set_slot "$slot"
+  started=$(date +%s.%N); ROW_T=$started
+  job_body "$name" >"$TMPDIR/output.log" 2>&1
+  rc=$?
+  # Reaping is part of completion. ABBA cannot start while a background child's server survives.
+  cleanup
+  ended=$(date +%s.%N)
+  printf '%s\t%s\t%s\t%s\n' "$name" "$slot" "$started" "$ended" > "$TMPDIR/family.tsv"
+  # The collector must never observe a newly created but still empty completion marker.
+  # Rename publishes the complete record only after logs, rows and owned children are settled.
+  printf '%s\t%s\t%s\n' "$rc" "$PASS" "$FAIL" > "$TMPDIR/done.tmp"
+  mv "$TMPDIR/done.tmp" "$TMPDIR/done"
+); }
+start_workers(){
+  phase parallel-begin
+  JOB_NAMES=(core-watch)
+  [ "$TIER" != full ] || JOB_NAMES+=(differ-split differ-armed)
+  local atomic mode section slot
+  # Long waits enter first so the short serial batteries hide under them. Clock aging remains
+  # the production 256-second bucket; no timeout, iteration, or test precondition is shortened.
+  for section in lruclock lfu; do
+    for atomic in 0 1; do for mode in split armed; do JOB_NAMES+=("evict-$section-$mode-$atomic"); done; done
+    if [ "$section" = lruclock ]; then
+      JOB_NAMES+=(flipctl)
+      # Whole boot groups preserve all per-server state/order and private nested ports. They
+      # contain correctness/memory/counter witnesses, not scored throughput comparisons, and
+      # fit beneath the longer oracle matrices on a large budget. Their 138 rows are collected
+      # later at their original source positions; a small budget simply queues them serially.
+      for atomic in 0 1; do JOB_NAMES+=("feature-split-$atomic" "feature-armed-$atomic"); done
+    fi
+  done
+  printf '0\n' > "$RUN_DIR/queue"
+  for ((slot=1; slot<GATE_SLOTS; slot++)); do
+    (
+      WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0
+      trap 'exit 130' INT TERM
+      while :; do
+        exec {queue_fd}>"$RUN_DIR/queue.lock"
+        flock "$queue_fd"
+        read -r index < "$RUN_DIR/queue"
+        if [ "$index" -ge "${#JOB_NAMES[@]}" ]; then flock -u "$queue_fd"; break; fi
+        printf '%s\n' "$((index+1))" > "$RUN_DIR/queue"
+        flock -u "$queue_fd"; exec {queue_fd}>&-
+        run_job "${JOB_NAMES[$index]}" "$slot"
+      done
+    ) &
+    WORKER_PIDS+=("$!")
+  done
+  # Later directed unit builds use only the main slot, never the cores of a live worker.
+  BUILD_CORES="$CORES,$LOAD_CORES"
+}
+collect_job(){
+  local name=$1 dir="$RUN_DIR/jobs/$1" live p job_rc job_pass job_fail
+  if [ "$GATE_SLOTS" = 1 ]; then run_job "$name" 0; fi
+  while [ ! -f "$dir/done" ]; do
+    live=0
+    for p in "${WORKER_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && live=1; done
+    [ "$live" = 1 ] || break
+    sleep 0.2
+  done
+  if [ ! -s "$dir/ledger" ] || [ ! -f "$dir/done" ]; then
+    bad "$(job_label "$name")" "worker did not complete; see $dir"
+    return
+  fi
+  read -r job_rc job_pass job_fail < "$dir/done"
+  if ! [[ "$job_rc" =~ ^[0-9]+$ && "$job_pass" =~ ^[0-9]+$ && "$job_fail" =~ ^[0-9]+$ ]]; then
+    bad "$(job_label "$name")" "malformed worker completion; see $dir"
+    return
+  fi
+  # A child can print success and then fail (including during teardown). Its process result is
+  # evidence too: never let a previously emitted green fragment swallow that failure.
+  if [ "$job_rc" -ne 0 ] && ! grep -q $'^FAIL\t' "$dir/ledger"; then
+    cat "$dir/output.log"
+    bad "$(job_label "$name")" "worker exited $job_rc after its rows; see $dir"
+    return
+  fi
+  cat "$dir/output.log"
+  cat "$dir/ledger" >> "$LEDGER"; cat "$dir/timings" >> "$TIMINGS"
+  PASS=$((PASS + $(awk -F '\t' '$1=="ok"{n++} END{print n+0}' "$dir/ledger")))
+  FAIL=$((FAIL + $(awk -F '\t' '$1=="FAIL"{n++} END{print n+0}' "$dir/ledger")))
+  ROW_T=$(date +%s.%N)
+}
+join_workers(){
+  local p
+  for p in "${WORKER_PIDS[@]}"; do wait "$p" || bad 'correctness worker completion'; done
+  WORKER_PIDS=()
+  BUILD_CORES=$ALL_BUILD_CORES
+  cat "$RUN_DIR"/jobs/*/family.tsv > "$RUN_DIR/families.tsv"
+}
+stop_workers(){
+  # Workers/servers are descendants started by this gate. Stop children first, by PID, and allow
+  # their traps to reap servers. Never match process argv or stop a pre-existing listener.
+  [ "${#WORKER_PIDS[@]}" -gt 0 ] || return 0
+  python3 - "${WORKER_PIDS[@]}" <<'PY'
+import os, signal, sys
+roots=set(map(int,sys.argv[1:])); parents={}
+for entry in os.scandir('/proc'):
+    if not entry.name.isdigit(): continue
+    try:
+        raw=open(entry.path+'/stat').read().rsplit(')',1)[1].split()
+        parents[int(entry.name)]=int(raw[1])
+    except (OSError,ValueError): pass
+owned=set(roots)
+while True:
+    more={p for p,pp in parents.items() if pp in owned}-owned
+    if not more: break
+    owned.update(more)
+for pid in sorted(owned,reverse=True):
+    try: os.kill(pid,signal.SIGTERM)
+    except ProcessLookupError: pass
+PY
+  for p in "${WORKER_PIDS[@]}"; do wait "$p" 2>/dev/null; done
+  WORKER_PIDS=()
+}
+
+
 # ---- 0. preflight: tools, oracle tree, strays ------------------------------------------------
 MISSING=
-for tool in g++ make python3 redis-cli memtier_benchmark ss taskset timeout awk setarch; do
+for tool in g++ make python3 redis-cli memtier_benchmark ss taskset timeout awk setarch flock; do
   command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
 done
 [ -z "$MISSING" ] || {
@@ -294,32 +702,40 @@ fi
 STRAYS=$(pgrep -x tomokv 2>/dev/null | paste -sd, -)
 [ -z "$STRAYS" ] || say "stray tomokv processes on this box (pids $STRAYS)" \
     "WARN (other lanes? they share CPU with the timed rows; the port guard covers only $PORT)"
+for reserved_port in "${SLOT_PORTS[@]}"; do
+  for reserved_offset in 0 1 2; do guard_port "$((reserved_port+reserved_offset))"; done
+done
 
 # ---- 1. builds (the static_asserts on sizeof(Op)/sizeof(Client) gate here) -------------------
-pausable make -j12 >/tmp/gate-build.txt 2>&1 \
-    && ok "release build (+footprint locks)" || bad "release build" "see /tmp/gate-build.txt"
-ASAN=/tmp/tomokv-gate-asan
+if [ "$BUILD_CANDIDATE" = 1 ]; then
+  pausable taskset -c "$BUILD_CORES" make -j"$BUILD_JOBS" >$TMPDIR/gate-build.txt 2>&1 \
+    && ok "release build (+footprint locks)" || bad "release build" "see $TMPDIR/gate-build.txt"
+else
+  [ -x "$CANDIDATE_BINARY" ] && ok "release build (+footprint locks)" \
+      || bad "release build" "candidate is not executable: $CANDIDATE_BINARY"
+fi
+ASAN="$PWD/build/gate-cache/tomokv-asan"
 # 42 translation units: compiled in parallel with a header-aware object cache rather than in one
 # serial g++, which cost 365s and was the largest row in the gate.
-pausable tests/parbuild.sh $ASAN /tmp/gate-obj-asan \
+pausable taskset -c "$BUILD_CORES" tests/parbuild.sh $ASAN "$PWD/build/gate-cache/obj-asan" \
     "-std=c++20 -O1 -g -fsanitize=address -march=native -pthread -I." \
     "-luring -pthread -lssl -lcrypto" \
-    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>/tmp/gate-asan-build.txt \
-    && ok "ASAN build" || bad "ASAN build" "see /tmp/gate-asan-build.txt"
+    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>$TMPDIR/gate-asan-build.txt \
+    && ok "ASAN build" || bad "ASAN build" "see $TMPDIR/gate-asan-build.txt"
 quiet_wait
-g++ -std=c++20 -O2 -I. tests/config_parser_test.cc -o /tmp/tomokv-config-parser-test \
-    && /tmp/tomokv-config-parser-test \
+g++ -std=c++20 -O2 -I. tests/config_parser_test.cc -o $TMPDIR/tomokv-config-parser-test \
+    && taskset -c "$CORES" $TMPDIR/tomokv-config-parser-test \
     && ok "Redis config quoting + mid-value #" || bad "Redis config quoting + mid-value #"
 # The flip-controller MODEL (fingerprint classes, ramp gate, count-noise rejection) has a unit
 # test that nothing built; a model regression surfaced only in flipctl.py's live 2-5 min row.
-g++ -std=c++20 -O2 -I. tests/flipctl_unit.cc src/core/flipctl.cc -o /tmp/tomokv-flipctl-unit \
-    2>/tmp/gate-flipctl-unit.txt \
-    && /tmp/tomokv-flipctl-unit >>/tmp/gate-flipctl-unit.txt 2>&1 \
+g++ -std=c++20 -O2 -I. tests/flipctl_unit.cc src/core/flipctl.cc -o $TMPDIR/tomokv-flipctl-unit \
+    2>$TMPDIR/gate-flipctl-unit.txt \
+    && $TMPDIR/tomokv-flipctl-unit >>$TMPDIR/gate-flipctl-unit.txt 2>&1 \
     && ok "flip controller model unit" \
-    || bad "flip controller model unit" "see /tmp/gate-flipctl-unit.txt"
+    || bad "flip controller model unit" "see $TMPDIR/gate-flipctl-unit.txt"
 g++ -std=c++20 -O2 -pthread -I. tests/foreign_read_safety_test.cc \
-    -o /tmp/tomokv-foreign-read-safety-test \
-    && /tmp/tomokv-foreign-read-safety-test \
+    -o $TMPDIR/tomokv-foreign-read-safety-test \
+    && $TMPDIR/tomokv-foreign-read-safety-test \
     && ok "B+ counting-fingerprint filter unit" \
     || bad "B+ counting-fingerprint filter unit"
 # THE RYOW WRITE RING, INCLUDING ITS ARMING TRANSIENT (DESIGN-RINGDIET.md). The connection records
@@ -331,17 +747,19 @@ g++ -std=c++20 -O2 -pthread -I. tests/foreign_read_safety_test.cc \
 # top of the fourteen ring cases the sizing lane left (which this row also brings into the gate for
 # the first time -- they were `make unit` only). 20 cases, one row.
 g++ -std=c++20 -O2 -march=native -pthread -I. tests/read_local_write_ring_unit.cc \
-    -o /tmp/tomokv-read-local-write-ring-unit 2>/tmp/gate-ring-unit.txt \
-    && /tmp/tomokv-read-local-write-ring-unit >>/tmp/gate-ring-unit.txt 2>&1 \
+    -o $TMPDIR/tomokv-read-local-write-ring-unit 2>$TMPDIR/gate-ring-unit.txt \
+    && $TMPDIR/tomokv-read-local-write-ring-unit >>$TMPDIR/gate-ring-unit.txt 2>&1 \
     && ok "read-local write ring + arming transient unit" \
-    || bad "read-local write ring + arming transient unit" "see /tmp/gate-ring-unit.txt"
+    || bad "read-local write ring + arming transient unit" "see $TMPDIR/gate-ring-unit.txt"
 # SURVIVING core concurrency regressions. Eight rows, all ABOVE the quick-tier exit.
 # Each selection asserts its hazardous state; ASAN/UBSAN and bounded interleaving hooks
 # make a broken mechanism fail. The fixture starts no server and opens no listener.
 CORE_UNIT_READY=1
-pausable make -j2 build/core-concurrency-unit >build/gate-core-concurrency-build.txt 2>&1 \
+pausable taskset -c "$BUILD_CORES" make -j2 build/core-concurrency-unit >build/gate-core-concurrency-build.txt 2>&1 \
     || CORE_UNIT_READY=0
-for core_row in watch scheduler lifetime drain route snapshot config notify; do
+start_workers
+collect_job core-watch
+for core_row in scheduler lifetime drain route snapshot config notify; do
   quiet_wait
   if [ "$CORE_UNIT_READY" = 1 ] && \
       ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
@@ -357,15 +775,32 @@ done
 # and UBSAN make undersized scratch and an invalid occupancy shift fail, never skip or time out green.
 g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
     -fno-omit-frame-pointer -pthread -I. tests/reorder_unit.cc \
-    -o /tmp/tomokv-reorder-unit 2>/tmp/gate-reorder-unit.txt \
-    && timeout 60 /tmp/tomokv-reorder-unit >>/tmp/gate-reorder-unit.txt 2>&1 \
+    -o $TMPDIR/tomokv-reorder-unit 2>$TMPDIR/gate-reorder-unit.txt \
+    && timeout 60 $TMPDIR/tomokv-reorder-unit >>$TMPDIR/gate-reorder-unit.txt 2>&1 \
     && ok "reorder mechanism + 32/128-task geometry battery" \
-    || bad "reorder mechanism + 32/128-task geometry battery" "see /tmp/gate-reorder-unit.txt"
+    || bad "reorder mechanism + 32/128-task geometry battery" "see $TMPDIR/gate-reorder-unit.txt"
 # Twelve storage regressions, all BEFORE the quick-tier exit. The hash reaper is production code;
 # store-boundary spies make held epochs, capture cursors, eviction and allocation failures exact.
 # No case skips. Build failure makes every dependent row red. EXPECT constants are maintainer-owned.
+store_build(){
+  local variant=${1:-} flags=${CXXFLAGS-'-std=c++20 -O2 -g -Wall -Wextra -march=native -pthread'}
+  # Match the three Makefile recipes, including the later -O1 override for TSan. Their former
+  # single compiler invocation serialized three large translation units on every cache miss.
+  # Reuse the header-aware cache and keep compilation on this slot while other batteries run.
+  if [ "$variant" = tsan ]; then
+    flags+=' -O1 -fsanitize=thread -fno-omit-frame-pointer -no-pie'
+  fi
+  flags+=' -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST'
+  [ "$variant" != sidecar ] || flags+=' -DTOMO_TTL_DEADLINE_SIDECAR=1'
+  flags+=' -I.'
+  pausable taskset -c "$CORES,$LOAD_CORES" tests/parbuild.sh \
+      "$PWD/build/store-regression${variant:+-$variant}" \
+      "$PWD/build/gate-cache/store${variant:+-$variant}-objects" \
+      "$flags" '-Wl,--gc-sections' \
+      tests/store_regression.cc src/cmd/t_hash.cc src/cmd/t_hash_ttl.cc
+}
 STORE_REGRESSION_BUILT=0
-pausable make build/store-regression >/tmp/gate-store-build.txt 2>&1 && STORE_REGRESSION_BUILT=1
+store_build >$TMPDIR/gate-store-build.txt 2>&1 && STORE_REGRESSION_BUILT=1
 for STORE_CASE in unlinked randomkey rehash rollback snapshot-eviction flags aof-eviction intents imported-hash field-index-failure hash-bytes; do
   STORE_RUN=(./build/store-regression "$STORE_CASE")
   STORE_CASE_BUILT=$STORE_REGRESSION_BUILT
@@ -373,45 +808,45 @@ for STORE_CASE in unlinked randomkey rehash rollback snapshot-eviction flags aof
     # Only this process disables address randomization: GCC TSan otherwise collides with the
     # host's mappings before main. A runtime race report or unavailable TSan is a red row.
     STORE_CASE_BUILT=0
-    pausable make build/store-regression-tsan >/tmp/gate-store-flags-build.txt 2>&1 && STORE_CASE_BUILT=1
+    store_build tsan >$TMPDIR/gate-store-flags-build.txt 2>&1 && STORE_CASE_BUILT=1
     STORE_RUN=(setarch x86_64 -R ./build/store-regression-tsan flags)
   fi
   quiet_wait
   if [ "$STORE_CASE_BUILT" = 1 ] && \
       timeout --foreground "$GATE_TEST_TIMEOUT" "${STORE_RUN[@]}" \
-          >/tmp/gate-store-$STORE_CASE.txt 2>&1; then
+          >$TMPDIR/gate-store-$STORE_CASE.txt 2>&1; then
     ok "storage $STORE_CASE regression"
   else
-    bad "storage $STORE_CASE regression" "see /tmp/gate-store-build.txt, /tmp/gate-store-$STORE_CASE-build.txt and /tmp/gate-store-$STORE_CASE.txt"
+    bad "storage $STORE_CASE regression" "see $TMPDIR/gate-store-build.txt, $TMPDIR/gate-store-$STORE_CASE-build.txt and $TMPDIR/gate-store-$STORE_CASE.txt"
   fi
 done
-pausable make build/store-regression-sidecar >/tmp/gate-store-sidecar.txt 2>&1 \
+store_build sidecar >$TMPDIR/gate-store-sidecar.txt 2>&1 \
     && timeout --foreground "$GATE_TEST_TIMEOUT" ./build/store-regression-sidecar deadline-sidecar \
-        >>/tmp/gate-store-sidecar.txt 2>&1 \
+        >>$TMPDIR/gate-store-sidecar.txt 2>&1 \
     && ok "storage deadline-sidecar regression" \
-    || bad "storage deadline-sidecar regression" "see /tmp/gate-store-sidecar.txt"
+    || bad "storage deadline-sidecar regression" "see $TMPDIR/gate-store-sidecar.txt"
 # SURVIVING.md's atomic lane: one build and fifteen named, deterministic defect rows.
 # Counted by line: all sixteen are ABOVE the quick-tier exit, so both tiers gain sixteen.
 # EXPECT_QUICK/EXPECT_FULL are deliberately left to the maintainer (see FIXES-ATOMICS.md).
-pausable make -j2 build/atomic-survivors-unit >/tmp/gate-atomic-survivors-build.txt 2>&1 \
+pausable taskset -c "$BUILD_CORES" make -j2 build/atomic-survivors-unit >$TMPDIR/gate-atomic-survivors-build.txt 2>&1 \
     && ok "atomic survivors unit build" \
-    || bad "atomic survivors unit build" "see /tmp/gate-atomic-survivors-build.txt"
+    || bad "atomic survivors unit build" "see $TMPDIR/gate-atomic-survivors-build.txt"
 for defect in admission closure script_keys rename_overlay write_latest script_apply \
               lua_conversion watch_parent watch_cycle mset_arity watch_oom lua_lines \
               library_limit stage_flag instruction_limit; do
   quiet_wait
   taskset -c "$CORES" timeout --foreground 30 ./build/atomic-survivors-unit "$defect" \
-      >"/tmp/gate-atomic-survivors-$defect.txt" 2>&1 \
+      >"$TMPDIR/gate-atomic-survivors-$defect.txt" 2>&1 \
       && ok "atomic survivor: $defect" \
-      || bad "atomic survivor: $defect" "see /tmp/gate-atomic-survivors-$defect.txt"
+      || bad "atomic survivor: $defect" "see $TMPDIR/gate-atomic-survivors-$defect.txt"
 done
 # Surviving networking/command audit: deterministic serverless failure states, both tiers.
-pausable make -j2 build/netcmd-unit >/tmp/gate-netcmd-build.txt 2>&1 \
-    && ok "netcmd regression build" || bad "netcmd regression build" "see /tmp/gate-netcmd-build.txt"
+pausable taskset -c "$BUILD_CORES" make -j2 build/netcmd-unit >$TMPDIR/gate-netcmd-build.txt 2>&1 \
+    && ok "netcmd regression build" || bad "netcmd regression build" "see $TMPDIR/gate-netcmd-build.txt"
 for NETCMD_CASE in streams zpop notify-oom notify-retry flush output pubsub receive config; do
-  timeout 60 ./build/netcmd-unit "$NETCMD_CASE" >/tmp/gate-netcmd-$NETCMD_CASE.txt 2>&1 \
+  timeout 60 ./build/netcmd-unit "$NETCMD_CASE" >$TMPDIR/gate-netcmd-$NETCMD_CASE.txt 2>&1 \
       && ok "netcmd $NETCMD_CASE regression" \
-      || bad "netcmd $NETCMD_CASE regression" "see /tmp/gate-netcmd-$NETCMD_CASE.txt"
+      || bad "netcmd $NETCMD_CASE regression" "see $TMPDIR/gate-netcmd-$NETCMD_CASE.txt"
 done
 if [ "$ORACLE_OK" = 1 ]; then
   python3 tools/gen_acl_categories.py --redis-root "$REDIS74_ROOT" \
@@ -422,109 +857,65 @@ else
 fi
 
 # ---- 2. boot matrix: deleted flags stay dead; live grammar boots ------------------------------
-./build/tomokv --mode 3s      2>&1 | grep -q "unknown" && ok "reject --mode (flag deleted)" || bad "reject --mode (flag deleted)"
-./build/tomokv --spread 4:4   2>&1 | grep -q "unknown"  && ok "reject --spread"    || bad "reject --spread"
-./build/tomokv --nodes 2      2>&1 | grep -q "unknown"  && ok "reject --nodes"     || bad "reject --nodes"
-./build/tomokv --ratio 4:4:2  2>&1 | grep -q "deleted"  && ok "reject 3-part ratio"|| bad "reject 3-part ratio"
-./build/tomokv /nonexistent-conf 2>&1 | grep -q "cannot open" && ok "reject missing conf" || bad "reject missing conf"
-printf 'florb 1\n' > /tmp/gate-bad.conf
-./build/tomokv /tmp/gate-bad.conf 2>&1 | grep -q "unknown argument" && ok "reject bad conf key" || bad "reject bad conf key"
-printf 'aclfile /tmp/gate-users.acl\nuser alice on nopass ~* &* +@all\n' > /tmp/gate-acl-mixed.conf
-./build/tomokv /tmp/gate-acl-mixed.conf 2>&1 | grep -q \
+reject_boot(){
+  local conf=() directory
+  # A broken rejection may accidentally start a server. Its affinity, bind, data directory and
+  # lifetime must still obey this slot. Config-file paths remain first, as the parser requires.
+  if [[ "$1" != --* ]]; then conf=("$1"); shift; fi
+  directory=$(mktemp -d "$TMPDIR/reject-boot.XXXXXX") || return 1
+  timeout --kill-after=5 10 taskset -c "$CORES" "$CANDIDATE_BINARY" "${conf[@]}" \
+      --port "$PORT" --bind 127.0.0.1 --shards 16 --ratio "$GATE_RATIO" --dir "$directory" "$@"
+}
+reject_boot --mode 3s      2>&1 | grep -q "unknown" && ok "reject --mode (flag deleted)" || bad "reject --mode (flag deleted)"
+reject_boot --spread 4:4   2>&1 | grep -q "unknown"  && ok "reject --spread"    || bad "reject --spread"
+reject_boot --nodes 2      2>&1 | grep -q "unknown"  && ok "reject --nodes"     || bad "reject --nodes"
+reject_boot --ratio 4:4:2  2>&1 | grep -q "deleted"  && ok "reject 3-part ratio"|| bad "reject 3-part ratio"
+reject_boot /nonexistent-conf 2>&1 | grep -q "cannot open" && ok "reject missing conf" || bad "reject missing conf"
+printf 'florb 1\n' > $TMPDIR/gate-bad.conf
+reject_boot $TMPDIR/gate-bad.conf 2>&1 | grep -q "unknown argument" && ok "reject bad conf key" || bad "reject bad conf key"
+printf 'aclfile %s\nuser alice on nopass ~* &* +@all\n' "$TMPDIR/gate-users.acl" > $TMPDIR/gate-acl-mixed.conf
+reject_boot $TMPDIR/gate-acl-mixed.conf 2>&1 | grep -q \
     "Configuring Redis with users defined in redis.conf and at the same setting an ACL file path is invalid" \
     && ok "reject aclfile + conf user lines" || bad "reject aclfile + conf user lines"
 
-port_listeners(){ # pids bound to a port, listening or not yet accepting (ss names the owner)
-  ss -H -ltnp "sport = :$1" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u \
-      | paste -sd, -
-}
-guard_port(){ # a bound listener OR an accepting peer on the port ends the gate, naming the pid
-  local owners; owners=$(port_listeners "$1")
-  if [ -n "$owners" ] || (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; then
-    say "port $1 pre-boot guard" \
-        "FAIL (already listening${owners:+; pid=$owners} -- a leftover server; kill it and re-run)"
-    exit 1
-  fi
-}
-settle(){ # after a server is gone: wait for $PORT to stop accepting, then a short settle.
-  # Replaces a fixed `sleep 5` (x55 per run, ~4.6 min). Not load-bearing: the listener sets
-  # SO_REUSEADDR+SO_REUSEPORT (src/core/io_loop.h:167) and `wait` already reaped the process.
-  # GATE_STOP_SETTLE=5 restores the old timing if a row ever turns out to depend on it -- which
-  # would itself be a finding worth a NOTES line.
-  for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null || break; sleep 0.1; done
-  sleep "${GATE_STOP_SETTLE:-1}"
-}
-launch(){ # logtag binary args... -> pid in $SRV, log in $SRVLOG; waits up to 30 s for the port
-  local tag=$1 bin=$2; shift 2
-  quiet_wait
-  SRV=0; SRVLOG=/dev/null
-  guard_port "$PORT"
-  [ -x "$bin" ] || { say "boot ($tag)" "FAIL ($bin is not an executable)"; return 1; }
-  SRVLOG=$(mktemp "/tmp/gate-srv-$tag.XXXXXX")
-  # Every ordinary boot gets an empty persistence directory. Explicit recovery arms override it
-  # through their later --dir argument; a previous battery's SAVE must not become this one's input.
-  local boot_dir
-  boot_dir=$(mktemp -d "/tmp/gate-data-$tag.XXXXXX") || return 1
-  taskset -c $CORES "$bin" --port $PORT --bind 127.0.0.1 --shards 16 --dir "$boot_dir" "$@" > "$SRVLOG" 2>&1 &
-  SRV=$!
-  # 30s, not 10s: the AOF replay boot replays its file BEFORE it listens, and on a box shared
-  # with other lanes that overran a 10s deadline and turned six AOF rows red with no defect behind
-  # them. A generous deadline costs nothing when the server is quick — the loop exits on connect.
-  for _ in $(seq 150); do
-    if ! kill -0 "$SRV" 2>/dev/null; then
-      wait "$SRV" 2>/dev/null; boot_log_tail "$tag" "exited before it listened"; return 1
-    fi
-    (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null && return 0; sleep 0.2; done
-  boot_log_tail "$tag" "never accepted on $PORT within 30s"
-  return 1
-}
-boot_log_tail(){ # a boot that failed is a defect report, not a filename: SHOW the server's words.
-                 # Tonight three boot failures were triaged twice over because the row said only
-                 # "see $SRVLOG" and the log was rotated by the next row's mktemp before anyone
-                 # opened it.
-  printf 'GATE: boot (%s) %s -- last 25 lines of %s:\n' "$1" "$2" "$SRVLOG" >&2
-  tail -n 25 "$SRVLOG" 2>/dev/null | sed 's/^/GATE|   /' >&2
-}
-boot(){ local bin=$1; shift; launch main "$bin" --ratio $GATE_RATIO "$@"; }
-boot_fused(){ # deliberately omits --ratio, which fused mode rejects
-  local bin=$1; shift; launch fused "$bin" --thread-mode fused "$@"; }
-stop(){ kill -TERM $SRV 2>/dev/null; wait $SRV 2>/dev/null; settle; }
-shutdown_clean(){ python3 tests/shutdown_report.py "$SRVLOG" clean; }
-shutdown_present(){ python3 tests/shutdown_report.py "$SRVLOG" present; }
-shutdown_value(){ python3 tests/shutdown_report.py "$SRVLOG" get "$1"; }
 
 # A registered command with no generated metadata row makes command_metadata_init fail, and the
 # server then refuses to boot at all -- every row below goes red at once with no indication which
 # command is at fault. Static, so it fires before any server starts.
-py tests/cmdmeta_coverage.py >/tmp/gate-cmdmeta-coverage.txt 2>&1 \
+py tests/cmdmeta_coverage.py >$TMPDIR/gate-cmdmeta-coverage.txt 2>&1 \
     && ok "cmdmeta covers every registered command" \
-    || bad "cmdmeta covers every registered command" "see /tmp/gate-cmdmeta-coverage.txt"
+    || bad "cmdmeta covers every registered command" "see $TMPDIR/gate-cmdmeta-coverage.txt"
 
+# Several release correctness batteries also assert rates, CPU ceilings, or timing ratios (XDS,
+# atomic floor, stream, expiry and borrow registry). Their checks are unchanged and run only after
+# the independent counter/state batteries drain; disjoint CPUs do not eliminate shared-box noise.
+join_workers
+phase serial-correctness-begin
 # ---- 3. correctness: smoke + torture + RYOW on the release build ------------------------------
 # MERGEWAITS.md: six rows, all BEFORE the quick-tier exit. Build/boot failure belongs to its
 # dependent row, so it cannot change the count. The retirement row intentionally includes lazy
 # expiry: cx-waits alone still fails that broader no-quiescence-wait law. Never skip/xfail it.
-pausable make build/waits-unit >/tmp/gate-waits-unit.txt 2>&1 \
-    && timeout --foreground 60 taskset -c "$CORES" ./build/waits-unit >>/tmp/gate-waits-unit.txt 2>&1 \
+pausable taskset -c "$BUILD_CORES" make build/waits-unit >$TMPDIR/gate-waits-unit.txt 2>&1 \
+    && timeout --foreground 60 taskset -c "$CORES" ./build/waits-unit >>$TMPDIR/gate-waits-unit.txt 2>&1 \
     && ok "waits config publication + admission unit" \
-    || bad "waits config publication + admission unit" "see /tmp/gate-waits-unit.txt"
-pausable make build/rehash-waits-unit >/tmp/gate-rehash-waits-unit.txt 2>&1 \
+    || bad "waits config publication + admission unit" "see $TMPDIR/gate-waits-unit.txt"
+pausable taskset -c "$BUILD_CORES" make build/rehash-waits-unit >$TMPDIR/gate-rehash-waits-unit.txt 2>&1 \
     && timeout --foreground 60 taskset -c "$CORES" ./build/rehash-waits-unit retirement \
-        >>/tmp/gate-rehash-waits-unit.txt 2>&1 \
+        >>$TMPDIR/gate-rehash-waits-unit.txt 2>&1 \
     && ok "reads never wait for retirement quiescence" \
-    || bad "reads never wait for retirement quiescence" "see /tmp/gate-rehash-waits-unit.txt"
+    || bad "reads never wait for retirement quiescence" "see $TMPDIR/gate-rehash-waits-unit.txt"
 for WAIT_MODE in split fused; do
   for WAIT_LOCAL in 0 1; do
     WAIT_BOOTED=0
     if [ "$WAIT_MODE" = split ]; then
-      boot ./build/tomokv --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
+      boot "$CANDIDATE_BINARY" --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
           --flip-auto 0 --enable-debug-command yes && WAIT_BOOTED=1
     else
-      boot_fused ./build/tomokv --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
+      boot_fused "$CANDIDATE_BINARY" --atomic 1 --read-local "$WAIT_LOCAL" --overlap 0 \
           --flip-auto 0 --enable-debug-command yes && WAIT_BOOTED=1
     fi
     WAIT_OK=0
-    WAIT_LOG="/tmp/gate-rehash-readonly-$WAIT_MODE-$WAIT_LOCAL.txt"
+    WAIT_LOG="$TMPDIR/gate-rehash-readonly-$WAIT_MODE-$WAIT_LOCAL.txt"
     if [ "$WAIT_BOOTED" = 1 ] && py tests/rehash_readonly.py 127.0.0.1 "$PORT" "$WAIT_MODE" "$WAIT_LOCAL" >"$WAIT_LOG" 2>&1; then
       WAIT_OK=1
     fi
@@ -536,21 +927,21 @@ for WAIT_MODE in split fused; do
     fi
   done
 done
-boot ./build/tomokv --enable-debug-command yes || bad "release boot"
-py tests/torture.py 127.0.0.1 $PORT >/tmp/gate-tort.txt 2>&1 \
-    && ok "torture battery" || bad "torture battery" "see /tmp/gate-tort.txt"
-py tests/ryow.py 127.0.0.1 $PORT >/tmp/gate-ryow.txt 2>&1 \
-    && ok "RYOW battery" || bad "RYOW battery" "see /tmp/gate-ryow.txt"
-py tests/acl_categories.py 127.0.0.1 $PORT >/tmp/gate-acl-categories.txt 2>&1 \
-    && ok "ACL category runtime table" || bad "ACL category runtime table" "see /tmp/gate-acl-categories.txt"
-py tests/acl.py 127.0.0.1 $PORT - >/tmp/gate-acl-nofile.txt 2>&1 \
-    && ok "ACL LOAD/SAVE no-file errors" || bad "ACL LOAD/SAVE no-file errors" "see /tmp/gate-acl-nofile.txt"
+boot "$CANDIDATE_BINARY" --enable-debug-command yes || bad "release boot"
+py tests/torture.py 127.0.0.1 $PORT >$TMPDIR/gate-tort.txt 2>&1 \
+    && ok "torture battery" || bad "torture battery" "see $TMPDIR/gate-tort.txt"
+py tests/ryow.py 127.0.0.1 $PORT >$TMPDIR/gate-ryow.txt 2>&1 \
+    && ok "RYOW battery" || bad "RYOW battery" "see $TMPDIR/gate-ryow.txt"
+py tests/acl_categories.py 127.0.0.1 $PORT >$TMPDIR/gate-acl-categories.txt 2>&1 \
+    && ok "ACL category runtime table" || bad "ACL category runtime table" "see $TMPDIR/gate-acl-categories.txt"
+py tests/acl.py 127.0.0.1 $PORT - >$TMPDIR/gate-acl-nofile.txt 2>&1 \
+    && ok "ACL LOAD/SAVE no-file errors" || bad "ACL LOAD/SAVE no-file errors" "see $TMPDIR/gate-acl-nofile.txt"
 # Idle-loop ceiling: owner-written counters remove scheduler/jiffy noise and name a spinning
 # thread. The helper requires two fresh LBSIGNALS captures and a sampling iteration, so a missing
 # DEBUG surface or cached/empty dump cannot turn this row green.
-py tests/spinprobe.py "$PORT" "$SRV" --idle-only >/tmp/gate-idle-signals.txt 2>&1 \
+py tests/spinprobe.py "$PORT" "$SRV" --idle-only >$TMPDIR/gate-idle-signals.txt 2>&1 \
     && ok "idle loop ceiling (LBSIGNALS, 1s)" \
-    || bad "idle loop ceiling" "see /tmp/gate-idle-signals.txt"
+    || bad "idle loop ceiling" "see $TMPDIR/gate-idle-signals.txt"
 stop
 # shutdown invariants + fired counters, from the TERM dump
 shutdown_clean \
@@ -563,41 +954,24 @@ E=$(shutdown_value work.executed)
 
 # Explicit ON boot plus the non-vacuous epoch-MVCC gates. atomic_torn includes its own OFF control,
 # predecessor/promotion counters, overlapping writers, window liveness, and live CONFIG flips.
-boot ./build/tomokv --atomic 1 --enable-debug-command yes || bad "atomic release boot"
-py tests/atomic_torn.py 127.0.0.1 $PORT --release-build >/tmp/gate-atomic-torn.txt 2>&1 \
-    && ok "atomic torn/window battery" || bad "atomic torn/window battery" "see /tmp/gate-atomic-torn.txt"
-py tests/atomic_ryow.py 127.0.0.1 $PORT >/tmp/gate-atomic-ryow.txt 2>&1 \
-    && ok "atomic RYOW/mixed-write battery" || bad "atomic RYOW/mixed-write battery" "see /tmp/gate-atomic-ryow.txt"
-py tests/atomic_hazards.py 127.0.0.1 $PORT >/tmp/gate-atomic-hazards.txt 2>&1 \
+boot "$CANDIDATE_BINARY" --atomic 1 --enable-debug-command yes || bad "atomic release boot"
+py tests/atomic_torn.py 127.0.0.1 $PORT --release-build >$TMPDIR/gate-atomic-torn.txt 2>&1 \
+    && ok "atomic torn/window battery" || bad "atomic torn/window battery" "see $TMPDIR/gate-atomic-torn.txt"
+py tests/atomic_ryow.py 127.0.0.1 $PORT >$TMPDIR/gate-atomic-ryow.txt 2>&1 \
+    && ok "atomic RYOW/mixed-write battery" || bad "atomic RYOW/mixed-write battery" "see $TMPDIR/gate-atomic-ryow.txt"
+py tests/atomic_hazards.py 127.0.0.1 $PORT >$TMPDIR/gate-atomic-hazards.txt 2>&1 \
     && ok "atomic owner-local hazard battery" \
-    || bad "atomic owner-local hazard battery" "see /tmp/gate-atomic-hazards.txt"
+    || bad "atomic owner-local hazard battery" "see $TMPDIR/gate-atomic-hazards.txt"
 stop
 shutdown_clean \
     && ok "atomic shutdown invariants" || bad "atomic shutdown invariants"
 
-# ---- feature batteries: every shipped feature's directed test, BOTH atomic settings -----------
-# The gate accumulates a section per landed feature (owner rule). Each test is directed and
-# asserts its own mechanisms fired; the boot covers multi/blocking/pubsub+sharded/lua/limits.
-# ONE list, shared with the fused+armed leg below, so the two legs cannot drift apart: a battery
-# added here runs on the armed lane too, and the ledger arithmetic counts it twice per atomic mode.
-FEATURE_BATTERIES="s6 multi_exec blocking blockmulti stream streamgroups pubsub lua_scripting scriptsurf limits resp3 bitfield dumprestore zsetops geo climon climon2 tracking hexpire servertail lcs concur edgeproto edgeenc edgetime arity contarity cmdgap aclsel expwide infofix pushtear netcmd"
-for AT in 0 1; do
-  boot ./build/tomokv --atomic $AT --enable-debug-command yes \
-      || bad "feature battery boot (atomic $AT)"
-  for t in $FEATURE_BATTERIES; do
-    FEATURE_ARGS=()
-    [ "$t" = stream ] && FEATURE_ARGS+=(--release-build)
-    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >/tmp/gate-$t-$AT.txt 2>&1 \
-        && ok "$t battery (atomic $AT)" || bad "$t battery (atomic $AT)" "see /tmp/gate-$t-$AT.txt"
-  done
-  stop
-  shutdown_clean \
-      && ok "feature shutdown invariants (atomic $AT)" || bad "feature shutdown invariants (atomic $AT)"
-done
+# Whole split boots run independently; their internal battery sequence remains unchanged.
+for AT in 0 1; do collect_job "feature-split-$AT"; done
 
 # ---- FUSED mode: one boot per atomic mode, coarse three-stream production subset --------------
 for AT in 0 1; do
-  if boot_fused ./build/tomokv --atomic "$AT" --enable-debug-command yes; then
+  if boot_fused "$CANDIDATE_BINARY" --atomic "$AT" --enable-debug-command yes; then
     FUSED_INFO=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO server 2>/dev/null | tr -d '\r')
     FUSED_MODE=$(printf '%s\n' "$FUSED_INFO" | sed -n 's/^thread_mode://p')
     FUSED_OVERLAP=$(printf '%s\n' "$FUSED_INFO" | sed -n 's/^overlap://p')
@@ -608,14 +982,14 @@ for AT in 0 1; do
     bad "fused boot line (atomic $AT)" "server did not boot; see $SRVLOG"
   fi
   for t in s6 multi_exec edgeproto atomfix; do
-    python3 "tests/$t.py" 127.0.0.1 "$PORT" >"/tmp/gate-fused-$t-$AT.txt" 2>&1 \
+    python3 "tests/$t.py" 127.0.0.1 "$PORT" >"$TMPDIR/gate-fused-$t-$AT.txt" 2>&1 \
         && ok "fused $t battery (atomic $AT)" \
-        || bad "fused $t battery (atomic $AT)" "see /tmp/gate-fused-$t-$AT.txt"
+        || bad "fused $t battery (atomic $AT)" "see $TMPDIR/gate-fused-$t-$AT.txt"
   done
-  py tests/spinprobe.py "$PORT" "$SRV" >"/tmp/gate-fused-spinprobe-$AT.txt" 2>&1 \
+  py tests/spinprobe.py "$PORT" "$SRV" >"$TMPDIR/gate-fused-spinprobe-$AT.txt" 2>&1 \
       && ok "fused spinprobe battery (atomic $AT)" \
       || bad "fused spinprobe battery (atomic $AT)" \
-             "see /tmp/gate-fused-spinprobe-$AT.txt"
+             "see $TMPDIR/gate-fused-spinprobe-$AT.txt"
   stop
   FUSED_REPORT_MODE=$(shutdown_value thread_mode)
   FUSED_REPORT_KIND=$(shutdown_value work.kind)
@@ -625,42 +999,8 @@ for AT in 0 1; do
              "mode=$FUSED_REPORT_MODE kind=$FUSED_REPORT_KIND; see $SRVLOG"
 done
 
-# ---- FUSED + read-local ARMED: the recommended read-heavy posture runs the whole feature list ----
-# The fused boots above never arm the local read lane, so until this leg no gate row had run a
-# feature battery on the path that serves every clean GET/MGET in that posture. The boot row asserts
-# the WIRE says so: INFO server thread_mode:1s AND read_local:1 -- the effective lane state, not the
-# knob, which CONFIG GET also echoes on a split boot where it is inert. The shutdown row is the
-# leg's vacuity guard: the lane's own hit counters must have moved during the batteries, or the 32
-# rows between ran on the owner path and proved nothing about the armed one.
-for AT in 0 1; do
-  if boot_fused ./build/tomokv --atomic "$AT" --read-local 1 --enable-debug-command yes; then
-    ARMED_INFO=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO server 2>/dev/null | tr -d '\r')
-    ARMED_MODE=$(printf '%s\n' "$ARMED_INFO" | sed -n 's/^thread_mode://p')
-    ARMED_RL=$(printf '%s\n' "$ARMED_INFO" | sed -n 's/^read_local://p')
-    [ "$ARMED_MODE" = 1s ] && [ "$ARMED_RL" = 1 ] \
-        && ok "fused+armed boot line (atomic $AT)" \
-        || bad "fused+armed boot line (atomic $AT)" "wire mode=$ARMED_MODE read_local=$ARMED_RL"
-  else
-    bad "fused+armed boot line (atomic $AT)" "server did not boot; see $SRVLOG"
-  fi
-  for t in $FEATURE_BATTERIES; do
-    FEATURE_ARGS=()
-    [ "$t" = stream ] && FEATURE_ARGS+=(--release-build)
-    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >/tmp/gate-fusedarmed-$t-$AT.txt 2>&1 \
-        && ok "fused+armed $t battery (atomic $AT)" \
-        || bad "fused+armed $t battery (atomic $AT)" "see /tmp/gate-fusedarmed-$t-$AT.txt"
-  done
-  ARMED_HITS=$(redis-cli -h 127.0.0.1 -p "$PORT" INFO stats 2>/dev/null | tr -d '\r' \
-      | awk -F: '/^read_local_keyspace_hits:|^read_local_mget_local_hits:/{s+=$2} END{print s+0}')
-  stop
-  ARMED_REPORT_MODE=$(shutdown_value thread_mode)
-  ARMED_REPORT_KIND=$(shutdown_value work.kind)
-  shutdown_clean && [ "$ARMED_REPORT_MODE" = 1s ] && [ "$ARMED_REPORT_KIND" = fused ] \
-      && [ -n "$ARMED_HITS" ] && [ "$ARMED_HITS" -gt 0 ] \
-      && ok "fused+armed shutdown report + lane fired (hits=$ARMED_HITS, atomic $AT)" \
-      || bad "fused+armed shutdown report + lane fired (atomic $AT)" \
-             "mode=$ARMED_REPORT_MODE kind=$ARMED_REPORT_KIND hits=$ARMED_HITS; see $SRVLOG"
-done
+# Whole armed boots run independently; collect their rows in the original atomic-mode order.
+for AT in 0 1; do collect_job "feature-armed-$AT"; done
 
 # ---- eviction accounting on both read paths: owner-served (split) and lane-served (fused+armed) --
 # tests/evict_battery.py needs one FRESH boot per section (it sets maxmemory itself and has no
@@ -672,18 +1012,8 @@ done
 # evicted FIRST, which is the inverse of the policy the boot asked for.
 for AT in 0 1; do
   for EVSEC in lfu lruclock; do
-    boot ./build/tomokv --atomic $AT \
-        || bad "eviction $EVSEC boot (split, atomic $AT)"
-    py tests/evict_battery.py $PORT $EVSEC >/tmp/gate-evict-$EVSEC-split-$AT.txt 2>&1 \
-        && ok "eviction $EVSEC battery (split, atomic $AT)" \
-        || bad "eviction $EVSEC battery (split, atomic $AT)" "see /tmp/gate-evict-$EVSEC-split-$AT.txt"
-    stop
-    boot_fused ./build/tomokv --atomic $AT --read-local 1 \
-        || bad "eviction $EVSEC boot (fused+armed, atomic $AT)"
-    py tests/evict_battery.py $PORT $EVSEC >/tmp/gate-evict-$EVSEC-armed-$AT.txt 2>&1 \
-        && ok "eviction $EVSEC battery (fused+armed, atomic $AT)" \
-        || bad "eviction $EVSEC battery (fused+armed, atomic $AT)" "see /tmp/gate-evict-$EVSEC-armed-$AT.txt"
-    stop
+    collect_job "evict-$EVSEC-split-$AT"
+    collect_job "evict-$EVSEC-armed-$AT"
   done
 done
 
@@ -691,18 +1021,18 @@ done
 # DEBUG geometry makes false positives impossible in these arms: A/B share one physical shard but
 # use distinct filter cells, as do P/C on the other participating owner. ATOMIC-COMMIT-DELAY holds
 # A/P after raw install and atomic_commit_holds proves the reserved/unpublished window was sampled.
-boot_fused ./build/tomokv --atomic 1 --read-local 1 \
+boot_fused "$CANDIDATE_BINARY" --atomic 1 --read-local 1 \
     --enable-debug-command yes \
     || bad "B+ read-local purpose boot"
-py tests/bplus.py 127.0.0.1 "$PORT" >/tmp/gate-bplus.txt 2>&1 \
+py tests/bplus.py 127.0.0.1 "$PORT" >$TMPDIR/gate-bplus.txt 2>&1 \
     && ok "B+ held-group GET/MGET filter battery" \
-    || bad "B+ held-group GET/MGET filter battery" "see /tmp/gate-bplus.txt"
+    || bad "B+ held-group GET/MGET filter battery" "see $TMPDIR/gate-bplus.txt"
 # Lane admission on the same armed boot: 32 connections per fused thread each pipelining 64 GETs
 # oversubscribe the 1024-entry lane; the excess must be deferred and re-parsed locally (counters
 # fire), never demoted to an owner task (fallback_lane_full stays 0), with order/RYOW intact.
-py tests/read_local_lane.py 127.0.0.1 "$PORT" >/tmp/gate-read-local-lane.txt 2>&1 \
+py tests/read_local_lane.py 127.0.0.1 "$PORT" >$TMPDIR/gate-read-local-lane.txt 2>&1 \
     && ok "read-local lane admission battery" \
-    || bad "read-local lane admission battery" "see /tmp/gate-read-local-lane.txt"
+    || bad "read-local lane admission battery" "see $TMPDIR/gate-read-local-lane.txt"
 stop
 
 # ---- ACL recheck over a CODED reply: exactly one reply per blocking command -------------------
@@ -712,15 +1042,15 @@ stop
 # mode: the battery creates an ACL user, and a live non-default user makes acl_active() true for
 # everything else sharing the boot. Verified discriminating -- with Op::clear_reply() reverted to
 # op.reply.clear() the four timeout rows fail and the rest pass.
-boot ./build/tomokv --enable-debug-command yes || bad "ACL-recheck reply boot (2s)"
-py tests/aclreply.py 127.0.0.1 "$PORT" >/tmp/gate-aclreply-2s.txt 2>&1 \
+boot "$CANDIDATE_BINARY" --enable-debug-command yes || bad "ACL-recheck reply boot (2s)"
+py tests/aclreply.py 127.0.0.1 "$PORT" >$TMPDIR/gate-aclreply-2s.txt 2>&1 \
     && ok "ACL recheck one-reply battery (2s)" \
-    || bad "ACL recheck one-reply battery (2s)" "see /tmp/gate-aclreply-2s.txt"
+    || bad "ACL recheck one-reply battery (2s)" "see $TMPDIR/gate-aclreply-2s.txt"
 stop
-boot_fused ./build/tomokv --enable-debug-command yes || bad "ACL-recheck reply boot (1s)"
-py tests/aclreply.py 127.0.0.1 "$PORT" >/tmp/gate-aclreply-1s.txt 2>&1 \
+boot_fused "$CANDIDATE_BINARY" --enable-debug-command yes || bad "ACL-recheck reply boot (1s)"
+py tests/aclreply.py 127.0.0.1 "$PORT" >$TMPDIR/gate-aclreply-1s.txt 2>&1 \
     && ok "ACL recheck one-reply battery (1s)" \
-    || bad "ACL recheck one-reply battery (1s)" "see /tmp/gate-aclreply-1s.txt"
+    || bad "ACL recheck one-reply battery (1s)" "see $TMPDIR/gate-aclreply-1s.txt"
 stop
 
 # ---- SORT's dynamic keys: exact production gate geometry, both atomic modes -------------------
@@ -728,17 +1058,17 @@ stop
 # DEBUG SHARD, and requires concrete BY and GET keys plus STORE destination on the executor slot
 # opposite the source. No same-owner or one-executor run can satisfy this row.
 for AT in 0 1; do
-  boot ./build/tomokv --ratio 6:2 --atomic "$AT" --enable-debug-command yes \
+  boot "$CANDIDATE_BINARY" --ratio 6:2 --atomic "$AT" --enable-debug-command yes \
       || bad "cross-owner SORT boot (atomic $AT)"
-  py tests/sort.py 127.0.0.1 "$PORT" >/tmp/gate-sort-$AT.txt 2>&1 \
+  py tests/sort.py 127.0.0.1 "$PORT" >$TMPDIR/gate-sort-$AT.txt 2>&1 \
       && ok "cross-owner SORT battery (atomic $AT)" \
-      || bad "cross-owner SORT battery (atomic $AT)" "see /tmp/gate-sort-$AT.txt"
+      || bad "cross-owner SORT battery (atomic $AT)" "see $TMPDIR/gate-sort-$AT.txt"
   stop
 done
 
 # ---- debug-surface batteries: these drive DEBUG subcommands, hence their own armed boot -------
 for AT in 0 1; do
-  boot ./build/tomokv --atomic $AT --enable-debug-command yes \
+  boot "$CANDIDATE_BINARY" --atomic $AT --enable-debug-command yes \
       || bad "debug-surface boot (atomic $AT)"
   # scriptatomic needs the armed boot for its cross-shard section (DEBUG SHARD proves the group
   # really spans owners; ATOMIC-COMMIT-DELAY / ATOMIC-READ-DELAY widen the window). It flips
@@ -774,19 +1104,19 @@ for AT in 0 1; do
   for t in lbsignals slowlog atomfix scriptatomic execatomic execiso execfix multires multirace session_monotonic xacct xmove xscript; do
     FEATURE_ARGS=()
     [ "$t" = xmove ] && FEATURE_ARGS+=(--release-build)
-    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >/tmp/gate-$t-$AT.txt 2>&1 \
-        && ok "$t battery (atomic $AT)" || bad "$t battery (atomic $AT)" "see /tmp/gate-$t-$AT.txt"
+    py tests/$t.py 127.0.0.1 $PORT "${FEATURE_ARGS[@]}" >$TMPDIR/gate-$t-$AT.txt 2>&1 \
+        && ok "$t battery (atomic $AT)" || bad "$t battery (atomic $AT)" "see $TMPDIR/gate-$t-$AT.txt"
   done
   stop
 done
 
 # ---- cross-owner script bounds: production auto budgets and four cut slots per IO ----------
 for XS_MODE in limit window; do
-  boot ./build/tomokv --atomic 1 --enable-debug-command yes \
+  boot "$CANDIDATE_BINARY" --atomic 1 --enable-debug-command yes \
       || bad "xscript $XS_MODE control boot"
-  py tests/xscript.py 127.0.0.1 $PORT "$XS_MODE" >/tmp/gate-xscript-$XS_MODE.txt 2>&1 \
+  py tests/xscript.py 127.0.0.1 $PORT "$XS_MODE" >$TMPDIR/gate-xscript-$XS_MODE.txt 2>&1 \
       && ok "xscript $XS_MODE control" || bad "xscript $XS_MODE control" \
-             "see /tmp/gate-xscript-$XS_MODE.txt"
+             "see $TMPDIR/gate-xscript-$XS_MODE.txt"
   stop
 done
 
@@ -795,103 +1125,103 @@ done
 # flag. A ratio of wall times is still a performance claim (see DESIGN-GATEHYGIENE.md).
 # --shards 1 for the same reason as the borrow guard: the sidecar under test is per shard, and the
 # battery asserts that precondition rather than quietly measuring a diluted one.
-boot ./build/tomokv --shards 1 --enable-debug-command yes || bad "expire-index guard boot"
-py tests/expireindex.py 127.0.0.1 $PORT --release-build >/tmp/gate-expireindex.txt 2>&1 \
-    && ok "expire-index growth bound" || bad "expire-index growth bound" "see /tmp/gate-expireindex.txt"
+boot "$CANDIDATE_BINARY" --shards 1 --enable-debug-command yes || bad "expire-index guard boot"
+py tests/expireindex.py 127.0.0.1 $PORT --release-build >$TMPDIR/gate-expireindex.txt 2>&1 \
+    && ok "expire-index growth bound" || bad "expire-index growth bound" "see $TMPDIR/gate-expireindex.txt"
 stop
 
 # one shard so every borrow lands in ONE registry (the quantity under test), and a small zc-min so
 # an ordinary-sized value still takes the borrow path and pays registry cost.
-boot ./build/tomokv --shards 1 --zc-min 64 --client-output-buffer-limit "normal 0 0 0" \
+boot "$CANDIDATE_BINARY" --shards 1 --zc-min 64 --client-output-buffer-limit "normal 0 0 0" \
     --enable-debug-command yes || bad "borrow-registry guard boot"
-py tests/borrow_registry.py 127.0.0.1 $PORT --release-build >/tmp/gate-borrow.txt 2>&1 \
-    && ok "borrow-registry growth bound" || bad "borrow-registry growth bound" "see /tmp/gate-borrow.txt"
+py tests/borrow_registry.py 127.0.0.1 $PORT --release-build >$TMPDIR/gate-borrow.txt 2>&1 \
+    && ok "borrow-registry growth bound" || bad "borrow-registry growth bound" "see $TMPDIR/gate-borrow.txt"
 stop
 
 # This row restores the original manual ownership geometry: two real owners plus empty fillers.
 # It boots its own arms; the maintainer runs it on the quiet box with the rest of the gate.
 quiet_wait
-XDS_PORT=$PORT XDS_CPUS=$CORES XDS_BIN=./build/tomokv bash tests/xshard_dispatch_scale.sh \
-    >/tmp/gate-xds.txt 2>&1 \
-    && ok "cross-shard dispatch scaling" || bad "cross-shard dispatch scaling" "see /tmp/gate-xds.txt"
+XDS_PORT=$PORT XDS_CPUS=$CORES XDS_BIN="$CANDIDATE_BINARY" bash tests/xshard_dispatch_scale.sh \
+    >$TMPDIR/gate-xds.txt 2>&1 \
+    && ok "cross-shard dispatch scaling" || bad "cross-shard dispatch scaling" "see $TMPDIR/gate-xds.txt"
 
 # ---- Redis-wire DUMP/RESTORE survives the native snapshot/restart boundary -------------------
-DUMPRESTORE_DIR=$(mktemp -d /tmp/gate-dumprestore.XXXXXX)
-boot ./build/tomokv --atomic 1 --dir "$DUMPRESTORE_DIR" --dbfilename dumprestore.tomo \
+DUMPRESTORE_DIR=$(mktemp -d $TMPDIR/gate-dumprestore.XXXXXX)
+boot "$CANDIDATE_BINARY" --atomic 1 --dir "$DUMPRESTORE_DIR" --dbfilename dumprestore.tomo \
     || bad "DUMP/RESTORE restart preparation boot"
 py tests/dumprestore.py 127.0.0.1 $PORT prepare_restart \
-    >/tmp/gate-dumprestore-restart.txt 2>&1 \
+    >$TMPDIR/gate-dumprestore-restart.txt 2>&1 \
     && ok "DUMP/RESTORE prepare + native SAVE" \
-    || bad "DUMP/RESTORE restart preparation" "see /tmp/gate-dumprestore-restart.txt"
+    || bad "DUMP/RESTORE restart preparation" "see $TMPDIR/gate-dumprestore-restart.txt"
 stop
-boot ./build/tomokv --atomic 1 --dir "$DUMPRESTORE_DIR" \
+boot "$CANDIDATE_BINARY" --atomic 1 --dir "$DUMPRESTORE_DIR" \
     --dbfilename dumprestore.tomo \
     || bad "DUMP/RESTORE snapshot reload boot"
 py tests/dumprestore.py 127.0.0.1 $PORT verify_restart \
-    >>/tmp/gate-dumprestore-restart.txt 2>&1 \
+    >>$TMPDIR/gate-dumprestore-restart.txt 2>&1 \
     && ok "DUMP/RESTORE cross-restart round-trip" \
-    || bad "DUMP/RESTORE cross-restart round-trip" "see /tmp/gate-dumprestore-restart.txt"
+    || bad "DUMP/RESTORE cross-restart round-trip" "see $TMPDIR/gate-dumprestore-restart.txt"
 stop
 shutdown_clean \
     && ok "DUMP/RESTORE restart shutdown invariants" \
     || bad "DUMP/RESTORE restart shutdown invariants"
 
 # ---- auth + audit DEBUG (purpose-booted; each test asserts its gate actually opened) -----------
-./build/tomokv --protected-mode maybe 2>&1 | grep -q "protected-mode wants" \
+"$CANDIDATE_BINARY" --protected-mode maybe 2>&1 | grep -q "protected-mode wants" \
     && ok "reject bad protected-mode" || bad "reject bad protected-mode"
-./build/tomokv --enable-debug-command maybe 2>&1 | grep -q "enable-debug-command wants" \
+"$CANDIDATE_BINARY" --enable-debug-command maybe 2>&1 | grep -q "enable-debug-command wants" \
     && ok "reject bad enable-debug-command" || bad "reject bad enable-debug-command"
-boot ./build/tomokv --requirepass gatepass || bad "auth purpose boot"
-py tests/auth.py 127.0.0.1 $PORT gatepass >/tmp/gate-auth.txt 2>&1 \
-    && ok "AUTH/HELLO/protected state machine" || bad "AUTH/HELLO/protected state machine" "see /tmp/gate-auth.txt"
+boot "$CANDIDATE_BINARY" --requirepass gatepass || bad "auth purpose boot"
+py tests/auth.py 127.0.0.1 $PORT gatepass >$TMPDIR/gate-auth.txt 2>&1 \
+    && ok "AUTH/HELLO/protected state machine" || bad "AUTH/HELLO/protected state machine" "see $TMPDIR/gate-auth.txt"
 stop
-ACL_DIR=$(mktemp -d /tmp/gate-acl.XXXXXX)
+ACL_DIR=$(mktemp -d $TMPDIR/gate-acl.XXXXXX)
 ACL_FILE="$ACL_DIR/users.acl"
 : > "$ACL_FILE"
-boot ./build/tomokv --aclfile "$ACL_FILE" || bad "ACL purpose boot"
-py tests/acl.py 127.0.0.1 $PORT "$ACL_FILE" >/tmp/gate-acl.txt 2>&1 \
-    && ok "ACL battery (atomic off)" || bad "ACL battery (atomic off)" "see /tmp/gate-acl.txt"
+boot "$CANDIDATE_BINARY" --aclfile "$ACL_FILE" || bad "ACL purpose boot"
+py tests/acl.py 127.0.0.1 $PORT "$ACL_FILE" >$TMPDIR/gate-acl.txt 2>&1 \
+    && ok "ACL battery (atomic off)" || bad "ACL battery (atomic off)" "see $TMPDIR/gate-acl.txt"
 stop
 ACL_ATOMIC_FILE="$ACL_DIR/users-atomic.acl"
 : > "$ACL_ATOMIC_FILE"
-boot ./build/tomokv --aclfile "$ACL_ATOMIC_FILE" --atomic 1 || bad "ACL atomic purpose boot"
-py tests/acl.py 127.0.0.1 $PORT "$ACL_ATOMIC_FILE" >/tmp/gate-acl-atomic.txt 2>&1 \
-    && ok "ACL battery (atomic on)" || bad "ACL battery (atomic on)" "see /tmp/gate-acl-atomic.txt"
+boot "$CANDIDATE_BINARY" --aclfile "$ACL_ATOMIC_FILE" --atomic 1 || bad "ACL atomic purpose boot"
+py tests/acl.py 127.0.0.1 $PORT "$ACL_ATOMIC_FILE" >$TMPDIR/gate-acl-atomic.txt 2>&1 \
+    && ok "ACL battery (atomic on)" || bad "ACL battery (atomic on)" "see $TMPDIR/gate-acl-atomic.txt"
 stop
-DEBUG_DIR=$(mktemp -d /tmp/gate-debug.XXXXXX)
-boot ./build/tomokv --enable-debug-command local --dir "$DEBUG_DIR" --dbfilename reload.tomo \
+DEBUG_DIR=$(mktemp -d $TMPDIR/gate-debug.XXXXXX)
+boot "$CANDIDATE_BINARY" --enable-debug-command local --dir "$DEBUG_DIR" --dbfilename reload.tomo \
     || bad "DEBUG purpose boot"
-py tests/debug.py 127.0.0.1 $PORT >/tmp/gate-debug.txt 2>&1 \
-    && ok "DEBUG toggle/reload battery" || bad "DEBUG toggle/reload battery" "see /tmp/gate-debug.txt"
+py tests/debug.py 127.0.0.1 $PORT >$TMPDIR/gate-debug.txt 2>&1 \
+    && ok "DEBUG toggle/reload battery" || bad "DEBUG toggle/reload battery" "see $TMPDIR/gate-debug.txt"
 { redis_cli_expect_ok FLUSHALL \
     && py tests/snap_typed_roundtrip.py $PORT build_save \
     && redis_cli_expect_ok DEBUG RELOAD \
     && py tests/snap_typed_roundtrip.py $PORT verify; } \
-    >/tmp/gate-snap-typed.txt 2>&1 \
+    >$TMPDIR/gate-snap-typed.txt 2>&1 \
     && ok "typed snapshot round-trip incl stream" \
-    || bad "typed snapshot round-trip incl stream" "see /tmp/gate-snap-typed.txt"
+    || bad "typed snapshot round-trip incl stream" "see $TMPDIR/gate-snap-typed.txt"
 stop
 
 # ---- snapshot data/sync engines: cut, typed round-trip, and typed preimage race ----------------
 for NET_IO in epoll uring; do
-  SNAP_DIR=$(mktemp -d "/tmp/gate-snapshot-${NET_IO}.XXXXXX")
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  SNAP_DIR=$(mktemp -d "$TMPDIR/gate-snapshot-${NET_IO}.XXXXXX")
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$SNAP_DIR" --dbfilename cut.tomo \
       || bad "snapshot cut boot ($NET_IO)"
   py tests/snap_cut_battery.py "$PORT" save \
-      >"/tmp/gate-snapshot-cut-${NET_IO}.txt" 2>&1 \
+      >"$TMPDIR/gate-snapshot-cut-${NET_IO}.txt" 2>&1 \
       && ok "snapshot concurrent cut ($NET_IO)" \
       || bad "snapshot concurrent cut ($NET_IO)" \
-             "see /tmp/gate-snapshot-cut-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-cut-${NET_IO}.txt"
   stop
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$SNAP_DIR" --dbfilename cut.tomo \
       || bad "snapshot cut reload boot ($NET_IO)"
   py tests/snap_cut_battery.py "$PORT" verify_cut \
-      >>"/tmp/gate-snapshot-cut-${NET_IO}.txt" 2>&1 \
+      >>"$TMPDIR/gate-snapshot-cut-${NET_IO}.txt" 2>&1 \
       && ok "snapshot cut reload ($NET_IO)" \
       || bad "snapshot cut reload ($NET_IO)" \
-             "see /tmp/gate-snapshot-cut-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-cut-${NET_IO}.txt"
   stop
 
   # The cut battery above writes only single keys, so it passes on a tree whose snapshot tears
@@ -899,89 +1229,89 @@ for NET_IO in epoll uring; do
   # generation-tagged groups, a live MGET reader that must stay clean throughout, and the
   # cuts_waited counter that separates a real group drain from a vacuous one. Both arms were
   # confirmed to FAIL on the pre-fix tree (44-53 and 10-13 torn groups per cut respectively).
-  GROUP_DIR=$(mktemp -d "/tmp/gate-snapshot-groups-${NET_IO}.XXXXXX")
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" --atomic 1 \
+  GROUP_DIR=$(mktemp -d "$TMPDIR/gate-snapshot-groups-${NET_IO}.XXXXXX")
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" --atomic 1 \
       --enable-debug-command yes --dir "$GROUP_DIR" --dbfilename groups.tomo \
       || bad "atomic group cut boot ($NET_IO, atomic 1)"
   py tests/snap_cut_battery.py "$PORT" atomic_groups "$GROUP_DIR/groups.tomo" mset 5 \
-      >"/tmp/gate-snapshot-groups-mset-${NET_IO}.txt" 2>&1 \
-      && grep -q "ATOMIC_GROUP_CUT PASS" "/tmp/gate-snapshot-groups-mset-${NET_IO}.txt" \
+      >"$TMPDIR/gate-snapshot-groups-mset-${NET_IO}.txt" 2>&1 \
+      && grep -q "ATOMIC_GROUP_CUT PASS" "$TMPDIR/gate-snapshot-groups-mset-${NET_IO}.txt" \
       && ok "snapshot never tears a cross-shard MSET group ($NET_IO, atomic 1)" \
       || bad "snapshot never tears a cross-shard MSET group ($NET_IO, atomic 1)" \
-             "see /tmp/gate-snapshot-groups-mset-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-groups-mset-${NET_IO}.txt"
   stop
   # CONTROL ARM: the DEFAULT --atomic 0. EXEC force-admits a group at either setting, so a
   # transaction is atomic to readers here too and the file must agree with them.
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" --atomic 0 \
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" --atomic 0 \
       --enable-debug-command yes --dir "$GROUP_DIR" --dbfilename groups.tomo \
       || bad "atomic group cut boot ($NET_IO, atomic 0)"
   py tests/snap_cut_battery.py "$PORT" atomic_groups "$GROUP_DIR/groups.tomo" exec 3 \
-      >"/tmp/gate-snapshot-groups-exec-${NET_IO}.txt" 2>&1 \
-      && grep -q "ATOMIC_GROUP_CUT PASS" "/tmp/gate-snapshot-groups-exec-${NET_IO}.txt" \
+      >"$TMPDIR/gate-snapshot-groups-exec-${NET_IO}.txt" 2>&1 \
+      && grep -q "ATOMIC_GROUP_CUT PASS" "$TMPDIR/gate-snapshot-groups-exec-${NET_IO}.txt" \
       && ok "snapshot never tears a MULTI/EXEC group ($NET_IO, default atomic 0)" \
       || bad "snapshot never tears a MULTI/EXEC group ($NET_IO, default atomic 0)" \
-             "see /tmp/gate-snapshot-groups-exec-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-groups-exec-${NET_IO}.txt"
   stop
 
-  TYPED_DIR=$(mktemp -d "/tmp/gate-snapshot-typed-${NET_IO}.XXXXXX")
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  TYPED_DIR=$(mktemp -d "$TMPDIR/gate-snapshot-typed-${NET_IO}.XXXXXX")
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$TYPED_DIR" --dbfilename typed.tomo \
       || bad "typed snapshot boot ($NET_IO)"
   py tests/snap_typed_roundtrip.py "$PORT" build_save \
-      >"/tmp/gate-snapshot-typed-${NET_IO}.txt" 2>&1 \
+      >"$TMPDIR/gate-snapshot-typed-${NET_IO}.txt" 2>&1 \
       && ok "typed snapshot save ($NET_IO)" \
       || bad "typed snapshot save ($NET_IO)" \
-             "see /tmp/gate-snapshot-typed-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-typed-${NET_IO}.txt"
   stop
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$TYPED_DIR" --dbfilename typed.tomo \
       || bad "typed snapshot reload boot ($NET_IO)"
   py tests/snap_typed_roundtrip.py "$PORT" verify \
-      >>"/tmp/gate-snapshot-typed-${NET_IO}.txt" 2>&1 \
+      >>"$TMPDIR/gate-snapshot-typed-${NET_IO}.txt" 2>&1 \
       && ok "typed snapshot reload ($NET_IO)" \
       || bad "typed snapshot reload ($NET_IO)" \
-             "see /tmp/gate-snapshot-typed-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-typed-${NET_IO}.txt"
   stop
 
-  RACE_DIR=$(mktemp -d "/tmp/gate-snapshot-race-${NET_IO}.XXXXXX")
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  RACE_DIR=$(mktemp -d "$TMPDIR/gate-snapshot-race-${NET_IO}.XXXXXX")
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$RACE_DIR" --dbfilename race.tomo --save '' --enable-debug-command yes \
       || bad "typed snapshot race boot ($NET_IO)"
   py tests/snap_typed_race.py "$PORT" race "$RACE_DIR/race.tomo" \
-      >"/tmp/gate-snapshot-race-${NET_IO}.txt" 2>&1 \
-      && grep -q 'PREIMAGE-FIRED PASS' "/tmp/gate-snapshot-race-${NET_IO}.txt" \
-      && grep -q 'SNAPSHOT-TICKET-ORACLE PASS' "/tmp/gate-snapshot-race-${NET_IO}.txt" \
+      >"$TMPDIR/gate-snapshot-race-${NET_IO}.txt" 2>&1 \
+      && grep -q 'PREIMAGE-FIRED PASS' "$TMPDIR/gate-snapshot-race-${NET_IO}.txt" \
+      && grep -q 'SNAPSHOT-TICKET-ORACLE PASS' "$TMPDIR/gate-snapshot-race-${NET_IO}.txt" \
       && ok "typed snapshot preimage race ($NET_IO)" \
       || bad "typed snapshot preimage race ($NET_IO)" \
-             "see /tmp/gate-snapshot-race-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-race-${NET_IO}.txt"
   stop
-  boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+  boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
       --dir "$RACE_DIR" --dbfilename race.tomo.cut \
       || bad "typed snapshot race reload boot ($NET_IO)"
   py tests/snap_typed_race.py "$PORT" verify "$RACE_DIR/race.tomo.oracle.json" \
-      >>"/tmp/gate-snapshot-race-${NET_IO}.txt" 2>&1 \
+      >>"$TMPDIR/gate-snapshot-race-${NET_IO}.txt" 2>&1 \
       && ok "typed snapshot race reload ($NET_IO)" \
       || bad "typed snapshot race reload ($NET_IO)" \
-             "see /tmp/gate-snapshot-race-${NET_IO}.txt"
+             "see $TMPDIR/gate-snapshot-race-${NET_IO}.txt"
   stop
 done
 
 # ---- notify lane: integrated owner/retire seams plus both live atomic settings -----------------
-boot ./build/tomokv --notify-keyspace-events KEAmn --enable-debug-command yes \
+boot "$CANDIDATE_BINARY" --notify-keyspace-events KEAmn --enable-debug-command yes \
     || bad "feature battery boot + notify CLI knob"   # armed: multi_exec.py needs DEBUG SHARD
                                                        # to locate a same-owner key pair, and it
                                                        # FAILS rather than skips without it
-py tests/multi_exec.py 127.0.0.1 $PORT >/tmp/gate-multi.txt 2>&1 \
-    && ok "MULTI feature battery" || bad "MULTI feature battery" "see /tmp/gate-multi.txt"
-py tests/blocking.py 127.0.0.1 $PORT >/tmp/gate-blocking.txt 2>&1 \
-    && ok "blocking feature battery" || bad "blocking feature battery" "see /tmp/gate-blocking.txt"
-py tests/pubsub.py 127.0.0.1 $PORT >/tmp/gate-pubsub.txt 2>&1 \
-    && ok "pubsub feature battery" || bad "pubsub feature battery" "see /tmp/gate-pubsub.txt"
-py tests/lua_scripting.py 127.0.0.1 $PORT >/tmp/gate-lua.txt 2>&1 \
-    && ok "Lua feature battery" || bad "Lua feature battery" "see /tmp/gate-lua.txt"
-py tests/notify.py 127.0.0.1 $PORT >/tmp/gate-notify.txt 2>&1 \
+py tests/multi_exec.py 127.0.0.1 $PORT >$TMPDIR/gate-multi.txt 2>&1 \
+    && ok "MULTI feature battery" || bad "MULTI feature battery" "see $TMPDIR/gate-multi.txt"
+py tests/blocking.py 127.0.0.1 $PORT >$TMPDIR/gate-blocking.txt 2>&1 \
+    && ok "blocking feature battery" || bad "blocking feature battery" "see $TMPDIR/gate-blocking.txt"
+py tests/pubsub.py 127.0.0.1 $PORT >$TMPDIR/gate-pubsub.txt 2>&1 \
+    && ok "pubsub feature battery" || bad "pubsub feature battery" "see $TMPDIR/gate-pubsub.txt"
+py tests/lua_scripting.py 127.0.0.1 $PORT >$TMPDIR/gate-lua.txt 2>&1 \
+    && ok "Lua feature battery" || bad "Lua feature battery" "see $TMPDIR/gate-lua.txt"
+py tests/notify.py 127.0.0.1 $PORT >$TMPDIR/gate-notify.txt 2>&1 \
     && ok "keyspace notification battery (atomic 0/1)" \
-    || bad "keyspace notification battery" "see /tmp/gate-notify.txt"
+    || bad "keyspace notification battery" "see $TMPDIR/gate-notify.txt"
 stop
 shutdown_clean \
     && ok "feature battery shutdown invariants" || bad "feature battery shutdown invariants"
@@ -994,32 +1324,21 @@ shutdown_clean \
 #   saturated flips    a one-shot quiesce snapshot once refused ~every flip under 512-conn
 #                      pipelined load while 8-conn tests sailed through; this row flips under
 #                      real saturation and asserts every one APPLIES (live split == requested)
-boot ./build/tomokv --enable-debug-command yes || bad "flip battery boot"
-py tests/flip.py 127.0.0.1 $PORT >/tmp/gate-flip.txt 2>&1 \
-    && ok "FLIP state battery" || bad "FLIP state battery" "see /tmp/gate-flip.txt"
-py tests/flip_under_load.py 127.0.0.1 $PORT 20 >/tmp/gate-flip-load.txt 2>&1 \
-    && ok "FLIP under verified load" || bad "FLIP under verified load" "see /tmp/gate-flip-load.txt"
-py tests/flip_ttl.py 127.0.0.1 $PORT >/tmp/gate-flip-ttl.txt 2>&1 \
-    && ok "FLIP TTL + expiry events" || bad "FLIP TTL + expiry events" "see /tmp/gate-flip-ttl.txt"
-py tests/spinprobe.py $PORT "$SRV" >/tmp/gate-spinprobe.txt 2>&1 \
-    && ok "partial-frame conn parks (no io spin)" || bad "partial-frame conn parks (no io spin)" "see /tmp/gate-spinprobe.txt"
+boot "$CANDIDATE_BINARY" --enable-debug-command yes || bad "flip battery boot"
+py tests/flip.py 127.0.0.1 $PORT >$TMPDIR/gate-flip.txt 2>&1 \
+    && ok "FLIP state battery" || bad "FLIP state battery" "see $TMPDIR/gate-flip.txt"
+py tests/flip_under_load.py 127.0.0.1 $PORT 20 >$TMPDIR/gate-flip-load.txt 2>&1 \
+    && ok "FLIP under verified load" || bad "FLIP under verified load" "see $TMPDIR/gate-flip-load.txt"
+py tests/flip_ttl.py 127.0.0.1 $PORT >$TMPDIR/gate-flip-ttl.txt 2>&1 \
+    && ok "FLIP TTL + expiry events" || bad "FLIP TTL + expiry events" "see $TMPDIR/gate-flip-ttl.txt"
+py tests/spinprobe.py $PORT "$SRV" >$TMPDIR/gate-spinprobe.txt 2>&1 \
+    && ok "partial-frame conn parks (no io spin)" || bad "partial-frame conn parks (no io spin)" "see $TMPDIR/gate-spinprobe.txt"
 stop
-boot ./build/tomokv --ratio 6:2 --atomic 0 --enable-debug-command yes --flip-auto 1 \
-     || bad "flipctl boot"
-# 300 -> 600 s: the stable-hold row now MEASURES its precondition (the driver's own command rate
-# must be stationary by the controller's own band) before its assertion window opens, and re-rolls
-# a hold whose load left that band up to three times inside its own wall budget before failing it.
-# The typical run is unchanged; the worst case adds the re-rolls plus their re-anchor waits.
-timeout 600 python3 tests/flipctl.py --host 127.0.0.1 --port $PORT --stable-seconds 30 \
-    >/tmp/gate-flipctl.txt 2>&1 \
-    && ok "flip controller: ramp gate, hold, surge + mix re-maneuvers" \
-    || bad "flip controller: ramp gate, hold, surge + mix re-maneuvers" \
-           "see /tmp/gate-flipctl.txt"
-stop
-boot ./build/tomokv --enable-debug-command yes || bad "flip battery reboot"
+collect_job flipctl
+boot "$CANDIDATE_BINARY" --enable-debug-command yes || bad "flip battery reboot"
 quiet_wait
 (
-  taskset -c "$CORES" memtier_benchmark -s 127.0.0.1 -p $PORT --protocol=redis -t 8 -c 32 \
+  taskset -c "$LOAD_CORES" memtier_benchmark -s 127.0.0.1 -p $PORT --protocol=redis -t 8 -c 32 \
     --pipeline=16 --ratio=1:1 --key-pattern=R:R --key-minimum=1 --key-maximum=200000 -d 64 \
     --test-time=25 --distinct-client-seed --hide-histogram >/dev/null 2>&1 &
   MTPID=$!
@@ -1030,9 +1349,9 @@ quiet_wait
     TIO=$(( TOTAL * FR / 100 )); [ "$TIO" -lt 2 ] && TIO=2; [ "$TIO" -gt $((TOTAL-2)) ] && TIO=$((TOTAL-2))
     OUT=$(redis-cli -p $PORT flip $TIO $((TOTAL-TIO)) 2>&1); sleep 1
     LIVE=$(redis-cli -p $PORT flip 2>/dev/null | paste - - | awk '/live_io/{print $2; exit}')
-    { [ "$OUT" = "OK" ] && [ "$LIVE" = "$TIO" ]; } || { SATOK=0; echo "flip $TIO refused/missed: '$OUT' live=$LIVE" >>/tmp/gate-flip-sat.txt; }
+    { [ "$OUT" = "OK" ] && [ "$LIVE" = "$TIO" ]; } || { SATOK=0; echo "flip $TIO refused/missed: '$OUT' live=$LIVE" >>$TMPDIR/gate-flip-sat.txt; }
   done
-  kill -9 $MTPID 2>/dev/null
+  kill -9 $MTPID 2>/dev/null; wait "$MTPID" 2>/dev/null
   # The 256 SIGKILLed connections must REAP before shutdown or the drain line reports them as
   # live (observed: live_conns=256 on the oversubscribed gate cores, where io threads are starved
   # at the moment of the kill). Waiting for reaping keeps the shutdown invariant meaningful: dead
@@ -1044,7 +1363,7 @@ quiet_wait
   done
   exit $((1 - SATOK))
 ) && ok "FLIP applies under saturated load" \
-  || bad "FLIP applies under saturated load" "see /tmp/gate-flip-sat.txt"
+  || bad "FLIP applies under saturated load" "see $TMPDIR/gate-flip-sat.txt"
 stop
 # The saturation row kill -9s its memtier, so 256 aborted connections drain at shutdown -- the
 # invariant line lands a beat after stop returns. Poll instead of racing it.
@@ -1063,11 +1382,11 @@ done
 # rate. Floor = 120k on the oversubscribed gate cores; healthy measures ~600k (5x margin), the
 # regression class this catches lands under 70k. Boots the harness posture on purpose -- debug
 # enabled, tripwire NOT armed -- because that is the posture every bench and gate row runs in.
-boot ./build/tomokv --atomic 1 --enable-debug-command yes || bad "atomic mm floor boot"
+boot "$CANDIDATE_BINARY" --atomic 1 --enable-debug-command yes || bad "atomic mm floor boot"
 MM_K8="__key__ __key__ __key__ __key__ __key__ __key__ __key__ __key__"
 MM_M8="__key__ __data__ __key__ __data__ __key__ __data__ __key__ __data__ __key__ __data__ __key__ __data__ __key__ __data__ __key__ __data__"
 quiet_wait
-taskset -c "$CORES" memtier_benchmark -s 127.0.0.1 -p $PORT --protocol=redis -t 4 -c 16 \
+taskset -c "$LOAD_CORES" memtier_benchmark -s 127.0.0.1 -p $PORT --protocol=redis -t 4 -c 16 \
   --pipeline=16 --command="MGET $MM_K8" --command-ratio=9 --command-key-pattern=R \
   --command="MSET $MM_M8" --command-ratio=1 --command-key-pattern=R -d 64 \
   --key-minimum=1 --key-maximum=200000 --test-time=20 --hide-histogram >/dev/null 2>&1 &
@@ -1076,7 +1395,7 @@ sleep 8
 MM_C0=$(redis-cli -p $PORT info stats 2>/dev/null | tr -d '\r' | sed -n 's/^total_commands_processed://p')
 sleep 6
 MM_C1=$(redis-cli -p $PORT info stats 2>/dev/null | tr -d '\r' | sed -n 's/^total_commands_processed://p')
-kill -9 $MMPID 2>/dev/null; wait $MMPID 2>/dev/null
+kill -9 $MMPID 2>/dev/null; wait $MMPID 2>/dev/null; MMPID=0
 MM_RATE=$(( (${MM_C1:-0} - ${MM_C0:-0}) / 6 ))
 [ "$MM_RATE" -ge 120000 ] \
     && ok "atomic MGET/MSET floor (${MM_RATE}/s >= 120k)" \
@@ -1090,30 +1409,30 @@ TWDIS=$(redis-cli -p $PORT debug tripwire disarm 2>&1)
     || bad "tripwire arm/disarm round-trip" "arm='$TWARM' disarm='$TWDIS'"
 # Same boot: pipelined same-connection program order (the seed-19 divergence). Pre-fix this
 # answered stale in ~74% of iterations, so 400 iterations are a decisive non-vacuous roll.
-timeout 120 python3 tests/pipeorder.py $PORT 400 >/tmp/gate-pipeorder.txt 2>&1 \
+timeout 120 python3 tests/pipeorder.py $PORT 400 >$TMPDIR/gate-pipeorder.txt 2>&1 \
     && ok "pipelined same-conn program order (400 rolls)" \
-    || bad "pipelined same-conn program order" "see /tmp/gate-pipeorder.txt"
+    || bad "pipelined same-conn program order" "see $TMPDIR/gate-pipeorder.txt"
 stop
 
 # ---- AOF boot/replay + non-vacuous DEBUG LOADAOF ---------------------------------------------
 for NET_IO in epoll uring; do
 for AOF_ATOMIC in 0 1; do
-AOF_DIR=$(mktemp -d "/tmp/gate-aof-${NET_IO}-atomic${AOF_ATOMIC}.XXXXXX")
+AOF_DIR=$(mktemp -d "$TMPDIR/gate-aof-${NET_IO}-atomic${AOF_ATOMIC}.XXXXXX")
 AOF_STATE=$AOF_DIR/state.json
-boot ./build/tomokv --protected-mode no --atomic "$AOF_ATOMIC" \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic "$AOF_ATOMIC" \
     --appendonly yes --appendfsync no \
     --net-io "$NET_IO" --enable-debug-command yes --dir "$AOF_DIR" \
     || bad "AOF purpose boot ($NET_IO, atomic $AOF_ATOMIC)"
 py tests/knobs.py 127.0.0.1 "$PORT" "$NET_IO" "$AOF_ATOMIC" \
-    >"/tmp/gate-knobs-${NET_IO}-${AOF_ATOMIC}.txt" 2>&1 \
+    >"$TMPDIR/gate-knobs-${NET_IO}-${AOF_ATOMIC}.txt" 2>&1 \
     && ok "configuration reduction + actual geometry ($NET_IO, atomic $AOF_ATOMIC)" \
     || bad "configuration reduction + actual geometry ($NET_IO, atomic $AOF_ATOMIC)"
-py tests/aof.py 127.0.0.1 $PORT populate "$AOF_STATE" >/tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
-    && py tests/aof.py 127.0.0.1 $PORT loadaof "$AOF_STATE" >>/tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
+py tests/aof.py 127.0.0.1 $PORT populate "$AOF_STATE" >$TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
+    && py tests/aof.py 127.0.0.1 $PORT loadaof "$AOF_STATE" >>$TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
     && ok "AOF byte-exact + script groups + DEBUG LOADAOF ($NET_IO, atomic $AOF_ATOMIC)" \
     || bad "AOF byte-exact + script groups + DEBUG LOADAOF ($NET_IO, atomic $AOF_ATOMIC)" \
-           "see /tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt"
-AOF_PRE_MODEL=$(py tests/aof.py 127.0.0.1 $PORT snapshot "$AOF_DIR/dump.tomo" 2>>/tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt)
+           "see $TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt"
+AOF_PRE_MODEL=$(py tests/aof.py 127.0.0.1 $PORT snapshot "$AOF_DIR/dump.tomo" 2>>$TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt)
 AOF_WRITTEN=$(redis-cli -h 127.0.0.1 -p $PORT INFO Persistence 2>/dev/null \
     | tr -d '\r' | sed -n 's/^aof_records_written://p')
 [ -n "$AOF_WRITTEN" ] && [ "$AOF_WRITTEN" -gt 0 ] \
@@ -1121,15 +1440,15 @@ AOF_WRITTEN=$(redis-cli -h 127.0.0.1 -p $PORT INFO Persistence 2>/dev/null \
 kill -KILL $SRV 2>/dev/null
 wait $SRV 2>/dev/null
 settle
-boot ./build/tomokv --protected-mode no --appendonly yes --appendfsync no \
+boot "$CANDIDATE_BINARY" --protected-mode no --appendonly yes --appendfsync no \
     --atomic "$AOF_ATOMIC" --net-io "$NET_IO" \
     --enable-debug-command yes --dir "$AOF_DIR" \
     || bad "AOF replay boot ($NET_IO, atomic $AOF_ATOMIC)"
-py tests/aof.py 127.0.0.1 $PORT verify "$AOF_STATE" >>/tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
+py tests/aof.py 127.0.0.1 $PORT verify "$AOF_STATE" >>$TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt 2>&1 \
     && ok "AOF process-restart script replay ($NET_IO, atomic $AOF_ATOMIC)" \
     || bad "AOF process-restart script replay ($NET_IO, atomic $AOF_ATOMIC)" \
-           "see /tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt"
-AOF_POST_MODEL=$(py tests/aof.py 127.0.0.1 $PORT snapshot "$AOF_DIR/dump.tomo" 2>>/tmp/gate-aof-$NET_IO-$AOF_ATOMIC.txt)
+           "see $TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt"
+AOF_POST_MODEL=$(py tests/aof.py 127.0.0.1 $PORT snapshot "$AOF_DIR/dump.tomo" 2>>$TMPDIR/gate-aof-$NET_IO-$AOF_ATOMIC.txt)
 [ -n "$AOF_PRE_MODEL" ] && [ "$AOF_PRE_MODEL" = "$AOF_POST_MODEL" ] \
     && ok "AOF native snapshot streams byte-exact" || bad "AOF native snapshot streams byte-exact"
 AOF_REPLAYED=$(redis-cli -h 127.0.0.1 -p $PORT INFO Persistence 2>/dev/null \
@@ -1142,63 +1461,63 @@ stop
 done
 
 # ---- AOF atomic-group bracketing + directed interrupted-process recovery ---------------------
-AOF_GROUP_DIR=$(mktemp -d "/tmp/gate-aof-group-${NET_IO}.XXXXXX")
+AOF_GROUP_DIR=$(mktemp -d "$TMPDIR/gate-aof-group-${NET_IO}.XXXXXX")
 AOF_GROUP_STATE=$AOF_GROUP_DIR/state.json
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync no \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync no \
     --net-io "$NET_IO" --enable-debug-command yes --dir "$AOF_GROUP_DIR" \
     || bad "AOF group purpose boot ($NET_IO)"
 py tests/aof_torn_group.py 127.0.0.1 $PORT prepare "$AOF_GROUP_STATE" \
-    >/tmp/gate-aof-group.txt 2>&1 \
+    >$TMPDIR/gate-aof-group.txt 2>&1 \
     && ok "AOF directed group interruption fired" \
-    || bad "AOF directed group interruption" "see /tmp/gate-aof-group.txt"
+    || bad "AOF directed group interruption" "see $TMPDIR/gate-aof-group.txt"
 wait $SRV 2>/dev/null
 settle
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync no \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync no \
     --net-io "$NET_IO" --enable-debug-command yes --dir "$AOF_GROUP_DIR" \
     || bad "AOF group recovery boot ($NET_IO)"
 py tests/aof_torn_group.py 127.0.0.1 $PORT verify "$AOF_GROUP_STATE" \
-    >>/tmp/gate-aof-group.txt 2>&1 \
+    >>$TMPDIR/gate-aof-group.txt 2>&1 \
     && py tests/aof_torn_group.py 127.0.0.1 $PORT scan \
        "$AOF_GROUP_DIR/appendonlydir/appendonly.aof.1.incr.tomo" \
-       >>/tmp/gate-aof-group.txt 2>&1 \
+       >>$TMPDIR/gate-aof-group.txt 2>&1 \
     && ok "AOF atomic-group recovery + writer order" \
-    || bad "AOF atomic-group recovery + writer order" "see /tmp/gate-aof-group.txt"
+    || bad "AOF atomic-group recovery + writer order" "see $TMPDIR/gate-aof-group.txt"
 stop
 shutdown_clean \
     && ok "AOF group shutdown invariants" || bad "AOF group shutdown invariants"
 
 # ---- AOF sync policies, reply gate, idle sync, and durability-window recovery ----------------
-AOF_ALWAYS_DIR=$(mktemp -d "/tmp/gate-aof-always-${NET_IO}.XXXXXX")
+AOF_ALWAYS_DIR=$(mktemp -d "$TMPDIR/gate-aof-always-${NET_IO}.XXXXXX")
 AOF_ALWAYS_STATE=$AOF_ALWAYS_DIR/state.json
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync always \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync always \
     --net-io "$NET_IO" --dir "$AOF_ALWAYS_DIR" \
     || bad "AOF always purpose boot ($NET_IO)"
 py tests/aof_fsync.py 127.0.0.1 $PORT populate "$AOF_ALWAYS_STATE" always 512 \
-    >/tmp/gate-aof-always.txt 2>&1 \
+    >$TMPDIR/gate-aof-always.txt 2>&1 \
     && ok "AOF always sync + reply gate fired" \
-    || bad "AOF always sync + reply gate" "see /tmp/gate-aof-always.txt"
+    || bad "AOF always sync + reply gate" "see $TMPDIR/gate-aof-always.txt"
 kill -KILL $SRV 2>/dev/null
 wait $SRV 2>/dev/null
 settle
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync always \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync always \
     --net-io "$NET_IO" --dir "$AOF_ALWAYS_DIR" \
     || bad "AOF always recovery boot ($NET_IO)"
 py tests/aof_fsync.py 127.0.0.1 $PORT verify "$AOF_ALWAYS_STATE" always 512 \
-    >>/tmp/gate-aof-always.txt 2>&1 \
+    >>$TMPDIR/gate-aof-always.txt 2>&1 \
     && ok "AOF always acknowledged-prefix recovery" \
-    || bad "AOF always acknowledged-prefix recovery" "see /tmp/gate-aof-always.txt"
+    || bad "AOF always acknowledged-prefix recovery" "see $TMPDIR/gate-aof-always.txt"
 stop
 
-AOF_EVERY_DIR=$(mktemp -d "/tmp/gate-aof-everysec-${NET_IO}.XXXXXX")
+AOF_EVERY_DIR=$(mktemp -d "$TMPDIR/gate-aof-everysec-${NET_IO}.XXXXXX")
 AOF_EVERY_STATE=$AOF_EVERY_DIR/state.json
 AOF_EVERY_FILE=$AOF_EVERY_DIR/appendonlydir/appendonly.aof.1.incr.tomo
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync everysec \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync everysec \
     --net-io "$NET_IO" --dir "$AOF_EVERY_DIR" \
     || bad "AOF everysec purpose boot ($NET_IO)"
 py tests/aof_fsync.py 127.0.0.1 $PORT populate "$AOF_EVERY_STATE" everysec 512 \
-    >/tmp/gate-aof-everysec.txt 2>&1 \
+    >$TMPDIR/gate-aof-everysec.txt 2>&1 \
     && ok "AOF everysec write gate + idle sync fired" \
-    || bad "AOF everysec write gate + idle sync" "see /tmp/gate-aof-everysec.txt"
+    || bad "AOF everysec write gate + idle sync" "see $TMPDIR/gate-aof-everysec.txt"
 kill -KILL $SRV 2>/dev/null
 wait $SRV 2>/dev/null
 AOF_EVERY_SIZE=$(stat -c %s "$AOF_EVERY_FILE" 2>/dev/null || echo 0)
@@ -1208,40 +1527,40 @@ case "$AOF_EVERY_FILE" in
   *) bad "AOF everysec tail target" ;;
 esac
 settle
-boot ./build/tomokv --protected-mode no --atomic 1 --appendonly yes --appendfsync everysec \
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 1 --appendonly yes --appendfsync everysec \
     --net-io "$NET_IO" --dir "$AOF_EVERY_DIR" \
     || bad "AOF everysec recovery boot ($NET_IO)"
 py tests/aof_fsync.py 127.0.0.1 $PORT verify "$AOF_EVERY_STATE" everysec 512 \
-    >>/tmp/gate-aof-everysec.txt 2>&1 \
+    >>$TMPDIR/gate-aof-everysec.txt 2>&1 \
     && grep -q "AOF warning: truncated AOF tail" "$SRVLOG" \
     && ok "AOF everysec durability window + tail warning" \
-    || bad "AOF everysec durability window + tail warning" "see /tmp/gate-aof-everysec.txt"
+    || bad "AOF everysec durability window + tail warning" "see $TMPDIR/gate-aof-everysec.txt"
 stop
 
-AOF_NO_DIR=$(mktemp -d "/tmp/gate-aof-no-sync-${NET_IO}.XXXXXX")
-boot ./build/tomokv --protected-mode no --atomic 0 --appendonly yes --appendfsync no \
+AOF_NO_DIR=$(mktemp -d "$TMPDIR/gate-aof-no-sync-${NET_IO}.XXXXXX")
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic 0 --appendonly yes --appendfsync no \
     --net-io "$NET_IO" --dir "$AOF_NO_DIR" \
     || bad "AOF no-sync purpose boot ($NET_IO)"
 py tests/aof_fsync.py 127.0.0.1 $PORT populate "$AOF_NO_DIR/state.json" no 128 \
-    >/tmp/gate-aof-no-sync.txt 2>&1 \
+    >$TMPDIR/gate-aof-no-sync.txt 2>&1 \
     && ok "AOF no-sync bypassed sync + reply gate" \
-    || bad "AOF no-sync bypass" "see /tmp/gate-aof-no-sync.txt"
+    || bad "AOF no-sync bypass" "see $TMPDIR/gate-aof-no-sync.txt"
 stop
 
 quiet_wait
 NET_IO=$NET_IO GATE_PORT=$PORT GATE_CORES=$CORES tests/aof_rewrite_matrix.sh \
-    >/tmp/gate-aof-rewrite.txt 2>&1 \
+    >$TMPDIR/gate-aof-rewrite.txt 2>&1 \
     && ok "AOF rewrite atomic/stage/corruption matrix" \
-    || bad "AOF rewrite matrix" "see /tmp/gate-aof-rewrite.txt"
+    || bad "AOF rewrite matrix" "see $TMPDIR/gate-aof-rewrite.txt"
 
 quiet_wait
 NET_IO=$NET_IO GATE_PORT=$PORT GATE_CORES=$CORES tests/aof_rewrite_trigger_matrix.sh \
-    >/tmp/gate-aof-rewrite-trigger.txt 2>&1 \
+    >$TMPDIR/gate-aof-rewrite-trigger.txt 2>&1 \
     && ok "AOF rewrite triggers + observability matrix" \
-    || bad "AOF rewrite triggers" "see /tmp/gate-aof-rewrite-trigger.txt"
+    || bad "AOF rewrite triggers" "see $TMPDIR/gate-aof-rewrite-trigger.txt"
 
-AOF_OFF_DIR=$(mktemp -d "/tmp/gate-aof-off-${NET_IO}.XXXXXX")
-boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+AOF_OFF_DIR=$(mktemp -d "$TMPDIR/gate-aof-off-${NET_IO}.XXXXXX")
+boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
     --appendonly no --dir "$AOF_OFF_DIR" \
     || bad "AOF-off negative-control boot"
 AOF_OFF_SEED=$(redis-cli -h 127.0.0.1 -p $PORT SET aof-negative-control must-disappear 2>&1 |
@@ -1253,7 +1572,7 @@ AOF_OFF_PRE_SIZE=$(redis-cli -h 127.0.0.1 -p $PORT DBSIZE 2>/dev/null | tr -d '\
 kill -KILL $SRV 2>/dev/null
 wait $SRV 2>/dev/null
 settle
-boot ./build/tomokv --protected-mode no --net-io "$NET_IO" \
+boot "$CANDIDATE_BINARY" --protected-mode no --net-io "$NET_IO" \
     --appendonly no --dir "$AOF_OFF_DIR" \
     || bad "AOF-off negative-control reboot"
 AOF_OFF_SIZE=$(redis-cli -h 127.0.0.1 -p $PORT DBSIZE 2>/dev/null | tr -d '\r')
@@ -1271,34 +1590,34 @@ done
 # battery, 0 of 117 on uring) and where the window is entered reliably enough for the row to prove
 # its mechanism fired. The battery FAILS on a build with the guard removed (6 of 6).
 for AOF_FRAME_ATOMIC in 0 1; do
-AOF_FRAME_DIR=$(mktemp -d "/tmp/gate-aof-frameorder-atomic${AOF_FRAME_ATOMIC}.XXXXXX")
-boot ./build/tomokv --protected-mode no --atomic "$AOF_FRAME_ATOMIC" --appendonly yes \
+AOF_FRAME_DIR=$(mktemp -d "$TMPDIR/gate-aof-frameorder-atomic${AOF_FRAME_ATOMIC}.XXXXXX")
+boot "$CANDIDATE_BINARY" --protected-mode no --atomic "$AOF_FRAME_ATOMIC" --appendonly yes \
     --appendfsync no --net-io epoll --auto-aof-rewrite-percentage 0 \
     --enable-debug-command yes --dir "$AOF_FRAME_DIR" \
     || bad "AOF frame-order purpose boot (atomic $AOF_FRAME_ATOMIC)"
 py tests/aof_frame_order.py 127.0.0.1 $PORT "$AOF_FRAME_DIR/appendonlydir" \
-    >/tmp/gate-aof-frameorder-$AOF_FRAME_ATOMIC.txt 2>&1 \
+    >$TMPDIR/gate-aof-frameorder-$AOF_FRAME_ATOMIC.txt 2>&1 \
     && ok "AOF control frame never inside a large record (atomic $AOF_FRAME_ATOMIC)" \
     || bad "AOF control frame never inside a large record (atomic $AOF_FRAME_ATOMIC)" \
-           "see /tmp/gate-aof-frameorder-$AOF_FRAME_ATOMIC.txt"
+           "see $TMPDIR/gate-aof-frameorder-$AOF_FRAME_ATOMIC.txt"
 stop
 done
 
 # ---- TLS memory-BIO transport: independent listener, auth matrix, parser/teardown fences -------
 TLS_PORT=$((PORT+1))
-TLS_DIR=$(mktemp -d /tmp/gate-tls.XXXXXX)
-py tests/tls.py --generate "$TLS_DIR" >/tmp/gate-tls-generate.txt 2>&1 \
+TLS_DIR=$(mktemp -d $TMPDIR/gate-tls.XXXXXX)
+py tests/tls.py --generate "$TLS_DIR" >$TMPDIR/gate-tls-generate.txt 2>&1 \
     && ok "TLS ephemeral CA/server/client certificates" \
-    || bad "TLS certificate generation" "see /tmp/gate-tls-generate.txt"
+    || bad "TLS certificate generation" "see $TMPDIR/gate-tls-generate.txt"
 
-./build/tomokv --port 0 --tls-port "$TLS_PORT" --tls-key-file "$TLS_DIR/server.key" \
+reject_boot --port 0 --tls-port "$TLS_PORT" --tls-key-file "$TLS_DIR/server.key" \
     --tls-auth-clients no 2>&1 | grep -q "tls-port requires tls-cert-file" \
     && ok "reject TLS listener without certificate" || bad "reject missing TLS certificate"
-./build/tomokv --port 0 --tls-port "$TLS_PORT" --tls-cert-file "$TLS_DIR/server.crt" \
+reject_boot --port 0 --tls-port "$TLS_PORT" --tls-cert-file "$TLS_DIR/server.crt" \
     --tls-key-file "$TLS_DIR/server.key" --tls-auth-clients no --tls-protocols SSLv3 \
     2>&1 | grep -q "Invalid tls-protocols" \
     && ok "reject invalid tls-protocols" || bad "reject invalid tls-protocols"
-./build/tomokv --port 0 --tls-port "$TLS_PORT" --tls-cert-file "$TLS_DIR/server.crt" \
+reject_boot --port 0 --tls-port "$TLS_PORT" --tls-cert-file "$TLS_DIR/server.crt" \
     --tls-key-file "$TLS_DIR/server.key" --tls-auth-clients no --tls-ciphers NOT-A-CIPHER \
     2>&1 | grep -q "Failed to configure tls-ciphers" \
     && ok "reject invalid tls-ciphers" || bad "reject invalid tls-ciphers"
@@ -1309,9 +1628,9 @@ tlsboot(){ # auth-mode [extra TLS knobs]
   SRV=0; SRVLOG=/dev/null
   guard_port "$PORT"
   guard_port "$TLS_PORT"
-  SRVLOG=$(mktemp /tmp/gate-tls-srv.XXXXXX)
-  taskset -c $CORES ./build/tomokv --port "$PORT" --tls-port "$TLS_PORT" \
-      --bind 127.0.0.1 --shards 16 --ratio "$GATE_RATIO" --protected-mode no \
+  SRVLOG=$(mktemp $TMPDIR/gate-tls-srv.XXXXXX)
+  taskset -c $CORES "$CANDIDATE_BINARY" --port "$PORT" --tls-port "$TLS_PORT" \
+      --bind 127.0.0.1 --shards 16 --ratio "$GATE_RATIO" --protected-mode no --dir "$TLS_DIR" \
       --tls-cert-file "$TLS_DIR/server.crt" --tls-key-file "$TLS_DIR/server.key" \
       --tls-ca-cert-file "$TLS_DIR/ca.crt" --tls-auth-clients "$auth" "$@" \
       >"$SRVLOG" 2>&1 &
@@ -1327,8 +1646,8 @@ tlsboot(){ # auth-mode [extra TLS knobs]
 
 tlsboot yes || bad "TLS client-auth yes purpose boot"
 py tests/tls.py 127.0.0.1 "$TLS_PORT" "$TLS_DIR" yes --plain-port "$PORT" \
-    >/tmp/gate-tls-yes.txt 2>&1 \
-    && ok "TLS client-auth yes matrix" || bad "TLS client-auth yes matrix" "see /tmp/gate-tls-yes.txt"
+    >$TMPDIR/gate-tls-yes.txt 2>&1 \
+    && ok "TLS client-auth yes matrix" || bad "TLS client-auth yes matrix" "see $TMPDIR/gate-tls-yes.txt"
 stop
 shutdown_clean \
     && ok "TLS yes shutdown invariants" || bad "TLS yes shutdown invariants"
@@ -1337,13 +1656,13 @@ shutdown_clean \
 
 tlsboot optional || bad "TLS client-auth optional purpose boot"
 py tests/tls.py 127.0.0.1 "$TLS_PORT" "$TLS_DIR" optional --plain-port "$PORT" \
-    >/tmp/gate-tls-optional.txt 2>&1 \
+    >$TMPDIR/gate-tls-optional.txt 2>&1 \
     && ok "TLS client-auth optional matrix" \
-    || bad "TLS client-auth optional matrix" "see /tmp/gate-tls-optional.txt"
+    || bad "TLS client-auth optional matrix" "see $TMPDIR/gate-tls-optional.txt"
 # Live kTLS engagement proof on the default boot: a plain TLS client connects and
 # must see itself counted in the active gauge. Client-auth 'optional' permits a cert-less client.
-python3 - "$TLS_PORT" "$TLS_DIR" <<'PYEOF' >/tmp/gate-ktls-live.txt 2>&1 \
-    && ok "kTLS engaged live (default boot)" || bad "kTLS engaged live" "see /tmp/gate-ktls-live.txt"
+python3 - "$TLS_PORT" "$TLS_DIR" <<'PYEOF' >$TMPDIR/gate-ktls-live.txt 2>&1 \
+    && ok "kTLS engaged live (default boot)" || bad "kTLS engaged live" "see $TMPDIR/gate-ktls-live.txt"
 import socket, ssl, sys, time
 port, certdir = int(sys.argv[1]), sys.argv[2]
 ctx = ssl.create_default_context(cafile=f"{certdir}/ca.crt")
@@ -1366,9 +1685,9 @@ tlsboot no --tls-protocols "TLSv1.2 TLSv1.3" --tls-ciphers ECDHE-RSA-AES256-SHA3
     --tls-ciphersuites TLS_AES_256_GCM_SHA384 --tls-prefer-server-ciphers yes \
     || bad "TLS coexistence purpose boot"
 py tests/tls.py 127.0.0.1 "$TLS_PORT" "$TLS_DIR" no --plain-port "$PORT" --full \
-    --expect-ktls no >/tmp/gate-tls-full.txt 2>&1 \
+    --expect-ktls no >$TMPDIR/gate-tls-full.txt 2>&1 \
     && ok "TLS pipeline/torn-record/coexistence battery" \
-    || bad "TLS correctness battery" "see /tmp/gate-tls-full.txt"
+    || bad "TLS correctness battery" "see $TMPDIR/gate-tls-full.txt"
 stop
 shutdown_clean \
     && ok "TLS shutdown invariants" || bad "TLS shutdown invariants"
@@ -1388,24 +1707,26 @@ TLS_ZC=$(shutdown_value tls.zc_suppressed)
 # --overlap {0,1}, --reorder {0,1}, --flip-auto {0,1} in the full 32-way product, and explicitly
 # sets both values of --atomic, --key-lb, --client-lb across it. The last three rows exercise
 # --shards {-1,1,16,256}, --ratio, --place, --shard-home (including empty owners), and --no-pin.
-# Unsupported combinations are FAIL, never expected rejections. Every boot has fired-mechanism
-# assertions; the Python inventory assertion refuses a missing value/product entry. See GATES.md.
+# The eight fused + flip-auto=1 cells must refuse the exact documented unsupported combination;
+# all other cells must boot and fire their mechanisms. These existing refusal checks remain
+# mandatory: accepting the combination or refusing for another reason is a failure. The Python
+# inventory assertion refuses a missing value/product entry. See GATES.md.
 FEATURE_OUTPUT=${GATE_FEATURE_OUTPUT:-$(mktemp -d "$PWD/build/gate-feature.XXXXXX")}
 for FM in 1s 2s; do
   for FR in 0 1; do for FO in 0 1; do for FQ in 0 1; do for FF in 0 1; do
     FEATURE_CELL=$FM-$FR-$FO-$FQ-$FF
-    py tests/feature_gate.py --cell "$FEATURE_CELL" --binary ./build/tomokv \
+    py tests/feature_gate.py --cell "$FEATURE_CELL" --binary "$CANDIDATE_BINARY" \
         --server-cpus "$CORES" --load-cpus "${GATE_LOAD_CORES:-96-127}" --ratio "$GATE_RATIO" \
-        --port "${GATE_FEATURE_PORT:-8620}" --output "$FEATURE_OUTPUT" \
+        --port "$PORT" --output "$FEATURE_OUTPUT" \
         >"$FEATURE_OUTPUT/$FEATURE_CELL.log" 2>&1 \
         && ok "feature $FEATURE_CELL" \
         || bad "feature $FEATURE_CELL" "see $FEATURE_OUTPUT/$FEATURE_CELL.log"
   done; done; done; done
 done
 for FEATURE_CELL in split-home-min fused-home-max-nopin split-shards-auto; do
-  py tests/feature_gate.py --cell "$FEATURE_CELL" --binary ./build/tomokv \
+  py tests/feature_gate.py --cell "$FEATURE_CELL" --binary "$CANDIDATE_BINARY" \
       --server-cpus "$CORES" --load-cpus "${GATE_LOAD_CORES:-96-127}" --ratio "$GATE_RATIO" \
-      --port "${GATE_FEATURE_PORT:-8620}" --output "$FEATURE_OUTPUT" \
+      --port "$PORT" --output "$FEATURE_OUTPUT" \
       >"$FEATURE_OUTPUT/$FEATURE_CELL.log" 2>&1 \
       && ok "feature $FEATURE_CELL" \
       || bad "feature $FEATURE_CELL" "see $FEATURE_OUTPUT/$FEATURE_CELL.log"
@@ -1413,13 +1734,15 @@ done
 
 # The ABBA tier's own decision logic, saturation rules and rejection paths, exercised serverless so
 # a broken comparator is caught on any machine and before any measurement is trusted.
-py tests/abbagate.py --self-test > /tmp/gate-abbagate-unit.txt 2>&1 \
+py tests/abbagate.py --self-test > $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && ok "ABBA comparison + saturation negative controls" \
-    || bad "ABBA comparison + saturation negative controls" "see /tmp/gate-abbagate-unit.txt"
+    || bad "ABBA comparison + saturation negative controls" "see $TMPDIR/gate-abbagate-unit.txt"
 
 if [ "$TIER" = quick ]; then
+  join_workers
+  phase end
   program_state "$EXPECT_QUICK"
-  echo; echo "GATE(quick): $PASS ok, $FAIL FAIL"; [ $FAIL -eq 0 ] || exit 1; exit 0
+  echo; echo "GATE(quick): $PASS ok, $FAIL FAIL (wall $((SECONDS-GATE_STARTED))s)"; [ $FAIL -eq 0 ] || exit 1; exit 0
 fi
 
 # ---- B. mandatory headline performance: ABBA vs the LAST PUSHED BINARY ------------------------
@@ -1431,24 +1754,18 @@ fi
 # failure threshold derived from the reference's own observed spread rather than a fixed
 # percentage. A missing reference is a loud SKIP that still cannot exit green.
 # Rationale and the full contract: the module docstring in tests/abbagate.py.
-quiet_wait
-python3 tests/abbagate.py
-ABBA_RC=$?
-case "$ABBA_RC" in
-  0) ok "headline ABBA vs last pushed binary";;
-  3) bad "headline ABBA vs last pushed binary" "SKIPPED -- NOT A PASS; see ABBA output";;
-  *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
-esac
+# Reserve this canonical row position; measurement starts only after the correctness barrier.
+ABBA_PREFIX_ROWS=$(wc -l < "$LEDGER")
 
 # ---- 4. full tier: torture under ASAN ---------------------------------------------------------
 boot $ASAN --atomic 1 --enable-debug-command yes || bad "ASAN boot"
-py tests/torture.py 127.0.0.1 $PORT >/tmp/gate-tort-asan.txt 2>&1 \
+py tests/torture.py 127.0.0.1 $PORT >$TMPDIR/gate-tort-asan.txt 2>&1 \
     && ok "torture under ASAN" || bad "torture under ASAN"
-py tests/ryow.py 127.0.0.1 $PORT >/tmp/gate-ryow-asan.txt 2>&1 \
+py tests/ryow.py 127.0.0.1 $PORT >$TMPDIR/gate-ryow-asan.txt 2>&1 \
     && ok "RYOW under ASAN" || bad "RYOW under ASAN"
 # Deliberately omit --release-build: coverage/safety checks remain mandatory, including the
 # derived-window witnesses; promotion timing prints without scoring its release budget.
-py tests/atomic_torn.py 127.0.0.1 $PORT >/tmp/gate-atomic-torn-asan.txt 2>&1 \
+py tests/atomic_torn.py 127.0.0.1 $PORT >$TMPDIR/gate-atomic-torn-asan.txt 2>&1 \
     && ok "atomic torn/window under ASAN" || bad "atomic torn/window under ASAN"
 # --no-rate-assertions: the battery's overlap section makes one claim about SPEED (pipelining 24
 # atomic groups beats 24 serial round trips by >10%). ASAN does not slow the two arms by the same
@@ -1458,7 +1775,7 @@ py tests/atomic_torn.py 127.0.0.1 $PORT >/tmp/gate-atomic-torn-asan.txt 2>&1 \
 # so a younger cross-key group WAS in flight while an older one decided) still runs on this tier,
 # and the measured rates are still printed in the log.
 py tests/atomic_ryow.py 127.0.0.1 $PORT --no-rate-assertions \
-    >/tmp/gate-atomic-ryow-asan.txt 2>&1 \
+    >$TMPDIR/gate-atomic-ryow-asan.txt 2>&1 \
     && ok "atomic RYOW under ASAN" || bad "atomic RYOW under ASAN"
 stop
 # "No ASAN report" is a finding only if the ASAN server actually ran to its shutdown dump; an
@@ -1470,39 +1787,39 @@ else bad "ASAN clean" "ASAN server never reached its shutdown dump; see $SRVLOG"
 # ---- CLIENT REPLY OFF/SKIP + cross-shard MGET on a zero-copy boot: suppressed replies leave nothing on the
 # wire and release their borrows (regression for the partial-array leak fixed on the netwb lane) ------------
 for RA in 0 1; do
-  boot ./build/tomokv --shards 64 --zc-min 64 --atomic $RA --enable-debug-command yes || bad "replyoff boot (atomic $RA)"
-  py tests/replyoff_xshard.py 127.0.0.1 $PORT >/tmp/gate-replyoff-$RA.txt 2>&1 \
+  boot "$CANDIDATE_BINARY" --shards 64 --zc-min 64 --atomic $RA --enable-debug-command yes || bad "replyoff boot (atomic $RA)"
+  py tests/replyoff_xshard.py 127.0.0.1 $PORT >$TMPDIR/gate-replyoff-$RA.txt 2>&1 \
       && ok "CLIENT REPLY OFF/SKIP cross-shard MGET wire silence (atomic $RA)" \
-      || bad "CLIENT REPLY OFF/SKIP cross-shard MGET wire silence (atomic $RA)" "see /tmp/gate-replyoff-$RA.txt"
+      || bad "CLIENT REPLY OFF/SKIP cross-shard MGET wire silence (atomic $RA)" "see $TMPDIR/gate-replyoff-$RA.txt"
   stop
 done
 
 # ---- 4b. full tier: zero-copy borrow lifetime (release+ASAN) ----------------------------------
 zcboot(){
   quiet_wait
-  tools/quietcheck.sh "${GATE_CORES:-192-199}" "$PORT" 2>/tmp/gate-quiet.err || {
+  tools/quietcheck.sh "${GATE_CORES:-192-199}" "$PORT" 2>$TMPDIR/gate-quiet.err || {
     sleep 3
-    tools/quietcheck.sh "${GATE_CORES:-192-199}" "$PORT" 2>>/tmp/gate-quiet.err || {
-      echo "boot preflight: cores/port not quiet: $(tail -1 /tmp/gate-quiet.err)"; return 1; }
+    tools/quietcheck.sh "${GATE_CORES:-192-199}" "$PORT" 2>>$TMPDIR/gate-quiet.err || {
+      echo "boot preflight: cores/port not quiet: $(tail -1 $TMPDIR/gate-quiet.err)"; return 1; }
   }
   SRV=0; SRVLOG=/dev/null
   guard_port "$PORT"
-  SRVLOG=$(mktemp /tmp/gate-srv-zc.XXXXXX)
+  SRVLOG=$(mktemp $TMPDIR/gate-srv-zc.XXXXXX)
   timeout 900 taskset -c $CORES "$1" --port $PORT --bind 127.0.0.1 --shards 16 --ratio $GATE_RATIO \
-      --zc-min 16384 > "$SRVLOG" 2>&1 &
+      --dir "$(mktemp -d "$TMPDIR/zc-data.XXXXXX")" --zc-min 16384 > "$SRVLOG" 2>&1 &
   SRV=$!
   for _ in $(seq 50); do
     if ! kill -0 "$SRV" 2>/dev/null; then wait "$SRV" 2>/dev/null; return 1; fi
     (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null && return 0; sleep 0.2; done
   return 1
 }
-zcboot ./build/tomokv || bad "zc boot"
-py tests/zc.py 127.0.0.1 $PORT >/tmp/gate-zc.txt 2>&1     && ok "zc borrow battery" || bad "zc borrow battery" "see /tmp/gate-zc.txt"
+zcboot "$CANDIDATE_BINARY" || bad "zc boot"
+py tests/zc.py 127.0.0.1 $PORT >$TMPDIR/gate-zc.txt 2>&1     && ok "zc borrow battery" || bad "zc borrow battery" "see $TMPDIR/gate-zc.txt"
 stop
 ZS=$(shutdown_value wb.zc_sends)
 [ -n "$ZS" ] && [ "$ZS" -gt 0 ] && ok "zc fired (zc_sends=$ZS)" || bad "zc fired"
 zcboot $ASAN || bad "zc ASAN boot"
-py tests/zc.py 127.0.0.1 $PORT >/tmp/gate-zc-asan.txt 2>&1     && ok "zc borrow battery under ASAN" || bad "zc borrow battery under ASAN"
+py tests/zc.py 127.0.0.1 $PORT >$TMPDIR/gate-zc-asan.txt 2>&1     && ok "zc borrow battery under ASAN" || bad "zc borrow battery under ASAN"
 stop
 if grep -q "ERROR: AddressSanitizer" "$SRVLOG"; then bad "zc ASAN clean" "see $SRVLOG"
 elif shutdown_present; then ok "zc ASAN clean"
@@ -1520,13 +1837,13 @@ else bad "zc ASAN clean" "ASAN server never reached its shutdown dump; see $SRVL
 # key often enough to cycle a block through put -> grace -> take, and its key distribution is flat
 # enough that the load balancer moves no shards at all. So this row supplies both missing halves:
 # a debug build that states the ownership laws as assertions, and traffic that forces shard moves.
-RLDBG=/tmp/tomokv-gate-rlcachedbg
-pausable tests/parbuild.sh $RLDBG /tmp/gate-obj-rlcachedbg \
+RLDBG="$PWD/build/gate-cache/tomokv-rlcachedbg"
+pausable taskset -c "$BUILD_CORES" tests/parbuild.sh $RLDBG "$PWD/build/gate-cache/obj-rlcachedbg" \
     "-std=c++20 -O2 -g -march=native -pthread -DTOMO_JEMALLOC -DTOMO_RL_CACHE_DEBUG -I." \
     "-ljemalloc -luring -pthread -lssl -lcrypto -lm" \
-    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>/tmp/gate-rlcachedbg-build.txt \
+    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>$TMPDIR/gate-rlcachedbg-build.txt \
     && ok "read-local ownership-invariant build" \
-    || bad "read-local ownership-invariant build" "see /tmp/gate-rlcachedbg-build.txt"
+    || bad "read-local ownership-invariant build" "see $TMPDIR/gate-rlcachedbg-build.txt"
 quiet_wait
 # More shards than workers permit ownership movement. The automatic balancer must move shards;
 # the battery's existing positive-movement assertion remains mandatory under the derived policy.
@@ -1535,9 +1852,9 @@ if boot_fused $RLDBG --shards 64 --atomic 1 --read-local 1 --enable-debug-comman
   # cache actually held blocks, and -- the precondition for this whole class of defect -- the load
   # balancer MOVED shards during the run.
   py tests/rlcache_churn.py 127.0.0.1 $PORT "${GATE_RLCACHE_SECONDS:-25}" 48 \
-      >/tmp/gate-rlcache-churn.txt 2>&1 \
+      >$TMPDIR/gate-rlcache-churn.txt 2>&1 \
       && ok "armed block-cache churn battery" \
-      || bad "armed block-cache churn battery" "see /tmp/gate-rlcache-churn.txt"
+      || bad "armed block-cache churn battery" "see $TMPDIR/gate-rlcache-churn.txt"
   stop
   if grep -q 'RLSINK-VIOLATION\|RLCACHE-VIOLATION\|RLRING-VIOLATION' "$SRVLOG"; then
     bad "read-local ownership invariants" "see $SRVLOG"
@@ -1554,14 +1871,7 @@ fi
 # ---- 4c. full tier: byte-exact differential matrix against pinned vanilla Redis 7.4 ----------
 # The helper discovers the ordinary suites from differ.py's gens registry, adds the two special
 # early-exit suites, and runs serially because this gate owns only one target/oracle port pair.
-DIFFER_ORACLE_PORT=${GATE_DIFFER_ORACLE_PORT:-$((PORT+1))}
-quiet_wait
-if GATE_DIFFER_ORACLE_CORES=${GATE_DIFFER_ORACLE_CORES:-$CORES} \
-    tests/differ_gate.sh ./build/tomokv "$PORT" "$DIFFER_ORACLE_PORT" "$CORES" "$GATE_RATIO"; then
-  ok "Redis 7.4 differential matrix"
-else
-  bad "Redis 7.4 differential matrix"
-fi
+collect_job differ-split
 
 # ---- 4c-bis. the same matrix in the ARMED-FUSED geometry ---------------------------------------
 # The row above boots the target split, with the read-local lane disarmed, which is the shape the
@@ -1572,13 +1882,7 @@ fi
 # binary the other way and runs the same matrix; differ_gate.sh's own non-vacuity check refuses to
 # report a pass unless read_local_hits actually advanced, so an accidentally-disarmed boot is a
 # FAIL rather than a quiet green.
-if GATE_DIFFER_GEOMETRY=armed-fused \
-    GATE_DIFFER_ORACLE_CORES=${GATE_DIFFER_ORACLE_CORES:-$CORES} \
-    tests/differ_gate.sh ./build/tomokv "$PORT" "$DIFFER_ORACLE_PORT" "$CORES" "$GATE_RATIO"; then
-  ok "Redis 7.4 differential matrix (armed fused + read-local)"
-else
-  bad "Redis 7.4 differential matrix (armed fused + read-local)"
-fi
+collect_job differ-armed
 
 # ---- 4d. full tier: glob / scan-cursor grammar parity -----------------------------------------
 # The differential matrix above generates COMMANDS, so it only reaches the glob patterns its
@@ -1587,24 +1891,54 @@ fi
 # -- plus the cursor and ACL LOG count grammars. It carries its own negative control: the ACL rows
 # are permission-WIDENING checks, which every allow-path test passes by construction.
 GLOBCASE_ORACLE_PORT=${GATE_GLOBCASE_ORACLE_PORT:-$((PORT+2))}
-if boot ./build/tomokv; then
+if boot "$CANDIDATE_BINARY"; then
   taskset -c ${GATE_DIFFER_ORACLE_CORES:-$CORES} \
       "${GATE_DIFFER_ORACLE_BIN:-$REDIS74_ROOT/src/redis-server}" \
-      --port "$GLOBCASE_ORACLE_PORT" --bind 127.0.0.1 --save '' --appendonly no \
-      >/tmp/gate-globcase-oracle.txt 2>&1 &
+      --port "$GLOBCASE_ORACLE_PORT" --bind 127.0.0.1 --save '' --appendonly no --dir "$(mktemp -d "$TMPDIR/glob-data.XXXXXX")" \
+      >$TMPDIR/gate-globcase-oracle.txt 2>&1 &
   GLOBCASE_ORACLE=$!
   for _ in $(seq 60); do
     (exec 3<>/dev/tcp/127.0.0.1/$GLOBCASE_ORACLE_PORT) 2>/dev/null && break; sleep 0.25
   done
   py tests/globcase.py 127.0.0.1 "$PORT" 127.0.0.1 "$GLOBCASE_ORACLE_PORT" \
-      >/tmp/gate-globcase.txt 2>&1 \
+      >$TMPDIR/gate-globcase.txt 2>&1 \
       && ok "glob/scan grammar parity vs Redis 7.4" \
-      || bad "glob/scan grammar parity vs Redis 7.4" "see /tmp/gate-globcase.txt"
-  kill -TERM $GLOBCASE_ORACLE 2>/dev/null; wait $GLOBCASE_ORACLE 2>/dev/null
+      || bad "glob/scan grammar parity vs Redis 7.4" "see $TMPDIR/gate-globcase.txt"
+  kill -TERM $GLOBCASE_ORACLE 2>/dev/null; wait $GLOBCASE_ORACLE 2>/dev/null; GLOBCASE_ORACLE=0
   stop
 else
   bad "glob/scan grammar parity vs Redis 7.4" "target boot failed"
 fi
+
+# Every worker has reaped its servers before this barrier returns. No build, correctness
+# driver, or background server can overlap ABBA. Its row is spliced into its historical position.
+join_workers
+phase abba-begin
+ABBA_LEDGER=$LEDGER
+ABBA_TIMINGS=$TIMINGS
+LEDGER="$RUN_DIR/abba.ledger"; TIMINGS="$RUN_DIR/abba.timings"; : > "$LEDGER"; : > "$TIMINGS"
+ROW_T=$(date +%s.%N)
+quiet_wait
+# Bash defers a TERM trap while waiting for a foreground external command. An explicit wait on
+# our tracked background child is interruptible, so stopping the gate reaches ABBA's cleanup.
+python3 tests/abbagate.py "${ABBA_ARGS[@]}" &
+ABBA_PID=$!
+wait "$ABBA_PID"
+ABBA_RC=$?
+ABBA_PID=0
+case "$ABBA_RC" in
+  0) ok "headline ABBA vs last pushed binary";;
+  3) bad "headline ABBA vs last pushed binary" "SKIPPED -- NOT A PASS; see ABBA output";;
+  *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
+esac
+
+phase abba-end
+LEDGER=$ABBA_LEDGER; TIMINGS=$ABBA_TIMINGS
+{ head -n "$ABBA_PREFIX_ROWS" "$LEDGER"; cat "$RUN_DIR/abba.ledger";
+  tail -n +"$((ABBA_PREFIX_ROWS+1))" "$LEDGER"; } > "$RUN_DIR/assembled.ledger"
+mv "$RUN_DIR/assembled.ledger" "$LEDGER"
+cat "$RUN_DIR/abba.timings" >> "$TIMINGS"
+ROW_T=$(date +%s.%N)
 
 # ---- 5. full tier: NIC regression cells vs pinned refs ----------------------------------------
 SPD=${GATE_SCRATCH:-/tmp/claude-1000/-home-user-Projects/ee6eb242-5302-49cf-b767-1a2d8d8f0f61/scratchpad}
@@ -1620,10 +1954,52 @@ if [ -f tests/niclib.sh ] && [ -f "$SPD/procsafe.sh" ] && [ -f tests/gate_refs.t
   fi
   ( set -u
     . tests/niclib.sh; . "$SPD/procsafe.sh"
-    NIC_PORT=6380; NIC_CLI_BIN=$SPD/bins/cli; BL_LOGDIR=$(mktemp -d)
+    NIC_PORT=$PORT; NIC_CLI_BIN=$SPD/bins/cli; BL_LOGDIR=$(mktemp -d)
     nic_assert_link || exit 9
+    # These stored-reference cells keep their original thread, ratio, shard and load geometry.
+    # Reuse the pinned CPU IDs when allowed; otherwise remap the same physical CPU counts into
+    # the phase's pools. Explicit SMT remains unused here because adding it would change those
+    # pinned geometries. Validate EVERY cell before booting any: a smaller budget must not run a
+    # partial reference matrix or escape its allocation to reach the 32-server/64-load cell.
+    python3 - "$PERF_SERVER_CORES" "$PERF_LOAD_CORES" tests/gate_refs.txt \
+        > "$BL_LOGDIR/refs.tsv" <<'PY' || exit 1
+import sys
+from pathlib import Path
+sys.path.insert(0, 'tests')
+from gateplan import cpu_string, parse_cpu_range, validate_axes
+
+try:
+    pools = validate_axes(sys.argv[1], '', sys.argv[2], '')
+    rows = []
+    for lineno, line in enumerate(Path(sys.argv[3]).read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        fields = line.split()
+        if len(fields) != 10:
+            raise ValueError(f'{sys.argv[3]}:{lineno}: expected ten reference fields')
+        for field, axis in ((1, 'server_cores'), (5, 'load_cores')):
+            pinned = parse_cpu_range(fields[field])
+            allowed = pools[axis]
+            if len(allowed) < len(pinned):
+                raise ValueError(f'{fields[0]} needs {len(pinned)} {axis.replace("_", " ")} '
+                                 f'but the supplied measurement pool has {len(allowed)}; '
+                                 'the reference geometry cannot fit this budget')
+            chosen = pinned if set(pinned).issubset(allowed) else allowed[:len(pinned)]
+            if chosen != pinned:
+                print(f'  NIC {fields[0]} {axis}: {cpu_string(pinned)} -> {cpu_string(chosen)}; '
+                      'WARN stored reference is provisional after CPU remapping '
+                      '(LLC/IRQ locality may differ; no reference was re-pinned)', file=sys.stderr)
+            fields[field] = cpu_string(chosen)
+        rows.append('\t'.join(fields))
+    if not rows:
+        raise ValueError('NIC reference matrix contains no cells')
+    print('\n'.join(rows))
+except (ValueError, OSError) as exc:
+    print(f'  NIC resource preflight FAIL: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY
     nic_tune >/dev/null 2>&1 || true
-    CPP=$(pwd)/build/tomokv; KMAX=2000000
+    CPP="$CANDIDATE_BINARY"; KMAX=2000000
     run_cell(){ # name cores ratio shards pipe lg t conns ratio_rw
       nic_kill_srv $NIC_PORT || return 1
       # --protected-mode no: protected mode (vanilla-compat: no bind check) denies non-local
@@ -1653,7 +2029,7 @@ status = "ok" if d >= -3.0 else "FAIL"
 print(f"  regression {name:<28} {got/1e6:.2f}M vs ref {ref/1e6:.2f}M ({d:+.1f}%)  {status}")
 sys.exit(0 if d >= -3.0 else 1)
 PY
-    done < tests/gate_refs.txt
+    done < "$BL_LOGDIR/refs.tsv"
     nic_kill_srv $NIC_PORT || RC=1
     exit $RC
   )
@@ -1666,7 +2042,8 @@ else
   say "NIC regression cells" "SKIPPED (no rig/refs)"
 fi
 
+phase end
 program_state "$((EXPECT_FULL+NIC_CHECKED))"
 echo
-echo "GATE(full): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED)"
+echo "GATE(full): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED, wall $((SECONDS-GATE_STARTED))s)"
 [ $FAIL -eq 0 ] || exit 1

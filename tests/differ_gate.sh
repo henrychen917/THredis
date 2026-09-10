@@ -4,11 +4,15 @@
 set -u
 cd "$(dirname "$0")/.."
 
-TARGET_BIN=${1:-./build/tomokv}
+TARGET_BIN=${1:-${GATE_CANDIDATE_BINARY:-./build/tomokv}}
 TARGET_PORT=${2:-${GATE_PORT:-7899}}
 ORACLE_PORT=${3:-${GATE_DIFFER_ORACLE_PORT:-$((TARGET_PORT+1))}}
 TARGET_CORES=${4:-${GATE_CORES:-0-7}}
 TARGET_RATIO=${5:-${GATE_DIFFER_RATIO:-6:2}}
+# The gate gives each matrix a disjoint server/load allocation. Keep the old standalone
+# default, but never move its clients back onto the server cores when a load set was supplied.
+LOAD_CORES=${GATE_LOAD_CORES:-$TARGET_CORES}
+[ -z "${GATE_LOAD_CORES:-}" ] || taskset -pc "$GATE_LOAD_CORES" "$$" >/dev/null
 # TARGET GEOMETRY. `split` is the canonical production shape this matrix has always used: two
 # thread roles at TARGET_RATIO with the read-local lane disarmed. `armed-fused` boots the same
 # binary the other way -- one fused role, --read-local 1 -- because the whole read-local parse and
@@ -25,7 +29,7 @@ ORACLE_CORES=${GATE_DIFFER_ORACLE_CORES:-$TARGET_CORES}
 REDIS_ROOT=${REDIS74_ROOT:-/tmp/claude-1000/redis74}
 ORACLE_BIN=${GATE_DIFFER_ORACLE_BIN:-$REDIS_ROOT/src/redis-server}
 REDIS_CLI=${GATE_DIFFER_REDIS_CLI:-$REDIS_ROOT/src/redis-cli}
-OUT=${GATE_DIFFER_OUT:-$(mktemp -d /tmp/gate-differ.XXXXXX)}
+OUT=${GATE_DIFFER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/gate-differ.XXXXXX")}
 SEEDS=(7 19)
 TARGET_PID=0
 ORACLE_PID=0
@@ -138,6 +142,11 @@ if ! [[ "$TARGET_PORT" =~ ^[0-9]+$ && "$ORACLE_PORT" =~ ^[0-9]+$ ]]; then
   echo "invalid differ gate ports" >&2
   exit 2
 fi
+if [ "$TARGET_PORT" -lt 1 ] || [ "$TARGET_PORT" -gt 65535 ] ||
+   [ "$ORACLE_PORT" -lt 1 ] || [ "$ORACLE_PORT" -gt 65535 ]; then
+  echo "differ gate ports must be between 1 and 65535" >&2
+  exit 2
+fi
 if [ "$TARGET_PORT" = "$ORACLE_PORT" ]; then
   echo "target and oracle ports must differ" >&2
   exit 2
@@ -178,7 +187,7 @@ boot_owned "vanilla Redis oracle" "$ORACLE_PORT" "$ORACLE_CORES" "$ORACLE_LOG" \
 ORACLE_PID=$BOOT_PID
 
 ORACLE_INFO=$(
-  "$REDIS_CLI" -h 127.0.0.1 -p "$ORACLE_PORT" --raw INFO server 2>/dev/null | tr -d '\r'
+  taskset -c "$LOAD_CORES" "$REDIS_CLI" -h 127.0.0.1 -p "$ORACLE_PORT" --raw INFO server 2>/dev/null | tr -d '\r'
 )
 if ! grep -q '^redis_version:' <<<"$ORACLE_INFO" ||
    grep -Eq '^(tomokv_version|dragonfly_version):' <<<"$ORACLE_INFO"; then
@@ -195,11 +204,15 @@ say "oracle identity" "ok (vanilla redis_version=$REDIS_VERSION)"
 START_SECONDS=$SECONDS
 for ATOMIC in 0 1; do
   TARGET_LOG="$OUT/target-atomic-$ATOMIC.log"
+  # Default startup reads ./dump.rdb even with saving disabled. A private data directory keeps
+  # concurrent matrices and persistence batteries from importing one another's state.
+  TARGET_DIR="$OUT/target-atomic-$ATOMIC"
+  mkdir -p "$TARGET_DIR"
   # The oracle is persistence-silent above; give the target the same explicit save value so CONFIG
   # remains part of the differential surface instead of diverging by harness construction.
   if ! boot_owned "target atomic=$ATOMIC" "$TARGET_PORT" "$TARGET_CORES" "$TARGET_LOG" \
       "$TARGET_BIN" --port "$TARGET_PORT" --bind 127.0.0.1 --shards 16 \
-      "${TARGET_SHAPE[@]}" --atomic "$ATOMIC" --save '' \
+      "${TARGET_SHAPE[@]}" --atomic "$ATOMIC" --save '' --dir "$TARGET_DIR" \
       --enable-debug-command yes; then
     FAIL=$((FAIL+1))
     break
@@ -218,7 +231,7 @@ for ATOMIC in 0 1; do
       fi
       LEG="differ $SUITE (atomic=$ATOMIC seed=$SEED)"
       LEG_LOG="$OUT/$SUITE-a$ATOMIC-s$SEED.txt"
-      if taskset -c "$TARGET_CORES" timeout 900 python3 tests/differ.py \
+      if taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
           127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" "$SUITE" "$SEED" \
           >"$LEG_LOG" 2>&1; then
         say "$LEG" "ok ($(tail -n 1 "$LEG_LOG"))"
@@ -240,7 +253,7 @@ for ATOMIC in 0 1; do
     for REP in $(seq "${GATE_DIFFER_MULTI_REPEATS:-4}"); do
       LEG="differ multi (atomic=1 seed=19 rep $REP)"
       LEG_LOG="$OUT/multi-a1-s19-rep$REP.txt"
-      if taskset -c "$TARGET_CORES" timeout 900 python3 tests/differ.py \
+      if taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
           127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" multi 19 \
           >"$LEG_LOG" 2>&1; then
         say "$LEG" "ok ($(tail -n 1 "$LEG_LOG"))"
@@ -257,7 +270,7 @@ for ATOMIC in 0 1; do
   # and must not be reported as a pass. Read the counter out of the live target before it is
   # stopped and fail the leg when it is zero or missing.
   if [ "$TARGET_GEOMETRY" = armed-fused ]; then
-    RL_INFO=$("$REDIS_CLI" -h 127.0.0.1 -p "$TARGET_PORT" --raw INFO all 2>/dev/null | tr -d '\r')
+    RL_INFO=$(taskset -c "$LOAD_CORES" "$REDIS_CLI" -h 127.0.0.1 -p "$TARGET_PORT" --raw INFO all 2>/dev/null | tr -d '\r')
     RL_HITS=$(sed -n 's/^read_local_hits://p' <<<"$RL_INFO" | head -1)
     RL_FB=$(sed -n 's/^read_local_fallbacks://p' <<<"$RL_INFO" | head -1)
     if [ "${RL_HITS:-0}" -gt 0 ] 2>/dev/null; then
