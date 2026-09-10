@@ -1,0 +1,1343 @@
+{
+  "schema": 1,
+  "box": {
+    "physical_cores": {
+      "value": 128,
+      "provenance": {
+        "when": "2026-09-10T23:13:16.623191+00:00",
+        "how": "Counted distinct /sys/devices/system/cpu/cpu*/topology/thread_siblings_list groups on this box."
+      }
+    },
+    "smt_siblings": {
+      "value": [
+        [
+          0,
+          128
+        ],
+        [
+          1,
+          129
+        ],
+        [
+          2,
+          130
+        ],
+        [
+          3,
+          131
+        ],
+        [
+          4,
+          132
+        ],
+        [
+          5,
+          133
+        ],
+        [
+          6,
+          134
+        ],
+        [
+          7,
+          135
+        ],
+        [
+          8,
+          136
+        ],
+        [
+          9,
+          137
+        ],
+        [
+          10,
+          138
+        ],
+        [
+          11,
+          139
+        ],
+        [
+          12,
+          140
+        ],
+        [
+          13,
+          141
+        ],
+        [
+          14,
+          142
+        ],
+        [
+          15,
+          143
+        ],
+        [
+          16,
+          144
+        ],
+        [
+          17,
+          145
+        ],
+        [
+          18,
+          146
+        ],
+        [
+          19,
+          147
+        ],
+        [
+          20,
+          148
+        ],
+        [
+          21,
+          149
+        ],
+        [
+          22,
+          150
+        ],
+        [
+          23,
+          151
+        ],
+        [
+          24,
+          152
+        ],
+        [
+          25,
+          153
+        ],
+        [
+          26,
+          154
+        ],
+        [
+          27,
+          155
+        ],
+        [
+          28,
+          156
+        ],
+        [
+          29,
+          157
+        ],
+        [
+          30,
+          158
+        ],
+        [
+          31,
+          159
+        ],
+        [
+          32,
+          160
+        ],
+        [
+          33,
+          161
+        ],
+        [
+          34,
+          162
+        ],
+        [
+          35,
+          163
+        ],
+        [
+          36,
+          164
+        ],
+        [
+          37,
+          165
+        ],
+        [
+          38,
+          166
+        ],
+        [
+          39,
+          167
+        ],
+        [
+          40,
+          168
+        ],
+        [
+          41,
+          169
+        ],
+        [
+          42,
+          170
+        ],
+        [
+          43,
+          171
+        ],
+        [
+          44,
+          172
+        ],
+        [
+          45,
+          173
+        ],
+        [
+          46,
+          174
+        ],
+        [
+          47,
+          175
+        ],
+        [
+          48,
+          176
+        ],
+        [
+          49,
+          177
+        ],
+        [
+          50,
+          178
+        ],
+        [
+          51,
+          179
+        ],
+        [
+          52,
+          180
+        ],
+        [
+          53,
+          181
+        ],
+        [
+          54,
+          182
+        ],
+        [
+          55,
+          183
+        ],
+        [
+          56,
+          184
+        ],
+        [
+          57,
+          185
+        ],
+        [
+          58,
+          186
+        ],
+        [
+          59,
+          187
+        ],
+        [
+          60,
+          188
+        ],
+        [
+          61,
+          189
+        ],
+        [
+          62,
+          190
+        ],
+        [
+          63,
+          191
+        ],
+        [
+          64,
+          192
+        ],
+        [
+          65,
+          193
+        ],
+        [
+          66,
+          194
+        ],
+        [
+          67,
+          195
+        ],
+        [
+          68,
+          196
+        ],
+        [
+          69,
+          197
+        ],
+        [
+          70,
+          198
+        ],
+        [
+          71,
+          199
+        ],
+        [
+          72,
+          200
+        ],
+        [
+          73,
+          201
+        ],
+        [
+          74,
+          202
+        ],
+        [
+          75,
+          203
+        ],
+        [
+          76,
+          204
+        ],
+        [
+          77,
+          205
+        ],
+        [
+          78,
+          206
+        ],
+        [
+          79,
+          207
+        ],
+        [
+          80,
+          208
+        ],
+        [
+          81,
+          209
+        ],
+        [
+          82,
+          210
+        ],
+        [
+          83,
+          211
+        ],
+        [
+          84,
+          212
+        ],
+        [
+          85,
+          213
+        ],
+        [
+          86,
+          214
+        ],
+        [
+          87,
+          215
+        ],
+        [
+          88,
+          216
+        ],
+        [
+          89,
+          217
+        ],
+        [
+          90,
+          218
+        ],
+        [
+          91,
+          219
+        ],
+        [
+          92,
+          220
+        ],
+        [
+          93,
+          221
+        ],
+        [
+          94,
+          222
+        ],
+        [
+          95,
+          223
+        ],
+        [
+          96,
+          224
+        ],
+        [
+          97,
+          225
+        ],
+        [
+          98,
+          226
+        ],
+        [
+          99,
+          227
+        ],
+        [
+          100,
+          228
+        ],
+        [
+          101,
+          229
+        ],
+        [
+          102,
+          230
+        ],
+        [
+          103,
+          231
+        ],
+        [
+          104,
+          232
+        ],
+        [
+          105,
+          233
+        ],
+        [
+          106,
+          234
+        ],
+        [
+          107,
+          235
+        ],
+        [
+          108,
+          236
+        ],
+        [
+          109,
+          237
+        ],
+        [
+          110,
+          238
+        ],
+        [
+          111,
+          239
+        ],
+        [
+          112,
+          240
+        ],
+        [
+          113,
+          241
+        ],
+        [
+          114,
+          242
+        ],
+        [
+          115,
+          243
+        ],
+        [
+          116,
+          244
+        ],
+        [
+          117,
+          245
+        ],
+        [
+          118,
+          246
+        ],
+        [
+          119,
+          247
+        ],
+        [
+          120,
+          248
+        ],
+        [
+          121,
+          249
+        ],
+        [
+          122,
+          250
+        ],
+        [
+          123,
+          251
+        ],
+        [
+          124,
+          252
+        ],
+        [
+          125,
+          253
+        ],
+        [
+          126,
+          254
+        ],
+        [
+          127,
+          255
+        ]
+      ],
+      "provenance": {
+        "when": "2026-09-10T23:13:16.623202+00:00",
+        "how": "Read all 256 online CPUs from /sys/devices/system/cpu/online and their topology/thread_siblings_list; each physical group occurs twice."
+      }
+    },
+    "memtier_instance_ceiling_ops_per_second": {
+      "value": [
+        12000000,
+        13000000
+      ],
+      "provenance": {
+        "when": "2026-09-09 (manifest recording date; exact measurement time not retained)",
+        "how": "/home/user/Projects/bench-bins/MANIFEST.md, Headline-number reference set: one memtier instance pinned to 64-127 capped around 12-13M ops/s. Informational measurement only; never a rate target or saturation exemption."
+      }
+    }
+  },
+  "geometries": {
+    "correctness": {
+      "8": {
+        "io": 6,
+        "ex": 2,
+        "provenance": {
+          "when": "2026-09-07 (project baseline context)",
+          "how": "Maintainer-reported full correctness gate at --shards 16, eight physical cores, 6 io + 2 ex; defects reproduce at this reviewed geometry."
+        }
+      }
+    },
+    "abba": {
+      "32": {
+        "io": 16,
+        "ex": 16,
+        "provenance": {
+          "when": "2026-09-10T22:18:54Z",
+          "how": "Observed explicit server boot geometry in build/calibrate-final/results.json environment: 32 physical cores, no server SMT, split_ratio 16:16. Campaign failed before valid measurements; this records thread shape, not a performance result."
+        }
+      }
+    }
+  },
+  "reference_binary": {
+    "path": "/home/user/Projects/bench-bins/tomokv-headline-c8e61f646",
+    "commit": "c8e61f64628655bf99acb91cd986684e5c608fde",
+    "sha256": "9846399c4c5ebb61d97015861b71e4408aad158eaf2f7dde979fde6b1044f154",
+    "provenance": {
+      "when": "2026-09-10T23:05:16.388009+00:00",
+      "how": "Commit identity from /home/user/Projects/bench-bins/MANIFEST.md headline pin and git rev-parse origin/cpp; SHA-256 computed from the existing executable. No rebuild or repin."
+    }
+  },
+  "load_floors": {
+    "h01": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "26.38M",
+      "observed_busy": "91.89%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h02": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "24.36M",
+      "observed_busy": "91.85%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h03": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "25.70M",
+      "observed_busy": "91.90%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h04": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "23.84M",
+      "observed_busy": "91.87%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h05": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "21.88M",
+      "observed_busy": "75.45%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h06": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "20.74M",
+      "observed_busy": "75.38%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h07": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "20.89M",
+      "observed_busy": "75.42%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h08": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "20.19M",
+      "observed_busy": "75.54%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h09": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "52.95M",
+      "observed_busy": "91.78%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h10": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "21.68M",
+      "observed_busy": "91.89%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h11": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "52.32M",
+      "observed_busy": "89.03%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h12": {
+      "instances": 4,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "21.34M",
+      "observed_busy": "91.90%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h13": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "52.03M",
+      "observed_busy": "75.48%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h14": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "19.16M",
+      "observed_busy": "80.35%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h15": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "52.29M",
+      "observed_busy": "74.34%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h16": {
+      "instances": 3,
+      "shape": {
+        "mode": "1s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "18.68M",
+      "observed_busy": "75.53%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h17": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "24.79M",
+      "observed_busy": "92.06%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h18": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "23.39M",
+      "observed_busy": "92.05%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h19": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "25.04M",
+      "observed_busy": "92.06%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h20": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "23.76M",
+      "observed_busy": "92.07%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h21": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "27.52M",
+      "observed_busy": "91.94%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h22": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "26.27M",
+      "observed_busy": "91.94%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h23": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "27.26M",
+      "observed_busy": "91.96%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h24": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 0,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "25.89M",
+      "observed_busy": "91.96%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h25": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "31.37M",
+      "observed_busy": "46.59%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h26": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "22.68M",
+      "observed_busy": "92.06%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h27": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "32.48M",
+      "observed_busy": "45.83%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h28": {
+      "instances": 3,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 0,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "22.73M",
+      "observed_busy": "92.05%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h29": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "32.70M",
+      "observed_busy": "45.92%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h30": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 0,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "24.10M",
+      "observed_busy": "92.01%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h31": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "GET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "30.37M",
+      "observed_busy": "46.62%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    },
+    "h32": {
+      "instances": 2,
+      "shape": {
+        "mode": "2s",
+        "read_local": 1,
+        "overlap": 1,
+        "reorder": 1,
+        "op": "SET",
+        "depth": 32,
+        "conns": 512,
+        "atomic": 1,
+        "score": "rate",
+        "mix": "-"
+      },
+      "geometry": null,
+      "status": "historical-unverified",
+      "observed_rate": "23.34M",
+      "observed_busy": "91.94%",
+      "provenance": {
+        "when": "unknown; recorded 2026-09-10T13:56:16+08:00",
+        "how": "Imported unchanged from tests/headline_cells.txt at 5fccd5909aa94ce5b02446228cb74cf5b67cd2a0. Raw calibration artifact not retained. The source describes 32 server cores but that driver default was 8-31 (24 cores); actual calibration geometry and measurement time cannot be established. Recalibration is required before use."
+      },
+      "instrument_sha256": null
+    }
+  }
+}

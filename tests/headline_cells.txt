@@ -1,9 +1,10 @@
-# Headline regression cells. Rate/busy observations are provenance, never verdict inputs.
-# Format: id | mode | rl | ov | ro | op | depth | total-conns | observed-rate | observed-busy | loadgen-pin | atomic | score | mix | smoke
+# Headline regression cell definitions. Measurements live in gate_measurements.json.
+# Format: id | mode | rl | ov | ro | op | depth | total-conns | reserved(-) | reserved(-) | reserved(-) | atomic | score | mix | smoke
 # mix is READ:WRITE for MIX/MIX8 and short-GET:long-BITCOUNT for REORDER; - means pure.
 # MGET/MSET/MIX8 use eight independently generated keys per operation.
 # New deep cells deliberately have no pin: they FAIL preflight until --escalate measures
-# their load floor and that floor is recorded here. A guessed pin is not validation.
+# their load floor and gate_measurements.py imports the validated result. A guessed pin is not validation.
+# Reserved columns keep diagnostic fixture grammar compatible; production rows must leave them empty.
 # Full push/release design: retained64 + multi-key96 + mixed6 + connections4 + atomic4 + tail4 =178.
 # --subset full is the ABBA default. --subset smoke is a complete15-cell ITERATION result.
 # It cannot replace the full set at a push or release.
@@ -27,71 +28,72 @@
 # OFAT cannot prove interactions. No claim of full cross-product coverage belongs to smoke.
 #
 # ORIGINAL64: preserve both modes x all8knob combinations x GET/SET x p1/p32 at512connections.
-# Existing measured pin values are retained and must still satisfy live saturation checks.
-h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 26.38M | 91.89% | 4 | atomic=1 | score=rate | mix=- | smoke=1
-h02 | 1s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 24.36M | 91.85% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h03 | 1s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.70M | 91.90% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h04 | 1s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.84M | 91.87% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h05 | 1s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 21.88M | 75.45% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h06 | 1s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 20.74M | 75.38% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h07 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 20.89M | 75.42% | 4 | atomic=1 | score=rate | mix=- | smoke=1
-h08 | 1s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 20.19M | 75.54% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h09 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 52.95M | 91.78% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h10 | 1s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 21.68M | 91.89% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h11 | 1s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 52.32M | 89.03% | 3 | atomic=1 | score=rate | mix=- | smoke=1
-h12 | 1s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 21.34M | 91.90% | 4 | atomic=1 | score=rate | mix=- | smoke=0
-h13 | 1s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 52.03M | 75.48% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h14 | 1s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 19.16M | 80.35% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h15 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 52.29M | 74.34% | 3 | atomic=1 | score=rate | mix=- | smoke=1
-h16 | 1s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 18.68M | 75.53% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h17 | 2s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 24.79M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=1
-h18 | 2s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 23.39M | 92.05% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h19 | 2s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.04M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h20 | 2s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.76M | 92.07% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h21 | 2s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 27.52M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h22 | 2s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 26.27M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h23 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 27.26M | 91.96% | 2 | atomic=1 | score=rate | mix=- | smoke=1
-h24 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 25.89M | 91.96% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h25 | 2s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 31.37M | 46.59% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h26 | 2s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 22.68M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h27 | 2s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 32.48M | 45.83% | 2 | atomic=1 | score=rate | mix=- | smoke=1
-h28 | 2s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 22.73M | 92.05% | 3 | atomic=1 | score=rate | mix=- | smoke=0
-h29 | 2s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 32.70M | 45.92% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h30 | 2s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 24.10M | 92.01% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h31 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 30.37M | 46.62% | 2 | atomic=1 | score=rate | mix=- | smoke=1
-h32 | 2s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 23.34M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
-h33 | 1s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h34 | 1s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h35 | 1s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h36 | 1s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h37 | 1s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h38 | 1s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h39 | 1s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h40 | 1s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h41 | 1s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h42 | 1s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h43 | 1s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h44 | 1s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h45 | 1s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h46 | 1s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h47 | 1s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h48 | 1s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=1
-h49 | 2s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h50 | 2s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h51 | 2s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h52 | 2s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h53 | 2s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h54 | 2s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h55 | 2s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h56 | 2s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h57 | 2s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h58 | 2s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h59 | 2s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h60 | 2s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h61 | 2s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h62 | 2s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h63 | 2s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
-h64 | 2s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+# Historical observations are retained in the config, marked unverified because their geometry
+# was not recorded. Recalibration must establish the live floor before those values can gate.
+h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h02 | 1s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h03 | 1s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h04 | 1s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h05 | 1s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h06 | 1s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h07 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h08 | 1s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h09 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h10 | 1s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h11 | 1s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h12 | 1s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h13 | 1s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h14 | 1s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h15 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h16 | 1s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h17 | 2s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h18 | 2s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h19 | 2s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h20 | 2s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h21 | 2s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h22 | 2s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h23 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h24 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h25 | 2s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h26 | 2s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h27 | 2s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h28 | 2s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h29 | 2s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h30 | 2s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h31 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+h32 | 2s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+h33 | 1s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h34 | 1s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h35 | 1s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h36 | 1s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h37 | 1s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h38 | 1s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h39 | 1s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h40 | 1s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h41 | 1s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h42 | 1s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h43 | 1s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h44 | 1s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h45 | 1s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h46 | 1s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h47 | 1s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h48 | 1s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=1
+h49 | 2s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h50 | 2s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h51 | 2s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h52 | 2s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h53 | 2s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h54 | 2s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h55 | 2s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h56 | 2s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h57 | 2s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h58 | 2s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h59 | 2s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h60 | 2s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h61 | 2s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h62 | 2s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h63 | 2s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+h64 | 2s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
 #
  # MULTI-KEY96: required full interaction coverage across the original three knobs,
 # both modes, both operations, and p1/p8/p32. p8 samples the measured multi-key knee.

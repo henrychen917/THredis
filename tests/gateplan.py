@@ -9,6 +9,8 @@ import re
 import shlex
 import sys
 
+from gate_measurements import ratio as measured_ratio
+
 
 SERVER_PER_SLOT = 8
 LOAD_PER_SLOT = 2
@@ -166,6 +168,9 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
     # The iteration budget changes only the measured cells. Normalize every complete gate to
     # the existing full correctness path, so a new purpose cannot bypass full-only batteries.
     purpose = args.tier
+    correctness_ratio = measured_ratio("correctness", SERVER_PER_SLOT)
+    if os.getenv("GATE_RATIO", correctness_ratio) != correctness_ratio:
+        raise ValueError("GATE_RATIO differs from the reviewed correctness geometry; update gate_measurements.json")
     tier = purpose if purpose in ("quick", "perf") else "full"
     subset = args.subset or ("smoke" if purpose == "iteration" else "full")
     if purpose == "quick" and args.subset is not None:
@@ -251,7 +256,7 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
     reference = executable(args.reference_binary, "--reference-binary")
     build_cpus = sorted(cpu for values in axes.values() for cpu in values)
     header = (f"{total} physical cores; {count} correctness slots = min({len(server)}/8 server, "
-              f"{len(load)}/2 load), 8 server threads at ratio {os.getenv('GATE_RATIO', '6:2')} and 3 ports per slot; "
+              f"{len(load)}/2 load), 8 server threads at ratio {correctness_ratio} and 3 ports per slot; "
               f"correctness load is modest protocol traffic (at least 2 physical cores per slot), "
               f"server SMT reserved; isolated ABBA {subset}: {len(perf_server)} server + "
               f"{len(perf_load)} load physical cores, {len(perf_load_smt)} load SMT threads "
@@ -260,7 +265,7 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
     if len(server) > len(perf_server):
         header += f" ({len(server)-len(perf_server)} surplus server cores move to ABBA load)"
     return {"tier": tier, "purpose": purpose, "subset": subset,
-            "physical_cores": total, "slot_count": count,
+            "physical_cores": total, "slot_count": count, "correctness_ratio": correctness_ratio,
             "server_per_slot": SERVER_PER_SLOT, "load_min_per_slot": LOAD_PER_SLOT,
             "ports_per_slot": PORTS_PER_SLOT, "ports_first": first, "ports_last": last,
             "axes": {key: cpu_string(value) for key, value in axes.items()}, "slots": slots,
@@ -272,7 +277,7 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
 
 def shell_plan(plan):
     scalars = {"TIER": plan["tier"], "GATE_PURPOSE": plan["purpose"],
-               "GATE_PHYSICAL_CORES": plan["physical_cores"],
+               "GATE_PHYSICAL_CORES": plan["physical_cores"], "GATE_RATIO": plan["correctness_ratio"],
                "GATE_SLOTS": plan["slot_count"], "GATE_PORT_FIRST": plan["ports_first"],
                "GATE_PORT_LAST": plan["ports_last"], "CANDIDATE_BINARY": plan["candidate_binary"],
                "REFERENCE_BINARY": plan["reference_binary"], "PERF_THREADS": plan["perf"]["threads"],
@@ -499,7 +504,9 @@ def self_test():
             self.assertEqual(shell_plan(self.plan()), shell_plan(self.plan()))
 
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(PlanningTests)
-    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+    from gate_measurements import self_test as measurements_self_test
+    return max(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1,
+               measurements_self_test())
 
 
 def main():

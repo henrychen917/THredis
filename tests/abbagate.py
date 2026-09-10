@@ -70,6 +70,8 @@ import time
 
 from _lib import Conn
 from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
+from gate_measurements import (load as load_measurements, ratio as measured_ratio,
+                               apply_floor, configured_reference, instrument_digest)
 from gate_quiet import QuietMonitor, QuietViolation
 from abba_saturation import (parse_snapshot, productive_saturation, bottleneck_saturation,
                             replay_saturation, require_saturation_window, SATURATION_FLOOR,
@@ -145,8 +147,11 @@ class Cell:
             "rate": "rate", "latency": "latency_ms", "p999": "p999_ms"}[self.score]
 
 
-def read_cells(path):
+def read_cells(path, *, placement=None):
     cells = []
+    measurements = load_measurements()
+    instrument = (instrument_digest() if any(floor["status"] == "calibrated"
+                  for floor in measurements["load_floors"].values()) else None)
     for lineno, line in enumerate(path.read_text().splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -161,11 +166,10 @@ def read_cells(path):
                 or any(not re.fullmatch(prefix + "=[01]", value)
                        for prefix, value in (("rl", rl), ("ov", ov), ("ro", ro)))):
             raise ValueError(f"{path}:{lineno}: unsupported/malformed cell: {line}")
-        # The last column PINS the load level. It is a test parameter, like the connection count
-        # beside it -- NOT a stored performance number, which this tier refuses on principle. It
-        # exists because escalating from one instance on every cell of every run re-derives a search
-        # whose answer we already have, at four measurements a rung. Unpinned ("-") falls back to
-        # the search, and the run says so.
+        # Production measurements have one home. The reserved legacy columns remain
+        # readable for private diagnostic fixtures, whose pins never modify production.
+        if path.resolve() == (ROOT / "tests/headline_cells.txt").resolve() and fields[8:11] != ["-"] * 3:
+            raise ValueError(f"{path}:{lineno}: measurements belong in gate_measurements.json")
         extra = {}
         if len(fields) == 15:
             atomic, score, mix, smoke = fields[11:]
@@ -184,6 +188,8 @@ def read_cells(path):
                 or (cell.op == "REORDER") != (cell.metric == "p999_ms")
                 or (cell.depth == 1 and cell.metric == "rate")):
             raise ValueError(f"{path}:{lineno}: workload, mix and scoring disagree")
+        if pinned == "-":
+            cell = apply_floor(cell, measurements, placement=placement, instrument_sha256=instrument)
         cells.append(cell)
     if not cells or len({c.id for c in cells}) != len(cells):
         raise ValueError("headline cells must be nonempty with unique IDs")
@@ -673,6 +679,13 @@ def resolve_reference(args, out):
         commit = git("rev-parse", "--verify", "origin/cpp^{commit}")
     except RuntimeError as e:
         raise Skip(f"no origin/cpp reference: {e}") from e
+    # The released identity is reviewed with the other measured inputs. A changed
+    # filename, byte stream or last-push commit must not silently choose a new arm.
+    if args.bench_bins.resolve() == Path("/home/user/Projects/bench-bins"):
+        try:
+            return configured_reference(commit)
+        except ValueError as error:
+            raise Skip(str(error)) from error
     binary = manifest_reference(args.bench_bins, commit)
     provenance = {"commit": commit, "ref": "origin/cpp", "manifest": str(args.bench_bins / "MANIFEST.md")}
     if binary:
@@ -1024,9 +1037,11 @@ class Runner:
                    "--enable-debug-command", "yes", "--save", "", "--appendonly", "no",
                    "--dir", str(folder)]
         # Defaults are made explicit so changes to placement cannot masquerade as code gains.
-        ex = len(self.server_cpus) // 2
+        ex = 0
         if cell.mode == "2s":
-            command += ["--ratio", f"{len(self.server_cpus) - ex}:{ex}", "--flip-auto", "0"]
+            split_ratio = measured_ratio("abba", len(self.server_cpus))
+            ex = int(split_ratio.split(":")[1])
+            command += ["--ratio", split_ratio, "--flip-auto", "0"]
         command += ["--shards", str(min(8 * (ex if cell.mode == "2s" else len(self.server_cpus)), 256))]
         for name, value in knobs.items():
             command += [f"--{name}", str(value)]
@@ -1333,7 +1348,8 @@ def parse_args():
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--background-environment", type=Path,
                    default=Path(os.environ["GATE_ABBA_BACKGROUND_ENVIRONMENT"]) if os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") else None,
-                   help="explicit reviewed idle identities; default refuses any observed foreign user CPU activity")
+                   help="reviewed background identities; free-roaming desktop work is recorded and budgeted, "
+                        "while competing experiments and unavoidable CPU overlap are refused")
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--collect-null", type=int, choices=(0, 1), default=0,
                    help="1 freezes one executable into identical arms and collects a null; always PARTIAL/exit 3")
@@ -1360,7 +1376,7 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
     out.mkdir(parents=True, exist_ok=False)
     report = {"schema": 1, "verdict": "FAIL", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "window_seconds": WINDOW, "order": list(ORDER), "cells": [], "output": str(out),
-              "subset": args.subset, "only": args.only,
+              "subset": args.subset, "only": args.only, "escalate": args.escalate,
               "run_kind": "null-control" if args.collect_null else "comparison", "comparison_trusted": False}
     if diagnostic_monitor is not None:
         # Internal-only background qualification may observe the real measurement loop while
@@ -1417,7 +1433,11 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
         # The driver also generates control traffic and collects counters. Keep it on load CPUs
         # even when invoked from a shell that was pinned to a correctness worker's server slot.
         os.sched_setaffinity(0, load_cpus)
-        cells = read_cells(args.cells)
+        split_ratio = measured_ratio("abba", len(server_cpus))
+        placement = dict(server_physical=server_physical, server_smt=server_smt,
+                         load_physical=load_physical, load_smt=load_smt, split_ratio=split_ratio)
+        cells = read_cells(args.cells, placement=placement)
+        report["measurements"] = load_measurements()
         report["cell_source"] = {"path": str(args.cells.resolve()), "sha256": sha256(args.cells),
                                  "text": args.cells.read_text(), "total_cells": len(cells)}
         cells = selected_cells(cells, args.subset, args.only)
@@ -1498,7 +1518,7 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                                  "load_cpus": load_cpus, "port": args.port,
                                  "permitted_ports": permitted_ports, "keys": KEYS,
                                  "data_bytes": 64, "key_pattern": "P:P", "atomic": "per-cell",
-                                 "split_ratio": f"{len(server_cpus)-len(server_cpus)//2}:{len(server_cpus)//2}",
+                                 "split_ratio": split_ratio,
                                  "split_flip_auto": 0, "memtier_path": args.memtier,
                                  "memtier_sha256": sha256(Path(args.memtier)),
                                  "memtier_version": capture([args.memtier, "--version"]).stdout.strip(),
@@ -1509,8 +1529,7 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
               f"server-smt={args.server_smt or '(reserved)'} ({len(server_cpus)} threads) "
               f"load={args.load_cores} load-smt={args.load_smt or '(reserved)'} "
               f"port={args.port} allowed={permitted_ports[0]}-{permitted_ports[1]}; "
-              "source headline file records 32 server cores; actual geometry recorded above. "
-              "Cell connections are TOTAL, shared across load instances. Split uses fixed even ratio, flip=0.", flush=True)
+              f"Cell connections are TOTAL, shared across load instances. Split uses reviewed ratio {split_ratio}, flip=0.", flush=True)
         quiet.check()
         support = {arm: {name: accepted(binary, name, value) for name, value in
                         (("thread-mode", "1s"), ("read-local", 0), ("overlap", 0), ("reorder", 0),
@@ -2170,7 +2189,8 @@ def self_test():
                             runner = Runner(args, folder, {arm: Path("never-executed-server")}, children)
                             population = mock.Mock(side_effect=RuntimeError("population boundary reached"))
                             with mock.patch.multiple(__name__, require_unbound_port=mock.Mock(),
-                                    Conn=mock.Mock(return_value=conn), info=mock.Mock(return_value=identity)), \
+                                    Conn=mock.Mock(return_value=conn), info=mock.Mock(return_value=identity),
+                                    measured_ratio=mock.Mock(return_value="4:4")), \
                                  mock.patch.object(runner, "populate", population), \
                                  contextlib.redirect_stdout(io.StringIO()):
                                 error = ("population boundary reached" if matches else
@@ -3240,6 +3260,7 @@ def self_test():
 
                 provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
                 with mock.patch.object(Runner, "measure", measure), \
+                     mock.patch(__name__ + ".measured_ratio", return_value="4:4"), \
                      mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)), \
                      mock.patch(__name__ + ".accepted", return_value=True), \
                      mock.patch(__name__ + ".check_placement"), \

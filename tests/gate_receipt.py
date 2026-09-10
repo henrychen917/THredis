@@ -186,6 +186,11 @@ def inventory(root, path):
     # receipt and compare it to abbagate's asdict(Cell) output. Unknown future fields fail closed
     # until the receipt schema is reviewed; they cannot silently escape source/inventory binding.
     cells = []
+    from gate_measurements import apply_floor, load as load_measurements, instrument_digest
+    measurements_path = root / "tests/gate_measurements.json"
+    measurements = load_measurements(measurements_path) if measurements_path.is_file() else None
+    instrument = (instrument_digest(root) if measurements and any(floor["status"] == "calibrated"
+                  for floor in measurements["load_floors"].values()) else None)
     for line in path.read_text().splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -209,6 +214,8 @@ def inventory(root, path):
                     re.fullmatch(r"smoke=[01]", smoke), "invalid extended cell schema")
             cell.update(atomic=int(atomic[-1]), score=score[6:], mix=mix[4:],
                         smoke=smoke[-1] == "1", pin_required=cell["depth"] > 1)
+        if pinned == "-" and measurements is not None:
+            cell = apply_floor(cell, measurements, instrument_sha256=instrument)
         cells.append(cell)
     require(cells and len({cell["id"] for cell in cells}) == len(cells), "duplicate/empty cell inventory")
     # Requiring the complete cross products catches retirement even if someone replaces removed
