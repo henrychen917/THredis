@@ -33,8 +33,9 @@ threshold and waves a real regression through. A failed block is never rerun unt
 pass, and the best of several runs is never selected.
 
 SATURATION IS A PRECONDITION, not a nice-to-have: an unsaturated cell has headroom that absorbs a
-regression, so it cannot detect one at any repetition count. Load generator instances escalate until
-the fastest arm stops gaining AND measured busy is at the required level. Depth 1 is exempt and
+regression, so it cannot detect one at any repetition count. Pinned load levels run one ABBA block
+and must still satisfy the busy floor. Unpinned cells, or --escalate, search until the fastest arm
+stops gaining AND measured busy is at the required level. Depth 1 is exempt and
 scored as latency -- it is round-trip bound by Little's law. Process CPU is NOT substituted for busy
 percentage: doing so hides exactly the unsaturated case this check exists to catch.
 
@@ -46,7 +47,7 @@ Exit 0: every cell passed; 1: failure; 3: loud skip or successful partial diagno
 --self-test is serverless. All other runs own and reap only their subprocess PIDs.
 """
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -205,8 +206,8 @@ def select_port(ports, port):
 
 def load_layout(load_cpus, n, conns):
     """Keep the cell's TOTAL connections fixed; partition physical/SMT pairs together."""
-    if conns % n:
-        raise ValueError(f"{conns} connections cannot be divided equally over {n} instances")
+    if not 1 <= n <= conns:
+        raise ValueError("every load instance needs at least one connection")
     groups, seen = [], set()
     for cpu in load_cpus:
         if cpu in seen:
@@ -218,10 +219,25 @@ def load_layout(load_cpus, n, conns):
         seen.update(group)
     if n > len(groups):
         raise ValueError("more load instances than physical CPU groups")
-    result = []
+    assignments = []
     for i in range(n):
         assigned = sorted(c for g in groups[i * len(groups) // n:(i + 1) * len(groups) // n]
                           for c in g)
+        assignments.append(assigned)
+    # Existing cells include pin=3 with 512 TOTAL connections. Rounding that to 510
+    # changes the workload; skipping it never runs the row. Preserve the existing
+    # equal layouts when divisible. Otherwise distribute whole clients per thread:
+    # 16 threads x (10,11,11) clients preserves 512 and the generator's thread count.
+    # Splitting 170/171/171 would force only 10/9/9 threads under memtier's -t/-c grammar.
+    common_threads = max(t for t in range(1, min(16, min(map(len, assignments)), conns // n) + 1)
+                         if conns % t == 0)
+    client_units = conns // common_threads
+    result = []
+    for i, assigned in enumerate(assignments):
+        if conns % n:
+            clients = (i + 1) * client_units // n - i * client_units // n
+            result.append({"cpus": assigned, "threads": common_threads, "clients": clients})
+            continue
         per_instance = conns // n
         threads = max(t for t in range(1, min(16, len(assigned), per_instance) + 1)
                       if per_instance % t == 0)
@@ -793,7 +809,7 @@ def parse_args():
                         "after the gate reports its pinned level no longer saturates")
     p.add_argument("--only", default="", help="comma-separated IDs; partial diagnostic, never a full-tier PASS")
     p.add_argument("--max-instances", type=int, choices=LADDER, default=16,
-                   help="bounded doubling search (default 8); 1 cannot prove deep-pipeline saturation")
+                   help="load-instance ceiling (default 16); 1 cannot prove unpinned deep-pipeline saturation")
     return p.parse_args()
 
 
@@ -885,23 +901,40 @@ def main(args):
                 row["knobs"] = plans
                 for note in row["notes"]:
                     print(f"  {cell.id} COMPATIBILITY: {note}", flush=True)
-                for n in LADDER:
+                pinned = cell.depth > 1 and cell.instances and not args.escalate
+                ladder = (cell.instances,) if pinned else LADDER
+                row["load_ladder"] = list(ladder)
+                # Clearing the assessment pin matters even at --max-instances=1:
+                # --escalate must prove its peak with a higher probe, never borrow
+                # the very stored saturation evidence the caller asked to ignore.
+                assessed_cell = replace(cell, instances=0) if args.escalate else cell
+                if pinned:
+                    print(f"  {cell.id} PINNED load={cell.instances}; one ABBA block (4 measurements)", flush=True)
+                    ceiling = min(args.max_instances, cell.conns, len(load_physical))
+                    if cell.instances > ceiling:
+                        raise ValueError(f"pinned load level {cell.instances} exceeds the instance/connection/"
+                                         f"physical-core ceiling {ceiling}; provide its required load budget "
+                                         "or re-pin it with --escalate")
+                elif cell.depth > 1:
+                    print(f"  {cell.id} {'ESCALATE ignores pin=' + str(cell.instances) if cell.instances else 'UNPINNED'}: "
+                          f"searching load ladder {','.join(map(str, ladder))}; record the validated pin", flush=True)
+                for n in ladder:
                     # Each generator owns at least one physical load core; its explicitly
                     # enabled SMT siblings travel with that core, not as another instance.
                     # At a small budget, assess the last possible block normally: an unproven
                     # plateau remains FAIL instead of attempting an impossible placement.
                     if n > args.max_instances or n > cell.conns or n > len(load_physical):
                         break
-                    if cell.conns % n:
+                    if cell.conns % n and not pinned:
                         continue
                     round_ = {"instances": n, "runs": []}
                     row["rounds"].append(round_)
                     for sequence, arm in enumerate(ORDER, 1):
                         round_["runs"].append(runner.measure(cell, arm, sequence, n, plans[arm]))
-                    row["assessment"] = assess(cell, row["rounds"])
+                    row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
-                    if saturation_done(cell, row["rounds"]):
+                    if saturation_done(assessed_cell, row["rounds"]):
                         break
             except InterruptedError:
                 raise
@@ -1122,12 +1155,106 @@ def self_test():
 
         def test_load_escalation_preserves_total_connections(self):
             load = list(range(64, 128)) + list(range(192, 256))
-            for n in (1, 2, 4, 8):
+            for n in (1, 2, 3, 4, 8):
                 layout = load_layout(load, n, 512)
                 self.assertEqual(sum(x["threads"] * x["clients"] for x in layout), 512)
                 assigned = [c for x in layout for c in x["cpus"]]
                 self.assertEqual(sorted(assigned), load)
                 self.assertEqual(len(assigned), len(set(assigned)))
+
+        def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
+                      climbing=False, ceiling=16):
+            # Invoke main() and its real load layout, not assess() with fabricated
+            # rounds. The regression was in the loop that PRODUCES rounds, and a
+            # pin=3/512 fixture also catches silently skipping a non-doubling pin.
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                directory = Path(tmp)
+                binary = directory / "candidate"
+                binary.write_bytes(b"test identity; never executed")
+                binary.chmod(0o700)
+                source = directory / "cells"
+                source.write_text(f"hp | 1s | rl=1 | ov=0 | ro=0 | GET | p{depth} | 512 | stale | stale | {pin}\n")
+                output = directory / "out"
+                argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
+                        "--output", str(output), "--memtier", sys.executable,
+                        "--server-cores", "0-31", "--load-cores", "32-127",
+                        "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
+                with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
+                    args = parse_args()
+                order, layouts = [], []
+
+                def measure(runner, cell, arm, sequence, instances, knobs):
+                    order.append((instances, arm))
+                    layouts.append(load_layout(runner.load_cpus, instances, cell.conns))
+                    return dict(arm=arm, rate=instances * 100 if climbing else 100,
+                                busy_pct=busy, latency_ms=1)
+
+                provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
+                stream = io.StringIO()
+                with mock.patch.object(Runner, "measure", measure), \
+                     mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)), \
+                     mock.patch(__name__ + ".accepted", return_value=True), \
+                     mock.patch(__name__ + ".check_placement"), \
+                     mock.patch.object(os, "sched_setaffinity"), \
+                     mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
+                     contextlib.redirect_stdout(stream):
+                    rc = main(args)
+                return rc, order, layouts, json.loads((output / "results.json").read_text()), stream.getvalue()
+
+        def test_pin_drives_real_loop_to_exactly_four_measurements(self):
+            for pin in (3, 4):
+                with self.subTest(pin=pin):
+                    rc, order, layouts, result, output = self.fake_main(pin=pin)
+                    self.assertEqual(rc, 0, output)
+                    self.assertEqual(order, [(pin, arm) for arm in ORDER])
+                    self.assertEqual(len(result["cells"][0]["rounds"]), 1)
+                    self.assertIn("PINNED", output)
+                    for layout in layouts:
+                        self.assertEqual(sum(x["threads"] * x["clients"] for x in layout), 512)
+                    if pin == 3:
+                        self.assertEqual([x["threads"] for x in layouts[0]], [16, 16, 16])
+                        self.assertEqual([x["clients"] for x in layouts[0]], [10, 11, 11])
+
+        def test_escalate_ignores_pin_and_drives_full_ladder(self):
+            rc, order, _, result, output = self.fake_main(pin=3, escalate=True, climbing=True)
+            self.assertEqual(order, [(n, arm) for n in LADDER for arm in ORDER])
+            self.assertEqual(len(order), 20)
+            self.assertEqual(rc, 1, output)  # Still rising at the ceiling is unproven saturation.
+            self.assertIn("ESCALATE ignores pin=3", output)
+            self.assertIn("no higher-instance saturation probe above the peak block",
+                          result["cells"][0]["assessment"]["reasons"])
+
+        def test_escalate_cannot_borrow_pin_for_a_single_block(self):
+            rc, order, _, result, _ = self.fake_main(pin=1, escalate=True, ceiling=1)
+            self.assertEqual(order, [(1, arm) for arm in ORDER])
+            self.assertEqual(rc, 1)
+            self.assertIn("no higher-instance saturation probe above the peak block",
+                          result["cells"][0]["assessment"]["reasons"])
+
+        def test_pin_that_outgrows_load_fails_after_four_and_names_remedy(self):
+            rc, order, _, result, _ = self.fake_main(pin=3, busy=BUSY_FLOOR - 1)
+            self.assertEqual(order, [(3, arm) for arm in ORDER])
+            self.assertEqual(rc, 1)
+            reasons = result["cells"][0]["assessment"]["reasons"]
+            self.assertTrue(any("re-pin it with --escalate" in reason for reason in reasons), reasons)
+
+        def test_unpinned_real_loop_searches_and_says_so(self):
+            rc, order, _, _, output = self.fake_main()
+            self.assertEqual(rc, 0, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2) for arm in ORDER])
+            self.assertIn("UNPINNED", output)
+
+        def test_depth_one_ignores_deep_pipeline_pin(self):
+            rc, order, _, result, output = self.fake_main(pin=3, depth=1, busy=1)
+            self.assertEqual(rc, 0, output)
+            self.assertEqual(order, [(1, arm) for arm in ORDER])
+            self.assertTrue(result["cells"][0]["assessment"]["saturation_exempt"])
+
+        def test_pin_beyond_budget_is_loud_not_an_unreached_measurement(self):
+            rc, order, _, result, output = self.fake_main(pin=4, ceiling=2)
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [])
+            self.assertIn("pinned load level 4 exceeds", result["cells"][0]["reason"])
 
         def test_explicit_axes_and_binary_arguments(self):
             argv = ["abbagate.py", "--candidate-binary", "/candidate", "--reference-binary", "/reference",
