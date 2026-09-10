@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Preregistered, on-demand ABBA experiments for gate measurement cost.
 
-One selected, already pinned cell runs four blocks in this fixed order: 20-second
-wire/wire null, 10-second wire/wire null, 20-second wire/snapshot comparison,
-20-second snapshot/snapshot null. Every measurement and unsuccessful block is
+One selected, already pinned cell runs six preregistered blocks: fresh-wire
+20s/10s nulls, a fresh/seeded-wire bridge, a seeded-wire 20s null, a matched-seed
+wire/snapshot comparison, and a snapshot 20s null. Every measurement and unsuccessful block is
 retained. No best repeat is selected, no default changes, and a single-cell
 experiment cannot certify the rest of the regression matrix.
 
 The comparison binary is byte-identical in both arms. Snapshot SAVE runs only on
-a separate unscored priming boot; it never changes a scored wire arm's layout.
+two unscored priming boots: capture an empty snapshot, then boot from that image,
+wire-populate and SAVE the full image. Scored seeded-wire arms also load the empty
+image before wire population; ordinary fresh-wire arms remain a distinct method.
+The bridge bundles seed and empty-loader effects; it is not a seed-only experiment.
 The rate window is central WINDOW seconds; memtier latency histograms cover
 WARMUP+WINDOW+TAIL (28/18 seconds here), which is reported separately.
 """
@@ -16,7 +19,7 @@ WARMUP+WINDOW+TAIL (28/18 seconds here), which is reported separately.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 import math
 import os
@@ -33,9 +36,15 @@ from abba_workloads import LONG_BYTES, LONG_KEYS, sample_long_cost
 from gateplan import cpu_string, default_physical, permitted_cpus, read_topology
 
 
-BLOCKS = (("wire20_null", 20, "wire", "wire"),
-          ("wire10_null", 10, "wire", "wire"),
-          ("wire_snapshot20", 20, "wire", "snapshot"),
+# Four original measurement purposes remain, plus two common-seed controls. The
+# fresh baseline/10s pair comes first; the bridge connects that construction to the
+# matched-seed pair. Every failed block remains evidence. Eight added measurements
+# cost about four minutes at the owner's measured 30s/run, outside the normal gate.
+BLOCKS = (("fresh20_null", 20, "fresh", "fresh"),
+          ("fresh10_null", 10, "fresh", "fresh"),
+          ("fresh_seeded20", 20, "fresh", "wire"),
+          ("seeded20_null", 20, "wire", "wire"),
+          ("seeded_snapshot20", 20, "wire", "snapshot"),
           ("snapshot20_null", 20, "snapshot", "snapshot"))
 BASE_RUNNER = abba.Runner
 GEOMETRY_KEYS = ("server_cores", "server_smt", "load_cores", "load_smt")
@@ -45,19 +54,71 @@ class SnapshotReady(Exception):
     """The unscored priming boot completed population/SAVE, before load generators."""
 
 
+def snapshot_metadata(path):
+    # Observe the server-written header; never manufacture a seed or snapshot.
+    # Production snapshot_read_plan validates all frames/footer on the next boot.
+    # Epoch/cut are retained but deliberately not compared: loading does not restore
+    # SnapshotManager epoch/cut, and all benchmark keys have no expiration.
+    with path.open("rb") as stream:
+        header = stream.read(80)
+    u32 = lambda offset: int.from_bytes(header[offset:offset + 4], "little")
+    u64 = lambda offset: int.from_bytes(header[offset:offset + 8], "little")
+    checksum = 1469598103934665603
+    for byte in header[:64]:
+        checksum = ((checksum ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    if (len(header) != 80 or header[:8] != b"TOMOSNP\0" or u32(8) != 1 or
+            u32(12) != 80 or checksum != u64(64) or not u32(16) or u32(20) > 1):
+        raise RuntimeError(f"invalid/unsupported server-generated snapshot header: {path}")
+    return {"path": str(path), "sha256": abba.sha256(path), "bytes": path.stat().st_size,
+            "format": u32(8), "shards": u32(16), "hash_kind": u32(20),
+            "hash_seed": u64(40), "sip_k0": u64(48), "sip_k1": u64(56),
+            "epoch": u64(24), "cut_ms": u64(32), "raw_header_hex": header.hex()}
+
+
+def seed_metadata(metadata):
+    return {key: metadata[key] for key in
+            ("format", "shards", "hash_kind", "hash_seed", "sip_k0", "sip_k1")}
+
+
+@dataclass(frozen=True)
+class SnapshotFixtures:
+    empty: Path
+    full: Path
+    empty_metadata: dict
+    full_metadata: dict
+
+    def validate(self):
+        for path, expected in ((self.empty, self.empty_metadata), (self.full, self.full_metadata)):
+            if snapshot_metadata(path) != expected:
+                raise RuntimeError("snapshot fixture changed after priming")
+        if seed_metadata(self.empty_metadata) != seed_metadata(self.full_metadata):
+            raise RuntimeError("empty/full snapshot hash seed metadata differ")
+
+
 class PrimingRunner(BASE_RUNNER):
-    snapshot = None
+    def __init__(self, *args, empty_snapshot=None, capture_empty=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.empty_snapshot, self.capture_empty = empty_snapshot, capture_empty
+        self.snapshot = None
+
+    def prepare_data(self, cell, arm, folder):
+        if not self.capture_empty:
+            if self.empty_snapshot is None:
+                raise RuntimeError("full priming requires the captured empty snapshot")
+            shutil.copyfile(self.empty_snapshot, folder / "dump.tomo")
 
     def populate(self, cell, arm, conn, folder):
-        super().populate(cell, arm, conn, folder)
+        if conn.must("DBSIZE") != 0:
+            raise RuntimeError("snapshot priming must start with exactly zero keys")
+        if not self.capture_empty:
+            super().populate(cell, arm, conn, folder)
         filename = conn.must("CONFIG", "GET", "dbfilename")[1].decode()
-        if Path(filename).name != filename:
-            raise RuntimeError("snapshot filename is not confined to our data directory")
+        if filename != "dump.tomo":
+            raise RuntimeError("snapshot filename differs from the measured boot destination")
         if conn.must("SAVE") != b"OK":
             raise RuntimeError("unscored snapshot SAVE failed")
         self.snapshot = folder / filename
-        if not self.snapshot.is_file() or not self.snapshot.stat().st_size:
-            raise RuntimeError("SAVE did not produce a snapshot")
+        snapshot_metadata(self.snapshot)
         raise SnapshotReady("unscored setup complete; no measurement window or load was started")
 
 
@@ -65,23 +126,49 @@ class ExperimentRunner(BASE_RUNNER):
     def __init__(self, *args, snapshot, population_by_arm, attempts, **kwargs):
         super().__init__(*args, **kwargs)
         self.snapshot = snapshot
+        self.snapshot.validate()
         self.population_by_arm = population_by_arm
         self.attempts = attempts
 
     def population_environment(self):
+        self.snapshot.validate()
         return {"population_by_arm": self.population_by_arm,
-                "population_snapshot_sha256": abba.sha256(self.snapshot)
-                    if "snapshot" in self.population_by_arm.values() else None}
+                "population_constructions": {"fresh": "fresh empty boot, then wire population; random boot seed",
+                    "wire": "server-generated empty snapshot restore, then normal wire population",
+                    "snapshot": "server-generated full snapshot restore; no wire repopulation"},
+                "population_empty_snapshot_sha256": self.snapshot.empty_metadata["sha256"],
+                "population_snapshot_sha256": self.snapshot.full_metadata["sha256"],
+                "population_common_seed": seed_metadata(self.snapshot.empty_metadata),
+                "population_seed_matched_arms": [arm for arm, method in self.population_by_arm.items() if method != "fresh"]}
 
     def prepare_data(self, cell, arm, folder):
-        if self.population_by_arm[arm] == "snapshot":
-            # Default dbfilename is explicitly checked on the priming boot. Copy
-            # into this measurement's owned directory before its server starts.
-            shutil.copyfile(self.snapshot, folder / self.snapshot.name)
+        self.snapshot.validate()
+        method = self.population_by_arm[arm]
+        source = self.snapshot.full if method == "snapshot" else self.snapshot.empty if method == "wire" else None
+        if method not in ("fresh", "wire", "snapshot"):
+            raise RuntimeError(f"unknown population construction: {method}")
+        if source is not None:
+            # Both images are generated by SAVE on owned unscored boots. The empty
+            # loader allocates no records, but is not claimed identical to a fresh
+            # boot: main retains a load plan and owner clocks/size are initialized.
+            # Full restore additionally retains its serialized shard sections for
+            # the server lifetime and inserts records before IO-loop initialization.
+            # These real startup/allocation effects belong in the measured method;
+            # warmup is not evidence that either construction matches fresh wire.
+            shutil.copyfile(source, folder / "dump.tomo")
+            if abba.sha256(folder / "dump.tomo") != abba.sha256(source):
+                raise RuntimeError("snapshot changed during the measurement's fixture copy")
 
     def populate(self, cell, arm, conn, folder):
-        if self.population_by_arm[arm] == "wire":
-            return super().populate(cell, arm, conn, folder)
+        method = self.population_by_arm[arm]
+        if method in ("fresh", "wire"):
+            if conn.must("DBSIZE") != 0:
+                raise RuntimeError(f"{method} population must start with exactly zero keys")
+            original = super().populate(cell, arm, conn, folder)
+            return {"method": method, "starting_construction": "empty-snapshot-then-wire" if method == "wire" else "fresh-then-wire",
+                    "starting_keys": 0, "wire_population": original,
+                    "common_seed": seed_metadata(self.snapshot.empty_metadata) if method == "wire" else None,
+                    "empty_snapshot_sha256": self.snapshot.empty_metadata["sha256"] if method == "wire" else None}
         expected = abba.KEYS + (LONG_KEYS if cell.op == "REORDER" else 0)
         if conn.must("DBSIZE") != expected:
             raise RuntimeError(f"snapshot restored wrong key count; expected exactly {expected}")
@@ -90,7 +177,8 @@ class ExperimentRunner(BASE_RUNNER):
             if not isinstance(value, bytes) or len(value) != 64:
                 raise RuntimeError("snapshot did not retain the populated short-key namespace")
         result = {"method": "snapshot", "keys": expected,
-                  "snapshot_sha256": abba.sha256(self.snapshot)}
+                  "snapshot_sha256": self.snapshot.full_metadata["sha256"],
+                  "common_seed": seed_metadata(self.snapshot.full_metadata)}
         if cell.op == "REORDER":
             for number in (1, LONG_KEYS):
                 if conn.must("BITCOUNT", f"blocker:memtier-{number}") != LONG_BYTES * 8:
@@ -133,33 +221,68 @@ def arguments_for_block(args, fixture, output):
 
 
 def prime_snapshot(args, fixture, output, cell):
-    children = abba.Children()
-    block_args = arguments_for_block(args, fixture, output)
-    block_args.port, _ = abba.select_port(block_args.ports, block_args.port)
-    runner = PrimingRunner(block_args, output, {"A": fixture / "reference", "B": fixture / "candidate"}, children)
+    output.mkdir(parents=True)
+    document = {"scored": False, "status": "INCOMPLETE", "boots": []}
+    record_path = output / "priming.json"
+    record_path.write_text(json.dumps(document, indent=2) + "\n")
+    binary = fixture / "candidate"
     try:
-        binary = fixture / "candidate"
         support = {arm: {name: abba.accepted(binary, name, value) for name, value in
                    (("thread-mode", "1s"), ("read-local", 0), ("overlap", 0), ("reorder", 0),
                     ("x-overlap", 0), ("x-ex-sched", 0))} for arm in ("A", "B")}
-        plans, notes = abba.knob_plan(cell, support)
-        try:
-            # Reuse the real boot/config/population code. SnapshotReady exits before
-            # the generator loop; the priming measurement.json remains unscored.
-            runner.measure(cell, "A", 0, cell.instances if cell.depth > 1 else 1, plans["A"])
-        except SnapshotReady:
-            pass
-        else:
-            raise RuntimeError("snapshot priming reached a scored measurement unexpectedly")
-        if runner.snapshot is None or runner.snapshot.name != "dump.tomo":
-            raise RuntimeError("priming snapshot does not match the normal boot's default dbfilename")
-        snapshot = fixture / "dump.tomo"
-        shutil.copyfile(runner.snapshot, snapshot)
-        return snapshot, {"path": str(snapshot), "sha256": abba.sha256(snapshot),
-                          "bytes": snapshot.stat().st_size, "scored": False,
-                          "source": str(runner.snapshot), "notes": notes}
+        plans, document["notes"] = abba.knob_plan(cell, support)
+        snapshots, metadata = [], []
+        for index, name in enumerate(("empty", "full")):
+            row = {"kind": name, "status": "INCOMPLETE", "scored": False,
+                   "starting_construction": "fresh-empty" if index == 0 else "captured-empty-restore-then-wire"}
+            document["boots"].append(row)
+            record_path.write_text(json.dumps(document, indent=2) + "\n")
+            children = abba.Children()
+            block_args = arguments_for_block(args, fixture, output / name)
+            block_args.port, _ = abba.select_port(block_args.ports, block_args.port)
+            runner = PrimingRunner(block_args, output / name,
+                {"A": binary, "B": binary}, children,
+                capture_empty=index == 0, empty_snapshot=snapshots[0] if snapshots else None)
+            try:
+                # SAVE doubles the live table's capacity, even on an empty store
+                # (FlatStore::snapshot_prepare/mark). NEVER continue population on
+                # the seed-capture boot. Restart from the empty image so full-fixture
+                # priming follows exactly the same startup path as scored seeded wire.
+                try:
+                    runner.measure(cell, "A", 0, cell.instances if cell.depth > 1 else 1, plans["A"])
+                except SnapshotReady:
+                    pass
+                else:
+                    raise RuntimeError("snapshot priming reached a scored measurement unexpectedly")
+                if runner.snapshot is None:
+                    raise RuntimeError("priming did not produce a snapshot")
+                source_metadata = snapshot_metadata(runner.snapshot)
+                target = fixture / ("empty.tomo" if index == 0 else "dump.tomo")
+                shutil.copyfile(runner.snapshot, target)
+                captured = snapshot_metadata(target)
+                if captured["sha256"] != source_metadata["sha256"]:
+                    raise RuntimeError("snapshot changed while freezing priming output")
+                snapshots.append(target)
+                metadata.append(captured)
+                row.update(snapshot=captured, source=str(runner.snapshot))
+            except BaseException as error:
+                row.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+                raise
+            finally:
+                # Finish the first owned process before constructing the second.
+                children.close()
+                record_path.write_text(json.dumps(document, indent=2) + "\n")
+            row["status"] = "COMPLETE"
+        images = SnapshotFixtures(*snapshots, *metadata)
+        images.validate()
+        document.update(status="COMPLETE", common_seed=seed_metadata(metadata[0]),
+                        seed_metadata_equal=True)
+        return images, document
+    except BaseException as error:
+        document.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+        raise
     finally:
-        children.close()
+        record_path.write_text(json.dumps(document, indent=2) + "\n")
 
 
 def run_block(args, fixture, output, cell, snapshot, specification):
@@ -241,52 +364,62 @@ def describe_block(cell, specification, report, attempts, rc):
     return result
 
 
+def construction_checks(comparison, baseline, alternative):
+    checks = {}
+    for metric, pair in comparison["metrics"].items():
+        null_error = max(abs(block["metrics"][metric]["delta_pct"]) for block in (baseline, alternative))
+        resolution = max(null_error, baseline["metrics"][metric]["reference_spread_pct"],
+                         alternative["metrics"][metric]["reference_spread_pct"])
+        repeatable = all(alternative["metrics"][metric][f"{arm}_spread_pct"] <=
+                         baseline["metrics"][metric][f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
+        # A later quiet null cannot erase a bad/noisy arm in its direct comparison.
+        checks[metric] = {"delta_pct": pair["delta_pct"], "null_resolution_pct": resolution,
+                          "within_measured_resolution": abs(pair["delta_pct"]) <= resolution,
+                          "spread_did_not_degrade": repeatable,
+                          "comparison_spread_did_not_degrade": pair["candidate_spread_pct"] <= pair["reference_spread_pct"]}
+    okay = comparison["status"] == "PASS" and all(
+        check["within_measured_resolution"] and check["spread_did_not_degrade"] and
+        check["comparison_spread_did_not_degrade"] for check in checks.values())
+    return {"status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT", "metrics": checks}
+
+
 def evaluate(blocks):
     by_name = {block["name"]: block for block in blocks}
-    output = {"defaults_changed": False, "scope": "selected cell only; full-matrix null still required"}
+    output = {"defaults_changed": False, "scope": "selected cell only; full-matrix null still required",
+              "snapshot_scope": "requires fresh/seeded bridge and matched-seed construction comparison; no ordinary gate adoption"}
     required = [spec[0] for spec in BLOCKS]
     if any(name not in by_name for name in required) or any(block["status"] == "UNTESTABLE" for block in blocks):
         return {**output, "window10": {"status": "UNTESTABLE"}, "snapshot": {"status": "UNTESTABLE"}}
-    wire20, wire10, comparison, snapshot20 = [by_name[name] for name in required]
-    nulls = (wire20, wire10, snapshot20)
+    fresh20, fresh10, bridge, seeded20, comparison, snapshot20 = [by_name[name] for name in required]
+    nulls = (fresh20, fresh10, seeded20, snapshot20)
     output["observed_null_error_pct"] = {block["name"]: {
         metric: abs(pair["delta_pct"]) for metric, pair in block["metrics"].items()} for block in nulls}
+    # Preserve the prior instrument-validity restriction: an unsuccessful null is
+    # never erased by a later block, nor used to widen a method's resolution.
     if any(block["status"] != "PASS" for block in nulls):
         reason = "the comparison instrument failed at least one byte-identical null"
         return {**output, "window10": {"status": "UNTESTABLE", "reason": reason},
                 "snapshot": {"status": "UNTESTABLE", "reason": reason}}
-    # Both arm spreads and every scored latency class must hold up. Rate stability
-    # alone cannot authorize shortening a latency histogram from 28 to 18 seconds.
-    window_checks = {metric: all(wire10["metrics"][metric][f"{arm}_spread_pct"] <=
+    # Both arm spreads and every scored latency class must hold up. These are the
+    # ordinary fresh-wire 20/10 paths, so no seeded-construction result substitutes.
+    window_checks = {metric: all(fresh10["metrics"][metric][f"{arm}_spread_pct"] <=
                                 pair[f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
-                     for metric, pair in wire20["metrics"].items()}
+                     for metric, pair in fresh20["metrics"].items()}
     output["window10"] = {"status": "MEETS_SELECTED_CELL_CRITERIA" if all(window_checks.values()) else "REJECT",
+                           "construction": "ordinary fresh boot plus wire population",
                            "spread_did_not_degrade": window_checks}
-    snapshot_checks = {}
-    for metric, pair in comparison["metrics"].items():
-        null_error = max(abs(block["metrics"][metric]["delta_pct"]) for block in (wire20, snapshot20))
-        resolution = max(null_error, wire20["metrics"][metric]["reference_spread_pct"],
-                         snapshot20["metrics"][metric]["reference_spread_pct"])
-        repeatable = all(snapshot20["metrics"][metric][f"{arm}_spread_pct"] <=
-                         wire20["metrics"][metric][f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
-        # The direct method comparison is evidence too. Stable snapshot-only repeats cannot
-        # erase a noisier restored arm in the block that actually compares it with wire loading.
-        comparison_repeatable = pair["candidate_spread_pct"] <= pair["reference_spread_pct"]
-        snapshot_checks[metric] = {"delta_pct": pair["delta_pct"], "null_resolution_pct": resolution,
-                                   "within_measured_resolution": abs(pair["delta_pct"]) <= resolution,
-                                   "spread_did_not_degrade": repeatable,
-                                   "comparison_spread_did_not_degrade": comparison_repeatable}
-    okay = comparison["status"] == "PASS" and all(
-               check["within_measured_resolution"] and check["spread_did_not_degrade"]
-               and check["comparison_spread_did_not_degrade"]
-               for check in snapshot_checks.values())
-    output["snapshot"] = {"status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT",
-                           "metrics": snapshot_checks}
+    bridge_checks = construction_checks(bridge, fresh20, seeded20)
+    bridge_checks["scope"] = "fresh/seeded bridge bundles random seed and empty-loader effects; not a seed-only control"
+    snapshot_checks = construction_checks(comparison, seeded20, snapshot20)
+    okay = all(check["status"] == "MEETS_SELECTED_CELL_CRITERIA" for check in (bridge_checks, snapshot_checks))
+    output["snapshot"] = {**snapshot_checks, "status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT",
+                           "fresh_seeded_bridge": bridge_checks,
+                           "matched_seed_comparison_status": snapshot_checks["status"]}
     return output
 
 
 def tables(report):
-    print("\n| Block | Rate window | A/B Mops/s | Delta % | Rate spread A/B % | Populate A/B s | Status |")
+    print("\n| Block | Rate window | A/B Mops/s | Delta % | Rate spread A/B % | Boot+populate A/B s | Status |")
     print("|---|---:|---:|---:|---:|---:|---|")
     for block in report.get("blocks", []):
         if "metrics" not in block:
@@ -338,6 +471,25 @@ def self_test():
     from unittest import mock
     from background_environment import canonical_contract
 
+    def write_snapshot(path, *, seed=7, epoch=1, cut=123, shards=256):
+        # Synthetic header fixtures only; real priming always uses the server's SAVE.
+        header = bytearray(80)
+        header[:8] = b"TOMOSNP\0"
+        for offset, value in ((8, 1), (12, 80), (16, shards), (20, 0)):
+            header[offset:offset + 4] = value.to_bytes(4, "little")
+        for offset, value in ((24, epoch), (32, cut), (40, seed), (48, seed + 1), (56, seed + 2)):
+            header[offset:offset + 8] = value.to_bytes(8, "little")
+        checksum = 1469598103934665603
+        for byte in header[:64]:
+            checksum = ((checksum ^ byte) * 1099511628211) & ((1 << 64) - 1)
+        header[64:72] = checksum.to_bytes(8, "little")
+        path.write_bytes(header)
+        return snapshot_metadata(path)
+
+    def image_fixture(directory):
+        empty, full = directory / "empty.tomo", directory / "dump.tomo"
+        return SnapshotFixtures(empty, full, write_snapshot(empty), write_snapshot(full, epoch=2, cut=456))
+
     class Experiments(unittest.TestCase):
         def test_background_environment_cli_env_and_block_arguments(self):
             with mock.patch.dict(os.environ, {"GATE_ABBA_BACKGROUND_ENVIRONMENT": "/reviewed/env.json"}):
@@ -347,7 +499,10 @@ def self_test():
                 block = arguments_for_block(args, Path("/fixture"), Path("/output"))
                 self.assertEqual(block.background_environment, args.background_environment)
 
-        def test_complete_driver_calls_real_abba_loop_sixteen_times(self):
+        def test_failed_first_null_is_retained_and_all_later_blocks_still_run(self):
+            self.test_complete_driver_calls_real_abba_loop_twenty_four_times(first_null_fail=True)
+
+        def test_complete_driver_calls_real_abba_loop_twenty_four_times(self, first_null_fail=False):
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 binary = directory / "input-binary"
@@ -363,7 +518,8 @@ def self_test():
                 def measure(runner, cell, arm, sequence, instances, knobs):
                     calls.append((abba.WINDOW, arm, sequence, instances, runner.population_by_arm[arm]))
                     ticks[0] += abba.WINDOW + 8
-                    return {"arm": arm, "rate": 100, "latency_ms": 1, "busy_pct": 99.9,
+                    return {"arm": arm, "rate": 90 if first_null_fail and len(calls) == 4 else 100,
+                            "latency_ms": 1, "busy_pct": 99.9,
                             "instances": instances,
                             "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
                             "complete": True, "window_seconds": abba.WINDOW + .001,
@@ -371,9 +527,8 @@ def self_test():
                             "commands": 2000, "pid": 123,
                             "artifacts": f"{cell.id}/n{instances}-{sequence}-{arm}"}
                 def prime(a, fixture, out, cell):
-                    snapshot = fixture / "dump.tomo"
-                    snapshot.write_bytes(b"snapshot fixture")
-                    return snapshot, {"scored": False, "sha256": abba.sha256(snapshot)}
+                    snapshot = image_fixture(fixture)
+                    return snapshot, {"scored": False, "seed_metadata_equal": True}
                 def reference(a, out):
                     return a.reference_binary, {"source": "test", "commit": "unverified",
                                                 "sha256": abba.sha256(a.reference_binary)}
@@ -409,20 +564,26 @@ def self_test():
                          original_gmtime(epoch + ticks[0] if seconds is None else seconds)), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": "", "GATE_ABBA_BACKGROUND_ENVIRONMENT": ""}), \
                      contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(main(args), 0)
+                    self.assertEqual(main(args), int(first_null_fail))
                 self.assertEqual(abba.WINDOW, original_window)
                 expected = [(window, arm, sequence, 4, method_a if arm == "A" else method_b)
                             for _, window, method_a, method_b in BLOCKS
                             for sequence, arm in enumerate(abba.ORDER, 1)]
                 self.assertEqual(calls, expected)
-                self.assertEqual(quiet_factory.call_count, 5)  # Priming plus all four real blocks.
+                self.assertEqual(quiet_factory.call_count, 7)  # Priming plus all six real blocks.
                 self.assertTrue(all(call.kwargs["background_environment"] == args.background_environment
                                     for call in quiet_factory.call_args_list))
                 report = json.loads((directory / "experiment/experiment.json").read_text())
-                self.assertEqual(len(report["blocks"]), 4)
-                self.assertEqual([len(block["attempts"]) for block in report["blocks"]], [4] * 4)
+                self.assertEqual(len(report["blocks"]), 6)
+                self.assertEqual([len(block["attempts"]) for block in report["blocks"]], [4] * 6)
                 self.assertFalse(report["evaluation"]["defaults_changed"])
+                self.assertEqual(report["plan"]["scored_measurements"], 24)
+                self.assertEqual(report["plan"]["unscored_snapshot_priming_boots"], 2)
                 for block in report["blocks"]:
+                    if first_null_fail and block["name"] == "fresh20_null":
+                        self.assertNotEqual(block["status"], "PASS")
+                        self.assertEqual(len(block["abba"]["cells"][0]["rounds"][0]["runs"]), 4)
+                        continue
                     self.assertEqual(block["abba"]["reference"]["sha256"], block["abba"]["candidate"]["sha256"])
                     self.assertEqual(block["abba"]["verdict"], "PARTIAL")
                     self.assertFalse(block["abba"]["comparison_trusted"])
@@ -497,47 +658,162 @@ def self_test():
                 self.assertEqual(report["quiet_priming"]["interference"], "late foreign work")
 
         def test_priming_saves_and_exits_before_measurement(self):
-            with tempfile.TemporaryDirectory() as tmp:
-                folder = Path(tmp)
-                conn = mock.Mock()
-                def command(*args):
-                    if args[:2] == ("CONFIG", "GET"):
-                        return [b"dbfilename", b"dump.tomo"]
-                    if args == ("SAVE",):
-                        (folder / "dump.tomo").write_bytes(b"saved")
-                        return b"OK"
-                    raise AssertionError(args)
-                conn.must.side_effect = command
-                runner = object.__new__(PrimingRunner)
-                with mock.patch.object(BASE_RUNNER, "populate", return_value=None) as population:
-                    with self.assertRaises(SnapshotReady):
+            for empty in (False, True):
+                with self.subTest(empty=empty), tempfile.TemporaryDirectory() as tmp:
+                    folder = Path(tmp)
+                    conn = mock.Mock()
+                    def command(*args):
+                        if args == ("DBSIZE",):
+                            return 0
+                        if args[:2] == ("CONFIG", "GET"):
+                            return [b"dbfilename", b"dump.tomo"]
+                        if args == ("SAVE",):
+                            write_snapshot(folder / "dump.tomo")
+                            return b"OK"
+                        raise AssertionError(args)
+                    conn.must.side_effect = command
+                    runner = object.__new__(PrimingRunner)
+                    runner.capture_empty = empty
+                    with mock.patch.object(BASE_RUNNER, "populate", return_value=None) as population:
+                        with self.assertRaises(SnapshotReady):
+                            runner.populate(None, "A", conn, folder)
+                    self.assertEqual(population.call_count, int(not empty))
+                    self.assertEqual(conn.must.call_args_list[0].args, ("DBSIZE",))
+                    self.assertEqual(conn.must.call_args_list[-1].args, ("SAVE",))
+                    self.assertEqual(snapshot_metadata(runner.snapshot)["hash_seed"], 7)
+                    conn.must.side_effect = lambda *a: 1
+                    with mock.patch.object(BASE_RUNNER, "populate") as population, \
+                         self.assertRaisesRegex(RuntimeError, "exactly zero keys"):
                         runner.populate(None, "A", conn, folder)
-                population.assert_called_once()
-                self.assertEqual(conn.must.call_args_list[-1].args, ("SAVE",))
-                self.assertEqual(runner.snapshot.read_bytes(), b"saved")
+                    population.assert_not_called()
+
+        def test_two_real_priming_hooks_restart_before_full_population(self):
+            for changed_seed in (False, True):
+                with self.subTest(changed_seed=changed_seed), tempfile.TemporaryDirectory() as tmp:
+                    directory = Path(tmp)
+                    fixture = directory / "fixture"
+                    fixture.mkdir()
+                    args = parse_args(["--server-cores", "0-31", "--server-smt", "", "--load-cores", "32-127", "--load-smt", "160-255"])
+                    cell = abba.Cell("h12", "1s", 1, 0, 1, "SET", 32, 512, instances=4)
+                    events, active = [], []
+                    class Children:
+                        def __init__(self):
+                            if active:
+                                raise AssertionError("priming boots overlapped")
+                            active.append(self)
+                        def close(self):
+                            events.append("stop")
+                            active.remove(self)
+                    def measure(runner, selected, arm, sequence, instances, knobs):
+                        folder = runner.out / "actual-hook"
+                        folder.mkdir(parents=True)
+                        runner.prepare_data(selected, arm, folder)
+                        events.append("empty-boot" if runner.capture_empty else "full-boot")
+                        if not runner.capture_empty:
+                            self.assertEqual(snapshot_metadata(folder / "dump.tomo")["hash_seed"], 7)
+                        else:
+                            self.assertFalse((folder / "dump.tomo").exists())
+                        def command(*command):
+                            if command == ("DBSIZE",): return 0
+                            if command[:2] == ("CONFIG", "GET"): return [b"dbfilename", b"dump.tomo"]
+                            if command == ("SAVE",):
+                                events.append("empty-save" if runner.capture_empty else "full-save")
+                                write_snapshot(folder / "dump.tomo", seed=8 if changed_seed and not runner.capture_empty else 7)
+                                return b"OK"
+                            raise AssertionError(command)
+                        runner.populate(selected, arm, mock.Mock(must=command), folder)
+                    with mock.patch.object(abba, "accepted", return_value=True), \
+                         mock.patch.object(abba, "Children", Children), \
+                         mock.patch.object(BASE_RUNNER, "measure", measure), \
+                         mock.patch.object(BASE_RUNNER, "populate", side_effect=lambda *a: events.append("wire-population")):
+                        if changed_seed:
+                            with self.assertRaisesRegex(RuntimeError, "seed metadata differ"):
+                                prime_snapshot(args, fixture, directory / "priming", cell)
+                        else:
+                            images, report = prime_snapshot(args, fixture, directory / "priming", cell)
+                            images.validate()
+                            self.assertEqual(report["status"], "COMPLETE")
+                            self.assertTrue(report["seed_metadata_equal"])
+                    self.assertEqual(events, ["empty-boot", "empty-save", "stop", "full-boot", "wire-population", "full-save", "stop"])
+                    self.assertEqual(active, [])
+                    artifact = json.loads((directory / "priming/priming.json").read_text())
+                    self.assertEqual(artifact["status"], "FAIL" if changed_seed else "COMPLETE")
+                    self.assertEqual(len(artifact["boots"]), 2)
+
+        def test_snapshot_headers_retain_exact_seed_and_reject_corruption(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                images = image_fixture(directory)
+                images.validate()  # Epoch/cut differ, while routing key material matches.
+                self.assertEqual(seed_metadata(images.empty_metadata), seed_metadata(images.full_metadata))
+                self.assertNotEqual(images.empty_metadata["epoch"], images.full_metadata["epoch"])
+                for offset in (0, 8, 12, 16, 20, 40, 48, 56, 64):
+                    data = bytearray(images.empty.read_bytes())
+                    data[offset] ^= 1
+                    bad = directory / "bad.tomo"
+                    bad.write_bytes(data)
+                    with self.subTest(offset=offset), self.assertRaisesRegex(RuntimeError, "snapshot header"):
+                        snapshot_metadata(bad)
+                images.empty.write_bytes(images.empty.read_bytes()[:79])
+                with self.assertRaisesRegex(RuntimeError, "snapshot header"):
+                    images.validate()
+                write_snapshot(images.empty, seed=99)
+                with self.assertRaisesRegex(RuntimeError, "fixture changed"):
+                    images.validate()
 
         def test_snapshot_hook_never_repopulates_or_saves(self):
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
-                snapshot = directory / "dump.tomo"
-                snapshot.write_bytes(b"saved state")
+                images = image_fixture(directory)
                 folder = directory / "measurement"
                 folder.mkdir()
                 runner = object.__new__(ExperimentRunner)
-                runner.snapshot = snapshot
+                runner.snapshot = images
                 runner.population_by_arm = {"A": "wire", "B": "snapshot"}
                 runner.prepare_data(None, "B", folder)
-                self.assertEqual((folder / "dump.tomo").read_bytes(), snapshot.read_bytes())
+                self.assertEqual((folder / "dump.tomo").read_bytes(), images.full.read_bytes())
                 conn = mock.Mock()
                 conn.must.side_effect = lambda *a: abba.KEYS if a == ("DBSIZE",) else b"x" * 64
                 cell = abba.Cell("h12", "1s", 1, 0, 1, "SET", 32, 512, instances=4)
                 with mock.patch.object(BASE_RUNNER, "populate", side_effect=AssertionError("snapshot was repopulated")):
                     result = runner.populate(cell, "B", conn, folder)
                 self.assertEqual(result["method"], "snapshot")
+                self.assertEqual(result["common_seed"], seed_metadata(images.empty_metadata))
                 self.assertTrue(all(call.args[0] in ("DBSIZE", "GET") for call in conn.must.call_args_list))
                 conn.must.side_effect = lambda *a: abba.KEYS - 1
                 with self.assertRaisesRegex(RuntimeError, "wrong key count"):
                     runner.populate(cell, "B", conn, folder)
+
+        def test_seeded_wire_and_fresh_hooks_are_distinct_and_never_save(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                images = image_fixture(directory)
+                runner = object.__new__(ExperimentRunner)
+                runner.snapshot = images
+                runner.population_by_arm = {"A": "fresh", "B": "wire"}
+                cell = abba.Cell("h12", "1s", 1, 0, 1, "SET", 32, 512, instances=4)
+                for arm in ("A", "B"):
+                    folder = directory / arm
+                    folder.mkdir()
+                    runner.prepare_data(cell, arm, folder)
+                    self.assertEqual((folder / "dump.tomo").exists(), arm == "B")
+                    if arm == "B":
+                        self.assertEqual((folder / "dump.tomo").read_bytes(), images.empty.read_bytes())
+                    conn = mock.Mock()
+                    conn.must.return_value = 0
+                    with mock.patch.object(BASE_RUNNER, "populate", return_value={"original": "wire"}) as populate:
+                        result = runner.populate(cell, arm, conn, folder)
+                    populate.assert_called_once()
+                    self.assertEqual(result["common_seed"], seed_metadata(images.empty_metadata) if arm == "B" else None)
+                    conn.must.assert_called_once_with("DBSIZE")
+                    conn.must.return_value = 1
+                    with mock.patch.object(BASE_RUNNER, "populate") as populate, \
+                         self.assertRaisesRegex(RuntimeError, "exactly zero keys"):
+                        runner.populate(cell, arm, conn, folder)
+                    populate.assert_not_called()
+                environment = runner.population_environment()
+                self.assertEqual(environment["population_seed_matched_arms"], ["B"])
+                self.assertEqual(environment["population_empty_snapshot_sha256"], images.empty_metadata["sha256"])
 
         def test_default_geometry_reserves_server_siblings(self):
             topology = {cpu: frozenset((cpu % 128, cpu % 128 + 128)) for cpu in range(256)}
@@ -588,6 +864,26 @@ def self_test():
             self.assertTrue(result["window10"]["spread_did_not_degrade"]["rate"])
             self.assertFalse(result["window10"]["spread_did_not_degrade"]["p999_ms"])
 
+        def test_bridge_failure_cannot_be_erased_by_matched_seed_results(self):
+            pair = {"delta_pct": 0, "reference_spread_pct": .1, "candidate_spread_pct": .1}
+            for poison in ("gain", "loss", "spread", "verdict"):
+                with self.subTest(poison=poison):
+                    blocks = [{"name": spec[0], "status": "PASS",
+                               "metrics": {"rate": dict(pair), "p999_ms": dict(pair), "long_p999_ms": dict(pair)}} for spec in BLOCKS]
+                    bridge = blocks[2]
+                    if poison in ("gain", "loss"):
+                        bridge["metrics"]["long_p999_ms"]["delta_pct"] = .2 if poison == "gain" else -.2
+                    elif poison == "spread":
+                        bridge["metrics"]["rate"]["candidate_spread_pct"] = .2
+                    else:
+                        bridge["status"] = "FAIL"
+                    result = evaluate(blocks)
+                    self.assertEqual(result["snapshot"]["status"], "REJECT")
+                    self.assertEqual(result["snapshot"]["fresh_seeded_bridge"]["status"], "REJECT")
+                    self.assertEqual(result["snapshot"]["matched_seed_comparison_status"], "MEETS_SELECTED_CELL_CRITERIA")
+                    self.assertEqual(result["window10"]["status"], "MEETS_SELECTED_CELL_CRITERIA")
+                    self.assertFalse(result["defaults_changed"])
+
         def test_snapshot_null_cannot_erase_a_bad_direct_comparison(self):
             pair = {"delta_pct": 0, "reference_spread_pct": .1, "candidate_spread_pct": .1}
             for poison in ("spread", "verdict"):
@@ -596,9 +892,9 @@ def self_test():
                                "metrics": {"rate": dict(pair)}} for spec in BLOCKS]
                     self.assertEqual(evaluate(blocks)["snapshot"]["status"], "MEETS_SELECTED_CELL_CRITERIA")
                     if poison == "spread":
-                        blocks[2]["metrics"]["rate"]["candidate_spread_pct"] = .2
+                        blocks[4]["metrics"]["rate"]["candidate_spread_pct"] = .2
                     else:
-                        blocks[2]["status"] = "FAIL"
+                        blocks[4]["status"] = "FAIL"
                     self.assertEqual(evaluate(blocks)["snapshot"]["status"], "REJECT")
 
     return 0 if unittest.TextTestRunner(verbosity=2).run(
@@ -620,7 +916,7 @@ def main(args):
     if cell.depth > 1 and not cell.instances:
         raise ValueError("selected cell has no measured pin; calibrate with abbagate --escalate first")
     plan = {"cell": asdict(cell), "geometry": {key: getattr(args, key) for key in GEOMETRY_KEYS},
-            "blocks": BLOCKS, "scored_measurements": 16, "unscored_snapshot_priming_boots": 1}
+            "blocks": BLOCKS, "scored_measurements": 24, "unscored_snapshot_priming_boots": 2}
     if args.plan_only:
         print(json.dumps(plan, indent=2))
         return 0
