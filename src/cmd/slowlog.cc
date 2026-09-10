@@ -19,7 +19,7 @@
 // The honest consequence, stated plainly: a command that is slow EXACTLY ONCE while sharing a
 // pipelined batch with other commands is not logged; it arms escalation instead, and its next
 // occurrence is logged exactly. Redis times every command individually and has no such window.
-// The trade buys the default-on hot path back. See NOTES-SERVERTAIL.md.
+// The trade buys the default-on hot path back.
 #include "slowlog.h"
 
 #include "command.h"

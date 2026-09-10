@@ -19,7 +19,9 @@ namespace tomo {
 
 class Server;
 
-// Preserve the measured sampler (DESIGN-flipfp.md): one whole parse pass in 100 on average.
+// Preserve the measured sampler: one whole parse pass in 100 on average. At a matched 512k ops/s,
+// a GET-only -> SET-only swap triggered the fingerprint detector once with both exhaustive and
+// 1-in-100 sampling; the sampled writer still detected the shift with the rate held fixed.
 // Arming derives solely from the controller latch. No runtime sampling knob or adaptive
 // per-operation work is needed; the detector already derives its bands from actual samples.
 inline constexpr uint32_t flip_fingerprint_window(bool controller_enabled) {
@@ -52,9 +54,11 @@ struct FlipFingerprintWindow {
     uint64_t closed_windows = 0;
 };
 
-// SAMPLED BY PARSE PASS (DESIGN-flipfp.md). The io loop asks pass_sampled() once per dispatched
-// frame -- one load of this writer's own word, on the line the old enabled() test already read,
-// and one predicted-false branch; no store. Inside a sampled pass the full fingerprint body runs
+// SAMPLED BY PARSE PASS. A per-op countdown would restore the store this sampler removes: no
+// existing io-side command counter covers both the point paths and all io-local commands.
+// The io loop asks pass_sampled() once per dispatched frame -- one load of this writer's own word,
+// on the line the old enabled() test already read, and one predicted-false branch; no store.
+// Inside a sampled pass the full fingerprint body runs
 // for every frame and note_command accumulates exactly what the exhaustive writer accumulated for
 // that pass; at the pass end finish_parse_pass() publishes it and the caller draws the gap to the
 // next sampled pass. `work_window_` is the mean commands per fingerprint

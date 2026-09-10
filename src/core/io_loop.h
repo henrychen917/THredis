@@ -1479,7 +1479,7 @@ private:
             self_->sig().accept_err++;
             return;
         }
-        // NOTHING READ-LOCAL IS ALLOCATED HERE ANY MORE (DESIGN-RINGDIET.md). The RYOW write-ring
+        // NOTHING READ-LOCAL IS ALLOCATED HERE ANY MORE. The RYOW write-ring
         // sidecar used to be built at accept for every connection on an armed boot, so a pure-read
         // or idle connection carried 1216 bytes (a 1280-byte jemalloc class) it could never use.
         // It is now built on the first write of a connection a local read has ARMED, from that
@@ -3051,7 +3051,7 @@ private:
         const uint64_t pass_read_cut = atomic_tracking ? srv_->atomic_snapshot() : 0;
         uint64_t batch_start_ops = 0;
         [[maybe_unused]] bool read_local_batch = false;
-        // LANE ADMISSION (P128.md): how many lane slots (pending local reads) this connection may
+        // LANE ADMISSION: how many lane slots (pending local reads) this connection may
         // hold during this pass. UINT32_MAX unless the thread's local-read lane is under pressure,
         // in which case it is the lane divided among the active connections
         // (ExLoop::read_local_lane_quota). The pressure byte is tested FIRST and on its own,
@@ -3352,7 +3352,7 @@ private:
                                 (void)rob.refine_current_write_hash(op->hash);
                                 op->mark_read_local_precise_write();
                             }
-                            // DEMOTION-PLAN GATE (DESIGN-DEMOTEGATE.md). prepare() returns true
+                            // DEMOTION-PLAN GATE. prepare() returns true
                             // without building a plan -- loop_ stays null, so active() is false
                             // and commit_reads() is its `if (!loop_) return;` no-op -- unless the
                             // current append must be reserved or a still-pending local read may
@@ -3519,7 +3519,7 @@ private:
                                         ReadLocalFallbackReason::SeqChurn;
                                     read_local_eligible = false;
                                 } else if (rob.pending_read_local_count() >= read_local_quota) {
-                                    // LANE ADMISSION, fair share (P128.md): the lane is under
+                                    // LANE ADMISSION, fair share: the lane is under
                                     // pressure and this connection already holds its share of
                                     // it. DEFER -- see the lane-full arm below for the shape.
                                     // Deliberately does NOT re-arm the pressure window: a signal
@@ -3533,7 +3533,7 @@ private:
                                     break;
                                 } else if (!fused_executor_->local_read_lane_has_room(
                                                read_local_lane_demand)) {
-                                    // LANE ADMISSION, lane full (P128.md): DEFER, never demote.
+                                    // LANE ADMISSION, lane full: DEFER, never demote.
                                     // Nothing about this frame has been published -- the ROB
                                     // slot is acquired but not published, no lane entry, no
                                     // pending bit, no owner slot -- so leaving the bytes at rpos
@@ -4376,7 +4376,7 @@ ordinary_shard_ready:
         return posted;
     }
 
-    // The per-operation gate of the SAMPLED fingerprint (DESIGN-flipfp.md): one load of the
+    // The per-operation gate of the SAMPLED fingerprint: one load of the
     // writer's own word -- the line the old enabled() test already read -- and one predicted-false
     // branch. The body below (the argv walk and its five counter stores, 63-86 instr/op when it ran
     // on every frame) runs only inside a sampled parse pass. Dark writer (--flip-auto 0, every 1s
@@ -4430,8 +4430,10 @@ ordinary_shard_ready:
 
     // THE ONE DOOR ONTO THE PARSE BARRIER. Every owner parks a connection through here so the
     // overlap -- two owners holding the barrier at once -- is COUNTED rather than assumed absent.
-    // NOTES-BARRIER.md section 2 argues from the source that no production sequence produces one
-    // today; barrier_owner_overlaps is that argument's live assertion, and a validation run that
+    // A blocking op is alone in its ROB: dispatch waits for all older ops to retire, then the
+    // barrier stops younger frames; a resumed move reuses that slot and inherits its owner bit.
+    // No external production path adds another owner while it is parked.
+    // barrier_owner_overlaps is that argument's live assertion, and a validation run that
     // wants the two-owner geometry gates on it rather than trusting the prose. Cold by
     // construction: the seven owners are EXEC, a subscribe, a blocking command, a deferred WAIT,
     // a deferred DEBUG SLEEP, a barriered scatter and a CLIENT fan-out. GET and SET never reach it.

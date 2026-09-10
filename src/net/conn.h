@@ -83,10 +83,11 @@ struct Session {
 
 // WHO IS HOLDING THE PARSE BARRIER. Six independent mechanisms park a connection's parse pass, and
 // they used to share ONE bool -- so any one of them could clear a barrier another one still needed.
-// No reachable interleaving overlapped two owners (see NOTES-BARRIER.md section 2: a blocking op is
-// provably alone in its ROB, and every other owner ends the parse pass on the spot), which is
-// exactly why the bool survived: the hazard is one relaxed guard away, not present. Owner bits make
-// the release symmetric with the acquire -- whoever set it is the one whose release can drop it --
+// No reachable interleaving overlapped two owners: a blocking op waits for an empty ROB, then sets
+// the barrier and ends parsing, so it has neither older nor younger neighbours; every other owner
+// also ends the parse pass on the spot. That is exactly why the bool survived: the hazard is one
+// relaxed guard away, not present. Owner bits make the release symmetric with the acquire --
+// whoever set it is the one whose release can drop it --
 // and cost nothing: the byte was already there, and "is any owner holding" is still one byte test.
 //
 // Adding an owner? Add a bit here and acquire it at the site that parks the connection. Do NOT

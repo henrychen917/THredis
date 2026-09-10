@@ -237,7 +237,7 @@ bool validate_source(Slice source, std::string& error) {
 // THERE IS NO UNDO LOG, IN EITHER ATOMIC MODE — AND THAT IS THE SEMANTICS, NOT A GAP.
 //
 // v1 kept a deep pre-image of every declared key while `--atomic 1` was on and restored it when the
-// activation failed (see NOTES-SCRIPTATOMIC.md). Redis has never undone a script's partial effects,
+// activation failed. Redis has never undone a script's partial effects,
 // so an activation that wrote and then raised diverged from the oracle the moment atomics were
 // enabled, and the divergence was a LOST WRITE: the restore republished a superseded value over a
 // committed one, or erased the key outright when the script had just created it. It also could not

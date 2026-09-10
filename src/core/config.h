@@ -290,8 +290,8 @@ struct Config {
     uint32_t client_lb = 1;
 
     // ---- automatic role split (boot-latched) -----------------------------------------------
-    // Ships dark. The controller alone arms the owner-local sampled fingerprint writer
-    // (DESIGN-flipfp.md); its measured sampling policy is internal to flipctl.h. Off and 1s
+    // Ships dark. The controller alone arms the owner-local sampled fingerprint writer;
+    // its measured sampling policy is internal to flipctl.h. Off and 1s
     // dispatch pay one predicted branch per op and no fingerprint store. Trigger bands learn
     // from the anchor's own quiet jitter; no separate controller tuning knobs remain.
     uint32_t flip_auto = 0;

@@ -374,7 +374,7 @@ void init_config(const Config& cfg) {
     g_config.push_back({"notify-keyspace-events", ConfigKind::NotifyFlags,
                         serialize_notify_flags(cfg.notify_events)});
     // Boot-latched: the io owners read the bound directly out of Config, so it is reported but
-    // not live-settable (redis allows CONFIG SET; see NOTES-CLIMON2.md).
+    // not live-settable (redis allows CONFIG SET).
     g_config.push_back({"tracking-table-max-keys", ConfigKind::Unsigned,
                         std::to_string(cfg.tracking_table_max_keys), true});
     add_config("databases", ConfigKind::Unsigned, cfg.databases);
@@ -932,7 +932,7 @@ void cmd_debug_impl(Shard& shard, Op& op) {
     // connection pipelining more than the cap in one parse pass oversubscribes the lane inside
     // that pass. That is what makes the battery's anti-vacuity checks deterministic at gate scale
     // instead of a rate race against the drain that only a saturated rig can win. 0 restores the
-    // derived value, which is what production always runs. See P128.md section 8.
+    // derived value, which is what production always runs.
     if (eq_icase(subcommand, "read-local-lane-cap") && op.argc() == 3) {
         uint64_t cap = 0;
         if (!parse_u64(op.arg(2), cap) || cap > kInboxSlots) {
@@ -946,10 +946,11 @@ void cmd_debug_impl(Shard& shard, Op& op) {
     }
     // GEOMETRY INJECTOR for the parse-barrier ownership regression. While armed, every blocking
     // dispatch pins a SECOND owner on its connection's parse barrier, so the blocking command's
-    // retirement releases a barrier it does not solely own. That two-owner state is unreachable on
-    // any production sequence (NOTES-BARRIER.md section 2) -- which is why it must be injected
-    // rather than provoked, and why a battery that only replays real command sequences proves
-    // nothing about this code. Production default is 0.
+    // retirement releases a barrier it does not solely own. Production blocking dispatch requires
+    // an empty ROB and then bars younger parsing, so the blocking op is alone and cannot meet a
+    // second owner. That is why the overlap must be injected rather than provoked, and why a
+    // battery that only replays real command sequences proves nothing about this code.
+    // Production default is 0.
     //
     // Observable while armed: a frame pipelined BEHIND a blocking command stays unparsed after the
     // blocking reply retires, instead of being answered in the same flush pass. Clearing the latch
@@ -2486,10 +2487,11 @@ void cmd_info(Shard&, Op& op) {
                 // reached the non-quiesced / mid-drain geometry it is there to cover.
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_segmented() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_deferred() : 0),
-                // barrier_owner_overlaps must read 0 on any production run: it is the live
-                // assertion behind NOTES-BARRIER.md's reachability verdict. barrier_releases_held
-                // is the fired-mechanism proof for DEBUG BARRIER-HOLD -- a barrier-ownership test
-                // that leaves it at 0 never reached its geometry and must fail, not pass.
+                // barrier_owner_overlaps must read 0 on any production run: blocking dispatch
+                // requires an empty ROB and bars younger parsing, excluding a second owner.
+                // barrier_releases_held is the fired-mechanism proof for DEBUG BARRIER-HOLD --
+                // a barrier-ownership test that leaves it at 0 never reached its geometry and
+                // must fail, not pass.
                 static_cast<unsigned long long>(
                     g_server ? g_server->barrier_owner_overlaps() : 0),
                 static_cast<unsigned long long>(

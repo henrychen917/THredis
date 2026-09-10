@@ -56,7 +56,7 @@ inline constexpr uint32_t kReadLocalMaxChunksBetweenOwnerBatches = 1;
 // Leave that credit outside the pending-read fanout budget so the combined reservation can always
 // fit an empty producer lane and therefore cannot retry forever.
 inline constexpr uint32_t kReadLocalDemotionBudget = kInboxSlots - 1;
-// Lane ADMISSION pressure window (P128.md). A LANE-FULL deferral arms this many fused rotations
+// Lane ADMISSION pressure window. A LANE-FULL deferral arms this many fused rotations
 // during which the parser bounds every connection to kInboxSlots / active connections in flight.
 // It decays by one per rotation and is re-armed only by the next lane-full event -- never by the
 // quota's own deferrals (the actuator must not police itself) -- so under sustained oversubscription
@@ -138,7 +138,8 @@ struct ReadLocalExState<true> {
         // already sat at offset 38 between reserved_schedule and demote_context, on the same first
         // cache line as lane_head/lane_tail/lane_count that every admission test already reads, so
         // the struct does not grow, nothing moves, and reading it costs no line the caller did not
-        // already own. See P128.md section 8.
+        // already own. Lowering admission lets one pipelined socket write fill the lane inside
+        // one parse pass, before a drain can race the test; traffic volume alone cannot force it.
         uint16_t lane_admit_cap = static_cast<uint16_t>(kInboxSlots);
         void* demote_context = nullptr;
         DemoteFn demote = nullptr;
@@ -275,7 +276,7 @@ public:
                    kReadLocalDemotionBudget - state.lane_demotion_demand;
     }
 
-    // LANE ADMISSION (P128.md). The parser asks once per parse pass how many lane slots (pending
+    // LANE ADMISSION. The parser asks once per parse pass how many lane slots (pending
     // local reads) one connection may hold. Unbounded while the lane is not under pressure -- below
     // kInboxSlots of aggregate demand per rotation. Under pressure it is the lane divided among the
     // connections competing for it, which by construction keeps the sum of admitted local reads
@@ -309,8 +310,8 @@ public:
     // IoLoop fields it does read live on two other lines entirely (notify_armed_ 7864,
     // proto_max_bulk_len_ 7872). That made always-on machinery cost one cold-line demand fill per
     // parse pass while every counter it owns still read zero -- measured on the owner's 32-core box
-    // at 512 connections as +11% DRAM and +3.4% same-CCX fills per op with instructions flat
-    // (P128.md 9.5). A hint must never be load-bearing, and machinery that has not fired must be
+    // at 512 connections as +11% DRAM and +3.4% same-CCX fills per op with instructions flat.
+    // A hint must never be load-bearing, and machinery that has not fired must be
     // free: gate the argument, not just the answer.
     bool read_local_lane_under_pressure() const {
         static_assert(Fused);
@@ -562,7 +563,7 @@ public:
         }
         if (read_local_enabled()) {
             did += read_local_impl().deferred.drain_ready();
-            // One rotation of the lane-admission pressure window has elapsed (P128.md).
+            // One rotation of the lane-admission pressure window has elapsed.
             if (__builtin_expect(read_local_impl().lane_pressure != 0, false))
                 read_local_impl().lane_pressure--;
             // Adopt the test lane cap, if one is set. ONE relaxed load per ROTATION of a
@@ -2339,7 +2340,7 @@ private:
                 // ONE ENTRY PER COMMAND, not per participating shard. A cross-shard op is handed
                 // to every owner it touches; all but the last return with the op still Issued.
                 // Recording only the owner that published Done means a scatter is attributed to
-                // the slice that actually computed the answer -- documented in NOTES-SERVERTAIL.md.
+                // the slice that actually computed the answer.
                 if (client &&
                     client->rob().at(batch[i].op_id).state.load(std::memory_order_relaxed) ==
                         OpState::Done)
@@ -2522,9 +2523,10 @@ private:
                 // fragment has installed nothing yet on this owner, so parking it cannot hold a
                 // half-applied command; and the predecessor can never wait on it, because on
                 // every shard the older unit's fragment is drained first and, if it is itself
-                // parked, parked_predecessor_in() holds this younger fragment behind it. That is
-                // the acyclicity NOTES-MULTIRES.md §5(a) found missing when the same hold was
-                // attempted mid-command against an order-blind key probe.
+                // parked, parked_predecessor_in() holds this younger fragment behind it. Putting
+                // the hold in prepare_write_key() deadlocked: the transaction held partial
+                // installs while waiting on an older group whose order-blind key probe then
+                // waited on those installs.
                 if (__builtin_expect(shard.store().atomic_has_records(), false) &&
                     shard.store().atomic_has_foreign_unit_undecided(
                         t.client->id(),
@@ -2948,8 +2950,8 @@ private:
         const uint32_t slot = c->wb_slot();
         if (slot != Client::kNoWbSlot) {
             // INSIDE AN EXECUTOR BATCH: record and return. The fence, the read-first set and the
-            // wake decision are paid once per batch in flush_notify_batch() (DESIGN-NOTIFY.md
-            // §2, §4). A batch of one op degrades to exactly the sequence below it.
+            // wake decision are paid once per batch in flush_notify_batch(). A batch of one op
+            // degrades to exactly the sequence below it.
             if (__builtin_expect(notify_batch_open_, true)) {
                 if (__builtin_expect(notify_batch_n_ == kNotifyBatchMax, false))
                     flush_notify_batch();
@@ -2992,7 +2994,7 @@ private:
     // decision per io that saw an empty->flagged edge. Deciding the wake once per io AFTER all of
     // its RMWs is equivalent to deciding it per edge: every RMW is a full barrier ahead of the
     // parked_ load, so the Dekker pair with ThreadCtx::arm_blocked closes for each edge on its
-    // own (DESIGN-NOTIFY.md §4.4). The wake is never memoised across flushes -- a cached "already
+    // own. The wake is never memoised across flushes -- a cached "already
     // woke this io" could straddle a park/unpark cycle of the consumer and miss its second park.
     void flush_notify_batch() {
         const uint32_t n = notify_batch_n_;
@@ -3117,7 +3119,7 @@ private:
     // commands pay one predicted-true test at an executor boundary and never touch the TLS
     // commit list.
     bool xshard_commit_pending_ = false;
-    // Per-batch completion notification (DESIGN-NOTIFY.md §2). While a batch is open, the slot
+    // Per-batch completion notification. While a batch is open, the slot
     // path of notify_sender records (io, slot) here instead of fencing and setting per op; the
     // batch end pays ONE seq_cst fence, one ReadyMask::set per recorded client run and one wake
     // decision per io that saw an empty->flagged edge. Sized to this loop's largest batch; the
@@ -3139,7 +3141,7 @@ template <> uint32_t ExLoopT<true>::split_read_local_pass();
 using FusedExLoop = ExLoopT<true>;
 
 // Disabled split executors retain the exact pre-read-local allocation stride plus the 264-byte
-// per-batch notification record (DESIGN-NOTIFY.md §2): 5848 + 8 + 32 * sizeof(NotifyEntry).
+// per-batch notification record: 5848 + 8 + 32 * sizeof(NotifyEntry).
 // 6104 -> 6112: read-local eviction accounting adds exactly ONE word, the per-thread LFU dice
 // (foreign_touch_random_). Its two companions -- the latched policy byte and the fan-out defer
 // hook -- went into padding the lb bool run already carried and cost nothing. This is a per-

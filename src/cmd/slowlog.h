@@ -5,8 +5,9 @@
 // not per op -- and reads no clock at all. Everything below that gate is out of line.
 //
 // WHEN ARMED the executor times at BATCH granularity (two clock reads per <=32 ops) and escalates
-// to per-op timing only after a batch overruns. See NOTES-SERVERTAIL.md for the attribution
-// semantics, which differ from redis's and are documented rather than papered over.
+// to per-op timing only after a batch overruns. A one-op batch is exact; a multi-op batch is
+// screened by its per-op average and, if it overruns, arms exact timing for the next 64 batches.
+// Unlike redis's per-command timing, a one-off slow op in that first multi-op batch is not logged.
 #pragma once
 #include <cstdint>
 

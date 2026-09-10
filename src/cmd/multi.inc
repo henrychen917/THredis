@@ -904,7 +904,7 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     // The park is supposed to foreclose it completely, because only this owner thread may publish
     // into this owner's pending list, so nothing can appear between the dispatch check and these
     // installs. A non-zero reading is therefore not a statistic: it is proof that the park's
-    // safety argument (NOTES-MULTIRACE.md §5) is false on this build, and that a transaction could
+    // safety argument is false on this build, and that a transaction could
     // again clone a withdrawable candidate into an acknowledged write.
     //
     // It counts into its OWN counter, deliberately. Sharing atomic_exec_order_holds with the park
@@ -915,9 +915,10 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     // Not a Shard::Stats field because Shard's layout is locked at 1440 bytes; a namespace-scope
     // atomic costs nothing here, since the increment is on a path that is never taken.
     //
-    // Holding the transaction HERE instead of counting was tried and is WRONG -- it deadlocks,
-    // NOTES-MULTIRES.md §5(a); the park is safe only because it happens before the fragment has
-    // installed anything on this owner.
+    // Holding the transaction HERE deadlocked with one connection and no WATCH (0 rounds versus
+    // 300 on base): the older group could wait on the transaction's partial installs while the
+    // transaction waited on that group. The dispatch-time park is safe because the fragment has
+    // installed nothing on this owner, so it cannot give the older group a reason to wait here.
     // The exclusion is BY EPOCH WORD and must cover the transaction's lowered children as well as
     // its own: a cross-shard child installs through the scatter path with its own ScatterState,
     // and counting that would report a violation every time a transaction merely met its own

@@ -431,7 +431,7 @@ public:
         // NOT share this counter: multi.inc's prepare_write_key() re-asks it at install time and
         // reports violations through INFO atomic_exec_order_late (multi_exec_order_late()), which
         // must read zero. Summing the two would hide a violation inside a number that is non-zero
-        // by design, leaving the park's safety argument with no falsifier (NOTES-MULTIRACE.md §5).
+        // by design, leaving the park's safety argument with no falsifier.
         uint64_t atomic_exec_order_holds = 0;
         // Times watch_finalize_reservation() answered "not ready" because the reservation's epoch
         // was still 0, i.e. a unit was turned into a Retry by an undecided WATCH reservation. It

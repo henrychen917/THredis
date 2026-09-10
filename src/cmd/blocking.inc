@@ -1348,7 +1348,7 @@ void blocking_retire(Server& server, Client& client, Op& op, ThreadCtx& thread) 
     // rob.in_flight() != 0, and the barrier this dispatch then takes stops the parse pass, so a
     // blocking op is provably ALONE in its ROB and no second owner can exist here. Nothing near
     // this line said so, and a relaxed guard or a seventh owner would have made it a live
-    // ordering defect of exactly the class t-storeorder fixed. NOTES-BARRIER.md has the audit.
+    // ordering defect of exactly the class t-storeorder fixed.
     //
     // Note the alternative -- clear only at ROB quiescence -- cannot be spelled here: Rob::drain
     // hands each op to this callback while flush_ is still at that op and stores the advanced

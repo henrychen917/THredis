@@ -240,8 +240,9 @@
     // unit publishes through, not just one: an EXEC's plain per-key installs use the transaction's
     // epoch, while each cross-shard child command lowered inside that EXEC keeps its own
     // ScatterState and therefore its own. Answering with only the transaction's word makes a
-    // transaction hold against its own RENAME/LMPOP child and hang -- the same self-hold
-    // NOTES-MULTIRES.md §5(a) hit from the other direction. Plain single-command pseudo-entries
+    // transaction hold against its own RENAME/LMPOP child and hang. Testing group pointers instead
+    // also deadlocked: an EXEC child's scatter record names a group, while the same EXEC's plain
+    // installs do not. Plain single-command pseudo-entries
     // carry no group_epoch at all: they draw their ticket in the same owner turn that installs
     // them, so they are never undecided and are skipped here.
     template <typename IsOwnUnit>
@@ -1429,7 +1430,7 @@ private:
         return true;
     }
 
-    // ---- armed-write block cache (src/store/kv_block_cache.h, NOTES-RECYCLE.md) ---------------
+    // ---- armed-write block cache (src/store/kv_block_cache.h) ---------------
     //
     // The cache itself belongs to the fused OWNER and is reached through the retire sink this store
     // is already bound to; the store contributes only the eligibility a shard can judge (object
@@ -1782,7 +1783,7 @@ private:
             // waiting on other shards can be overtaken at the ticket counter by a MULTI/EXEC the
             // same connection sent afterwards. Ranking those two by raw ticket then re-installed
             // the OLDER group's value over the newer transaction's, destroying a write EXEC had
-            // already acknowledged -- reproduced at 246/1120 (NOTES-MULTIRES.md).
+            // already acknowledged -- reproduced at 246/1120.
             // Repairing the epoch to be monotone per connection removes the inversion without
             // reordering anything across connections, where the ticket remains the only truth.
             if (key.prev_set && owner.origin_conn_id == key.prev_conn_id &&
@@ -2171,7 +2172,7 @@ private:
             // waiting on other shards can be overtaken at the ticket counter by a MULTI/EXEC the
             // same connection sent afterwards. Ranking those two by raw ticket then re-installed
             // the OLDER group's value over the newer transaction's, destroying a write EXEC had
-            // already acknowledged -- reproduced at 246/1120 (NOTES-MULTIRES.md).
+            // already acknowledged -- reproduced at 246/1120.
             // Repairing the epoch to be monotone per connection removes the inversion without
             // reordering anything across connections, where the ticket remains the only truth.
             if (key.prev_set && owner.origin_conn_id == key.prev_conn_id &&

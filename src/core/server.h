@@ -8,8 +8,10 @@
 //
 // THE ONE MUTABLE HOT-PATH STRUCTURE is shard_owner_: shard id -> thread id, one atomic load per
 // dispatch. Router's packed bucket array remains the bucket-granularity authority; shard_owner_ is
-// its derived shard-granularity fast path, published only at a quiesced commit. See
-// NOTES-MIGRATE.md for the handoff and stale-route forwarding contract.
+// its derived shard-granularity fast path, published only at a quiesced commit. Shards move only
+// after executing, deferred, group and pinned-read work drains; destination routes publish after
+// the ownership edge. An IO may enqueue using an old route after that edge, so tasks and borrow
+// releases recheck ownership and forward before shard access instead of carrying routing epochs.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -308,7 +310,7 @@ public:
         for (uint32_t i = 0; i < nthreads; i++) {
             threads_[i] = std::make_unique<ThreadCtx>();
             // The fingerprint writer is armed only when its one reader, the flip controller, is
-            // enabled (DESIGN-flipfp.md): with --flip-auto 0 and in 1s mode it is dark and costs
+            // enabled: with --flip-auto 0 and in 1s mode it is dark and costs
             // one predicted branch per op. The enabled sampler keeps its measured 1-in-100 policy.
             threads_[i]->init(i, placement_.role_of(i), nthreads,
                               0,
@@ -1969,7 +1971,7 @@ public:
         shard_owner_[shard_id].store(thread_id, std::memory_order_release);
     }
 
-    // The caller must hold both executor loops at the safe point described in NOTES-MIGRATE.md:
+    // The caller must hold both executor loops at the safe point:
     // no executing/retry/group/snapshot work may touch this shard.  Queue entries which arrive via
     // a stale pre-commit route are harmless because ExLoop rechecks and forwards before access.
     // Vector capacity and membership are settled while PREPARING still names the source.  The
@@ -1988,7 +1990,7 @@ public:
     // lost, a block ends up linked twice, and the damage surfaces later as either
     // KvBlockCache::put's `heads[cls] == memory` abort or a take() of a still-linked block whose
     // KvObj header overwrites the list `next`, so that the NEXT take dereferences a wild pointer.
-    // Both were observed (see DESIGN-P0REPLY.md).
+    // Both were observed.
     //
     // The rebind used to be deferred to the destination's own next executor pass
     // (`lb_rebind_pending_` -> `read_local_rebind_owned_shards_after_lb`). Nothing ordered that
@@ -2827,7 +2829,7 @@ public:
     // is xshard_prepare()'s already-cold direct-RENAME arm, so the disabled cost is nothing on any
     // other command. It widens -- deterministically -- the window in which a younger whole-owner
     // walker could overtake an older same-connection group on the destination shard.
-    // TEST HOOK (P128.md section 8): effective local-read LANE CAPACITY for admission. 0 means
+    // TEST HOOK: effective local-read LANE CAPACITY for admission. 0 means
     // derive, which is kInboxSlots and is what production always runs. A non-zero value only makes
     // the armed parser stop admitting sooner; the physical ring keeps its kInboxSlots entries and
     // its masking, so this can never overrun anything. It exists because lane oversubscription is
@@ -2935,9 +2937,11 @@ public:
     // is already set. Nothing on GET/SET touches it.
     //
     // Why a hook is needed at all: the barrier's six owners cannot overlap on any reachable
-    // sequence (NOTES-BARRIER.md section 2), so the state the owner-scoped release exists to
-    // survive -- a release that must NOT drop the barrier -- has to be injected. It is held past
-    // ROB quiescence on purpose; barrier_release_quiesced() exempts this one bit for that reason.
+    // sequence: a blocking op requires an empty ROB, then sets the barrier before any younger
+    // frame can be parsed; a resumed scatter inherits that same slot and barrier. The state the
+    // owner-scoped release exists to survive -- a release that must NOT drop the barrier -- has
+    // to be injected. It is held past ROB quiescence on purpose; barrier_release_quiesced()
+    // exempts this one bit for that reason.
     //
     // A LATCH, NOT A DEADLINE, and that is not a style choice. A barred connection's io thread has
     // nothing left to do and parks on submit_and_wait(1) -- unbounded under io_uring. A hold that
@@ -2968,12 +2972,11 @@ public:
         return debug_blocking_timeout_reaps_.load(std::memory_order_relaxed);
     }
     // An overlap: some owner took the parse barrier while another owner already held it. With
-    // DEBUG BARRIER-HOLD off this must read ZERO -- it is the live form of the reachability verdict
-    // in NOTES-BARRIER.md, and if it ever moves on production traffic the latent case just went
-    // live and the owner-scoped release in blocking_retire() became load-bearing rather than
-    // defensive. With the latch ON it advances once per blocking dispatch, which is the counter's
-    // own positive control: a "must be zero" reading proves nothing until something has been shown
-    // able to make it non-zero.
+    // DEBUG BARRIER-HOLD off this must read ZERO -- if it ever moves on production traffic the
+    // latent case just went live and the owner-scoped release in blocking_retire() became
+    // load-bearing rather than defensive. With the latch ON it advances once per blocking dispatch,
+    // which is the counter's own positive control: a "must be zero" reading proves nothing until
+    // something has been shown able to make it non-zero.
     void note_barrier_overlap() {
         barrier_owner_overlaps_.fetch_add(1, std::memory_order_relaxed);
     }

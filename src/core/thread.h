@@ -118,7 +118,7 @@ enum class ReadLocalFallbackReason : uint8_t {
     ContextRoute,           // scatter/script/all-shard or conservative broad-owner route
     ContextKeymissNotify,   // MGET miss must retain owner-side notification behavior
     InflightWrite,
-    ArmTransient,           // pre-arming writes still in flight (DESIGN-RINGDIET.md)
+    ArmTransient,           // pre-arming writes still in flight
     AtomicPending,
     Missing,
     Typed,
@@ -151,7 +151,7 @@ struct ReadLocalStats {
     // ARM-ON-DEMAND TRANSIENT. Reads demoted because the connection carried writes published
     // BEFORE a local read armed it -- writes the RYOW ring deliberately never recorded. Bounded
     // per connection by one ROB drain and reported separately from the steady-state key conflict
-    // above so that the two can never be confused in a bench (DESIGN-RINGDIET.md).
+    // above so that the two can never be confused in a bench.
     uint64_t fallback_arm_transient = 0;
     uint64_t fallback_atomic_pending = 0;
     uint64_t fallback_missing = 0;
@@ -160,7 +160,7 @@ struct ReadLocalStats {
     uint64_t fallback_seq_churn = 0;
     uint64_t fallback_generation = 0;
     uint64_t fallback_lane_full = 0;
-    // Lane ADMISSION deferrals (P128.md). Frames the armed parser left unconsumed at rpos, to be
+    // Lane ADMISSION deferrals. Frames the armed parser left unconsumed at rpos, to be
     // re-parsed by a later pass of the same thread, because the local-read lane had no room
     // (defer_lane_full) or because the connection already held its fair share of a lane under
     // pressure (defer_quota). Neither is a fallback: the read still completes locally, and no

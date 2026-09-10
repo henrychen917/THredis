@@ -591,7 +591,9 @@ public:
 
     // Eight slot bytes at the 70% target load cost 11.43 bytes per live key. Accounting rounds
     // that stable-state estimate to 12; transient dual tables, tombstones and allocator metadata
-    // are deliberately outside the maxmemory model and documented in NOTES-EVICT.md.
+    // are deliberately outside the maxmemory model: charging those costs would make enforcement
+    // depend on resize history rather than maintained object/key counters. This is a stable
+    // logical cache budget, not an RSS ceiling.
     static constexpr size_t   kSlotOverheadPerKey = 12;
     static constexpr uint32_t kEvictionsPerOp = 16;
     static constexpr uint32_t kSampleProbeAttempts = 16;

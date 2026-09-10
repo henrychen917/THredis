@@ -173,7 +173,7 @@ void cmd_wait(Shard&, Op& op) {
 // against vanilla redis. The numlocal == 1 form -- "block until my writes are covered by a local
 // fsync" -- is NOT implemented and returns an explicit error rather than a plausible number.
 //
-// Why it is not implemented here, and what it needs (NOTES-SERVERTAIL.md carries the full design):
+// Why it is not implemented here, and what it needs:
 // a connection-local handler runs at PARSE time, before the ops ahead of it on the same connection
 // have executed, so the AOF sequence it could sample does not yet cover the caller's own writes.
 // Waiting synchronously cannot fix that: retiring those older ops requires this very IO thread, so
@@ -230,7 +230,7 @@ void cmd_failover(Shard&, Op& op) {
 
 // DELIBERATE DEVIATION. Redis answers +OK and starts replicating. TomoKV has no replication at
 // all, and silently accepting the command would leave a client believing it had a replica. An
-// explicit error is the honest answer; it is documented in NOTES-SERVERTAIL.md.
+// explicit error is the honest answer.
 void cmd_replicaof(Shard&, Op& op) {
     reply_err(op.sink(), "ERR replication is not supported by tomokv");
 }

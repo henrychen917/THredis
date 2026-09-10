@@ -51,7 +51,7 @@ namespace tomo {
 // its unreachability proof is written against. net/conn.h re-exports it by including this file.
 inline constexpr uint32_t kRobWindow = 64;   // max in-flight ops per connection
 
-// COLD-PATH COUNTERS FOR ARM-ON-DEMAND (DESIGN-RINGDIET.md). Three events, none of them on a hot
+// COLD-PATH COUNTERS FOR ARM-ON-DEMAND. Three events, none of them on a hot
 // path: a connection being armed, its RYOW sidecar being allocated, and one write being committed
 // into the ring. They are the instrument the design is proved with -- "pure SET does zero ring
 // bookkeeping" is exactly write_ring_records staying at zero -- so they are always on rather than
@@ -133,8 +133,8 @@ static_assert(ReadLocalRobState::kWriteRingCapacity <=
 // rounds to its 1280-byte class -- measured as +965 bytes of RSS per connection that owns one
 // (scratchpad/ringsize section 3) against the sixteen-slot sidecar's 296/320. It is NO LONGER paid
 // by every connection: arm-on-demand allocates it at the first write of an ARMED connection, so a
-// pure-write connection, a pure-read connection and an idle connection each carry none of it
-// (DESIGN-RINGDIET.md). Locked all the same, so that a later field cannot quietly add another size
+// pure-write connection, a pure-read connection and an idle connection each carry none of it.
+// Locked all the same, so that a later field cannot quietly add another size
 // class to every read/write connection without someone re-measuring that number.
 // The MGET latest-read fence used to live here and now lives in the Rob: it is a read-side fence
 // with nothing to do with the write ring, and keeping it here would have forced a pure-MGET
@@ -315,7 +315,7 @@ public:
     // until this id either completes locally or is irrevocably transferred to the owner path. It
     // lives on the Rob's own producer line rather than in the write-ring sidecar because it is a
     // READ-side fence -- a connection that only ever sends MGETs must not have to allocate 1216
-    // bytes of write ring to hold one id (DESIGN-RINGDIET.md).
+    // bytes of write ring to hold one id.
     void arm_current_local_mget_fence() {
         if (local_mget_fence_id_ != UINT64_MAX) std::abort();
         local_mget_fence_id_ = dispatch_id();
@@ -338,7 +338,7 @@ public:
 
     bool has_pending_read_local() const { return read_local_pending_slots_ != 0; }
     // Lane slots this connection holds right now: local reads published and not yet executed (or
-    // demoted). The parser's fair-share admission (P128.md) compares THIS, not in_flight(): a
+    // demoted). The parser's fair-share admission compares THIS, not in_flight(): a
     // reply that PHASE 2's bounded serve has not flushed yet holds no lane slot and must not
     // count against the connection's share (measured: it halved ops per rotation).
     uint32_t pending_read_local_count() const {
@@ -361,7 +361,7 @@ public:
     // Retires through the same clear-on-empty rule as the per-op form: when the drained chunk was
     // the whole pending set the summary restarts from zero (the contract stated in fcab80884; the
     // chunk form had dropped it, so the filter only ever grew in read-heavy streams and the first
-    // write of every batch paid the exact walk — AUDIT-MARKDIET.md section 4).
+    // write of every batch paid the exact walk).
     void complete_pending_read_local_mask(uint64_t bits) {
         if ((read_local_pending_slots_ & bits) != bits) std::abort();
         read_local_retire_pending_bit(bits);
@@ -471,7 +471,7 @@ public:
     // Every write starts conservative. After arity and routing are known, ordinary point writes
     // and bounded blind keysets may refine it; all other special/multi-key writes leave it broad.
     void mark_current_write() {
-        // ARM ON DEMAND, THE WRITE HALF (DESIGN-RINGDIET.md). Until a local read has armed this
+        // ARM ON DEMAND, THE WRITE HALF. Until a local read has armed this
         // connection the ring records NOTHING: no sidecar, no prune, no descriptor, no Staged tag
         // -- and so no resolve on the next frame either. The entire bookkeeping is one store of
         // this write's id, into a word on the producer's own cache line that dispatch_ has already
@@ -557,7 +557,7 @@ public:
     template <typename KeysetTouchesHash>
     __attribute__((always_inline)) bool read_local_write_conflicts(
             uint64_t hash, KeysetTouchesHash&& keyset_touches_hash) {
-        // ARM ON DEMAND, THE READ HALF (DESIGN-RINGDIET.md). ONE predictable test, on a word this
+        // ARM ON DEMAND, THE READ HALF. ONE predictable test, on a word this
         // frame's acquire_read_local has already pulled into L1 with dispatch_, and nothing is
         // evaluated behind it: a connection in steady state (armed, no arming generation left in
         // flight) reads a zero and falls straight through to the unchanged probe below. The word
@@ -687,7 +687,7 @@ public:
     }
 
     // The RYOW write ring's sidecar. Called from the connection's own IO thread on the first
-    // write of an ARMED connection -- never at accept (DESIGN-RINGDIET.md) -- and directly by the
+    // write of an ARMED connection -- never at accept -- and directly by the
     // unit test, which drives the ROB without a server. Returns false only on allocation failure;
     // every caller has a safe unarmed fallback for that.
     bool prepare_read_local() {
@@ -805,7 +805,7 @@ private:
     static constexpr uintptr_t kReadLocalStateTagBits =
         kReadLocalStateInactive | kReadLocalStateStaged;
 
-    // ARM-ON-DEMAND STATE (DESIGN-RINGDIET.md), one word on the producer line, zero in the state
+    // ARM-ON-DEMAND STATE, one word on the producer line, zero in the state
     // every connection ends up in. Two non-zero values, and a connection passes through each of
     // them at most once:
     //   Unarmed   no local read has been seen. Writes record nothing but their newest id.

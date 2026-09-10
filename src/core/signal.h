@@ -47,7 +47,7 @@ inline uint64_t now_ns() {
 // that will be compared against a deadline must come from here and never from now_ns() above --
 // that one is CLOCK_MONOTONIC, so its "milliseconds" are milliseconds since boot and sit roughly
 // five orders of magnitude below any real deadline. A monotonic value used as an expiry cut does
-// not skew the answer, it disables expiry outright; see NOTES-EXPWIDE.md defect W3.
+// not skew the answer, it disables expiry outright.
 inline int64_t now_realtime_ms() {
     timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

@@ -8,7 +8,7 @@
 //
 // Selector 2 (post-QSBR same-class recycling) is RETIRED: it won its bake-off and was hardcoded.
 // Armed writes now draw their block from, and return it to, the shard's own post-grace block cache
-// unconditionally (FlatStore::read_local_cache_take/put, NOTES-RECYCLE.md), so there is no longer a
+// unconditionally (FlatStore::read_local_cache_take/put), so there is no longer a
 // build that recycles and a build that does not. Selecting 2 is a compile error rather than a
 // silent second recycler competing with the shipped one.
 #pragma once

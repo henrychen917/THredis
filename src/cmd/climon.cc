@@ -605,7 +605,7 @@ bool IoLoop::climon_pause_holds(Op& op) {
     if (cached_now_ms_ >= climon_pause_deadline_ms_) return false;
     const CommandSpec* spec = op.spec;
     if (!spec) return false;
-    // DELIBERATE DIVERGENCE FROM REDIS, documented in NOTES-CLIMON2.md: redis postpones CLIENT
+    // DELIBERATE DIVERGENCE FROM REDIS: redis postpones CLIENT
     // UNPAUSE itself under PAUSE ... ALL, so an ALL pause can only end by expiring. We exempt the
     // connection-control class (CLIENT/RESET/MONITOR, the CmdFlags::Climon rows) so UNPAUSE
     // always works. Everything else -- including PING and reads -- is held under ALL, matching
