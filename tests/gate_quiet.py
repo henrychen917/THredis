@@ -101,8 +101,9 @@ def experiment_driver(argv: list[bytes]) -> bool:
     return False
 
 
-def snapshot(proc_root=Path("/proc")) -> dict[int, Process]:
+def snapshot(proc_root=Path("/proc"), *, cmdline_reader=None) -> dict[int, Process]:
     result = {}
+    read_cmdline = cmdline_reader or (lambda entry, start: (entry / "cmdline").read_bytes())
     for entry in proc_root.iterdir():
         if not entry.name.isdecimal():
             continue
@@ -121,7 +122,7 @@ def snapshot(proc_root=Path("/proc")) -> dict[int, Process]:
             result[pid] = Process(pid, int(fields[19]), int(fields[1]), name,
                                   int(fields[11]) + int(fields[12]),
                                   affinity, False if kernel else experiment_driver(
-                                      (entry / "cmdline").read_bytes().split(b"\0")), kernel)
+                                      read_cmdline(entry, int(fields[19])).split(b"\0")), kernel)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError as exc:
@@ -236,6 +237,11 @@ def interference(before: dict[int, Process], after: dict[int, Process],
 
 class QuietMonitor:
     """Latch the first interference; checking never retries a bad sample into green."""
+    def _snapshot(self):
+        # The normal observer always requires its original complete /proc view.
+        # A permanently untrusted diagnostic subclass may supply its reviewed observation policy.
+        return snapshot()
+
     def __init__(self, server_cpus, load_cpus, *, own_root_pid=None, interval=1.0,
                  window_seconds=20):
         requested = set(server_cpus) | set(load_cpus)
@@ -253,7 +259,7 @@ class QuietMonitor:
         self.window_seconds = window_seconds
         self.cpu_budget_seconds = GENERIC_CPU_FRACTION * self.server_physical_cores * window_seconds
         self.tick_seconds = 1 / os.sysconf("SC_CLK_TCK")
-        self.previous = snapshot()
+        self.previous = self._snapshot()
         self.previous_at = time.monotonic()
         self.started_monotonic = self.previous_at
         pid = os.getpid() if own_root_pid is None else own_root_pid
@@ -286,7 +292,7 @@ class QuietMonitor:
         self.finished = None
 
     def sample(self):
-        current = snapshot()
+        current = self._snapshot()
         now = time.monotonic()
         elapsed = now - self.previous_at
         if elapsed < 0:

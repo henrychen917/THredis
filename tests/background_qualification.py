@@ -2,8 +2,11 @@
 """On-demand, permanently untrusted qualification of an explicitly reviewed background.
 
 First capture an inventory, review exact identities, and mark selected records reviewed=true
-with classification desktop / interactive-frontend / waiting-supervisor. No name is approved
-by default, unreadable identities stay unknown, and approval never includes descendants.
+with classification desktop / interactive-frontend / waiting-supervisor. A system-service
+whose exe link is permission-denied may instead be explicitly reviewed with
+accept_incomplete_executable=true: only its observable PID/start/UID/comm/permission states
+and argv digest are then bound. Executable path and bytes remain UNKNOWN. This weaker option
+exists only for this permanently untrusted diagnostic; approval never includes descendants.
 `run` captures 120 seconds before any boot, executes exactly one pinned ABBA block each for
 h01/h09/h12 through abbagate.main(), then captures 60 seconds after the last measurement.
 The normal generic CPU budget is only audited here; its crossings remain would-refuse events.
@@ -28,7 +31,7 @@ import abbagate as abba
 import gate_quiet as quiet
 
 CELLS = ("h01", "h09", "h12")
-CLASSES = {"desktop", "interactive-frontend", "waiting-supervisor"}
+CLASSES = {"desktop", "interactive-frontend", "waiting-supervisor", "system-service"}
 PREFLIGHT = 120
 POSTFLIGHT = 60
 _DIGESTS = {}
@@ -101,9 +104,52 @@ def identity(pid, expected_start=None, proc_root=Path("/proc")):
             "argv_sha256": hashlib.sha256(argv).hexdigest()}
 
 
+def denied(error):
+    return {"status": "permission-denied", "error_type": type(error).__name__, "errno": error.errno}
+
+
+def incomplete_identity(pid, expected_start=None, proc_root=Path("/proc")):
+    entry = proc_root / str(pid)
+    def state():
+        raw = (entry / "stat").read_text()
+        comm, fields = raw.split("(", 1)[1].rsplit(")", 1)
+        return comm, int(fields.split()[19])
+    comm, start = state()
+    uids = [line.split()[1:] for line in (entry / "status").read_text().splitlines() if line.startswith("Uid:")]
+    if len(uids) != 1 or len(uids[0]) != 4:
+        raise quiet.QuietViolation(f"PID {pid} UID fields are not observable")
+    try:
+        os.readlink(entry / "exe")
+    except PermissionError as error:
+        observation = denied(error)
+    else:
+        raise quiet.QuietViolation(f"PID {pid} executable link is now readable; incomplete identity changed")
+    try:
+        argv = (entry / "cmdline").read_bytes()
+        command = {"status": "readable", "bytes": len(argv), "sha256": hashlib.sha256(argv).hexdigest()}
+    except PermissionError as error:
+        command = denied(error)
+    result = {"provenance": "incomplete-executable", "pid": pid, "start_ticks": start,
+              "comm": comm, "proc_directory_uid": entry.stat().st_uid, "status_uids": list(map(int, uids[0])),
+              "exe": None, "executable_observation": observation, "argv_observation": command,
+              "limitation": "executable path, bytes and script provenance are unobserved"}
+    if state() != (comm, start) or expected_start is not None and expected_start != start:
+        raise quiet.QuietViolation(f"PID {pid} changed while reading its incomplete identity")
+    return result
+
+
+def inventory_cmdline(entry, start):
+    try:
+        return (entry / "cmdline").read_bytes()
+    except PermissionError:
+        # Capture only: no approval or activity exemption follows from missing argv.
+        # The incomplete identity explicitly records this permission failure.
+        return b""
+
+
 def inventory():
     rows = []
-    for row in sorted(quiet.snapshot().values(), key=lambda row: row.pid):
+    for row in sorted(quiet.snapshot(cmdline_reader=inventory_cmdline).values(), key=lambda row: row.pid):
         if row.kernel_thread:
             continue  # PF_KTHREAD accounting remains separately visible in every run.
         record = {"pid": row.pid, "start_ticks": row.start, "parent_pid": row.parent,
@@ -111,6 +157,13 @@ def inventory():
                   "reviewed": False, "classification": None, "identity": None}
         try:
             record["identity"] = identity(row.pid, row.start)
+        except PermissionError as error:
+            record["identity_error"] = str(error)
+            try:
+                record["identity"] = incomplete_identity(row.pid, row.start)
+                record["accept_incomplete_executable"] = False
+            except (OSError, quiet.QuietViolation) as observed_error:
+                record["incomplete_identity_error"] = str(observed_error)
         except (OSError, quiet.QuietViolation) as error:
             record["identity_error"] = str(error)
         rows.append(record)
@@ -125,6 +178,20 @@ def reviewed_inventory(document):
         if row.get("reviewed") is not True:
             continue
         value = row.get("identity")
+        if isinstance(value, dict) and value.get("provenance") == "incomplete-executable":
+            command = value.get("argv_observation", {})
+            if (row.get("classification") != "system-service" or row.get("accept_incomplete_executable") is not True or
+                    value.get("pid") != row.get("pid") or value.get("start_ticks") != row.get("start_ticks") or
+                    value.get("comm") != row.get("comm") or value.get("exe", "missing") is not None or
+                    value.get("executable_observation", {}).get("status") != "permission-denied" or
+                    len(value.get("status_uids", [])) != 4 or command.get("status") not in ("readable", "permission-denied") or
+                    command["status"] == "readable" and not re.fullmatch(r"[0-9a-f]{64}", command.get("sha256", ""))):
+                raise ValueError(f"PID {row.get('pid')} lacks explicit review of complete observable service fields")
+            if row["pid"] in pids or row.get("comm") in quiet.COMPETING:
+                raise ValueError(f"duplicate or competing reviewed PID {row['pid']}")
+            pids.add(row["pid"])
+            reviewed[row["pid"], row["start_ticks"]] = value
+            continue
         if (row.get("classification") not in CLASSES or not isinstance(value, dict) or
                 value.get("pid") != row.get("pid") or value.get("start_ticks") != row.get("start_ticks") or
                 not isinstance(value.get("exe"), dict) or not value["exe"].get("path") or
@@ -147,12 +214,29 @@ def reviewed_inventory(document):
 def summary(document):
     for row in document["processes"]:
         value = row.get("identity")
+        description = ("INCOMPLETE executable provenance; " + str(value["executable_observation"])
+                       if value and value.get("provenance") == "incomplete-executable" else
+                       value["exe"]["path"] if value else "UNKNOWN: " + row.get("identity_error", "unreadable"))
         print(f"{'REVIEWED' if row.get('reviewed') else 'unreviewed':10} "
               f"{row['pid']}:{row['start_ticks']} {row['comm']} ticks={row['cpu_ticks']} "
-              f"{value['exe']['path'] if value else 'UNKNOWN: ' + row.get('identity_error', 'unreadable')}")
+              f"{description}")
 
 
 class QualificationMonitor(quiet.QuietMonitor):
+    def _snapshot(self):
+        def read_cmdline(entry, start):
+            try:
+                return (entry / "cmdline").read_bytes()
+            except PermissionError as error:
+                expected = self.reviewed.get((int(entry.name), start), {})
+                if (expected.get("provenance") != "incomplete-executable" or
+                        expected.get("argv_observation") != denied(error)):
+                    raise
+                # Only an explicitly reviewed, already-unreadable argv may stay unreadable.
+                # Known comms still trigger the observer; new children/identities remain foreign.
+                return b""
+        return quiet.snapshot(cmdline_reader=read_cmdline)
+
     def __init__(self, *args, reviewed, document, output, **kwargs):
         self.reviewed = reviewed
         self.document = document
@@ -194,8 +278,9 @@ class QualificationMonitor(quiet.QuietMonitor):
                     current = after.get(key[0])
                     if current is None or current.identity != key:
                         raise quiet.QuietViolation(f"reviewed PID/start {key} exited or changed")
-                    if current.identity not in owned and identity(current.pid, current.start) != expected:
-                        raise quiet.QuietViolation(f"reviewed PID {current.pid} executable/argv identity changed")
+                    reader = incomplete_identity if expected.get("provenance") == "incomplete-executable" else identity
+                    if reader(current.pid, current.start) != expected:
+                        raise quiet.QuietViolation(f"reviewed PID {current.pid} observed identity changed")
                 for row in after.values():
                     if row.kernel_thread or row.identity in owned or row.identity not in active:
                         continue
@@ -357,7 +442,99 @@ def self_test():
             {"pid": 20, "start_ticks": 3, "comm": "frontend", "cpu_ticks": 0,
              "reviewed": True, "classification": "interactive-frontend", "identity": metadata()}]}
 
+    def weak_metadata():
+        return {"provenance": "incomplete-executable", "pid": 20, "start_ticks": 3, "comm": "frontend",
+                "proc_directory_uid": 0, "status_uids": [0, 0, 0, 0], "exe": None,
+                "executable_observation": denied(PermissionError(13, "permission denied")),
+                "argv_observation": {"status": "readable", "bytes": 32, "sha256": "a" * 64},
+                "limitation": "executable path, bytes and script provenance are unobserved"}
+
+    def weak_document():
+        value = document()
+        value["processes"][0].update(classification="system-service", accept_incomplete_executable=True,
+                                      identity=weak_metadata())
+        return value
+
     class Controls(unittest.TestCase):
+        def test_incomplete_reader_records_denial_without_inventing_an_executable(self):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                entry = root / "20"
+                entry.mkdir()
+                fields = ["0"] * 20
+                fields[19] = "3"
+                (entry / "stat").write_text("20 (systemd-logind) " + " ".join(fields))
+                (entry / "status").write_text("Uid:\t0\t0\t0\t0\n")
+                (entry / "cmdline").write_bytes(b"/usr/lib/systemd/systemd-logind\0")
+                with mock.patch.object(os, "readlink", side_effect=PermissionError(13, "permission denied")):
+                    observed = incomplete_identity(20, 3, root)
+                    self.assertIsNone(observed["exe"])
+                    self.assertEqual(observed["executable_observation"]["errno"], 13)
+                    self.assertEqual(observed["status_uids"], [0] * 4)
+                    self.assertEqual(observed["comm"], "systemd-logind")
+                    self.assertEqual(observed["argv_observation"]["sha256"],
+                                     hashlib.sha256((entry / "cmdline").read_bytes()).hexdigest())
+                with mock.patch.object(os, "readlink", return_value="/now/readable"):
+                    with self.assertRaisesRegex(quiet.QuietViolation, "now readable"):
+                        incomplete_identity(20, 3, root)
+
+        def test_incomplete_service_requires_explicit_acceptance_and_never_accepts_servers(self):
+            value = weak_document()
+            self.assertEqual(reviewed_inventory(value)[20, 3]["provenance"], "incomplete-executable")
+            for field, replacement in (("reviewed", False), ("accept_incomplete_executable", False),
+                                       ("classification", "desktop")):
+                mutated = weak_document()
+                mutated["processes"][0][field] = replacement
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    reviewed_inventory(mutated)
+            for name in ("GarnetServer", "memcached", "cc1plus"):
+                mutated = weak_document()
+                mutated["processes"][0]["comm"] = name
+                mutated["processes"][0]["identity"]["comm"] = name
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    reviewed_inventory(mutated)
+
+        def test_exact_incomplete_service_can_be_observed_but_remains_untrusted(self):
+            with self.fixture() as (monitor, rows, clock), \
+                 mock.patch(__name__ + ".incomplete_identity", return_value=weak_metadata()) as read:
+                monitor.document = weak_document()
+                monitor.reviewed = reviewed_inventory(monitor.document)
+                clock[0] = 20
+                rows[20] = replace(rows[20], ticks=201)
+                monitor.sample()
+                monitor.check()
+                self.assertEqual(read.call_count, 1)
+                self.assertFalse(monitor.evidence()["complete"])
+                self.assertEqual(len(monitor.would_refuse), 1)
+
+        def test_any_incomplete_observation_change_is_hard(self):
+            for field, replacement in (("status_uids", [1] * 4), ("comm", "changed"),
+                    ("executable_observation", denied(PermissionError(1, "different denial"))),
+                    ("argv_observation", denied(PermissionError(13, "now unreadable"))),
+                    ("argv_observation", {"status": "readable", "bytes": 32, "sha256": "b" * 64})):
+                with self.subTest(field=field), self.fixture() as (monitor, rows, clock), \
+                     mock.patch(__name__ + ".incomplete_identity", return_value={**weak_metadata(), field: replacement}):
+                    monitor.document = weak_document()
+                    monitor.reviewed = reviewed_inventory(monitor.document)
+                    monitor.sample()
+                    with self.assertRaisesRegex(quiet.QuietViolation, "observed identity changed"):
+                        monitor.check()
+
+        def test_unreadable_argv_is_allowed_only_when_that_exact_state_was_reviewed(self):
+            with self.fixture() as (monitor, rows, clock), \
+                 mock.patch.object(Path, "read_bytes", side_effect=PermissionError(13, "denied")), \
+                 mock.patch.object(quiet, "snapshot", side_effect=lambda **kw: kw["cmdline_reader"](Path("/proc/20"), 3)):
+                value = weak_document()
+                value["processes"][0]["identity"]["argv_observation"] = denied(PermissionError(13, "denied"))
+                monitor.reviewed = reviewed_inventory(value)
+                self.assertEqual(monitor._snapshot(), b"")
+                monitor.reviewed = reviewed_inventory(weak_document())  # Previously readable.
+                with self.assertRaises(PermissionError):
+                    monitor._snapshot()
+                monitor.reviewed = reviewed_inventory(document())  # Full identity cannot downgrade.
+                with self.assertRaises(PermissionError):
+                    monitor._snapshot()
+
         def test_script_content_change_is_detected_at_same_path_and_same_argv(self):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -387,7 +564,7 @@ def self_test():
             rows = {10: quiet.Process(10, 1, 1, "python3", 10, frozenset(range(64))),
                     20: quiet.Process(20, 3, 1, "frontend", 100, frozenset(range(64)))}
             with tempfile.TemporaryDirectory() as tmp, \
-                 mock.patch.object(quiet, "snapshot", side_effect=lambda: dict(rows)), \
+                 mock.patch.object(quiet, "snapshot", side_effect=lambda **kwargs: dict(rows)), \
                  mock.patch.object(quiet, "read_topology", side_effect=lambda cpus: {c: frozenset([c]) for c in cpus}), \
                  mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]), \
                  mock.patch(__name__ + ".identity", side_effect=lambda pid, start: metadata(pid, start)):
@@ -435,7 +612,7 @@ def self_test():
             with self.fixture() as (monitor, rows, clock), \
                  mock.patch(__name__ + ".identity", return_value={**metadata(), "argv_sha256": "b" * 64}):
                 monitor.sample()
-                with self.assertRaisesRegex(quiet.QuietViolation, "executable/argv identity changed"):
+                with self.assertRaisesRegex(quiet.QuietViolation, "observed identity changed"):
                     monitor.check()
 
         def test_unreadable_reviewed_identity_and_observer_error_stay_hard(self):
