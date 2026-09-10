@@ -252,6 +252,10 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
             "server_cpus": cpu_string(perf_server + perf_server_smt),
             "load_cpus": cpu_string(perf_load + perf_load_smt),
             "threads": len(perf_server) + len(perf_server_smt), "port": first}
+    # Reject an unreviewed measurement shape before correctness spends its whole budget.
+    # Include explicit server SMT in the lookup: it changes the actual thread budget.
+    # Quick never launches ABBA, so it needs only the reviewed correctness-slot ratio.
+    perf["split_ratio"] = "" if purpose == "quick" else measured_ratio("abba", perf["threads"])
     candidate = executable(args.candidate_binary, "--candidate-binary")
     reference = executable(args.reference_binary, "--reference-binary")
     build_cpus = sorted(cpu for values in axes.values() for cpu in values)
@@ -262,6 +266,8 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
               f"{len(perf_load)} load physical cores, {len(perf_load_smt)} load SMT threads "
               f"({'automatic available siblings' if args.load_smt is None else 'explicit selection'}), "
               f"{len(perf_server_smt)} explicit server SMT threads")
+    if perf["split_ratio"]:
+        header += f", reviewed ratio {perf['split_ratio']}"
     if len(server) > len(perf_server):
         header += f" ({len(server)-len(perf_server)} surplus server cores move to ABBA load)"
     return {"tier": tier, "purpose": purpose, "subset": subset,
@@ -350,6 +356,8 @@ def self_test():
             self.assertEqual(plan["perf"]["server_cores"], "0-31")
             self.assertEqual(plan["perf"]["load_cores"], "32-127")
             self.assertEqual(plan["perf"]["server_smt"], "")
+            self.assertEqual(plan["perf"]["split_ratio"], "16:16")
+            self.assertIn("reviewed ratio 16:16", plan["header"])
             self.assertEqual(parse_cpu_range(plan["perf"]["load_smt"]),
                              [1000 + 3 * cpu for cpu in range(32, 128)])
             self.assertEqual(len(parse_cpu_range(plan["perf"]["load_cpus"])), 192)
@@ -400,7 +408,7 @@ def self_test():
 
         def test_auto_smt_obeys_selected_budget_and_available_topology(self):
             with mock.patch.dict(os.environ, {}, clear=True):
-                args = parser().parse_args(["--server-cores", "0-15", "--load-cores", "32-47"])
+                args = parser().parse_args(["quick", "--server-cores", "0-15", "--load-cores", "32-47"])
             available = set(range(128)) | {1000 + 3 * cpu for cpu in range(40, 64)}
             plan = make_plan(args, topology=topology, available=available, check_available=False)
             self.assertEqual(plan["perf"]["server_cores"], "0-15")
@@ -411,19 +419,31 @@ def self_test():
                 self.assertFalse(topology[cpu] & set(range(16)))
 
         def test_minimum_budget(self):
-            plan = self.plan("--server-cores", "0-7", "--load-cores", "8-15", "--ports", "9000-9002")
+            plan = self.plan("quick", "--server-cores", "0-7", "--load-cores", "8-15", "--ports", "9000-9002")
             self.assertEqual(plan["slot_count"], 1)
             self.assertEqual(plan["perf"]["threads"], 8)
+            self.assertEqual(plan["perf"]["split_ratio"], "")
             self.assertEqual(plan["slots"][0]["load_cpus"], "8-15")
+
+        def test_unknown_abba_thread_budget_fails_before_work(self):
+            geometries = (("--server-cores", "0-7", "--load-cores", "8-15"),
+                          ("--server-cores", "0-15", "--load-cores", "16-31"),
+                          ("--server-cores", "0-31", "--server-smt", "1000",
+                           "--load-cores", "32-47"))
+            for purpose in ("iteration", "push", "release", "full", "perf"):
+                for threads, flags in zip((8, 16, 33), geometries):
+                    with self.subTest(purpose=purpose, threads=threads), self.assertRaisesRegex(
+                            ValueError, f"no reviewed abba io:ex ratio for {threads} server threads"):
+                        self.plan(purpose, *flags)
 
         def test_planned_port_overrides_stale_abba_environment(self):
             import abbagate
-            plan = self.plan("--server-cores", "0-7", "--load-cores", "8-15", "--ports", "9000-9002")
+            plan = self.plan("--server-cores", "0-31", "--load-cores", "32-47", "--ports", "9000-9011")
             _, _, *argv = self.argv(plan)
             with mock.patch.dict(os.environ, {"GATE_ABBA_PORT": "65000"}, clear=True), \
                  mock.patch.object(sys, "argv", ["abbagate.py", *argv]):
                 parsed = abbagate.parse_args()
-            self.assertEqual(abbagate.select_port(parsed.ports, parsed.port), (9000, (9000, 9002)))
+            self.assertEqual(abbagate.select_port(parsed.ports, parsed.port), (9000, (9000, 9011)))
 
         def test_slots_own_disjoint_resources(self):
             plan = self.plan("--server-cores", "0-31,64-95", "--load-cores", "32-47,96-111")
@@ -454,7 +474,7 @@ def self_test():
                 self.plan("--server-cores", "0-7,1000", "--load-cores", "8-15")
 
         def test_explicit_smt_follows_selected_physical_owner(self):
-            plan = self.plan("--server-cores", "0-39", "--server-smt", "1000,1096",
+            plan = self.plan("quick", "--server-cores", "0-39", "--server-smt", "1000,1096",
                              "--load-cores", "40-63", "--load-smt", "1120")
             self.assertEqual(plan["perf"]["server_smt"], "1000")
             self.assertEqual(plan["perf"]["load_smt"], "1096,1120")

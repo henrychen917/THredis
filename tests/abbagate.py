@@ -1617,6 +1617,15 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
             raise RuntimeError(report["reason"])
         report["measurement_valid"] = diagnostic_monitor is None
         report["elapsed_seconds"] = time.monotonic() - start
+        if args.escalate:
+            # Calibration starts with unpinned INPUTS. Preserve that inventory,
+            # but a confirmed live plateau is no longer a pending measurement.
+            # Otherwise a successful --collect-null --escalate campaign fails
+            # its final evidence check merely because its input was unmeasured.
+            report["coverage"]["requested_pending_pins"] = report["coverage"]["pending_pins"][:]
+            report["coverage"]["pending_pins"] = [row["cell"]["id"] for row in report["cells"]
+                if row["cell"]["depth"] > 1 and row.get("assessment", {}).get(
+                    "load_selection", {}).get("status") != "CONFIRMED"]
         report["statistical_verdict"], report["worst_cell"] = overall(report["cells"])
         report["verdict"] = report["statistical_verdict"]
         if report["statistical_verdict"] == "PASS":
@@ -3093,7 +3102,7 @@ def self_test():
                 original_gmtime = time.gmtime
                 sequence = [0]
 
-                def run(*, collect=False, subset="full", control=None, candidate_rate=100, only=""):
+                def run(*, collect=False, subset="full", control=None, candidate_rate=100, only="", escalate=False):
                     sequence[0] += 1
                     out = directory / f"run-{sequence[0]}"
                     null_path = directory / "standing.json"
@@ -3106,6 +3115,8 @@ def self_test():
                         "--subset", subset, "--collect-null", str(int(collect)), "--null-result", str(null_path)]
                     if only:
                         argv += ["--only", only]
+                    if escalate:
+                        argv += ["--escalate"]
                     with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                         args = parse_args()
                     calls = []
@@ -3156,6 +3167,14 @@ def self_test():
                                  (3, 8, "PARTIAL", "PASS"))
                 self.assertFalse(control["comparison_trusted"])
                 self.assertEqual((control_out / "binary-A").read_bytes(), (control_out / "binary-B").read_bytes())
+                original_source = source.read_text()
+                source.write_text(original_source.replace(" | 4 | ", " | - | "))
+                rc, calls, calibrated, _ = run(collect=True, escalate=True)
+                source.write_text(original_source)
+                self.assertEqual((rc, len(calls), calibrated["null_control"]["verdict"]), (3, 16, "PASS"))
+                self.assertEqual(calibrated["coverage"]["requested_pending_pins"], ["n1", "n2"])
+                self.assertEqual(calibrated["coverage"]["pending_pins"], [])
+                self.assertEqual([row["cell"]["instances"] for row in calibrated["cells"]], [0, 0])
                 # The same magnitude in either direction fails an identical-arm
                 # collection. The favorable direction still passes a normal code
                 # comparison: this changes null validity, not regression thresholds.

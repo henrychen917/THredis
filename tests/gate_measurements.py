@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 
 DEFAULT = Path(__file__).with_name("gate_measurements.json")
 SHAPE = ("mode", "read_local", "overlap", "reorder", "op", "depth", "conns", "atomic", "score", "mix")
@@ -136,18 +137,23 @@ def import_calibration(path, measurements, cells):
     # Recompute the mathematical selection; trusting a serialized PASS would let an
     # edited summary promote an unsaturated or incomplete measurement to a floor.
     from abbagate import Cell, select_load_floor
+    from abba_evidence import validate_measurements, validate_null
+    from abba_instrument import instrument_fingerprint
     path = Path(path).resolve()
-    report = json.loads(path.read_text())
-    require(report.get("normal_gate_eligible", True) and report.get("measurement_valid") is True,
-            "calibration has invalid/untrusted instrument evidence")
+    content = path.read_bytes()
+    report = json.loads(content)
+    fingerprint = instrument_fingerprint(DEFAULT.parent.parent)
+    # Load selection alone cannot certify an instrument: an explicit failed null,
+    # a failed depth-1 row, a shortened measurement, or incomplete quiet coverage
+    # must reject the entire import too. Reuse the normal report validator.
+    validate_measurements(report, now=time.time(), expected_instrument=fingerprint)
+    if report["run_kind"] == "null-control":
+        validate_null(report, now=time.time())
     require(report.get("escalate") is True, "floor import requires an explicit --escalate campaign")
-    require(report.get("quiet_box", {}).get("complete") is True and
-            not report["quiet_box"].get("interference"), "calibration did not complete its quiet observer")
     datetime.fromisoformat(report["started_utc"].replace("Z", "+00:00"))
     placement = geometry(report["environment"])
-    instrument = instrument_digest()
-    require(report.get("instrument_fingerprint", {}).get("sha256") == instrument,
-            "calibration instrument changed; workload shape/floor must be recalibrated")
+    instrument = fingerprint["sha256"]
+    report_digest = hashlib.sha256(content).hexdigest()
     require(placement["split_ratio"] == ratio("abba", len(report["environment"]["server_cpus"]), measurements),
             "calibration ratio differs from reviewed config")
     current = {cell.id: cell for cell in cells}
@@ -168,7 +174,7 @@ def import_calibration(path, measurements, cells):
         updates[cell.id] = dict(instances=count, shape=shape(cell), geometry=placement,
             instrument_sha256=instrument, status="calibrated",
             observed_rate=None, observed_busy=None, provenance={"when": report["started_utc"],
-            "how": f"abbagate --escalate; {path}; sha256={sha256(path)}; "
+            "how": f"abbagate --escalate; {path}; sha256={report_digest}; "
                    f"reference={report['reference']['sha256']}; candidate={report['candidate']['sha256']}; "
                    f"lowest tested qualifying instances={count}; confirmation={selection['confirmation_instances']}"})
     require(updates, "calibration contains no deep-pipeline load floors")
@@ -244,7 +250,10 @@ def self_test():
                     configured_reference(commit, self.config)
 
         def test_calibration_import_replays_evidence_and_rejects_mutations(self):
-            from abbagate import Cell, load_layout, ORDER
+            from abbagate import Cell, load_layout, ORDER, assess
+            from abba_instrument import instrument_fingerprint
+            from abba_evidence import null_result
+            from background_environment import canonical_contract
             from _abba_test_fixtures import saturation_record
             cell = Cell(**self.cell)
             rounds = []
@@ -252,13 +261,32 @@ def self_test():
                 layout = load_layout(self.placement["load_physical"] + self.placement["load_smt"], count, cell.conns)
                 rounds.append(dict(instances=count, runs=[dict(arm=arm, rate=100, busy_pct=99.9,
                     saturation=saturation_record(cell.mode), window_seconds=20, midpoint_monotonic=11,
-                    complete=True, instances=count, load_layout=layout) for arm in ORDER]))
-            report = dict(measurement_valid=True, escalate=True, started_utc="2026-09-11T00:00:00Z",
-                instrument_fingerprint={"sha256": instrument_digest()},
-                quiet_box=dict(complete=True, interference=None),
-                environment={**self.placement, "server_cpus": list(range(32))},
+                    complete=True, instances=count, load_layout=layout, latency_ms=1, commands=2000, pid=123,
+                    artifacts=f"{cell.id}/n{count}-{index}-{arm}") for index, arm in enumerate(ORDER, 1)]))
+            started = "2026-09-10T00:00:00Z"
+            epoch = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+            instrument = instrument_fingerprint(DEFAULT.parent.parent)
+            load_cpus = self.placement["load_physical"] + self.placement["load_smt"]
+            monitored = list(range(32)) + load_cpus
+            background = canonical_contract(None)
+            source = "synthetic cell fixture\n"
+            report = dict(schema=1, order=list(ORDER), window_seconds=20, elapsed_seconds=200,
+                verdict="PARTIAL", statistical_verdict="PASS", run_kind="comparison", subset="full", only="",
+                receipt_harness_sha256="a" * 64, comparison_trusted=False,
+                measurement_valid=True, escalate=True, started_utc=started, instrument_fingerprint=instrument,
+                cell_source=dict(text=source, sha256=hashlib.sha256(source.encode()).hexdigest(), total_cells=1),
+                quiet_box=dict(complete=True, interference=None, policy="operational-environment-v1",
+                    started_at=epoch, finished_at=epoch + 200, sample_interval_seconds=1, samples=201,
+                    cpus=monitored, requested_cpus=monitored, background_environment=dict(contract=background,
+                        sample_count=201, sample_artifact="synthetic.jsonl", listener_snapshots=0,
+                        source={"path": None, "sha256": None}, reviewed_inventory=None)),
+                environment={**self.placement, "server_cpus": list(range(32)), "load_cpus": load_cpus,
+                    "python_runtime": instrument["python"], "uname": ["synthetic"], "memtier_sha256": "c" * 64,
+                    "memtier_version": "fixture", "keys": 2000000, "data_bytes": 64, "key_pattern": "P:P",
+                    "population_by_arm": {"A": "wire", "B": "wire"}, "background_environment": background},
                 candidate={"sha256": "a" * 64}, reference={"sha256": "b" * 64},
-                coverage={"ids": [cell.id]}, cells=[dict(cell=asdict(cell), rounds=rounds)])
+                coverage={"ids": [cell.id], "count": 1, "pending_pins": [], "requested_pending_pins": [cell.id]},
+                cells=[dict(cell=asdict(cell), rounds=rounds, verdict="PASS", assessment=assess(cell, rounds))])
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "results.json"
                 path.write_text(json.dumps(report))
@@ -268,13 +296,16 @@ def self_test():
                 self.assertIn(sha256(path), config["load_floors"][cell.id]["provenance"]["how"])
                 for mutate in (
                         lambda v: v.update(measurement_valid=False),
+                        lambda v: v.update(verdict="FAIL"),
                         lambda v: v.update(escalate=False),
                         lambda v: v["instrument_fingerprint"].update(sha256="0" * 64),
                         lambda v: v["quiet_box"].update(complete=False),
+                        lambda v: v["quiet_box"].update(finished_at=epoch + 1),
                         lambda v: v["coverage"]["ids"].append("missing"),
                         lambda v: v["cells"][0]["cell"].update(conns=2048),
                         lambda v: v["cells"][0]["rounds"].pop(),
                         lambda v: v["cells"][0]["rounds"][1]["runs"][1].update(complete=False),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][1].update(window_seconds=1),
                         lambda v: v["cells"][0]["rounds"][0]["runs"][0].update(
                             saturation=saturation_record(cell.mode, score=1))):
                     broken, unchanged = copy.deepcopy(report), copy.deepcopy(self.config)
@@ -283,6 +314,24 @@ def self_test():
                     with self.assertRaises(ValueError):
                         import_calibration(path, unchanged, [cell])
                     self.assertEqual(unchanged, self.config)
+                null = copy.deepcopy(report)
+                null["run_kind"] = "null-control"
+                null["reference"]["sha256"] = null["candidate"]["sha256"]
+                null["null_control"] = null_result(null, now=time.time())
+                path.write_text(json.dumps(null))
+                self.assertEqual(import_calibration(path, copy.deepcopy(self.config), [cell]), [cell.id])
+                null["null_control"]["verdict"] = "FAIL"
+                path.write_text(json.dumps(null))
+                with self.assertRaisesRegex(ValueError, "null control did not complete and pass"):
+                    import_calibration(path, copy.deepcopy(self.config), [cell])
+                failed_latency = copy.deepcopy(report)
+                p1 = replace(cell, id="latency", depth=1, score="latency")
+                failed_latency["cells"].append(dict(cell=asdict(p1), verdict="FAIL"))
+                failed_latency["coverage"].update(ids=[cell.id, p1.id], count=2)
+                failed_latency["cell_source"]["total_cells"] = 2
+                path.write_text(json.dumps(failed_latency))
+                with self.assertRaisesRegex(ValueError, "nonpassing ABBA cell: latency"):
+                    import_calibration(path, copy.deepcopy(self.config), [cell, p1])
 
     return 0 if unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(Measurements)).wasSuccessful() else 1
