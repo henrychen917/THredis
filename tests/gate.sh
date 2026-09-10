@@ -1035,12 +1035,12 @@ for core_row in watch scheduler lifetime drain route snapshot config notify; do
   if [ "$CORE_UNIT_READY" = 1 ] && \
       ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
       taskset -c "$CORES" ./build/core-concurrency-unit "$core_row" \
-          >"build/gate-core-$core_row.txt" 2>&1 && \
+          >"$TMPDIR/gate-core-$core_row.txt" 2>&1 && \
       tsan_unit "$CORE_TSAN" core-concurrency-tsan \
           "PASS core concurrency $core_row (state assertions fired)" "$core_row"; then
     ok "core concurrency $core_row"
   else
-    bad "core concurrency $core_row" "see build/gate-core-$core_row.txt, $TMPDIR/tsan-core-concurrency-tsan-$core_row.log, and $RUN_DIR/jobs/production_units/build.log and $RUN_DIR/jobs/core_tsan_build/build.log"
+    bad "core concurrency $core_row" "see $TMPDIR/gate-core-$core_row.txt, $TMPDIR/tsan-core-concurrency-tsan-$core_row.log, and $RUN_DIR/jobs/production_units/build.log and $RUN_DIR/jobs/core_tsan_build/build.log"
   fi
 done
 }
