@@ -1236,12 +1236,14 @@ done
 
 job_netcmd_units(){
 # Surviving networking/command audit: deterministic serverless failure states, both tiers.
+# notify-retry and flush prepare a four-thread topology. Workers inherit their small load
+# slot, so every unit case runs on the assigned eight-CPU server slot instead.
 row_begin "netcmd regression build"
 unit_ready netcmd-unit \
     && ok "netcmd regression build" || bad "netcmd regression build" "see $RUN_DIR/jobs/production_units/build.log"
 for NETCMD_CASE in streams zpop notify-oom notify-retry flush output pubsub receive config; do
   row_begin "netcmd $NETCMD_CASE regression"
-  ./build/netcmd-unit "$NETCMD_CASE" >$TMPDIR/gate-netcmd-$NETCMD_CASE.txt 2>&1 \
+  taskset -c "$CORES" ./build/netcmd-unit "$NETCMD_CASE" >$TMPDIR/gate-netcmd-$NETCMD_CASE.txt 2>&1 \
       && ok "netcmd $NETCMD_CASE regression" \
       || bad "netcmd $NETCMD_CASE regression" "see $TMPDIR/gate-netcmd-$NETCMD_CASE.txt"
 done
