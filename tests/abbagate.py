@@ -103,7 +103,12 @@ BUSY_FLOOR = 95.0      # below this a cell is rejected outright, plateau or not
 # saturate, so capping the ladder at 8 makes an improvement fail the saturation precondition -- the
 # gate would reject exactly the changes it exists to certify. The preferred diagnostic
 # level remains 98%; the enforced BUSY_FLOOR above is unchanged.
-LADDER = (1, 2, 4, 8, 16)
+# At 512 connections on the default 192 load CPUs, n=12 assigns 16 workers per
+# process and two or three clients per worker: all 192 workers serve exactly 512
+# connections. n=8 uses 128 workers; n=16 also uses only 128 because its equal
+# connection shares must divide the worker count. Keep n=16 as a separate probe,
+# but selection must not credit its smaller worker pool as increased capacity.
+LADDER = (1, 2, 4, 8, 12, 16)
 # Project measurement-integrity boundary, NOT the regression tolerance.
 MAX_SPREAD = 2.0
 ORDER = ("A", "B", "B", "A")
@@ -2158,7 +2163,7 @@ def self_test():
 
         def test_load_escalation_preserves_total_connections(self):
             load = list(range(64, 128)) + list(range(192, 256))
-            for n in (1, 2, 3, 4, 8):
+            for n in sorted(set(LADDER) | {3}):
                 layout = load_layout(load, n, 512)
                 self.assertEqual(sum(x["threads"] * x["clients"] for x in layout), 512)
                 assigned = [c for x in layout for c in x["cpus"]]
@@ -2167,7 +2172,7 @@ def self_test():
 
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
                       climbing=False, ceiling=16, contend_after=None, reference_error=None, rates=None,
-                      run_overrides=None):
+                      run_overrides=None, load_cores="32-127", load_smt="160-255"):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
             # pin=3/512 fixture also catches silently skipping a non-doubling pin.
@@ -2181,8 +2186,8 @@ def self_test():
                 output = directory / "out"
                 argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
                         "--output", str(output), "--memtier", sys.executable,
-                        "--server-cores", "0-31", "--server-smt", "", "--load-cores", "32-127",
-                        "--load-smt", "160-255", "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
+                        "--server-cores", "0-31", "--server-smt", "", "--load-cores", load_cores,
+                        "--load-smt", load_smt, "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
                 with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                     args = parse_args()
                 order, layouts = [], []
@@ -2293,7 +2298,7 @@ def self_test():
             self.assertFalse(report["measurement_valid"])
 
         def test_pin_drives_real_loop_to_exactly_four_measurements(self):
-            for pin in (3, 4):
+            for pin in (3, 4, 12):
                 with self.subTest(pin=pin):
                     rc, order, layouts, result, output = self.fake_main(pin=pin)
                     self.assertEqual(rc, 3, output)  # No standing null: raw success cannot be trusted PASS.
@@ -2306,11 +2311,14 @@ def self_test():
                     if pin == 3:
                         self.assertEqual([x["threads"] for x in layouts[0]], [16, 16, 16])
                         self.assertEqual([x["clients"] for x in layouts[0]], [10, 11, 11])
+                    if pin == 12:
+                        self.assertEqual(sum(x["threads"] for x in layouts[0]), 192)
+                        self.assertEqual(sorted(x["clients"] for x in layouts[0]), [2] * 4 + [3] * 8)
 
         def test_escalate_ignores_pin_and_drives_full_ladder(self):
             rc, order, _, result, output = self.fake_main(pin=3, escalate=True, climbing=True)
-            self.assertEqual(order, [(n, arm) for n in (1, 2, 3, 4, 8, 16) for arm in ORDER])
-            self.assertEqual(len(order), 24)
+            self.assertEqual(order, [(n, arm) for n in sorted(set(LADDER) | {3}) for arm in ORDER])
+            self.assertEqual(len(order), 28)
             self.assertEqual(rc, 1, output)  # Still rising at the ceiling is unproven saturation.
             self.assertIn("ESCALATE ignores pin=3", output)
             self.assertIn("n=16: no higher-instance confirmation block",
@@ -2376,18 +2384,65 @@ def self_test():
                     self.assertEqual(chosen["confirmation_shape"], "congestion")
                     self.assertEqual(selection["generator_headroom"], "UNPROVEN")
 
-        def test_real_escalation_cannot_call_same_worker_count_more_capacity(self):
+        def test_real_escalation_twelve_confirms_eight_with_more_workers(self):
             rates = {n: [min(n, 8) * 100] * 4 for n in LADDER}
+            rc, order, layouts, result, output = self.fake_main(escalate=True, rates=rates)
+            self.assertEqual(rc, 3, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2, 4, 8, 12) for arm in ORDER])
+            self.assertEqual(len(order), 20)
+            workers = {n: sum(p["threads"] for p in layout)
+                       for (n, _), layout in zip(order, layouts)}
+            self.assertEqual(workers, {1: 16, 2: 32, 4: 64, 8: 128, 12: 192})
+            for layout in layouts:
+                assigned = [cpu for p in layout for cpu in p["cpus"]]
+                self.assertEqual(sorted(assigned), list(range(32, 128)) + list(range(160, 256)))
+                self.assertEqual(sum(p["threads"] * p["clients"] for p in layout), 512)
+            selection = result["cells"][0]["assessment"]["load_selection"]
+            self.assertEqual(selection["lowest_tested_qualifying_instances"], 8)
+            self.assertEqual(selection["confirmation_instances"], 12)
+            self.assertEqual(selection["generator_headroom"], "UNPROVEN")
+
+        def test_real_escalation_sixteen_cannot_credit_fewer_workers_than_twelve(self):
+            rates = {n: [min(n, 12) * 100] * 4 for n in LADDER}
             rc, order, layouts, result, output = self.fake_main(escalate=True, rates=rates)
             self.assertEqual(rc, 1, output)
             self.assertEqual(order, [(n, arm) for n in LADDER for arm in ORDER])
+            self.assertEqual(len(order), 24)
             workers = {n: sum(p["threads"] for p in layout)
                        for (n, _), layout in zip(order, layouts)}
-            self.assertEqual(workers, {1: 16, 2: 32, 4: 64, 8: 128, 16: 128})
+            self.assertEqual(workers, {1: 16, 2: 32, 4: 64, 8: 128, 12: 192, 16: 128})
             selection = result["cells"][0]["assessment"]["load_selection"]
             self.assertIsNone(selection["lowest_tested_qualifying_instances"])
             self.assertIn("higher instance count did not increase generator worker capacity",
                           selection["tested_rungs"][-2]["rejection_reasons"])
+
+        def test_real_escalation_cannot_call_same_worker_count_more_capacity(self):
+            # A smaller explicitly assigned load pool makes n=4 and n=8 both use
+            # 64 workers. Even a clean plateau cannot turn more processes into
+            # evidence of greater worker capacity; retain every rejected probe.
+            rates = {n: [(400 if n == 8 else min(n, 12) * 100)] * 4 for n in LADDER}
+            rc, order, layouts, result, output = self.fake_main(
+                escalate=True, rates=rates, load_cores="32-79", load_smt="160-207")
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [(n, arm) for n in LADDER for arm in ORDER])
+            self.assertEqual(len(order), 24)
+            workers = {n: sum(p["threads"] for p in layout)
+                       for (n, _), layout in zip(order, layouts)}
+            self.assertEqual(workers[4], 64)
+            self.assertEqual(workers[8], workers[4])
+            selection = result["cells"][0]["assessment"]["load_selection"]
+            self.assertIsNone(selection["lowest_tested_qualifying_instances"])
+            rung = next(row for row in selection["tested_rungs"] if row["instances"] == 4)
+            self.assertIn("higher instance count did not increase generator worker capacity",
+                          rung["rejection_reasons"])
+
+        def test_real_escalation_accepts_twelve_as_cli_ceiling(self):
+            rc, order, _, result, output = self.fake_main(escalate=True, climbing=True, ceiling=12)
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2, 4, 8, 12) for arm in ORDER])
+            self.assertEqual(len(order), 20)
+            self.assertIn("n=12: no higher-instance confirmation block",
+                          result["cells"][0]["assessment"]["reasons"])
 
         def test_real_escalation_incomplete_measurement_is_permanent_failure(self):
             rc, order, _, result, output = self.fake_main(escalate=True,
