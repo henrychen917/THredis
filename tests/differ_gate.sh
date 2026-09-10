@@ -9,9 +9,9 @@ TARGET_PORT=${2:-${GATE_PORT:-7899}}
 ORACLE_PORT=${3:-${GATE_DIFFER_ORACLE_PORT:-$((TARGET_PORT+1))}}
 TARGET_CORES=${4:-${GATE_CORES:-0-7}}
 TARGET_RATIO=${5:-${GATE_DIFFER_RATIO:-6:2}}
-# The gate gives each matrix a disjoint server/load allocation. Keep the old standalone
-# default, but never move its clients back onto the server cores when a load set was supplied.
-LOAD_CORES=${GATE_LOAD_CORES:-$TARGET_CORES}
+# Correctness needs modest traffic. The standalone 0-7 server uses eight separate
+# load cores; the parent gate supplies its smaller, physically disjoint load slot.
+LOAD_CORES=${GATE_LOAD_CORES:-8-15}
 [ -z "${GATE_LOAD_CORES:-}" ] || taskset -pc "$GATE_LOAD_CORES" "$$" >/dev/null
 # TARGET GEOMETRY. `split` is the canonical production shape this matrix has always used: two
 # thread roles at TARGET_RATIO with the read-local lane disarmed. `armed-fused` boots the same
@@ -313,6 +313,27 @@ done
 stop_owned "oracle" "$ORACLE_PID" "$ORACLE_PORT" || FAIL=$((FAIL+1))
 ORACLE_PID=0
 python3 tests/_differ_history.py summary "$OUT" || FAIL=$((FAIL+1))
+# One existing differential gate row now also requires exact mode equivalence.
+# Keep every Redis leg above intact. The split job runs this once, after both
+# listeners close: its private target port is reused across all 32 fresh boots.
+# The armed job need not repeat the identical matrix. The new per-run seed also
+# rotates the equivalence stream; discovered counterexamples remain permanent.
+if [ "$TARGET_GEOMETRY" = split ]; then
+  EQUIVALENCE_SEED=$(python3 - "$OUT/seeds.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['rotating'])
+PY
+  ) || exit 2
+  if python3 tests/mode_equivalence.py --binary "$TARGET_BIN" --server-cpus "$TARGET_CORES" \
+      --load-cpus "$LOAD_CORES" --port "$TARGET_PORT" --seed "$EQUIVALENCE_SEED" \
+      --output "$OUT/mode-equivalence" >"$OUT/mode-equivalence.log" 2>&1; then
+    say 'mode equivalence: all 32 execution/knob combinations' 'ok (exact replies and mechanism witnesses)'
+    PASS=$((PASS+1))
+  else
+    say 'mode equivalence: all 32 execution/knob combinations' "FAIL (see $OUT/mode-equivalence.log)"
+    FAIL=$((FAIL+1))
+  fi
+fi
 ELAPSED=$((SECONDS-START_SECONDS))
 printf 'DIFFER GATE: pass=%d fail=%d runtime=%dm%02ds\n' \
     "$PASS" "$FAIL" "$((ELAPSED/60))" "$((ELAPSED%60))"

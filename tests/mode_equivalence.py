@@ -30,6 +30,7 @@ import time
 from _gate_process import (cpus, encode, info, install_signals, pin_driver, require, server)
 from feature_gate import check_config, smoke
 from _differ_history import default_history, failing_seeds, record_leg
+from gateplan import permitted_cpus
 
 ROOT = Path(__file__).resolve().parents[1]
 CELLS = [f'{mode}-{r}-{o}-{q}-{a}' for mode in ('1s', '2s')
@@ -143,7 +144,10 @@ def configuration(cell):
 def validate_geometry(server_cpus, load_cpus):
     servers, loads = set(cpus(server_cpus)), set(cpus(load_cpus))
     require(len(servers) == 8, 'equivalence fixture requires eight server CPUs and split ratio 6:2')
-    require((servers | loads) <= set(os.sched_getaffinity(0)), 'requested CPUs escape process affinity')
+    # The coordinator deliberately inherits only its load slot. That temporary
+    # taskset mask is not the cgroup's allowed CPU set; probe and restore it just
+    # as the main planner does, before the child server takes its own slot.
+    require((servers | loads) <= permitted_cpus(servers | loads), 'requested CPUs unavailable')
     for cpu in servers:
         siblings = set(cpus(Path(f'/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list').read_text().strip()))
         require(not siblings & loads, 'server/load CPUs share a physical core (including SMT siblings)')
@@ -151,6 +155,7 @@ def validate_geometry(server_cpus, load_cpus):
 
 
 def self_test():
+    from unittest import mock
     a, b, other = command_stream(7, 20), command_stream(7, 20), command_stream(19, 20)
     require(a == b and a != other, 'seed determinism/rotation control')
     require(len(CELLS) == len(set(CELLS)) == 32, 'matrix lost a combination')
@@ -170,6 +175,19 @@ def self_test():
         require('byte divergence at op 0' in str(exc), 'wrong negative control failure')
     else:
         raise AssertionError('changed reply survived the real replay comparator')
+    def siblings(path):
+        cpu = int(path.parent.parent.name.removeprefix('cpu'))
+        return f'{cpu},{cpu + 128}'
+    with mock.patch(__name__ + '.permitted_cpus', return_value=set(range(256))), \
+         mock.patch.object(os, 'sched_getaffinity', return_value={8, 9}), \
+         mock.patch.object(Path, 'read_text', siblings):
+        validate_geometry('0-7', '8-9')  # Coordinator inherits only its load CPUs.
+        try:
+            validate_geometry('0-7', '128')
+        except AssertionError as exc:
+            require('share a physical core' in str(exc), 'wrong SMT rejection')
+        else:
+            raise AssertionError('server SMT sibling was accepted as a load CPU')
     print('MODE EQUIVALENCE self-test: seed/matrix/raw replay/divergence controls passed; no servers')
 
 
