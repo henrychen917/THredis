@@ -722,8 +722,8 @@ bool encode_zset_image(const std::vector<ZImageItem>& items, ObjectImage& image)
     return true;
 }
 
-// `expanded` is the SOURCE key's encoding (skiplist vs listpack): it selects how a negative LIMIT
-// offset resolves, exactly as on the single-shard range path.
+// Retain source encoding in this image interface; the current LIMIT-offset rule is
+// encoding-independent and shared with the single-shard range path.
 bool select_zrange(const std::vector<ZImageItem>& input, const ImageRangeOptions& options,
                    const ImageRangeSpec& range, bool expanded,
                    std::vector<ZImageItem>& selected) {

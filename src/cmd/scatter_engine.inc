@@ -40,9 +40,8 @@ struct ObjectImage {
     // Persistence/reload starts a new lifetime and does not serialize this field.
     bool reserve_ttl_slot = false;
     // Collections only: the source key was in the EXPANDED (skiplist/hashtable/deque) encoding
-    // rather than the compact one. Carried because ZRANGESTORE's negative-LIMIT-offset rule is
-    // encoding-selected on the oracle (see zset_resolve_limit_offset in t_zset.h) and the payload
-    // itself is encoding-free. `encoding` below is the SNAPSHOT type byte, which is 0 for zsets.
+    // rather than the compact one. The image interface retains source encoding independently
+    // of the encoding-free payload. `encoding` below is the SNAPSHOT type byte, 0 for zsets.
     bool expanded = false;
     Type type = Type::String;
     uint8_t encoding = 0;

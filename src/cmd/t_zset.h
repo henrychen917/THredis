@@ -25,34 +25,18 @@ enum class ZsetOwnerResult : uint8_t {
     InsertFailed,
 };
 
-// A NEGATIVE `LIMIT offset` is resolved against the END of the matched range -- but only for the
-// expanded (skiplist) encoding. Redis 7.4 splits here and we match it per encoding, because the
-// split is observable and the differ compares bytes. Probed on the oracle with the same logical
-// zset {a:1,b:3,c:5,d:7} held in each encoding:
-//
-//   ZRANGE k 0 10 BYSCORE LIMIT -1 -1   listpack: (empty)   skiplist: d
-//   ZRANGE k 0 10 BYSCORE LIMIT -3 -1   listpack: (empty)   skiplist: b c d
-//   ZRANGE k 0 10 BYSCORE LIMIT -5 -1   listpack: (empty)   skiplist: (empty)
-//   ZRANGE k 10 0 BYSCORE REV LIMIT -2 -1  listpack: (empty)  skiplist: b a
-//
-// So on the skiplist the start index is `available + offset` counted in ITERATION order (REV
-// included, which is why callers pass the count of matched entries and not a rank), an index
-// below zero selects nothing, and on the listpack every negative offset selects nothing.
-//
-// `available` is the number of entries inside the range. Returns false when the range selects
-// nothing; otherwise `resolved` is the non-negative start index within the range.
-inline bool zset_resolve_limit_offset(int64_t offset, uint64_t available, bool expanded,
+// The pinned Redis 7.4.10 oracle (f103d127b) rejects every negative LIMIT offset,
+// for both compact and expanded zsets. Older 7.4 builds accidentally counted backwards
+// in the skiplist path; preserving that quirk made cgaps seed 28 store a member where
+// the oracle deleted the destination. Rank ranges still accept negative indices, and a
+// negative LIMIT count still means unbounded: only this offset is invalid.
+// Keep the encoding argument for the shared local/scatter callers; it cannot change
+// the result. `available` counts entries inside the range, in either iteration order.
+inline bool zset_resolve_limit_offset(int64_t offset, uint64_t available, bool /*expanded*/,
                                       uint64_t& resolved) {
-    if (offset >= 0) {
-        resolved = static_cast<uint64_t>(offset);
-        return resolved < available;
-    }
-    if (!expanded) return false;
-    // available <= INT64_MAX for any real zset, so the signed add cannot overflow.
-    const int64_t start = static_cast<int64_t>(available) + offset;
-    if (start < 0) return false;
-    resolved = static_cast<uint64_t>(start);
-    return true;
+    if (offset < 0) return false;
+    resolved = static_cast<uint64_t>(offset);
+    return resolved < available;
 }
 
 // Owner-thread-only bridge used by GEO. Entries are copied out so no pointer can escape the
@@ -67,9 +51,7 @@ ZsetOwnerResult zset_owner_replace(Shard& shard, Slice key, uint64_t hash, bool 
 
 // SORT converts a zset source to the expanded encoding on the oracle and never converts back:
 // SORT, SORT_RO and even a BY-nosort SORT all do it, because sorting wants indexed access. It
-// produces no reply of its own, but it is not cosmetic -- the encoding decides how a later
-// negative LIMIT offset resolves (zset_resolve_limit_offset above), so skipping it made
-// ZRANGESTORE diverge on any zset that had been SORTed.
+// produces no reply of its own, but OBJECT ENCODING exposes this change to clients.
 //
 // The key is looked up LIVE and in place: callers must not hand in a pointer they already hold,
 // because on the scatter path that pointer can be an MVCC-tracked version rather than the store's

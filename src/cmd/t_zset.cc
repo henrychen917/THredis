@@ -1702,8 +1702,7 @@ void emit_rank_range(Op& op, const CollectionRef& value, int64_t start, int64_t 
 
 void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& range,
                       const RangeOptions& options) {
-    // A negative LIMIT offset is NOT rejected here: it counts back from the end of the matched
-    // range on the expanded encoding. See zset_resolve_limit_offset in t_zset.h.
+    // Both encodings use the same LIMIT-offset rule; negative rank indices are separate.
     if (score_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;
@@ -1776,7 +1775,7 @@ void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& rang
 
 void emit_lex_range(Op& op, const CollectionRef& value, const LexRange& range,
                     const RangeOptions& options) {
-    // As in emit_score_range: a negative LIMIT offset is resolved per encoding, not rejected.
+    // As in emit_score_range, LIMIT offsets have the same rule in both encodings.
     if (lex_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;

@@ -359,7 +359,7 @@ def fold_order_battery(c):
 
 
 def zrangestore_battery(c):
-    """ZRANGESTORE edges: destination lifecycle, and the encoding-selected negative LIMIT offset.
+    """ZRANGESTORE edges: destination lifecycle and negative LIMIT offsets in both encodings.
 
     Every cell asserts the DESTINATION's existence, type and content -- not just the integer
     reply, which cannot tell an empty store from a skipped one.
@@ -434,31 +434,34 @@ def zrangestore_battery(c):
                  "LIMIT is only supported in combination with either BYSCORE or BYLEX",
                  "  LIMIT rejected on a rank range")
 
-    # -- the encoding-selected negative LIMIT offset (the bug this battery guards) ---------------
-    # compact:  every negative offset selects nothing.
-    # expanded: -k counts k back from the END of the matched range, in ITERATION order.
+    # Redis 7.4.10 f103d127b returns empty for negative LIMIT offsets in BOTH encodings.
+    # Older 7.4 builds accidentally counted backwards in skiplists; cgaps seed 28 exposed
+    # that stale compatibility rule after SORT promoted its source. Keep both physical
+    # encodings asserted, so a compact-only run cannot hide the old expanded-path defect.
     for expanded in (False, True):
         tag = "skiplist" if expanded else "listpack"
         key = make_zset(c, f"zrs:{tag}", [("1", "a"), ("3", "b"), ("5", "c"), ("7", "d")],
                         expanded)
-        forward = {-1: [b"d"], -2: [b"c", b"d"], -3: [b"b", b"c", b"d"],
-                   -4: [b"a", b"b", b"c", b"d"], -5: [], -6: []}
-        reverse = {-1: [b"a"], -2: [b"b", b"a"], -3: [b"c", b"b", b"a"],
-                   -4: [b"d", b"c", b"b", b"a"], -5: [], -6: []}
-        for offset, expanded_result in forward.items():
-            wanted = expanded_result if expanded else []
+        for offset in range(-1, -7, -1):
             expect(c.command("ZRANGE", key, "0", "10", "BYSCORE", "LIMIT", str(offset), "-1"),
-                   wanted, f"  {tag}: BYSCORE LIMIT {offset} -1")
+                   [], f"  {tag}: BYSCORE LIMIT {offset} -1")
             expect(c.command("ZRANGE", key, "[a", "[z", "BYLEX", "LIMIT", str(offset), "-1"),
-                   wanted, f"  {tag}: BYLEX LIMIT {offset} -1")
-        for offset, expanded_result in reverse.items():
-            wanted = expanded_result if expanded else []
+                   [], f"  {tag}: BYLEX LIMIT {offset} -1")
+        for offset in range(-1, -7, -1):
             expect(c.command("ZRANGE", key, "10", "0", "BYSCORE", "REV",
                              "LIMIT", str(offset), "-1"),
-                   wanted, f"  {tag}: BYSCORE REV LIMIT {offset} -1")
-        # A negative offset still honours a positive count.
+                   [], f"  {tag}: BYSCORE REV LIMIT {offset} -1")
+            expect(c.command("ZRANGE", key, "[z", "[a", "BYLEX", "REV",
+                             "LIMIT", str(offset), "-1"),
+                   [], f"  {tag}: BYLEX REV LIMIT {offset} -1")
+        # A positive count does not rescue an invalid offset.
         expect(c.command("ZRANGE", key, "0", "10", "BYSCORE", "LIMIT", "-3", "2"),
-               [b"b", b"c"] if expanded else [], f"  {tag}: BYSCORE LIMIT -3 2")
+               [], f"  {tag}: BYSCORE LIMIT -3 2")
+        # Negative RANK indices and an unbounded negative COUNT remain valid.
+        expect(c.command("ZRANGE", key, "-2", "-1"), [b"c", b"d"],
+               f"  {tag} control: negative rank indices select the tail")
+        expect(c.command("ZRANGE", key, "0", "10", "BYSCORE", "LIMIT", "1", "-1"),
+               [b"b", b"c", b"d"], f"  {tag} control: negative count is unbounded")
         # NEGATIVE CONTROL: non-negative offsets are identical in both encodings.
         expect(c.command("ZRANGE", key, "0", "10", "BYSCORE", "LIMIT", "1", "2"),
                [b"b", b"c"], f"  {tag} control: LIMIT 1 2 is encoding-independent")
@@ -467,13 +470,13 @@ def zrangestore_battery(c):
         # and ZRANGESTORE lowers to the same rule.
         c.command("DEL", "zrs:neg")
         count = c.command("ZRANGESTORE", "zrs:neg", key, "0", "10", "BYSCORE", "LIMIT", "-1", "4")
-        expect(count, 1 if expanded else 0, f"  {tag}: ZRANGESTORE LIMIT -1 4 count")
+        expect(count, 0, f"  {tag}: ZRANGESTORE LIMIT -1 4 count")
         expect(c.command("ZRANGE", "zrs:neg", "0", "-1", "WITHSCORES"),
-               [b"d", b"7"] if expanded else [], f"  {tag}: ZRANGESTORE LIMIT -1 4 content")
-        expect(c.command("EXISTS", "zrs:neg"), 1 if expanded else 0,
+               [], f"  {tag}: ZRANGESTORE LIMIT -1 4 content")
+        expect(c.command("EXISTS", "zrs:neg"), 0,
                f"  {tag}: ZRANGESTORE LIMIT -1 4 destination lifecycle")
 
-    # -- SORT promotes a zset source, which is what selects the rule above ----------------------
+    # SORT still promotes its source, but that promotion must not revive negative offsets.
     for form in (["SORT", "zrs:sorted", "ALPHA"],
                  ["SORT_RO", "zrs:sorted", "ALPHA"],
                  ["SORT", "zrs:sorted", "ALPHA", "STORE", "zrs:sortdst"]):
@@ -485,6 +488,12 @@ def zrangestore_battery(c):
                f"  {' '.join(form[2:])}: {form[0]} expands the zset source")
         expect(c.command("ZRANGE", "zrs:sorted", "0", "-1", "WITHSCORES"),
                [b"a", b"1", b"b", b"2"], f"  ... content survives the expansion ({form[0]})")
+        c.command("SET", "zrs:neg", "stale-destination")
+        expect(c.command("ZRANGESTORE", "zrs:neg", "zrs:sorted", "0", "(8", "BYSCORE",
+                         "LIMIT", "-1", "-1"), 0,
+               f"  {form[0]} promotion cannot make a negative offset select a member")
+        expect(c.command("TYPE", "zrs:neg"), b"none",
+               f"  {form[0]} promoted source: invalid offset deletes a stale destination")
     # NEGATIVE CONTROL: a non-zset SORT source has no encoding to promote and must not be touched.
     c.command("DEL", "zrs:list")
     c.command("RPUSH", "zrs:list", "2", "1")
