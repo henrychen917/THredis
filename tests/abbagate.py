@@ -1357,8 +1357,12 @@ def self_test():
                 out = Path(tmp) / "out"
                 source = Path(tmp) / "unmeasured-cells"
                 source.write_text("u01 | 1s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1\n")
-                with mock.patch.object(sys, "argv", ["abbagate.py", "--subset", "smoke", "--output", str(out),
-                                                      "--cells", str(source)]):
+                # Exercise the missing-pin precondition even inside a two-CPU gate worker.
+                # Synthetic placement is validated separately and never schedules real work here.
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(sys, "argv", ["abbagate.py", "--subset", "smoke", "--output", str(out),
+                         "--cells", str(source), "--server-cores", "0-31", "--server-smt", "",
+                         "--load-cores", "32-63", "--load-smt", ""]):
                     args = parse_args()
                 with mock.patch(__name__ + ".resolve_reference", side_effect=AssertionError("unmeasured pin reached reference")), \
                      mock.patch(__name__ + ".check_placement"), mock.patch.object(os, "sched_setaffinity"), \
