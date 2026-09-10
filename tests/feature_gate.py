@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Feature witnesses; each matrix cell is a mandatory boot, never an expected rejection.
+"""Feature witnesses; each matrix cell is a mandatory boot, with ONE refusal class.
+
+A fused server has no io/ex split, so a controller that rebalances that split has nothing to
+actuate -- config.h refuses --flip-auto with --thread-mode 1s exactly as it refuses --ratio, for
+the same stated reason ("every thread handles networking and execution"). The eight 1s cells with
+flip-auto=1 therefore assert the REFUSAL and its documented message.
+
+That is not an "expected rejection" escape hatch: the row FAILS if the server boots, so deleting
+the guard turns these rows red, and it FAILS if the refusal cites a different reason. The
+combination stays covered either way. Every other cell is still a mandatory boot.
 
 gate.sh invokes --cell once per ledger row. --matrix runs just this tier for development.
 No rates are scored. Independent connections carry pipelined work so reorder can permute.
@@ -22,6 +31,17 @@ SWITCHES = ('read-local', 'overlap', 'reorder', 'flip-auto')
 MATRIX = [f'{mode}-{r}-{o}-{q}-{f}' for mode in MODES
           for r, o, q, f in itertools.product((0, 1), repeat=4)]
 TOPOLOGY = ('split-home-min', 'fused-home-max-nopin', 'split-shards-auto')
+# The refusal is part of the product surface, so its text is pinned here: a guard that starts
+# rejecting for a different reason is a different guard.
+FUSED_FLIP_REFUSAL = '--flip-auto is unavailable with --thread-mode 1s'
+
+
+def refuses_boot(cell):
+    """True for the cells the server must REJECT rather than boot."""
+    if cell in TOPOLOGY:
+        return False
+    mode, _read_local, _overlap, _reorder, flip_auto = cell.split('-')
+    return mode == '1s' and int(flip_auto) == 1
 CELLS = MATRIX + list(TOPOLOGY)
 
 
@@ -245,6 +265,26 @@ def run_cell(args, cell):
     directory = Path(args.output) / cell
     start = time.monotonic()
     evidence = dict(cell=cell, requested=knobs)
+    if refuses_boot(cell):
+        evidence['contract'] = 'refusal'
+        try:
+            with server(args.binary, args.server_cpus, args.port, directory, argv):
+                pass
+            evidence.update(verdict='FAIL',
+                            reason='server BOOTED with --flip-auto in 1s: the config guard is gone')
+        except Exception as exc:
+            reason = str(exc)
+            if FUSED_FLIP_REFUSAL in reason:
+                evidence.update(verdict='ok', reason=f'refused as documented: {FUSED_FLIP_REFUSAL}')
+            else:
+                evidence.update(verdict='FAIL',
+                                reason=f'refused, but not for the documented reason: {reason}')
+        evidence['seconds'] = time.monotonic() - start
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'result.json').write_text(json.dumps(evidence, indent=2) + '\n')
+        print(f'FEATURE {cell} {evidence["verdict"]} {evidence["seconds"]:.2f}s '
+              f'{evidence["reason"]}', flush=True)
+        return evidence['verdict'] == 'ok'
     try:
         with server(args.binary, args.server_cpus, args.port, directory, argv) as (conn, process):
             actual = info(conn, 'SERVER', 'STATS', 'FLIPCTL')
