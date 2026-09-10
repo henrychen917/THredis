@@ -130,6 +130,80 @@ def require_workload_witness(cell, before, after, mode_before, mode_after, legac
     return evidence
 
 
+def memtier_workload_counts(cell, data, connections):
+    """Keep reported command counts and the independent, fully drained HDR count."""
+    if type(connections) is not int or connections <= 0 or cell.depth <= 0:
+        raise RuntimeError("invalid generator geometry for finite outstanding-request bound")
+    stats = data["ALL STATS"]
+    interrupted = stats["Runtime"]["Interrupted"]
+    if interrupted is not False and interrupted != "false":
+        raise RuntimeError("memtier run was interrupted; no completed-work accounting")
+    names = workload_command_names(cell)
+    counts, observations = {}, {}
+    for name in names:
+        rows = [row for key, row in stats.items() if key.upper() in (name, name + "S")]
+        if len(rows) != 1:
+            raise RuntimeError(f"expected one memtier {name} command Count")
+        row = rows[0]
+        count = row["Count"]
+        if type(count) is not int or count <= 0:
+            raise RuntimeError(f"invalid memtier {name} command Count: {count!r}")
+        counts[name] = count
+        histogram = decode_histogram(row["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"])
+        observations[name] = sum(histogram.values())
+        if observations[name] <= 0:
+            raise RuntimeError(f"empty memtier {name} completed-response histogram")
+    expected_rows = {name + "S" for name in names} | set(names)
+    for name, row in stats.items():
+        if name != "Totals" and isinstance(row, dict) and "Count" in row:
+            if name.upper() not in expected_rows and row["Count"] != 0:
+                raise RuntimeError(f"unexpected memtier workload command: {name}")
+    if type(stats["Totals"]["Count"]) is not int or stats["Totals"]["Count"] != sum(counts.values()):
+        raise RuntimeError("memtier Totals Count differs from logical workload command Counts")
+
+    # Audited memtier 2.5.1, upstream 5f634d171b83efca9640c5a87606c47b34d3d330:
+    # client::finished uses m_cur_stats.m_second. On the first callback in the final
+    # second, shard_connection::process_response/fill_pipeline stop generating and
+    # client::set_end_time snapshots m_cur_stats once. run_stats::merge copies those
+    # snapshots, but not the later current bucket; final drain replies can be absent
+    # from JSON Count. Crossing another second while draining can instead duplicate
+    # that first callback's bucket. The first callback plus outstanding replies are
+    # at most pipeline per connection (fill_pipeline's queue bound). Thus the SUM of
+    # absolute per-command errors is bounded by connections * pipeline, not an error
+    # percentage. Normal disconnect drains every reply; per-command HDR is updated
+    # on each response and merged after pthread_join, so it supplies the exact count.
+    # No retries, reconnection, cluster routing, transactions or staircase are enabled
+    # by Runner.memtier/workload_arguments. Unknown schemas fail rather than guessing.
+    bound = connections * cell.depth
+    error = sum(abs(counts[name] - observations[name]) for name in names)
+    if error > bound:
+        raise RuntimeError(f"memtier Count/HDR discrepancy {error} exceeds finite outstanding bound {bound}")
+    return {"connections": connections, "pipeline": cell.depth, "outstanding_bound": bound,
+            "reported_counts": counts, "completed_hdr_counts": observations,
+            "count_hdr_absolute_difference": error, "runtime": stats["Runtime"]}
+
+
+def require_workload_accounting(cell, before, after, generators):
+    """Compare the entire generator lifetime; observer/setup commands are excluded."""
+    if sum(row["connections"] for row in generators) != cell.conns:
+        raise RuntimeError("accounted generator connections differ from requested cell geometry")
+    evidence = {}
+    for name in workload_command_names(cell):
+        start, _ = command_stat(before, name)
+        finish, _ = command_stat(after, name)
+        reported = sum(row["reported_counts"][name] for row in generators)
+        completed = sum(row["completed_hdr_counts"][name] for row in generators)
+        calls = finish - start
+        evidence[name] = {"server_calls": calls, "memtier_count": reported,
+                          "completed_hdr_count": completed, "server_minus_count": calls - reported}
+        if calls != completed or completed <= 0:
+            raise RuntimeError(f"{name} whole-run accounting mismatch: server={calls}, "
+                               f"completed HDR={completed}, memtier Count={reported}")
+    return {"commands": evidence, "count_outstanding_bound": sum(row["outstanding_bound"] for row in generators),
+            "scope": "whole generator run, including warmup and tail; logical commands, not keys",
+            "hdr_accounting": "exact; no discrepancy allowance"}
+
+
 def decode_histogram(encoded):
     """Decode memtier's HDR v2 integer histogram into (upper microseconds,count).
 
@@ -199,19 +273,19 @@ def percentile(histogram, percent):
     raise AssertionError("unreachable histogram rank")
 
 
-def command_histogram(data, command):
+def command_histogram(data, command, *, count_bound=0):
     stats = data["ALL STATS"]
     matches = [value for name, value in stats.items() if name.upper() in (command, command + "S")]
     if len(matches) != 1:
         raise ValueError(f"expected one {command} command histogram")
     row = matches[0]
     histogram = decode_histogram(row["Percentile Latencies"]["Histogram log format"]["Compressed Histogram"])
-    # The producer's completed Count and HDR observations are different counters:
-    # saved 2026-09-10 memtier output has Count=165918660 and HDR=165919453, with
-    # exactly matching producer/decoded percentiles. Preserve HDR counts for merging
-    # and require at least the completed count; never scale bins to force equality.
-    if sum(histogram.values()) < row["Count"] or row["Count"] <= 0:
-        raise ValueError(f"{command} histogram omits completed commands")
+    # The finite Count/HDR difference is explained in memtier_workload_counts.
+    # Runner supplies its audited connections*pipeline bound only AFTER exact
+    # whole-run server/HDR accounting passed. Standalone callers default to exact
+    # equality; neither direction gets an unbounded allowance and bins never scale.
+    if count_bound < 0 or abs(sum(histogram.values()) - row["Count"]) > count_bound or row["Count"] <= 0:
+        raise ValueError(f"{command} Count/HDR discrepancy exceeds outstanding bound {count_bound}")
     # Cross-check our decoder against the producer's own percentile. A 0.001 ms
     # output rounding unit is the only permitted difference, not a measurement
     # tolerance. This catches units/geometry/format drift before it changes a verdict.
@@ -220,11 +294,15 @@ def command_histogram(data, command):
     return histogram
 
 
-def merged_tail(documents):
+def merged_tail(documents, *, count_bounds=None):
     short, long = Counter(), Counter()
-    for document in documents:
-        short.update(command_histogram(document, "GET"))
-        long.update(command_histogram(document, "BITCOUNT"))
+    if count_bounds is None:
+        count_bounds = [0] * len(documents)
+    if len(count_bounds) != len(documents):
+        raise ValueError("missing per-generator Count/HDR bound")
+    for document, bound in zip(documents, count_bounds):
+        short.update(command_histogram(document, "GET", count_bound=bound))
+        long.update(command_histogram(document, "BITCOUNT", count_bound=bound))
     if min(sum(short.values()), sum(long.values())) < 1000:
         raise ValueError("fewer than 1000 observations in a latency class; p99.9 not resolved")
     return {"p999_ms": percentile(short, 99.9), "long_p999_ms": percentile(long, 99.9),

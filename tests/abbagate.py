@@ -74,7 +74,8 @@ from gate_receipt import harness_fingerprint, read_json
 from abba_evidence import match_null, null_result
 from abba_instrument import instrument_fingerprint
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
-                            require_workload_witness, workload_command_names)
+                            require_workload_witness, workload_command_names,
+                            memtier_workload_counts, require_workload_accounting)
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW = 20
@@ -713,15 +714,21 @@ def cpu_seconds(pid):
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
-def memtier_totals(path):
+def memtier_totals(path, cell, connections):
     data = json.loads(path.read_text())
     totals = data["ALL STATS"]["Totals"]
     rate, latency = float(totals["Ops/sec"]), float(totals["Latency"])
     if not all(math.isfinite(x) and x > 0 for x in (rate, latency)):
         raise RuntimeError(f"invalid memtier totals in {path}")
-    if float(totals.get("Errors", 0)) or float(totals.get("Errors/sec", 0)):
+    if not {"Connection Errors", "Connection Errors/sec"} <= totals.keys():
+        raise RuntimeError(f"missing memtier connection-error counters: {path}")
+    if any(float(totals.get(field, 0)) != 0 for field in
+           ("Errors", "Errors/sec", "Connection Errors", "Connection Errors/sec")):
         raise RuntimeError(f"memtier reported errors: {path}")
-    return {"rate": rate, "latency_ms": latency}
+    return {"rate": rate, "latency_ms": latency,
+            "connection_errors": totals["Connection Errors"],
+            "connection_errors_per_second": totals["Connection Errors/sec"],
+            **memtier_workload_counts(cell, data, connections)}
 
 
 def require_unbound_port(port):
@@ -865,6 +872,11 @@ class Runner:
                     raise RuntimeError(f"boot did not apply {name}={value}: {actual!r}")
             result["population"] = self.populate(cell, arm, conn, folder)
             result["populate_seconds"] = time.monotonic() - started
+            # Bracket ALL generators, after wire/snapshot population and any service-
+            # cost probes. Only the named workload command counters enter accounting;
+            # INFO/DEBUG and client protocol setup never become phantom workload ops.
+            result["whole_run_commandstats_before"] = info(conn, "commandstats")
+            result["whole_run_clients_before"] = info(conn, "clients")
             for i, placement in enumerate(layout):
                 argv = self.memtier(placement) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
                         f"--test-time={WARMUP + WINDOW + TAIL}",
@@ -922,17 +934,27 @@ class Runner:
                           info_before=before, info_after=after)
             result["workload_witness"] = require_workload_witness(
                 cell, before_commands, after_commands, before_mode, after_mode, legacy_control)
-            totals = []
+            totals = result["memtier"] = []
             for i, p in enumerate(generators):
                 if p.wait(timeout=30):
                     raise RuntimeError(f"load generator {i} failed; see {folder}")
-                totals.append(memtier_totals(folder / f"load-{i}.json"))
+            # All processes have drained and exited before the second endpoint.
+            # Keep the central WINDOW calculation above unchanged: these wider
+            # endpoints establish counter integrity, not a second throughput rate.
+            result["whole_run_commandstats_after"] = info(conn, "commandstats")
+            result["whole_run_clients_after"] = info(conn, "clients")
+            for i, placement in enumerate(layout):
+                totals.append(memtier_totals(folder / f"load-{i}.json", cell,
+                                            placement["threads"] * placement["clients"]))
+            result["whole_run_accounting"] = require_workload_accounting(
+                cell, result["whole_run_commandstats_before"], result["whole_run_commandstats_after"], totals)
             total_rate = sum(t["rate"] for t in totals)
             result.update(complete=True, memtier=totals, memtier_rate=total_rate,
                           latency_ms=sum(t["latency_ms"] * t["rate"] for t in totals) / total_rate)
             if cell.metric == "p999_ms":
                 result.update(merged_tail([json.loads((folder / f"load-{i}.json").read_text())
-                                           for i in range(len(generators))]))
+                                           for i in range(len(generators))],
+                                          count_bounds=[row["outstanding_bound"] for row in totals]))
                 # Memtier's HDR spans its entire run. State that separately from the
                 # central counter window; startup/warmup/tail samples are not silently
                 # represented as a histogram of only WINDOW seconds.
@@ -1395,6 +1417,159 @@ def self_test():
             with self.assertRaisesRegex(RuntimeError, 'BITCOUNT did not execute'):
                 require_workload_witness(cell, before, {**after, 'cmdstat_bitcount': 'calls=10'}, {}, {}, control)
 
+        @staticmethod
+        def accounting_document(counts, reported=None):
+            import base64
+            import struct
+            import zlib
+            # A real decodable one-bin HDR, with the producer count controlled
+            # separately. The saved producer fixture below independently tests
+            # the decoder; these controls test accounting, not percentile shape.
+            stats = {"Runtime": {"Interrupted": "false"}}
+            for name, count in counts.items():
+                number, payload = count << 1, bytearray()
+                while number >= 128:
+                    payload.append((number & 127) | 128)
+                    number >>= 7
+                payload.append(number)
+                body = struct.pack(">IIiiQQd", 0x1c849303, len(payload), 0, 3, 1, 1000000, 1.0) + payload
+                compressed = zlib.compress(body)
+                encoded = base64.b64encode(struct.pack(">II", 0x1c849304, len(compressed)) + compressed).decode()
+                stats[name.capitalize() + "s"] = {"Count": (reported or counts)[name],
+                    "Percentile Latencies": {"p99.90": 0.0, "Histogram log format": {"Compressed Histogram": encoded}}}
+            stats["Totals"] = {"Count": sum((reported or counts).values()), "Ops/sec": 1000,
+                               "Latency": 1, "Connection Errors": 0, "Connection Errors/sec": 0}
+            return {"ALL STATS": stats}
+
+        def test_whole_run_counts_use_logical_multikey_units_and_exact_hdr(self):
+            cell = replace(self.cell, op="MIX8", depth=8, conns=2, mix="18:14")
+            document = self.accounting_document({"MGET": 18000, "MSET": 14000},
+                                                 {"MGET": 17993, "MSET": 14009})
+            producer = memtier_workload_counts(cell, document, 2)
+            self.assertEqual(producer["count_hdr_absolute_difference"], 16)
+            before = {"cmdstat_mget": "calls=100", "cmdstat_mset": "calls=200", "cmdstat_info": "calls=10"}
+            after = {"cmdstat_mget": "calls=18100", "cmdstat_mset": "calls=14200", "cmdstat_info": "calls=9999"}
+            witness = require_workload_accounting(cell, before, after, [producer])
+            self.assertEqual(witness["commands"]["MGET"]["server_calls"], 18000)  # not eight keys per op
+            with self.assertRaisesRegex(RuntimeError, "connections differ"):
+                require_workload_accounting(replace(cell, conns=4), before, after, [producer])
+            for count in (18099, 18101, 100, 36100, 144100):
+                with self.subTest(count=count), self.assertRaisesRegex(RuntimeError, "accounting mismatch"):
+                    require_workload_accounting(cell, before, {**after, "cmdstat_mget": f"calls={count}"}, [producer])
+            # The bound applies to the SUM of both errors, not independently to
+            # every command; one command cannot hide the other's discrepancy.
+            too_far = self.accounting_document({"MGET": 18000, "MSET": 14000},
+                                               {"MGET": 17992, "MSET": 14009})
+            with self.assertRaisesRegex(RuntimeError, "17 exceeds finite outstanding bound 16"):
+                memtier_workload_counts(cell, too_far, 2)
+
+        def test_count_hdr_tail_validation_uses_the_same_finite_bound(self):
+            from abba_workloads import command_histogram
+            for difference in (-16, 16):
+                doc = self.accounting_document({"GET": 5000}, {"GET": 5000 + difference})
+                self.assertEqual(sum(command_histogram(doc, "GET", count_bound=16).values()), 5000)
+                with self.assertRaisesRegex(ValueError, "exceeds outstanding bound"):
+                    command_histogram(doc, "GET", count_bound=15)
+                with self.assertRaises(ValueError):
+                    command_histogram(doc, "GET")
+
+        def test_accounting_rejects_interrupted_errors_unknown_and_missing_commands(self):
+            import copy
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                path = Path(tmp) / "load.json"
+                base = self.accounting_document({"GET": 5000})
+                bad = []
+                item = copy.deepcopy(base)
+                item["ALL STATS"]["Runtime"]["Interrupted"] = "true"
+                bad.append(item)
+                item = copy.deepcopy(base)
+                item["ALL STATS"]["Totals"]["Connection Errors"] = 1
+                bad.append(item)
+                item = copy.deepcopy(base)
+                del item["ALL STATS"]["Totals"]["Connection Errors"]
+                bad.append(item)
+                item = copy.deepcopy(base)
+                item["ALL STATS"]["Sets"] = {"Count": 1}
+                bad.append(item)
+                item = copy.deepcopy(base)
+                item["ALL STATS"]["Totals"]["Count"] += 1
+                bad.append(item)
+                item = copy.deepcopy(base)
+                del item["ALL STATS"]["Gets"]
+                bad.append(item)
+                for i, document in enumerate(bad):
+                    with self.subTest(case=i), self.assertRaises((RuntimeError, KeyError)):
+                        path.write_text(json.dumps(document))
+                        memtier_totals(path, self.cell, 2)
+                path.write_text(json.dumps(base))
+                self.assertEqual(memtier_totals(path, self.cell, 2)["reported_counts"], {"GET": 5000})
+
+        def test_real_measure_brackets_all_generators_and_rejects_counter_mutants(self):
+            from types import SimpleNamespace
+            # Exercise Runner.measure itself, including argv production, generator
+            # waits, JSON parsing, both endpoint reads and failure artifacts. Only
+            # process/network/time boundaries are fake; the accounting is real.
+            for corruption in (0, -1, 10000):
+                with self.subTest(corruption=corruption), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                    directory, events, generators = Path(tmp), [], []
+                    phase = {"window": 0, "finished": 0}
+                    srv = SimpleNamespace(pid=123, poll=lambda: None)
+                    def start(argv, log, cwd):
+                        if "--protocol=redis" not in argv:
+                            return srv
+                        events.append("start")
+                        path = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--json-out-file=")))
+                        path.write_text(json.dumps(self.accounting_document({"GET": 5000})))
+                        def wait(timeout):
+                            phase["finished"] += 1
+                            events.append("finish")
+                            return 0
+                        process = SimpleNamespace(poll=lambda: None, wait=wait)
+                        generators.append(process)
+                        return process
+                    children = SimpleNamespace(start=start, stop=lambda process: None)
+                    conn = SimpleNamespace(must=lambda *args: [args[-1].encode(), b"1"], close=lambda: None)
+                    def snapshot(_conn, section):
+                        if section == "server":
+                            return {"process_id": "123"}
+                        if section == "clients":
+                            return {"connected_clients": "1" if not generators or phase["finished"] == 2 else "5"}
+                        if section == "commandstats":
+                            events.append(("commandstats", len(generators), phase["finished"]))
+                            count = (10100 + corruption if phase["finished"] == 2 else
+                                     6100 if phase["window"] == 2 else 2100 if phase["window"] else 100)
+                            return {"cmdstat_get": f"calls={count}", "cmdstat_info": "calls=99"}
+                        self.assertEqual(section, "stats")
+                        return {"total_commands_processed": "6101" if phase["window"] == 2 else "2100",
+                                "keyspace_misses": "0"}
+                    def sleep(seconds):
+                        self.assertIn(seconds, (WARMUP, WINDOW))
+                        phase["window"] += 1
+                    cell = replace(self.cell, conns=4)
+                    args = SimpleNamespace(server_cores="0-1", server_smt="", load_cores="2-3", load_smt="",
+                                           port=9090, memtier="never-executed-memtier")
+                    runner = Runner(args, directory, {"A": Path("never-executed-server")}, children)
+                    lb = SimpleNamespace(threads={i: {"role": "fused", "busy": 10, "idle": 0} for i in (0, 1)})
+                    with mock.patch.multiple(__name__, require_unbound_port=mock.Mock(), Conn=mock.Mock(return_value=conn),
+                            info=mock.Mock(side_effect=snapshot), lb_snapshot=mock.Mock(return_value=lb),
+                            cpu_seconds=mock.Mock(return_value=0), busy_between=mock.Mock(return_value=(99, {})),
+                            busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={})), \
+                         mock.patch.object(runner, "populate", return_value=None), \
+                         mock.patch.object(time, "sleep", side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
+                        if corruption:
+                            with self.assertRaisesRegex(RuntimeError, "accounting mismatch"):
+                                runner.measure(cell, "A", 1, 2, {})
+                        else:
+                            result = runner.measure(cell, "A", 1, 2, {})
+                            self.assertEqual(result["commands"], 4000)
+                            self.assertEqual(result["whole_run_accounting"]["commands"]["GET"]["server_calls"], 10000)
+                    self.assertEqual(events[0], ("commandstats", 0, 0))
+                    self.assertEqual(events[-1], ("commandstats", 2, 2))
+                    retained = json.loads((directory / cell.id / "n2-1-A/measurement.json").read_text())
+                    self.assertEqual(retained["complete"], not bool(corruption))
+                    self.assertIn("whole_run_commandstats_after", retained)
+                    self.assertEqual(len(retained["memtier"]), 2)
+
         def test_legacy_control_requires_both_live_verdicts_and_caches_only_success(self):
             from types import SimpleNamespace
             import legacy_reorder_witness
@@ -1461,7 +1636,7 @@ def self_test():
             documents = [{"short": {10: 100000}, "long": {20: 10000}},
                          {"short": {1000: 1000}, "long": {2000: 1000}}]
             with mock.patch("abba_workloads.command_histogram",
-                            side_effect=lambda doc, name: doc["short" if name == "GET" else "long"]):
+                            side_effect=lambda doc, name, **kw: doc["short" if name == "GET" else "long"]):
                 tails = merged_tail(documents)
             self.assertEqual(tails["p999_ms"], 1)
             self.assertEqual(tails["long_p999_ms"], 2)
