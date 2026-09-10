@@ -691,8 +691,13 @@ def parse_args():
     p.add_argument("--cells", type=Path, default=Path(os.getenv("GATE_ABBA_CELLS", ROOT / "tests" / "headline_cells.txt")))
     p.add_argument("--bench-bins", type=Path, default=Path(os.getenv("GATE_ABBA_BINS", "/home/user/Projects/bench-bins")))
     p.add_argument("--build-reference", type=int, choices=(0, 1), default=int(os.getenv("GATE_ABBA_BUILD_REFERENCE", "1")))
-    p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES", "8-31"))
-    p.add_argument("--load-cores", default=os.getenv("GATE_ABBA_LOAD_CORES", "64-127,192-255"))
+    # Validated geometry (2026-09-10): 32 server cores, matching what the headline cells record,
+    # and EVERY remaining thread as load except the server cores' own SMT siblings (128-159).
+    # A smaller load pool could not pin the faster arm: with 64-127,192-255 alone the candidate
+    # stalled at 97.1% busy and the tier read that as an unsaturated cell.
+    p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES", "0-31"))
+    p.add_argument("--load-cores",
+                   default=os.getenv("GATE_ABBA_LOAD_CORES", "32-63,64-127,160-191,192-255"))
     p.add_argument("--port", type=int, default=int(os.getenv("GATE_ABBA_PORT", "8700")))
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--output", type=Path, default=None)
