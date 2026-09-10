@@ -95,7 +95,7 @@ def experiment_driver(argv: list[bytes]) -> bool:
         if argument.startswith(b"-"):
             continue
         return Path(os.fsdecode(argument)).name in ("abbagate.py", "abba_experiments.py", "legacy_reorder_witness.py",
-                                                    "background_qualification.py", "abba_saturation_controls.py")
+                                                    "background_qualification.py", "abba_saturation_controls.py", "abba_aslr.py")
     return False
 
 
@@ -675,6 +675,7 @@ def self_test():
         def test_python_driver_detection_uses_script_argument_not_source_substrings(self):
             self.assertTrue(experiment_driver([b"python3", b"-u", b"/work/tests/abbagate.py", b"--only", b"h01"]))
             self.assertTrue(experiment_driver([b"python3", b"/work/tests/legacy_reorder_witness.py"]))
+            self.assertTrue(experiment_driver([b"python3", b"/work/tests/abba_aslr.py"]))
             self.assertFalse(experiment_driver([b"python3", b"-c", b"source mentions /work/tests/abbagate.py"]))
             self.assertFalse(experiment_driver([b"bash", b"-c", b"cat tests/abbagate.py"]))
             from dataclasses import replace
