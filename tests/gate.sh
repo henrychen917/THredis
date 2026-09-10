@@ -1031,7 +1031,8 @@ collect_differ_group(){
 }
 collect_job(){
   case "$1" in differ-split|differ-armed) collect_differ_group "${1#differ-}"; return;; esac
-  local name=$1 dir="$RUN_DIR/jobs/$1" live p job_rc job_pass job_fail
+  local name=$1 dir="$RUN_DIR/jobs/$1" live p job_rc job_pass job_fail ledger_counts ledger_pass ledger_fail
+  local completion=()
   while [ ! -f "$dir/done" ]; do
     live=0
     for p in "${WORKER_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && live=1; done
@@ -1042,22 +1043,41 @@ collect_job(){
     bad "$(job_label "$name")" "worker did not complete; see $dir"
     return
   fi
-  read -r job_rc job_pass job_fail < "$dir/done"
-  if ! [[ "$job_rc" =~ ^[0-9]+$ && "$job_pass" =~ ^[0-9]+$ && "$job_fail" =~ ^[0-9]+$ ]]; then
+  mapfile -t completion < "$dir/done"
+  read -r job_rc job_pass job_fail <<< "${completion[0]:-}"
+  if [ "${#completion[@]}" != 1 ] ||
+      ! [[ "$job_rc" =~ ^(0|[1-9][0-9]{0,2})$ && "$job_pass" =~ ^[0-9]+$ && "$job_fail" =~ ^[0-9]+$ ]] ||
+      [ "$job_rc" -gt 255 ]; then
     bad "$(job_label "$name")" "malformed worker completion; see $dir"
+    return
+  fi
+  if ! ledger_counts=$(awk -F '\t' '
+      NF != 3 || $1 !~ /^(ok|FAIL)$/ || $2 !~ /^[0-9]+([.][0-9]+)?$/ || $3 == "" {exit 1}
+      $1 == "ok" {passed++}
+      $1 == "FAIL" {failed++}
+      END {printf "%d %d\n", passed, failed}' "$dir/ledger"); then
+    bad "$(job_label "$name")" "malformed worker ledger; see $dir"
+    return
+  fi
+  read -r ledger_pass ledger_fail <<< "$ledger_counts"
+  # The completion record is independent failure evidence. Ignoring its counts lets an
+  # explicit failed completion turn green when its fragment contains only passing rows.
+  # Require an exact inventory agreement before publishing either artifact to the gate.
+  if [ "$job_pass" != "$ledger_pass" ] || [ "$job_fail" != "$ledger_fail" ]; then
+    bad "$(job_label "$name")" "worker completion disagrees with ledger ($job_pass/$job_fail versus $ledger_pass/$ledger_fail); see $dir"
     return
   fi
   # A child can print success and then fail (including during teardown). Its process result is
   # evidence too: never let a previously emitted green fragment swallow that failure.
-  if [ "$job_rc" -ne 0 ] && ! grep -q $'^FAIL\t' "$dir/ledger"; then
+  if [ "$job_rc" -ne 0 ] && [ "$ledger_fail" = 0 ]; then
     cat "$dir/output.log"
     bad "$(job_label "$name")" "worker exited $job_rc after its rows; see $dir"
     return
   fi
   cat "$dir/output.log"
   cat "$dir/ledger" >> "$LEDGER"; cat "$dir/timings" >> "$TIMINGS"
-  PASS=$((PASS + $(awk -F '\t' '$1=="ok"{n++} END{print n+0}' "$dir/ledger")))
-  FAIL=$((FAIL + $(awk -F '\t' '$1=="FAIL"{n++} END{print n+0}' "$dir/ledger")))
+  PASS=$((PASS + ledger_pass))
+  FAIL=$((FAIL + ledger_fail))
   ROW_T=$(date +%s.%N)
 }
 join_workers(){

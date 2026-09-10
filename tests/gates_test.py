@@ -429,6 +429,61 @@ def preserve_scheduler_failure(root, directory, script, stdout='', stderr=''):
     return saved
 
 
+class WorkerCompletion(unittest.TestCase):
+    def collect(self, completion, ledger='ok\t0.125000\tfixture\n'):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        collector = gate[gate.index('collect_job(){'):gate.index('\njoin_workers(){')]
+        # Execute the real collector with already published artifacts. This isolates the
+        # failure evidence boundary without starting workers or replacing verdict logic.
+        stub = r'''
+set -u
+PASS=0; FAIL=0; WORKER_PIDS=()
+LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"
+: > "$LEDGER"; : > "$TIMINGS"
+job_label(){ printf 'fixture\n'; }
+bad(){ printf 'FAIL\t0\t%s\n' "$1" >> "$LEDGER"; FAIL=$((FAIL+1)); }
+'''
+        with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+            directory = Path(temporary)
+            job = directory / 'jobs/fixture'
+            job.mkdir(parents=True)
+            (job / 'ledger').write_text(ledger)
+            (job / 'timings').write_text(ledger)
+            (job / 'output.log').write_text('fixture output\n')
+            (job / 'done').write_text(completion)
+            result = subprocess.run(['bash', '-c', stub + collector +
+                                     '\ncollect_job fixture\nprintf "%s %s\\n" "$PASS" "$FAIL"\n'],
+                                    cwd=root, env=dict(os.environ, RUN_DIR=temporary),
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return tuple(map(int, result.stdout.splitlines()[-1].split())), (directory / 'ledger').read_text()
+
+    def test_matching_completion_preserves_both_verdicts(self):
+        self.assertEqual(self.collect('0\t1\t0\n')[0], (1, 0))
+        self.assertEqual(self.collect('1\t0\t1\n', 'FAIL\t0.125000\tfixture\n')[0], (0, 1))
+
+    def test_explicit_failure_or_wrong_counts_cannot_be_hidden_by_a_passing_fragment(self):
+        for completion in ('0\t1\t1\n', '0\t0\t1\n', '0\t2\t0\n', '0\t0\t0\n',
+                           '1\t1\t0\n'):
+            with self.subTest(completion=completion):
+                counts, ledger = self.collect(completion)
+                self.assertEqual(counts, (0, 1))
+                self.assertEqual(ledger, 'FAIL\t0\tfixture\n')
+
+    def test_completion_must_be_one_complete_record(self):
+        for completion in ('', '0\t1\n', '0\t1\t0\n0\t0\t1\n', '0\t1\t0\n\n',
+                           '256\t1\t0\n', '999999999999999999999999\t1\t0\n'):
+            with self.subTest(completion=completion):
+                self.assertEqual(self.collect(completion)[0], (0, 1))
+
+    def test_empty_or_malformed_fragment_cannot_supply_passing_rows(self):
+        for ledger in ('', 'ok\tfixture\n', 'ok\tNaN\tfixture\n', 'ok\t-1\tfixture\n',
+                       'ok\t0.125000\t\n', 'ok\t0.125000\tfixture\nBROKEN\t0\tother\n'):
+            with self.subTest(ledger=ledger):
+                self.assertEqual(self.collect('0\t1\t0\n', ledger)[0], (0, 1))
+
+
 class SchedulerWiring(unittest.TestCase):
     # Enumerate the real collector loops, not a hand-maintained approximation of their inventory.
     # This invokes only collect_job stubs: no compiler, server, battery or benchmark is started.
