@@ -169,11 +169,20 @@ def controller_watchdog(rows, ancestors, spec, *, reader=None):
                 script != expected_script or argv[2] != "watch" or len(argv[3:]) % 2):
             raise ValueError("watchdog executable/script/parent differs")
         options = dict(zip(argv[3::2], argv[4::2]))
+        cancellation = {"--generation", "--cancel-request", "--cancel-receipt"}
         if (len(options) * 2 != len(argv[3:]) or
-                set(options) - {"--pid", "--parent-start", "--seconds", "--marker", "--grace"} or
+                set(options) - {"--pid", "--parent-start", "--seconds", "--marker", "--grace"} - cancellation or
                 options.get("--pid") != str(parent.pid) or options.get("--parent-start") != str(parent.start) or
                 "--seconds" not in options or "--marker" not in options):
             raise ValueError("watchdog arguments do not name its exact controller parent")
+        if set(options) & cancellation:
+            if not cancellation <= set(options) or not re.fullmatch(
+                    rf"{parent.pid}\.{parent.start}\.[1-9][0-9]*", options["--generation"]):
+                raise ValueError("watchdog cancellation generation does not name its exact parent")
+            prefix = options["--marker"].removesuffix(".json") + "." + options["--generation"]
+            if (options["--cancel-request"] != prefix + ".cancel" or
+                    options["--cancel-receipt"] != prefix + ".cancelled"):
+                raise ValueError("watchdog cancellation paths do not name this generation")
     except (OSError, ValueError, IndexError) as error:
         raise QuietViolation("cannot validate declared ABBA watchdog: " + str(error)) from error
     return {identity: {"pid": row.pid, "start_ticks": row.start, "parent_pid": parent.pid,
@@ -418,6 +427,19 @@ def self_test():
                 self.assertEqual({row["pid"] for row in monitor.failure["processes"]}, {40, 50})
             # Without the explicit declaration the identical sibling Python workload is foreign.
             self.assertEqual(interference(before, after, self.root.identity, {0}, {(1, 77)})[0]["pid"], 30)
+
+        def test_cancellation_options_are_bound_to_exact_watch_generation(self):
+            rows, metadata = self.watchdog_fixture()
+            argv, script, identity, parent = metadata
+            extra = ["--generation", "1.77.2", "--cancel-request", "/tmp/test-row-marker.1.77.2.cancel",
+                     "--cancel-receipt", "/tmp/test-row-marker.1.77.2.cancelled"]
+            reader = lambda _: (argv + extra, script, identity, parent)
+            self.assertEqual(len(controller_watchdog(rows, {(1, 77)}, "30:42", reader=reader)), 1)
+            for bad in (extra[:2], [*extra[:1], "1.99.2", *extra[2:]],
+                        [*extra[:-1], "/tmp/another-generation.cancelled"]):
+                with self.subTest(options=bad), self.assertRaises(QuietViolation):
+                    controller_watchdog(rows, {(1, 77)}, "30:42",
+                                        reader=lambda _: (argv + bad, script, identity, parent))
 
         def test_watchdog_identity_parent_and_script_cannot_be_spoofed(self):
             from dataclasses import replace

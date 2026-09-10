@@ -470,11 +470,26 @@ reap_children(){ :; } # Real teardown is covered by gate_history's owned-process
         if delayed_completion:
             # Widen the real open-before-write window past the collector's polling interval.
             # Readers must wait for publication even when the writer is descheduled here.
+            # Filter the completion record's format/three integer fields BEFORE readlink: a
+            # wrapper that forks for every printf adds work to every label/ledger operation.
+            # With 97 fixture workers on one CPU that instrumentation itself exhausted 45s,
+            # invoking timeout teardown while otherwise healthy rows were still completing.
             prelude += '''
+mkdir "$RUN_DIR/delayed-publication"
 printf(){
   local writer_pid=$BASHPID target
-  target=$(readlink "/proc/$writer_pid/fd/1")
-  case "$target" in */done|*/done.tmp) sleep .6;; esac
+  if [ "${1-}" = '%s\\t%s\\t%s\\n' ] && [ "$#" = 4 ] &&
+      [[ "$2" =~ ^[0-9]+$ && "$3" =~ ^[0-9]+$ && "$4" =~ ^[0-9]+$ ]]; then
+    target=$(readlink "/proc/$writer_pid/fd/1")
+    case "$target" in */done|*/done.tmp)
+      local family=${target%/*}; family=${family##*/}
+      # Exactly one marker per actual publication. Append exposes a duplicate finalizer;
+      # checking markers below makes a narrowed hook that never opens the window fail.
+      builtin printf '%s\\t%s\\t%s\\n' "$writer_pid" "$CLEANUP_OWNER" "$EPOCHREALTIME" \\
+          >> "$RUN_DIR/delayed-publication/$family"
+      sleep .6;;
+    esac
+  fi
   builtin printf "$@"
 }
 '''
@@ -562,6 +577,19 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             if result.returncode:
                 output += preserve_failure(result.stdout, result.stderr)
             self.assertEqual(result.returncode, 0, output)
+            if delayed_completion:
+                try:
+                    fired = directory / 'delayed-publication'
+                    expected_families = {path.name for path in (directory / 'jobs').iterdir()}
+                    self.assertEqual({path.name for path in fired.iterdir()}, expected_families)
+                    for path in fired.iterdir():
+                        events = path.read_text().splitlines()
+                        self.assertEqual(len(events), 1, f'{path.name}: completion injection repeated')
+                        writer, owner, timestamp = events[0].split('\t')
+                        self.assertEqual(writer, owner, f'{path.name}: non-owner published completion')
+                        self.assertGreater(float(timestamp), 0)
+                except (AssertionError, ValueError, OSError) as exc:
+                    self.fail(str(exc) + preserve_failure(result.stdout, result.stderr))
             timed_rows = [line.split('\t') for line in (directory / 'ledger').read_text().splitlines()]
             for row in timed_rows:
                 self.assertEqual(len(row), 3)
@@ -629,7 +657,10 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
 
     def test_completion_is_not_visible_before_its_record_is_written(self):
-        result = self.run_scheduler(delayed_completion=True)
+        # Publication is independent of completion order, which has its own full-inventory
+        # forward/reverse controls above. Three workers still open every family's publication
+        # window while the collector runs; 97 synchronized shells on one CPU only add contention.
+        result = self.run_scheduler(slots=3, ordered=False, delayed_completion=True)
         self.assertEqual(result['counts'], (len(self.canonical), 0))
 
     def test_limited_workers_reuse_slots_without_losing_or_repeating_jobs(self):

@@ -618,8 +618,38 @@ def reap_tree(pid: int, parent_start: int, *, grace: float = 5.0) -> dict:
             "survivors": {child: born for child, born in owned.items() if process_alive(child, born)}}
 
 
+def signal_child(pid: int, start: int, parent: int, parent_start: int) -> None:
+    # Only the caller's exact sibling can be its row watcher. Reparenting or a recycled PID
+    # is not ownership; the pidfd in signal_identity closes the final check/signal race.
+    caller = process_identity(parent)
+    if parent != os.getppid() or caller is None or caller[1] != parent_start:
+        raise ValueError("signal-child caller parent identity changed")
+    identity = process_identity(pid)
+    if identity is None:
+        return
+    if identity != (parent, start):
+        raise ValueError("signal-child target PID/start or direct-parent identity changed")
+    signal_identity(pid, start, signal.SIGKILL)
+
+
+def cancellation_receipt(path: Path, fields: tuple[str, ...]) -> None:
+    # The shell reads one complete receipt only after its atomic publication. A fragment,
+    # older pause/rearm generation, or unrelated PID cannot explain a watcher's exit0.
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=path.name + ".",
+                                     delete=False, encoding="utf-8") as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write("\t".join(("CANCELLED", *fields)) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def watch(pid: int, parent_start: int, marker: Path, *, seconds: float | None = None,
-          deadline: float | None = None, grace: float = 5.0) -> None:
+          deadline: float | None = None, grace: float = 5.0, generation: str | None = None,
+          cancel_request: Path | None = None, cancel_receipt: Path | None = None) -> None:
     grace = finite_number(grace, "grace", positive=True)
     if pid <= 1 or parent_start <= 0:
         raise ValueError("watch requires a non-init parent PID and positive start ticks")
@@ -634,10 +664,31 @@ def watch(pid: int, parent_start: int, marker: Path, *, seconds: float | None = 
         raise ValueError("row shell PID/start identity is no longer live")
     if os.getppid() != pid:
         raise ValueError("watch can only supervise its own direct parent")
+    cancellation = (generation, cancel_request, cancel_receipt)
+    if any(value is not None for value in cancellation) and not all(value is not None for value in cancellation):
+        raise ValueError("watch cancellation requires generation, request, and receipt together")
+    if generation is not None and not re.fullmatch(rf"{pid}\.{parent_start}\.[1-9][0-9]*", generation):
+        raise ValueError("watch cancellation generation must name its parent PID/start and sequence")
+    self_identity = process_identity(os.getpid())
+    if self_identity is None or self_identity[0] != pid:
+        raise ValueError("watch cannot establish its own direct-parent/PID/start identity")
+    cancellation_fields = tuple(map(str, (pid, parent_start, os.getpid(), self_identity[1], generation)))
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        # A TERM delivered during Bash's pre-exec transition was observed being lost while
+        # this Python process then slept for the entire 900s budget. The parent's persistent
+        # request survives that transition. Expiry is checked FIRST: a late cancellation
+        # cannot suppress its marker or steal the five-second descendant escalation below.
+        if cancel_request is not None and cancel_request.exists():
+            expected = "\t".join(("CANCEL", *cancellation_fields)) + "\n"
+            if cancel_request.read_text() != expected:
+                raise ValueError("watch cancellation request does not match this PID/start/generation")
+            if time.monotonic() >= deadline:
+                break
+            cancellation_receipt(cancel_receipt, cancellation_fields)
+            return
         time.sleep(min(remaining, 0.1))
         identity = process_identity(pid)
         if identity is None or identity[1] != parent_start:
@@ -987,7 +1038,90 @@ eval "$4"
             outsider.wait(timeout=5)
 
 
-    def shell_row(self, body, timeout=1.0, extra_functions=""):
+    def bounded_shell(self, argv, root, directory, environment, timeout):
+        # This item-one control must work before mutation mode exists. Own one shell,
+        # capture its descendants by PID/start, and reap orphaned test children locally.
+        # In particular the poisoned old wait must not leave its 30s watcher behind.
+        import ctypes
+        import subprocess
+        from types import SimpleNamespace
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        if libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0 or libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "cannot scope cancellation control as subreaper")
+        own_pid = os.getpid()
+        own_children = Path(f"/proc/{own_pid}/task/{own_pid}/children")
+        preexisting = {int(pid): process_identity(int(pid)) for pid in own_children.read_text().split()}
+        owned, process, expired = {}, None, False
+        logfile = directory / 'owned-command.log'
+
+        def capture():
+            if process is not None:
+                identity = process_identity(process.pid)
+                if identity is not None and identity[1] == owned.get(process.pid):
+                    owned.update(descendants(process.pid, identity[1]))
+            # Only children orphaned by this fixture are new direct children of this
+            # synchronous test process; pre-existing children remain outside its ownership.
+            for token in own_children.read_text().split():
+                pid = int(token)
+                identity = process_identity(pid)
+                if identity is not None and identity != preexisting.get(pid):
+                    owned[pid] = identity[1]
+
+        def reap():
+            for pid, born in tuple(owned.items()):
+                if process is not None and pid == process.pid:
+                    continue  # Popen alone owns its direct child's wait status.
+                if process_identity(pid) == (own_pid, born):
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+
+        try:
+            with logfile.open('w') as log:
+                process = subprocess.Popen(argv, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT)
+                identity = process_identity(process.pid)
+                if identity is not None:
+                    owned[process.pid] = identity[1]
+                deadline = time.monotonic() + timeout
+                while process.poll() is None and time.monotonic() < deadline:
+                    capture()
+                    reap()
+                    time.sleep(.01)
+                expired = process.poll() is None
+        finally:
+            # Clean descendants first, giving the shell a chance to consume wait status
+            # and leave normally. Every cleanup phase is bounded even in the poisoned case.
+            for sig, grace in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 1.0)):
+                until = time.monotonic() + grace
+                while True:
+                    capture()
+                    live = {pid: born for pid, born in owned.items() if process_alive(pid, born)}
+                    children = {pid: born for pid, born in live.items()
+                                if process is None or pid != process.pid}
+                    # Do not interrupt a healthy shell that is now publishing its row
+                    # after the stranded watcher stopped. It has this first grace to exit.
+                    targets = children or (live if sig == signal.SIGKILL or time.monotonic() >= until else {})
+                    for pid, born in targets.items():
+                        signal_identity(pid, born, sig)
+                    reap()
+                    if process is not None:
+                        process.poll()
+                    if not live or time.monotonic() >= until:
+                        break
+                    time.sleep(.01)
+            capture()
+            reap()
+            leaked = {pid: born for pid, born in owned.items() if process_alive(pid, born)}
+            if process is not None:
+                process.poll()
+            libc.prctl(36, previous.value, 0, 0, 0)
+        observed = dict(returncode=process.returncode, expired=expired, leaked_pids=leaked)
+        (directory / 'owned-command.json').write_text(json.dumps(observed, indent=2) + '\n')
+        return SimpleNamespace(**observed, stdout=logfile.read_text(), stderr='')
+
+    def shell_row(self, body, timeout=1.0, extra_functions="", owned_timeout=None):
         import subprocess
         root = Path(__file__).resolve().parents[1]
         gate = (root / 'tests/gate.sh').read_text()
@@ -1003,8 +1137,13 @@ PASS=0; FAIL=0
 quiet_wait(){ :; }
 : > "$LEDGER"; : > "$TIMINGS"
 '''
-        result = subprocess.run(['bash', '-c', setup + helpers + '\n' + extra_functions + '\n' + body], cwd=root,
-            env=dict(os.environ, FIXTURE=str(directory)), capture_output=True, text=True, timeout=10)
+        command_line = ['bash', '-c', setup + helpers + '\n' + extra_functions + '\n' + body]
+        environment = dict(os.environ, FIXTURE=str(directory))
+        if owned_timeout is None:
+            result = subprocess.run(command_line, cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=10)
+        else:
+            result = self.bounded_shell(command_line, root, directory, environment, owned_timeout)
         rows = (directory / 'ledger').read_text().splitlines()
         return result, [row.split('\t') for row in rows], read_history(directory / 'history')
 
@@ -1036,6 +1175,144 @@ quiet_wait(){ :; }
         self.assertIn("row watchdog exited unexpectedly: 17", result.stdout)
         self.assertEqual(history[0]["verdict"], "FAIL")
         self.assertFalse(history[0]["timed_out"])
+
+    def test_cancel_request_survives_preexec_first_term_loss(self):
+        lose_first_term = '''python3(){
+  if [ "${2-}" = watch ]; then
+    # Deterministically model the retained Bash pre-exec transition: the first TERM is
+    # consumed, after which the same PID execs a normally TERM-sensitive Python watcher.
+    trap 'printf consumed > "$FIXTURE/first-term"' TERM
+    : > "$FIXTURE/preexec-ready"
+    while [ ! -f "$FIXTURE/first-term" ]; do sleep .01; done
+    trap - TERM
+    exec /usr/bin/python3 "$@"
+  else command python3 "$@"
+  fi
+}
+'''
+        body = '''row_begin fixture
+while [ ! -f "$FIXTURE/preexec-ready" ]; do sleep .01; done
+ok fixture
+'''
+        result, rows, history = self.shell_row(body, 30, lose_first_term, owned_timeout=3)
+        self.assertFalse(result.expired, result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(result.leaked_pids, result.stdout)
+        self.assertEqual([(row[0], row[2]) for row in rows], [('ok', 'fixture')])
+        self.assertEqual(history[0]['verdict'], 'ok')
+        self.assertTrue((self.directory / 'first-term').exists(), 'first TERM was never consumed')
+        receipts = list(self.directory.glob('*.cancelled'))
+        self.assertEqual(len(receipts), 1, 'request was not acknowledged by the execed watcher')
+        receipt = receipts[0].read_text().strip().split('\t')
+        self.assertEqual(receipt[0], 'CANCELLED')
+        self.assertEqual(receipt[5].split('.')[:2], receipt[1:3])
+
+        # Poison only cancellation with the inherited unconditional wait. This must fail
+        # the same bounded actual-process experiment; hand-constructing classify() inputs
+        # would miss the precise production failure that this control is for.
+        for path in (self.directory / 'first-term', self.directory / 'preexec-ready'):
+            path.unlink()
+        old_unwatch = '''row_unwatch(){
+  if [ "$ROW_WATCHDOG" -gt 0 ]; then
+    kill -TERM "$ROW_WATCHDOG" 2>/dev/null
+    wait "$ROW_WATCHDOG" 2>/dev/null || :
+    ROW_WATCHDOG=0
+  fi
+}
+'''
+        poisoned, _, _ = self.shell_row(body, 30, lose_first_term + old_unwatch, owned_timeout=3)
+        self.assertTrue(poisoned.expired, 'unbounded old cancellation unexpectedly completed')
+        self.assertFalse(poisoned.leaked_pids, 'negative control left an owned watcher running')
+
+    def test_watchdog_exit_zero_without_receipt_is_still_red(self):
+        broken = '''row_watch(){
+  python3 -c 'raise SystemExit(0)' &
+  ROW_WATCHDOG=$!
+}
+'''
+        result, rows, history = self.shell_row(
+            'row_begin fixture\nwait "$ROW_WATCHDOG"\nok fixture\n', extra_functions=broken)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(rows[0][0], 'FAIL')
+        self.assertIn('row watchdog exited unexpectedly: 0', result.stdout)
+        self.assertEqual(history[0]['verdict'], 'FAIL')
+
+    def test_pause_rearm_has_distinct_cancellation_generations(self):
+        # Repeated scopes share a PID and marker; their request/receipt paths must not.
+        result, rows, _ = self.shell_row('''row_begin fixture
+first=$ROW_WATCH_GENERATION
+row_unwatch
+row_watch
+[ "$first" != "$ROW_WATCH_GENERATION" ] || exit 71
+ok fixture
+''', 5)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(rows[0][0], 'ok', result.stdout)
+
+    def test_stalled_cancellation_is_bounded_reaped_and_red(self):
+        stalled = '''python3(){
+  if [ "${2-}" = watch ]; then
+    exec /usr/bin/python3 -c 'import os,signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,signal.SIG_IGN); Path(os.environ["FIXTURE"]+"/stalled-ready").touch(); time.sleep(60)'
+  else command python3 "$@"
+  fi
+}
+'''
+        result, rows, history = self.shell_row('''row_begin fixture
+while [ ! -f "$FIXTURE/stalled-ready" ]; do sleep .01; done
+ok fixture
+''', 30, stalled, owned_timeout=9)
+        self.assertFalse(result.expired, result.stdout)
+        self.assertFalse(result.leaked_pids, result.stdout)
+        self.assertEqual(rows[0][0], 'FAIL', result.stdout)
+        self.assertIn('exceeded its bounded grace', result.stdout)
+        self.assertEqual(history[0]['verdict'], 'FAIL')
+        self.assertFalse(history[0]['timed_out'], 'monitor failure is not a fabricated row expiry')
+
+    def test_cancel_receipt_rejects_stale_generation_or_extra_records(self):
+        body = '''ROW_WATCH_PARENT=101; ROW_WATCH_PARENT_START=202
+ROW_WATCHDOG=303; ROW_WATCHDOG_START=404; ROW_WATCH_GENERATION=101.202.2
+ROW_WATCH_RECEIPT="$FIXTURE/receipt"
+printf 'CANCELLED\\t101\\t202\\t303\\t404\\t101.202.1\\n' > "$ROW_WATCH_RECEIPT"
+row_watch_receipt && exit 81
+printf 'CANCELLED\\t101\\t202\\t303\\t404\\t101.202.2\\nextra\\n' > "$ROW_WATCH_RECEIPT"
+row_watch_receipt && exit 82
+printf 'CANCELLED\\t101\\t202\\t303\\t404\\t101.202.2\\t\\n' > "$ROW_WATCH_RECEIPT"
+row_watch_receipt && exit 84
+printf 'CANCELLED\\t101\\t202\\t303\\t404\\t101.202.2' > "$ROW_WATCH_RECEIPT"
+row_watch_receipt && exit 85
+printf 'CANCELLED\\t101\\t202\\t303\\t404\\t101.202.2\\n' > "$ROW_WATCH_RECEIPT"
+row_watch_receipt || exit 83
+'''
+        result, rows, _ = self.shell_row(body)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(rows, [])
+
+    def test_late_cancellation_cannot_override_expiry(self):
+        from unittest.mock import patch
+        marker = self.directory / 'expired.json'
+        request, receipt = self.directory / 'request', self.directory / 'receipt'
+        request.write_text('CANCEL\t111\t22\t222\t33\t111.22.1\n')
+        identities = lambda pid: (0, 22) if pid == 111 else (111, 33)
+        with patch(__name__ + '.process_identity', side_effect=identities), \
+             patch.object(os, 'getpid', return_value=222), patch.object(os, 'getppid', return_value=111), \
+             patch.object(time, 'monotonic', return_value=11), patch.object(signal, 'signal'), \
+             patch(__name__ + '.descendants', return_value={}), patch(__name__ + '.signal_identity') as sent:
+            watch(111, 22, marker, deadline=10, generation='111.22.1',
+                  cancel_request=request, cancel_receipt=receipt)
+        self.assertEqual(json.loads(marker.read_text())['state'], 'TIMEOUT')
+        self.assertFalse(receipt.exists())
+        sent.assert_called_once_with(111, 22, signal.SIGUSR1)
+
+    def test_forced_watcher_signal_rejects_reuse_and_foreign_parent(self):
+        from unittest.mock import patch
+        for target_identity in ((111, 999), (999, 33)):
+            with self.subTest(target=target_identity), patch.object(os, 'getppid', return_value=111), \
+                 patch(__name__ + '.process_identity', side_effect=lambda pid:
+                       (0, 22) if pid == 111 else target_identity), \
+                 patch(__name__ + '.signal_identity') as sent:
+                with self.assertRaisesRegex(ValueError, 'target PID/start or direct-parent'):
+                    signal_child(222, 33, 111, 22)
+                sent.assert_not_called()
 
     def test_real_shell_records_only_the_rows_own_duration(self):
         result, rows, history = self.shell_row('sleep 1\nrow_begin fixture\nsleep .03\nok fixture\n', 5)
@@ -1427,6 +1704,14 @@ def main() -> int:
     timing.add_argument("--seconds", type=float)
     timing.add_argument("--deadline", type=float)
     p.add_argument("--grace", type=float, default=5.0)
+    p.add_argument("--generation")
+    p.add_argument("--cancel-request", type=Path)
+    p.add_argument("--cancel-receipt", type=Path)
+    p = sub.add_parser("signal-child")
+    p.add_argument("--pid", type=int, required=True)
+    p.add_argument("--start", type=int, required=True)
+    p.add_argument("--parent", type=int, required=True)
+    p.add_argument("--parent-start", type=int, required=True)
     p = sub.add_parser("identity")
     p.add_argument("--pid", type=int, required=True)
     p = sub.add_parser("reap-tree")
@@ -1463,7 +1748,10 @@ def main() -> int:
             print(canonical_label(args.label))
         elif args.command == "watch":
             watch(args.pid, args.parent_start, args.marker, seconds=args.seconds,
-                  deadline=args.deadline, grace=args.grace)
+                  deadline=args.deadline, grace=args.grace, generation=args.generation,
+                  cancel_request=args.cancel_request, cancel_receipt=args.cancel_receipt)
+        elif args.command == "signal-child":
+            signal_child(args.pid, args.start, args.parent, args.parent_start)
         elif args.command == "identity":
             identity = process_identity(args.pid)
             if identity is None:

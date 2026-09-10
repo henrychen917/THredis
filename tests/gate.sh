@@ -262,6 +262,7 @@ canonical_label(){ sed -E \
 # shell loops and waits all count. On expiry the family stops red; later rows are visibly
 # unreached through the existing completion/count checks. No timeout becomes a skip.
 ROW_ID=; ROW_WATCHDOG=0; ROW_EXPIRED=0; ROW_START=0; ROW_PAUSED=0
+ROW_WATCH_SEQUENCE=0; ROW_WATCHDOG_START=0; ROW_WATCH_PARENT=0; ROW_WATCH_PARENT_START=0
 row_clock(){
   # Kernel uptime is monotonic and has 10 ms resolution. A wall-clock/NTP step
   # must neither manufacture an expiry nor extend a hung row's measured history.
@@ -273,25 +274,122 @@ row_watch(){
   read -r parent_stat < "/proc/$BASHPID/stat"
   parent_stat=${parent_stat##*) }; read -ra parent_fields <<< "$parent_stat"
   parent_start=${parent_fields[19]}
+  ROW_WATCH_PARENT=$parent_pid; ROW_WATCH_PARENT_START=$parent_start
+  ROW_WATCH_SEQUENCE=$((${ROW_WATCH_SEQUENCE:-0}+1))
+  ROW_WATCH_GENERATION="$parent_pid.$parent_start.$ROW_WATCH_SEQUENCE"
+  ROW_WATCH_CANCEL="${ROW_MARKER%.json}.$ROW_WATCH_GENERATION.cancel"
+  ROW_WATCH_RECEIPT="${ROW_MARKER%.json}.$ROW_WATCH_GENERATION.cancelled"
   row_clock
   remaining=$(awk -v budget="$ROW_TIMEOUT" -v start="$ROW_START" -v now="$ROW_NOW" -v paused="$ROW_PAUSED" \
       'BEGIN {v=budget-(now-start-paused); print (v>0?v:0.001)}')
   python3 tests/gate_history.py watch --pid "$parent_pid" --parent-start "$parent_start" \
-      --seconds "$remaining" --marker "$ROW_MARKER" &
+      --seconds "$remaining" --marker "$ROW_MARKER" --generation "$ROW_WATCH_GENERATION" \
+      --cancel-request "$ROW_WATCH_CANCEL" --cancel-receipt "$ROW_WATCH_RECEIPT" &
   ROW_WATCHDOG=$!
+  ROW_WATCHDOG_START=0
+  if { read -r parent_stat < "/proc/$ROW_WATCHDOG/stat"; } 2>/dev/null; then
+    parent_stat=${parent_stat##*) }; read -ra parent_fields <<< "$parent_stat"
+    [ "${parent_fields[1]}" != "$parent_pid" ] || ROW_WATCHDOG_START=${parent_fields[19]}
+  fi
+}
+row_watch_probe(){
+  local state fields
+  ROW_WATCH_STATE=gone
+  if { read -r state < "/proc/$ROW_WATCHDOG/stat"; } 2>/dev/null; then
+    state=${state##*) }; read -ra fields <<< "$state"
+    if [ "${fields[1]}" != "${ROW_WATCH_PARENT:-0}" ] ||
+        [ "${fields[19]}" != "${ROW_WATCHDOG_START:-0}" ] ||
+        [ "$BASHPID" != "${ROW_WATCH_PARENT:-0}" ]; then
+      ROW_WATCH_STATE=mismatch
+    else ROW_WATCH_STATE=${fields[0]}
+    fi
+  fi
+}
+row_watch_clock(){
+  local uptime idle whole fraction
+  read -r uptime idle < /proc/uptime || return 1
+  whole=${uptime%.*}; fraction=${uptime#*.}00
+  ROW_WATCH_CLOCK=$((10#$whole*100+10#${fraction:0:2}))
+}
+row_watch_receipt(){
+  local line expected lines=()
+  [ -f "${ROW_WATCH_RECEIPT:-}" ] || return 1
+  mapfile -t lines < "$ROW_WATCH_RECEIPT"
+  [ "${#lines[@]}" = 1 ] || return 1
+  IFS= read -r line < "$ROW_WATCH_RECEIPT" || return 1
+  printf -v expected 'CANCELLED\t%s\t%s\t%s\t%s\t%s' "$ROW_WATCH_PARENT" "$ROW_WATCH_PARENT_START" \
+      "$ROW_WATCHDOG" "$ROW_WATCHDOG_START" "$ROW_WATCH_GENERATION"
+  [ "$line" = "$expected" ]
 }
 row_unwatch(){
-  local watcher_rc=0
+  local watcher_rc=0 until expired=0 forced=0 can_wait=1
   if [ "$ROW_WATCHDOG" -gt 0 ]; then
+    # Captured 2026-09-10: TERM in Bash's fork/exec transition was lost, leaving three
+    # Python watchers sleeping for 900s while their parents waited forever. An EXIT-owner
+    # guard prevents false publication but cannot make that first signal reliable.
+    # Publish a generation-specific request before TERM; a child that starts afterwards
+    # acknowledges it. Pause/rearm generations never share cancellation evidence.
+    row_watch_probe
+    if [ "$ROW_WATCH_STATE" != gone ] && [ "$ROW_WATCH_STATE" != Z ] &&
+        [ "$ROW_WATCH_STATE" != mismatch ] && [ ! -f "$ROW_MARKER" ]; then
+      if ! { printf 'CANCEL\t%s\t%s\t%s\t%s\t%s\n' "$ROW_WATCH_PARENT" "$ROW_WATCH_PARENT_START" \
+          "$ROW_WATCHDOG" "$ROW_WATCHDOG_START" "$ROW_WATCH_GENERATION" > "$ROW_WATCH_CANCEL.tmp" &&
+          mv "$ROW_WATCH_CANCEL.tmp" "$ROW_WATCH_CANCEL"; }; then ROW_MONITOR_FAILED=1; fi
+      kill -TERM "$ROW_WATCHDOG" 2>/dev/null || :
+    fi
+    row_watch_clock || { ROW_MONITOR_FAILED=1; return 1; }
+    until=$((ROW_WATCH_CLOCK+500)) # Match watch()'s existing five-second cleanup grace.
+    while :; do
+      row_watch_probe
+      case "$ROW_WATCH_STATE" in
+        gone|Z) break;;
+        mismatch)
+          ROW_MONITOR_FAILED=1; can_wait=0
+          say "$ROW_ID" 'FAIL (row watchdog PID/start or direct-parent identity changed)'
+          break;;
+      esac
+      row_watch_clock || { ROW_MONITOR_FAILED=1; can_wait=0; break; }
+      if [ -f "$ROW_MARKER" ] && [ "$expired" = 0 ]; then
+        # Expiry owns descendant reclamation. Allow its full five seconds plus one
+        # second for marker publication/scheduling; never TERM/KILL it immediately.
+        expired=1; until=$((ROW_WATCH_CLOCK+600))
+      fi
+      if [ "$ROW_WATCH_CLOCK" -ge "$until" ]; then
+        forced=1; ROW_MONITOR_FAILED=1
+        say "$ROW_ID" 'FAIL (row watchdog cancellation/expiry cleanup exceeded its bounded grace)'
+        # This exceptional path pays for a pidfd helper so PID reuse across inspection
+        # and SIGKILL cannot touch another process. Forced cleanup can never turn green.
+        python3 tests/gate_history.py signal-child --pid "$ROW_WATCHDOG" --start "$ROW_WATCHDOG_START" \
+            --parent "$ROW_WATCH_PARENT" --parent-start "$ROW_WATCH_PARENT_START" || :
+        row_watch_clock || { can_wait=0; break; }
+        until=$((ROW_WATCH_CLOCK+100))
+        while :; do
+          row_watch_probe
+          case "$ROW_WATCH_STATE" in gone|Z) break;; mismatch) can_wait=0; break;; esac
+          row_watch_clock || { can_wait=0; break; }
+          [ "$ROW_WATCH_CLOCK" -lt "$until" ] || { can_wait=0; break; }
+          sleep .01
+        done
+        break
+      fi
+      sleep .01
+    done
     # A published timeout owns its five-second kill escalation. Let it finish so a
     # TERM-ignoring child cannot survive the correctness barrier into performance.
-    [ -f "$ROW_MARKER" ] || kill -TERM "$ROW_WATCHDOG" 2>/dev/null
-    wait "$ROW_WATCHDOG" 2>/dev/null || watcher_rc=$?
-    if [ "$watcher_rc" != 143 ] && { [ "$watcher_rc" != 0 ] || [ ! -f "$ROW_MARKER" ]; }; then
+    # wait is reached only after this exact child is gone/zombie, never while it runs.
+    if [ "$can_wait" = 1 ]; then
+      wait "$ROW_WATCHDOG" 2>/dev/null || watcher_rc=$?
+    else
+      watcher_rc=255; ROW_MONITOR_FAILED=1
+      say "$ROW_ID" 'FAIL (row watchdog remains live/unowned; refusing an unbounded wait)'
+    fi
+    if [ "$watcher_rc" != 143 ] &&
+        { [ "$watcher_rc" != 0 ] || { [ ! -f "$ROW_MARKER" ] && ! row_watch_receipt; }; }; then
       ROW_MONITOR_FAILED=1
       say "$ROW_ID" "FAIL (row watchdog exited unexpectedly: $watcher_rc)"
     fi
     ROW_WATCHDOG=0
+    [ "$forced" = 0 ] && [ "$can_wait" = 1 ] || return 1
   fi
 }
 row_begin(){
