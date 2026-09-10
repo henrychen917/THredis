@@ -723,6 +723,16 @@ def memtier_totals(path):
     return {"rate": rate, "latency_ms": latency}
 
 
+def require_unbound_port(port):
+    # Correctness closes connections on this same port before ABBA starts. A plain bind
+    # rejects their TIME_WAIT sockets even after the listener and every server PID are gone.
+    # Match the server's address reuse, but NEVER enable REUSEPORT: this probe must still
+    # reject an actual listener, including one which opted into shared-port listeners.
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("127.0.0.1", port))
+
+
 class Runner:
     def __init__(self, args, out, binaries, children):
         self.args, self.out, self.binaries, self.children = args, out, binaries, children
@@ -765,8 +775,7 @@ class Runner:
         folder.mkdir(parents=True)
         layout = load_layout(self.load_cpus, instances, cell.conns)
         # Never connect to or terminate an existing listener, even if it speaks TomoKV.
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", self.args.port))
+        require_unbound_port(self.args.port)
         command = ["taskset", "-c", cpu_string(self.server_cpus), self.binaries[arm],
                    "--port", str(self.args.port), "--bind", "127.0.0.1", "--atomic", str(cell.atomic),
                    "--enable-debug-command", "yes", "--save", "", "--appendonly", "no",
@@ -1762,6 +1771,47 @@ def self_test():
                                         ("9", None), ("9,10", None)):
                 with self.subTest(permitted=permitted, selected=selected), self.assertRaises(ValueError):
                     select_port(permitted, selected)
+
+        def test_bind_guard_accepts_owned_time_wait_that_plain_bind_rejects(self):
+            import errno
+            # Make the accepted peer the active closer, putting OUR server port into
+            # TIME_WAIT. Connect only to this listener, on a kernel-assigned ephemeral port.
+            with socket.socket() as listener, socket.socket() as client:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.settimeout(2)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                address = listener.getsockname()
+                client.settimeout(2)
+                client.connect(address)
+                remote = client.getsockname()
+                peer, _ = listener.accept()
+                peer.close()
+                self.assertEqual(client.recv(1), b"")
+            expected = [f"0100007F:{address[1]:04X}", f"0100007F:{remote[1]:04X}"]
+            deadline = time.monotonic() + 2
+            while True:
+                states = [row.split()[3] for row in Path("/proc/net/tcp").read_text().splitlines()[1:]
+                          if row.split()[1:3] == expected]
+                if states == ["06"]:  # Prove TIME_WAIT opened; never skip the window.
+                    break
+                self.assertLess(time.monotonic(), deadline, f"owned connection never entered TIME_WAIT: {states}")
+                time.sleep(.01)
+            with socket.socket() as old_probe, self.assertRaises(OSError) as caught:
+                old_probe.bind(address)
+            self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
+            require_unbound_port(address[1])
+
+        def test_bind_guard_rejects_live_listener_even_with_reuseport(self):
+            import errno
+            with socket.socket() as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                with self.assertRaises(OSError) as caught:
+                    require_unbound_port(listener.getsockname()[1])
+                self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
 
         def test_placement_caps_physical_cores_and_preserves_explicit_smt(self):
             with mock.patch(__name__ + ".validate_axes") as validate:
