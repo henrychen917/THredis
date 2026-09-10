@@ -1,0 +1,3 @@
+# Permanent differential seeds. Keep historical counterexamples even as rotation adds coverage.
+7
+19

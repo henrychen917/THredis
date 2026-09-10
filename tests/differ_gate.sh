@@ -30,7 +30,8 @@ REDIS_ROOT=${REDIS74_ROOT:-/tmp/claude-1000/redis74}
 ORACLE_BIN=${GATE_DIFFER_ORACLE_BIN:-$REDIS_ROOT/src/redis-server}
 REDIS_CLI=${GATE_DIFFER_REDIS_CLI:-$REDIS_ROOT/src/redis-cli}
 OUT=${GATE_DIFFER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/gate-differ.XXXXXX")}
-SEEDS=(7 19)
+SEEDS=()
+SEED_RUN=${GATE_RUN_ID:-$OUT}
 TARGET_PID=0
 ORACLE_PID=0
 BOOT_PID=0
@@ -173,10 +174,37 @@ if [ "${#SUITES[@]}" -eq 0 ]; then
   echo "differ suite discovery returned no suites" >&2
   exit 2
 fi
+mkdir -p "$OUT"
+# Rotation adds coverage; it never displaces permanent seeds 7/19 or a discovered counterexample.
+# The durable corpus is outside build/, so make clean cannot erase a failing seed. A root gate can
+# export one GATE_RUN_ID to give concurrent geometries the same newly allocated seed.
+SELECTED_SEEDS=$(python3 tests/_differ_history.py allocate --run "$SEED_RUN" \
+    --output "$OUT/seeds.json") || exit 2
+read -r -a SEEDS <<<"$SELECTED_SEEDS"
+[ "${#SEEDS[@]}" -ge 3 ] || { echo 'differ seed inventory lost a permanent or rotating seed' >&2; exit 2; }
 printf 'DIFFER suites (%d): %s\n' "${#SUITES[@]}" "${SUITES[*]}"
 printf 'DIFFER geometry: %s (%s)\n' "$TARGET_GEOMETRY" "${TARGET_SHAPE[*]}"
-printf 'DIFFER matrix: atomic={0,1} seeds={%s,%s} legs=%d logs=%s\n' \
-    "${SEEDS[0]}" "${SEEDS[1]}" "$((2 * ${#SEEDS[@]} * ${#SUITES[@]}))" "$OUT"
+printf 'DIFFER matrix: atomic={0,1} seeds={%s} legs=%d logs=%s\n' \
+    "${SEEDS[*]}" "$((2 * ${#SEEDS[@]} * ${#SUITES[@]}))" "$OUT"
+
+run_differ_leg(){
+  local suite=$1 seed=$2 logfile=$3 rc=0 verdict=ok
+  GATE_DIFFER_COVERAGE="$logfile.coverage.json" \
+      taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
+      127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" "$suite" "$seed" \
+      >"$logfile" 2>&1 || rc=$?
+  # A missing coverage artifact means the comparison reporter never completed; a zero exit must
+  # not hide that instrumentation failure. The test's own failed exit is preserved unchanged.
+  if [ ! -s "$logfile.coverage.json" ]; then
+    printf '\nFAIL: executed comparison coverage artifact missing\n' >>"$logfile"
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  [ "$rc" -eq 0 ] || verdict=FAIL
+  python3 tests/_differ_history.py record --run "$SEED_RUN" --seed "$seed" --suite "$suite" \
+      --geometry "$TARGET_GEOMETRY" --atomic "$ATOMIC" --verdict "$verdict" --log "$logfile" \
+      || return 2
+  return "$rc"
+}
 
 mkdir -p "$OUT/oracle"
 ORACLE_LOG="$OUT/oracle.log"
@@ -231,9 +259,7 @@ for ATOMIC in 0 1; do
       fi
       LEG="differ $SUITE (atomic=$ATOMIC seed=$SEED)"
       LEG_LOG="$OUT/$SUITE-a$ATOMIC-s$SEED.txt"
-      if taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
-          127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" "$SUITE" "$SEED" \
-          >"$LEG_LOG" 2>&1; then
+      if run_differ_leg "$SUITE" "$SEED" "$LEG_LOG"; then
         say "$LEG" "ok ($(tail -n 1 "$LEG_LOG"))"
         PASS=$((PASS+1))
       else
@@ -253,9 +279,7 @@ for ATOMIC in 0 1; do
     for REP in $(seq "${GATE_DIFFER_MULTI_REPEATS:-4}"); do
       LEG="differ multi (atomic=1 seed=19 rep $REP)"
       LEG_LOG="$OUT/multi-a1-s19-rep$REP.txt"
-      if taskset -c "$LOAD_CORES" timeout 900 python3 tests/differ.py \
-          127.0.0.1 "$TARGET_PORT" 127.0.0.1 "$ORACLE_PORT" multi 19 \
-          >"$LEG_LOG" 2>&1; then
+      if run_differ_leg multi 19 "$LEG_LOG"; then
         say "$LEG" "ok ($(tail -n 1 "$LEG_LOG"))"
         PASS=$((PASS+1))
       else
@@ -288,6 +312,7 @@ done
 
 stop_owned "oracle" "$ORACLE_PID" "$ORACLE_PORT" || FAIL=$((FAIL+1))
 ORACLE_PID=0
+python3 tests/_differ_history.py summary "$OUT" || FAIL=$((FAIL+1))
 ELAPSED=$((SECONDS-START_SECONDS))
 printf 'DIFFER GATE: pass=%d fail=%d runtime=%dm%02ds\n' \
     "$PASS" "$FAIL" "$((ELAPSED/60))" "$((ELAPSED%60))"
