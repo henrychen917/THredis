@@ -130,7 +130,8 @@ TIMINGS="$LEDGER.timings"
 : > "$LEDGER"; : > "$TIMINGS"
 ROW_T=$(date +%s.%N)
 ROW_HISTORY=${GATE_HISTORY:-$PWD/.gate-history/rows}
-ROW_RUN_ID=${RUN_DIR##*/}
+ROW_RUN_ID="$GATE_PURPOSE:${RUN_DIR##*/}"
+export GATE_RUN_ID="$ROW_RUN_ID"
 ROW_PLAN="$RUN_DIR/row-timeouts.json"
 HISTORY_ARGS=()
 [ ! -s "$TIMINGS.prev" ] || HISTORY_ARGS+=(--import-ledger "$TIMINGS.prev")
@@ -349,6 +350,14 @@ program_state(){
   echo "  ledger: $LEDGER (verdict / own-row seconds / stable label); timings: $TIMINGS; slowest rows:"
   sort -t "$(printf '\t')" -k2,2 -rn "$TIMINGS" | head -12 \
       | awk -F '\t' '{printf "    %7.1fs  %-4s %s\n", $2, $1, $3}'
+  # Every observation remains in the durable corpus, including failures and
+  # timeouts. A previous failure is evidence to investigate, never an anecdote
+  # erased by this run's green verdict or a make clean.
+  if python3 tests/gate_history.py report --history "$ROW_HISTORY" > "$RUN_DIR/verdict-history.txt"; then
+    cat "$RUN_DIR/verdict-history.txt"
+  else
+    bad 'verdict history report' "could not read $ROW_HISTORY"
+  fi
 }
 redis_cli_expect_ok(){
   local reply
