@@ -419,10 +419,11 @@ job_body(){
   local current=$1 dependency
   : > "$RUN_DIR/started/$current"
   if ! job_ready "$current"; then echo "started $current before dependency completed" >&2; exit 18; fi
-  if [ "$current" = production_units ]; then
-    : > "$RUN_DIR/completed/$current"
-    return 0
-  fi
+  case "$current" in
+    production_units|core_tsan_build|waits_tsan_build)
+      : > "$RUN_DIR/completed/$current"
+      return 0;;
+  esac
   if [ "$DEPENDENCY_PROBE" = 1 ]; then
     if [ "$current" = release ]; then
       while [ ! -f "$RUN_DIR/started/asan" ]; do pause; done
@@ -491,11 +492,11 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                         counts=tuple(map(int, (directory / 'counts').read_text().split())),
                         completion=(directory / 'completion-order').read_text().splitlines(),
                         families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()
-                                  if not line.startswith('production_units\t')],
+                                  if line.split('\t')[0] not in ('production_units', 'core_tsan_build', 'waits_tsan_build')],
                         helpers={path.parent.name for path in (directory / 'jobs').glob('*/done')
-                                 if path.parent.name == 'production_units'},
+                                 if path.parent.name in ('production_units', 'core_tsan_build', 'waits_tsan_build')},
                         cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')
-                                 if path.parent.name != 'production_units'})
+                                 if path.parent.name not in ('production_units', 'core_tsan_build', 'waits_tsan_build')})
 
     def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
         forward = self.run_scheduler()
@@ -547,17 +548,122 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         result = self.run_scheduler(slots=2, ordered=False, failure='release', behavior='crash')
         self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
         self.assertIn(b'FAIL\tcorrectness family release\n', result['ledger'])
-        self.assertEqual(result['helpers'], {'production_units'})
+        self.assertEqual(result['helpers'], {'production_units', 'core_tsan_build', 'waits_tsan_build'})
         self.assertCountEqual(result['completion'], [name for name in self.canonical if name != 'release'])
 
     def test_release_boots_do_not_wait_for_independent_asan_build(self):
         result = self.run_scheduler(slots=2, ordered=False, dependency_probe=True)
         self.assertEqual(result['counts'], (len(self.canonical), 0))
-        self.assertEqual(result['helpers'], {'production_units'})
+        self.assertEqual(result['helpers'], {'production_units', 'core_tsan_build', 'waits_tsan_build'})
         self.assertCountEqual(result['completion'], self.canonical)
         self.assertLess(result['completion'].index('release_batteries'), result['completion'].index('asan'))
         families = {row[0]: row for row in result['families']}
         self.assertGreaterEqual(float(families['release_batteries'][2]), float(families['release'][3]))
+
+
+class TSANWiring(unittest.TestCase):
+    def run_rows(self, kind='core', failure='', ready=True):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        helpers = gate[gate.index('tsan_unit(){'):gate.index('\njob_production_units(){')]
+        first, after = ('job_core_units(){', 'job_reorder_unit(){') if kind == 'core' else ('job_wait_units(){', 'job_readonly(){')
+        body = gate[gate.index(first):gate.index(after)]
+        stub = r'''set -u
+CORE_TSAN=/unused-core-tsan; WAITS_TSAN=/unused-waits-tsan; CORES=0-7
+quiet_wait(){ :; }
+unit_ready(){ return 0; }
+ok(){ printf 'ok\t%s\n' "$1" >> "$RUN_DIR/rows"; }
+bad(){ printf 'FAIL\t%s\n' "$1" >> "$RUN_DIR/rows"; }
+timeout(){
+  local argv="$*" selected=${@: -1}
+  case "$argv" in
+    *"$CORE_TSAN"*|*"$WAITS_TSAN"*)
+      printf 'tsan\t%s\n' "$selected" >> "$RUN_DIR/calls"
+      [ "$TSAN_OPTIONS" = halt_on_error=1:exitcode=66 ] || return 89
+      [ "$FAILURE" != unavailable ] || return 127
+      [ "$FAILURE" != runtime ] || return 66
+      [ "$FAILURE" != report ] || echo 'WARNING: ThreadSanitizer: data race'
+      [ "$FAILURE" != witness ] || return 0
+      if [[ "$argv" == *"$CORE_TSAN"* ]]; then
+        printf 'PASS core concurrency %s (state assertions fired)\n' "$selected"
+      else printf 'waits unit: PASS\n'; fi;;
+    *)
+      printf 'control\t%s\n' "$selected" >> "$RUN_DIR/calls"
+      [ "$FAILURE" != control ] || return 1;;
+  esac
+}
+'''
+        with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+            directory = Path(temporary)
+            (directory / 'build').mkdir()
+            (directory / 'unit-ready').mkdir()
+            if ready:
+                for name in ('core-concurrency-tsan', 'waits-unit-tsan'):
+                    (directory / 'unit-ready' / name).touch()
+            result = subprocess.run(['bash', '-c', stub + helpers + body + '\n' + first.split('(')[0]],
+                cwd=directory, env=dict(os.environ, RUN_DIR=temporary, TMPDIR=temporary, FAILURE=failure),
+                capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return [line.split('\t') for line in (directory / 'rows').read_text().splitlines()], \
+                   [line.split('\t') for line in (directory / 'calls').read_text().splitlines()]
+
+    def test_core_rows_execute_both_matching_controls(self):
+        rows, calls = self.run_rows()
+        selections = 'watch scheduler lifetime drain route snapshot config notify'.split()
+        self.assertEqual(rows, [['ok', 'core concurrency ' + case] for case in selections])
+        self.assertEqual([case for mode, case in calls if mode == 'tsan'], selections)
+        self.assertEqual(len([1 for mode, _ in calls if mode == 'control']), 8)
+
+    def test_core_runtime_report_unavailability_and_missing_witness_all_fail(self):
+        for failure in ('runtime', 'report', 'unavailable', 'witness', 'control'):
+            with self.subTest(failure=failure):
+                rows, calls = self.run_rows(failure=failure)
+                self.assertEqual([row[0] for row in rows], ['FAIL'] * 8)
+                if failure == 'control':
+                    self.assertTrue(all(mode == 'control' for mode, _ in calls))
+        rows, calls = self.run_rows(ready=False)
+        self.assertEqual([row[0] for row in rows], ['FAIL'] * 8)
+        self.assertTrue(all(mode == 'control' for mode, _ in calls))
+
+    def test_waits_keeps_existing_rows_and_adds_one_tsan_execution(self):
+        rows, calls = self.run_rows(kind='waits')
+        self.assertEqual([row[0] for row in rows], ['ok', 'ok'])
+        self.assertEqual(len([1 for mode, _ in calls if mode == 'tsan']), 1)
+        rows, _ = self.run_rows(kind='waits', failure='unavailable')
+        self.assertEqual([row[0] for row in rows], ['FAIL', 'ok'])
+
+    def test_core_build_instruments_every_dependency_and_failed_build_publishes_no_ready_marker(self):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        bodies = gate[gate.index('job_core_tsan_build(){'):gate.index('tsan_unit(){')]
+        makefile = (root / 'Makefile').read_text().replace('\\\n', ' ')
+        production = set()
+        for line in makefile.splitlines():
+            if line.startswith('SRC '):
+                production.update(line.split('=', 1)[1].split())
+        expected = production - {'src/main.cc', 'src/core/genthread.cc'} | {'tests/core_concurrency_unit.cc'}
+        with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+            directory = Path(temporary)
+            stub = r'''set -u
+CORE_TSAN="$RUN_DIR/core"; WAITS_TSAN="$RUN_DIR/waits"; BUILD_CORES=0-7
+pausable(){ printf '%s\0' "$@" > "$RUN_DIR/argv"; return "$BUILD_RC"; }
+'''
+            for rc in (0, 1):
+                ready = directory / 'unit-ready' / 'core-concurrency-tsan'
+                ready.unlink(missing_ok=True)
+                result = subprocess.run(['bash', '-c', stub + bodies + '\njob_core_tsan_build'], cwd=root,
+                    env=dict(os.environ, RUN_DIR=temporary, TMPDIR=temporary, BUILD_RC=str(rc)),
+                    text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, rc)
+                self.assertEqual(ready.exists(), rc == 0)
+                args = (directory / 'argv').read_bytes().decode().rstrip('\0').split('\0')
+                index = args.index('tests/parbuild.sh')
+                flags = args[index + 3]
+                self.assertIn('-fsanitize=thread', flags)
+                self.assertIn('-DTOMO_CORE_CONCURRENCY_TEST', flags)
+                self.assertNotIn('-fsanitize=address', flags)
+                self.assertEqual(set(args[index + 5:]), expected)
+                self.assertFalse(any(arg.endswith('.o') for arg in args))
 
 
 class PerfCandidateDispatch(unittest.TestCase):

@@ -709,7 +709,7 @@ start_workers(){
   # Correctness traffic is modest and stays on each slot's two or more physical load cores.
   # Compilers use that slot's server+load cores. The release build alone unlocks release jobs;
   # ASAN and standalone units do not delay boots, and full-only builds start immediately too.
-  JOB_NAMES=(release asan)
+  JOB_NAMES=(release asan core_tsan_build waits_tsan_build)
   [ "$TIER" != full ] || JOB_NAMES+=(rldbg)
   JOB_NAMES+=(config_unit flip_unit filter_unit ring_unit reorder_unit storage_units
               production_units acl_metadata cmd_metadata abba_selftest)
@@ -844,6 +844,8 @@ PY
 # dispatch moved: collection at the original tier/source positions remains the ledger contract.
 ASAN="$PWD/build/gate-cache/tomokv-asan"
 RLDBG="$PWD/build/gate-cache/tomokv-rlcachedbg"
+CORE_TSAN="$PWD/build/gate-cache/core-concurrency-tsan"
+WAITS_TSAN="$PWD/build/gate-cache/waits-unit-tsan"
 FEATURE_OUTPUT=${GATE_FEATURE_OUTPUT:-$(mktemp -d "$PWD/build/gate-feature.XXXXXX")}
 
 reject_boot(){
@@ -954,10 +956,12 @@ for core_row in watch scheduler lifetime drain route snapshot config notify; do
   if [ "$CORE_UNIT_READY" = 1 ] && \
       ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
       taskset -c "$CORES" ./build/core-concurrency-unit "$core_row" \
-          >"build/gate-core-$core_row.txt" 2>&1; then
+          >"build/gate-core-$core_row.txt" 2>&1 && \
+      tsan_unit "$CORE_TSAN" core-concurrency-tsan \
+          "PASS core concurrency $core_row (state assertions fired)" "$core_row"; then
     ok "core concurrency $core_row"
   else
-    bad "core concurrency $core_row" "see build/gate-core-$core_row.txt and $RUN_DIR/jobs/production_units/build.log"
+    bad "core concurrency $core_row" "see build/gate-core-$core_row.txt, $TMPDIR/tsan-core-concurrency-tsan-$core_row.log, and $RUN_DIR/jobs/production_units/build.log and $RUN_DIR/jobs/core_tsan_build/build.log"
   fi
 done
 }
@@ -1096,8 +1100,9 @@ job_wait_units(){
 row_begin "waits config publication + admission unit"
 unit_ready waits-unit \
     && taskset -c "$CORES" ./build/waits-unit >>$TMPDIR/gate-waits-unit.txt 2>&1 \
+    && tsan_unit "$WAITS_TSAN" waits-unit-tsan "waits unit: PASS" \
     && ok "waits config publication + admission unit" \
-    || bad "waits config publication + admission unit" "see $TMPDIR/gate-waits-unit.txt"
+    || bad "waits config publication + admission unit" "see $TMPDIR/gate-waits-unit.txt, $TMPDIR/tsan-waits-unit-tsan.log, and $RUN_DIR/jobs/waits_tsan_build/build.log"
 row_begin "reads never wait for retirement quiescence"
 unit_ready rehash-waits-unit \
     && taskset -c "$CORES" ./build/rehash-waits-unit retirement \
@@ -2197,6 +2202,51 @@ else
 fi
 }
 
+# TSan complements the existing ASAN/UBSAN controls; neither replaces the other's assertions.
+# All core dependencies are instrumented in an isolated cache. Linking release objects here
+# would leave command/owner accesses invisible, while sharing the ASAN cache would mix runtimes.
+# One compile mode across every TU also gives inline test hooks identical definitions everywhere.
+# These builds own no ledger row: the existing eight core rows and waits row require both runs.
+job_core_tsan_build(){
+  local source sources=()
+  mkdir -p "$RUN_DIR/unit-ready"
+  for source in src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc; do
+    [ "$source" = src/core/genthread.cc ] || sources+=("$source")
+  done
+  pausable taskset -c "$BUILD_CORES" tests/parbuild.sh "$CORE_TSAN" \
+      "$PWD/build/gate-cache/obj-core-tsan" \
+      '-std=c++20 -O1 -g -march=native -pthread -fsanitize=thread -fno-omit-frame-pointer -no-pie -DTOMO_CORE_CONCURRENCY_TEST -I.' \
+      '-luring -pthread -lssl -lcrypto -lm' tests/core_concurrency_unit.cc "${sources[@]}" \
+      >"$TMPDIR/build.log" 2>&1 && : > "$RUN_DIR/unit-ready/core-concurrency-tsan"
+}
+job_waits_tsan_build(){
+  mkdir -p "$RUN_DIR/unit-ready"
+  pausable taskset -c "$BUILD_CORES" tests/parbuild.sh "$WAITS_TSAN" \
+      "$PWD/build/gate-cache/obj-waits-tsan" \
+      '-std=c++20 -O1 -g -march=native -pthread -fsanitize=thread -fno-omit-frame-pointer -no-pie -I.' \
+      '-pthread' tests/waits_unit.cc >"$TMPDIR/build.log" 2>&1 \
+      && : > "$RUN_DIR/unit-ready/waits-unit-tsan"
+}
+tsan_unit(){
+  local binary=$1 ready=$2 witness=$3 rc log
+  shift 3
+  log="$TMPDIR/tsan-$ready${1:+-$1}.log"
+  [ -f "$RUN_DIR/unit-ready/$ready" ] || {
+    echo "TSAN FAIL: $ready build did not complete; see $RUN_DIR/jobs/*tsan_build/build.log" >&2
+    return 1
+  }
+  # Match the existing storage-TSAN address-map workaround, and keep all runtime reports fatal.
+  # Do not inherit caller suppression options. A platform/runtime failure is a red row, never skip.
+  # Existing fixture arming assertions, waits alarm and core interleaving bounds are unchanged.
+  TSAN_OPTIONS=halt_on_error=1:exitcode=66 timeout --foreground 60 \
+      setarch x86_64 -R taskset -c "$CORES" "$binary" "$@" >"$log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ] || grep -q 'ThreadSanitizer' "$log" || ! grep -Fxq "$witness" "$log"; then
+    echo "TSAN FAIL: $ready ${*:-} exit=$rc; runtime report, unavailable runtime, or missing state witness; see $log" >&2
+    return 1
+  fi
+}
+
 job_production_units(){
   local target
   mkdir -p "$RUN_DIR/unit-ready"
@@ -2219,8 +2269,10 @@ unit_ready(){
 
 job_dependencies(){
   case "$1" in
-    release|asan|rldbg|config_unit|flip_unit|filter_unit|ring_unit|reorder_unit|storage_units|acl_metadata|cmd_metadata|abba_selftest) ;;
-    core_units|atomic_units|netcmd_units|wait_units) echo production_units;;
+    release|asan|rldbg|core_tsan_build|waits_tsan_build|config_unit|flip_unit|filter_unit|ring_unit|reorder_unit|storage_units|acl_metadata|cmd_metadata|abba_selftest) ;;
+    core_units) echo 'production_units core_tsan_build';;
+    wait_units) echo 'production_units waits_tsan_build';;
+    atomic_units|netcmd_units) echo production_units;;
     asan_batteries) echo asan;;
     zc) echo 'release asan';;
     rlcache) echo rldbg;;
