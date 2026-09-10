@@ -1023,6 +1023,20 @@ quiet_wait(){ :; }
         self.assertIn('missing row_begin', result.stdout)
         self.assertFalse(history)  # No invented exact timing for work that was not observed.
 
+    def test_unexpected_watchdog_exit_still_fails_after_ownership_guards(self):
+        broken_monitor = '''row_watch(){
+  python3 -c 'raise SystemExit(17)' &
+  ROW_WATCHDOG=$!
+}
+'''
+        result, rows, history = self.shell_row(
+            'row_begin fixture\nwait "$ROW_WATCHDOG"\nok fixture\n', extra_functions=broken_monitor)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([(row[0], row[2]) for row in rows], [("FAIL", "fixture")])
+        self.assertIn("row watchdog exited unexpectedly: 17", result.stdout)
+        self.assertEqual(history[0]["verdict"], "FAIL")
+        self.assertFalse(history[0]["timed_out"])
+
     def test_real_shell_records_only_the_rows_own_duration(self):
         result, rows, history = self.shell_row('sleep 1\nrow_begin fixture\nsleep .03\nok fixture\n', 5)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1066,12 +1080,27 @@ quiet_wait(){ :; }
 set_slot(){ CORES="$FIXTURE_CPU"; LOAD_CORES="$FIXTURE_CPU"; }
 job_label(){ printf 'fixture family\n'; }
 job_body(){
-  row_begin first; sleep .02; ok first
+  row_begin first
+  if [ "$BEHAVIOR" = inherited-finalizer ]; then
+    # Replay the captured pre-exec state deterministically: a cancelled watchdog child
+    # still has the worker's EXIT trap and active row, but does not own either one.
+    inherited_exit=$(trap -p EXIT)
+    (
+      ROW_WATCHDOG=0
+      eval "$inherited_exit"
+      printf '%s\t%s\n' "$BASHPID" "$CLEANUP_OWNER" > "$RUN_DIR/inherited-finalizer"
+      exit 0
+    )
+    [ ! -s "$LEDGER" ] && [ ! -e "$TMPDIR/done" ] || return 91
+  else
+    sleep .02
+  fi
+  ok first
   if [ "$BEHAVIOR" = timeout ]; then
     row_begin expires
     sleep 60
     ok expires
-  else
+  elif [ "$BEHAVIOR" = teardown ]; then
     python3 -c 'import os,signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,signal.SIG_IGN); Path(os.environ["RUN_DIR"]+"/child").write_text(str(os.getpid())); time.sleep(60)' &
     SRV=$!
     while [ ! -s "$RUN_DIR/child" ]; do sleep .01; done
@@ -1092,6 +1121,16 @@ job_body(){
         job = directory / "jobs/fixture"
         self.assertTrue((job / "ledger").exists(), result.stdout + result.stderr)
         return result, job, [line.split("\t") for line in (job / "ledger").read_text().splitlines()]
+
+    def test_inherited_exit_trap_cannot_finalize_the_workers_active_row(self):
+        result, job, rows = self.run_real_job("inherited-finalizer")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + (job / "output.log").read_text())
+        child, owner = (self.directory / "inherited-finalizer").read_text().split()
+        self.assertNotEqual(child, owner, "the replay must execute in a different process")
+        self.assertEqual([(row[0], row[2]) for row in rows], [("ok", "first")])
+        self.assertEqual((job / "done").read_text(), "0\t1\t0\n")
+        self.assertEqual([(row["label"], row["verdict"]) for row in read_history(self.directory / "history")],
+                         [("first", "ok")])
 
     def test_actual_job_timeout_preserves_partial_ledger_and_publishes_done(self):
         result, job, rows = self.run_real_job("timeout")
@@ -1166,6 +1205,38 @@ ok "headline ABBA vs last pushed binary"
         self.assertEqual([(row[0], row[2]) for row in rows],
                          [("ok", "before"), ("FAIL", label), ("ok", "after")])
         self.assertGreaterEqual(float(rows[1][1]), .3)
+
+    def test_inherited_root_cleanup_cannot_publish_the_parents_abba_fragment(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / "tests/gate.sh").read_text()
+        cleanup = gate[gate.index("reap_children(){"):gate.index("\ntrap 'cleanup")]
+        (self.directory / "ledger").write_text("ok\t.1\tbefore\nok\t.2\tafter\n")
+        (self.directory / "timings").write_text("")
+        (self.directory / "abba.ledger").write_text("ok\t.3\tabba\n")
+        (self.directory / "abba.timings").write_text("ok\t.3\tabba\n")
+        setup = '''set -u
+WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; ABBA_PID=0; PAUSABLE_PID=0
+ABBA_LEDGER="$RUN_DIR/ledger"; ABBA_TIMINGS="$RUN_DIR/timings"; ABBA_PREFIX_ROWS=1; ABBA_PENDING=1
+row_unwatch(){ :; }
+'''
+        body = '''trap 'cleanup || exit 1' EXIT
+inherited_exit=$(trap -p EXIT)
+(
+  eval "$inherited_exit"
+  printf '%s\\t%s\\n' "$BASHPID" "$CLEANUP_OWNER" > "$RUN_DIR/inherited-root"
+  exit 0
+)
+[ "$(wc -l < "$ABBA_LEDGER")" = 2 ] || exit 92
+'''
+        result = subprocess.run(["bash", "-c", "\n".join((setup, cleanup, body))], cwd=root,
+            env=dict(os.environ, RUN_DIR=str(self.directory)), capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        child, owner = (self.directory / "inherited-root").read_text().split()
+        self.assertNotEqual(child, owner)
+        self.assertEqual((self.directory / "ledger").read_text(),
+                         "ok\t.1\tbefore\nok\t.3\tabba\nok\t.2\tafter\n")
+        self.assertEqual((self.directory / "timings").read_text(), "ok\t.3\tabba\n")
 
 
 class FlakeHistoryTests(unittest.TestCase):

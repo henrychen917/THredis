@@ -544,10 +544,12 @@ publish_abba(){
   ABBA_PENDING=0
 }
 cleanup(){ # EXIT/INT/TERM: publication and teardown remain bounded outside normal row scopes.
+  [ "$BASHPID" = "$CLEANUP_OWNER" ] || return 0
   row_unwatch
   publish_abba || return 1
   reap_children
 }
+CLEANUP_OWNER=$BASHPID
 trap 'cleanup || exit 1' EXIT
 trap 'exit 130' INT TERM
 
@@ -769,6 +771,11 @@ job_recover(){
   mv "$dir/done.tmp" "$dir/done"
 }
 job_finalize(){
+  # A fast row can cancel its watchdog after fork but before Python exec. Bash may then
+  # run the inherited EXIT trap in that child (captured 2026-09-10), while its parent correctly
+  # waits status143. Only the worker may publish its ledger/done or reclaim its children.
+  # Keep row_unwatch's unexpected-status checks: this fixes ownership, not the verdict rule.
+  [ "$BASHPID" = "$CLEANUP_OWNER" ] || return 0
   local rc=$1 ended
   trap - EXIT INT TERM
   if [ -n "$ROW_ID" ]; then
@@ -793,7 +800,7 @@ job_finalize(){
   exit "$rc"
 }
 run_job(){ (
-  local name=$1 slot=$2 started=$EPOCHREALTIME ended rc
+  local name=$1 slot=$2 started=$EPOCHREALTIME ended rc CLEANUP_OWNER=$BASHPID
   WORKER_PIDS=(); SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0
   PASS=0; FAIL=0; ROW_ID=; ROW_WATCHDOG=0; ROW_EXPIRED=0
   export TMPDIR="$RUN_DIR/jobs/$name"

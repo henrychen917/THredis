@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import stat
 import sys
 import time
 import tempfile
@@ -369,6 +370,28 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
                 foreign.wait(timeout=5)
 
 
+def preserve_scheduler_failure(root, directory, script, stdout='', stderr=''):
+    saved = Path(tempfile.mkdtemp(prefix='scheduler-failure-', dir=root / 'build'))
+    # Write the command evidence first; a copy error must not erase the reason for preserving it.
+    (saved / 'fixture.sh').write_text(script)
+    (saved / 'command.stdout').write_text(stdout)
+    (saved / 'command.stderr').write_text(stderr)
+
+    def copy_artifact(source, target):
+        mode = os.stat(source).st_mode
+        if stat.S_ISFIFO(mode):
+            # The scheduler's pause FIFO is a rendezvous object, with no file contents to read.
+            os.mkfifo(target, stat.S_IMODE(mode))
+            return target
+        return shutil.copy2(source, target)
+
+    try:
+        shutil.copytree(directory, saved, dirs_exist_ok=True, copy_function=copy_artifact)
+    except OSError as exc:
+        raise RuntimeError(f'Scheduler failure artifacts partially preserved in {saved}: {exc}') from exc
+    return saved
+
+
 class SchedulerWiring(unittest.TestCase):
     # Enumerate the real collector loops, not a hand-maintained approximation of their inventory.
     # This invokes only collect_job stubs: no compiler, server, battery or benchmark is started.
@@ -487,15 +510,17 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             script = '\n'.join((prelude, arrays, ledger_functions, placement, scheduler,
                                 'trap stop_workers EXIT', stub))
             def preserve_failure(stdout='', stderr=''):
-                saved = Path(tempfile.mkdtemp(prefix='scheduler-failure-', dir=root / 'build'))
-                shutil.copytree(directory, saved, dirs_exist_ok=True)
-                (saved / 'fixture.sh').write_text(script)
-                (saved / 'command.stdout').write_text(stdout)
-                (saved / 'command.stderr').write_text(stderr)
+                saved = preserve_scheduler_failure(root, directory, script, stdout, stderr)
                 return f'\nScheduler failure artifacts: {saved}\n'
-            result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu,
-                                     'bash', '-c', script], cwd=root, env=env,
-                                    text=True, capture_output=True, timeout=50)
+            try:
+                result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu,
+                                         'bash', '-c', script], cwd=root, env=env,
+                                        text=True, capture_output=True, timeout=50)
+            except subprocess.TimeoutExpired as exc:
+                def as_text(value):
+                    return value.decode(errors='replace') if isinstance(value, bytes) else value or ''
+                evidence = preserve_failure(as_text(exc.stdout), as_text(exc.stderr))
+                self.fail(f'Scheduler exceeded the outer fixture deadline.{evidence}')
             output = result.stdout + result.stderr
             if result.returncode:
                 output += preserve_failure(result.stdout, result.stderr)
@@ -519,6 +544,21 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                                  if path.parent.name in ('production_units', 'core_tsan_build', 'waits_tsan_build')},
                         cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')
                                  if path.parent.name not in ('production_units', 'core_tsan_build', 'waits_tsan_build')})
+
+    def test_failure_evidence_survives_a_named_pipe_in_the_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'build').mkdir()
+            directory = root / 'fixture'
+            directory.mkdir()
+            os.mkfifo(directory / 'pause')
+            (directory / 'ledger').write_text('FAIL\t0.001\tfixture\n')
+            saved = preserve_scheduler_failure(root, directory, 'actual shell', 'actual stdout', 'actual stderr')
+            self.assertTrue(stat.S_ISFIFO((saved / 'pause').stat().st_mode))
+            self.assertEqual((saved / 'ledger').read_bytes(), (directory / 'ledger').read_bytes())
+            self.assertEqual((saved / 'fixture.sh').read_text(), 'actual shell')
+            self.assertEqual((saved / 'command.stdout').read_text(), 'actual stdout')
+            self.assertEqual((saved / 'command.stderr').read_text(), 'actual stderr')
 
     def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
         forward = self.run_scheduler()
