@@ -268,10 +268,16 @@ def evaluate(blocks):
                          snapshot20["metrics"][metric]["reference_spread_pct"])
         repeatable = all(snapshot20["metrics"][metric][f"{arm}_spread_pct"] <=
                          wire20["metrics"][metric][f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
+        # The direct method comparison is evidence too. Stable snapshot-only repeats cannot
+        # erase a noisier restored arm in the block that actually compares it with wire loading.
+        comparison_repeatable = pair["candidate_spread_pct"] <= pair["reference_spread_pct"]
         snapshot_checks[metric] = {"delta_pct": pair["delta_pct"], "null_resolution_pct": resolution,
                                    "within_measured_resolution": abs(pair["delta_pct"]) <= resolution,
-                                   "spread_did_not_degrade": repeatable}
-    okay = all(check["within_measured_resolution"] and check["spread_did_not_degrade"]
+                                   "spread_did_not_degrade": repeatable,
+                                   "comparison_spread_did_not_degrade": comparison_repeatable}
+    okay = comparison["status"] == "PASS" and all(
+               check["within_measured_resolution"] and check["spread_did_not_degrade"]
+               and check["comparison_spread_did_not_degrade"]
                for check in snapshot_checks.values())
     output["snapshot"] = {"status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT",
                            "metrics": snapshot_checks}
@@ -521,6 +527,19 @@ def self_test():
             self.assertEqual(result["window10"]["status"], "REJECT")
             self.assertTrue(result["window10"]["spread_did_not_degrade"]["rate"])
             self.assertFalse(result["window10"]["spread_did_not_degrade"]["p999_ms"])
+
+        def test_snapshot_null_cannot_erase_a_bad_direct_comparison(self):
+            pair = {"delta_pct": 0, "reference_spread_pct": .1, "candidate_spread_pct": .1}
+            for poison in ("spread", "verdict"):
+                with self.subTest(poison=poison):
+                    blocks = [{"name": spec[0], "status": "PASS",
+                               "metrics": {"rate": dict(pair)}} for spec in BLOCKS]
+                    self.assertEqual(evaluate(blocks)["snapshot"]["status"], "MEETS_SELECTED_CELL_CRITERIA")
+                    if poison == "spread":
+                        blocks[2]["metrics"]["rate"]["candidate_spread_pct"] = .2
+                    else:
+                        blocks[2]["status"] = "FAIL"
+                    self.assertEqual(evaluate(blocks)["snapshot"]["status"], "REJECT")
 
     return 0 if unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(Experiments)).wasSuccessful() else 1
