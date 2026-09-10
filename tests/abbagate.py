@@ -65,6 +65,8 @@ import time
 
 from _lib import Conn
 from gateplan import validate_axes
+from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
+                            require_workload_witness, workload_command_names)
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW = 20
@@ -114,6 +116,16 @@ class Cell:
     depth: int
     conns: int
     instances: int = 0     # PINNED load-generator instance count; 0 = unpinned, search for it
+    atomic: int = 1
+    score: str = "auto"
+    mix: str = "-"         # READ:WRITE for MIX/MIX8; short:long for REORDER
+    smoke: bool = False
+    pin_required: bool = False
+
+    @property
+    def metric(self):
+        return ("latency_ms" if self.depth == 1 else "rate") if self.score == "auto" else {
+            "rate": "rate", "latency": "latency_ms", "p999": "p999_ms"}[self.score]
 
 
 def read_cells(path):
@@ -122,11 +134,12 @@ def read_cells(path):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         fields = [x.strip() for x in line.split("|")]
-        if len(fields) != 11:
-            raise ValueError(f"{path}:{lineno}: expected 11 pipe-separated fields")
-        ident, mode, rl, ov, ro, op, depth, conns, _measured, _busy, pinned = fields
+        if len(fields) not in (11, 15):
+            raise ValueError(f"{path}:{lineno}: expected 11 legacy or 15 extended pipe-separated fields")
+        ident, mode, rl, ov, ro, op, depth, conns, _measured, _busy, pinned = fields[:11]
         if (not re.fullmatch(r"[A-Za-z0-9_-]+", ident) or mode not in ("1s", "2s")
-                or op not in ("GET", "SET") or not re.fullmatch(r"p[1-9][0-9]*", depth)
+                or op not in ("GET", "SET", "MGET", "MSET", "MIX", "MIX8", "REORDER")
+                or not re.fullmatch(r"p[1-9][0-9]*", depth)
                 or not re.fullmatch(r"[1-9][0-9]*", conns)
                 or any(not re.fullmatch(prefix + "=[01]", value)
                        for prefix, value in (("rl", rl), ("ov", ov), ("ro", ro)))):
@@ -136,12 +149,52 @@ def read_cells(path):
         # exists because escalating from one instance on every cell of every run re-derives a search
         # whose answer we already have, at four measurements a rung. Unpinned ("-") falls back to
         # the search, and the run says so.
-        cells.append(Cell(ident, mode, int(rl[-1]), int(ov[-1]), int(ro[-1]),
-                          op, int(depth[1:]), int(conns),
-                          int(pinned) if re.fullmatch(r"[1-9][0-9]*", pinned) else 0))
+        extra = {}
+        if len(fields) == 15:
+            atomic, score, mix, smoke = fields[11:]
+            if (not re.fullmatch(r"atomic=[01]", atomic)
+                    or score not in ("score=rate", "score=latency", "score=p999")
+                    or not re.fullmatch(r"mix=(-|[1-9][0-9]*:[1-9][0-9]*)", mix)
+                    or not re.fullmatch(r"smoke=[01]", smoke)
+                    or not re.fullmatch(r"-|[1-9][0-9]*", pinned)):
+                raise ValueError(f"{path}:{lineno}: malformed extended workload fields")
+            extra = dict(atomic=int(atomic[-1]), score=score[6:], mix=mix[4:],
+                         smoke=smoke[-1] == "1", pin_required=int(depth[1:]) > 1)
+        cell = Cell(ident, mode, int(rl[-1]), int(ov[-1]), int(ro[-1]),
+                    op, int(depth[1:]), int(conns),
+                    int(pinned) if re.fullmatch(r"[1-9][0-9]*", pinned) else 0, **extra)
+        if ((cell.op in ("MIX", "MIX8", "REORDER")) != (cell.mix != "-")
+                or (cell.op == "REORDER") != (cell.metric == "p999_ms")
+                or (cell.depth == 1 and cell.metric == "rate")):
+            raise ValueError(f"{path}:{lineno}: workload, mix and scoring disagree")
+        cells.append(cell)
     if not cells or len({c.id for c in cells}) != len(cells):
         raise ValueError("headline cells must be nonempty with unique IDs")
     return cells
+
+
+def selected_cells(cells, subset, only=""):
+    selected = [cell for cell in cells if subset == "full" or cell.smoke]
+    if not selected:
+        raise ValueError(f"cell source has no {subset} cells")
+    if only:
+        requested = set(only.split(","))
+        if requested - {cell.id for cell in selected}:
+            raise ValueError("--only names a cell absent from the selected subset")
+        selected = [cell for cell in selected if cell.id in requested]
+    return selected
+
+
+def coverage(cells):
+    return {"count": len(cells), "ids": [cell.id for cell in cells],
+            "modes": sorted({cell.mode for cell in cells}),
+            "operations": sorted({cell.op for cell in cells}),
+            "commands": sorted({command for cell in cells for command in workload_command_names(cell)}),
+            "depths": sorted({cell.depth for cell in cells}),
+            "connections": sorted({cell.conns for cell in cells}),
+            "atomic": sorted({cell.atomic for cell in cells}),
+            "scores": sorted({cell.metric for cell in cells}),
+            "pending_pins": [cell.id for cell in cells if cell.depth > 1 and not cell.instances]}
 
 
 def sha256(path):
@@ -283,15 +336,24 @@ def assess(cell, rounds):
     peak = peak_index(rounds)
     current = rounds[peak]
     rate = paired(current["runs"])
-    p = paired(current["runs"], "latency_ms") if cell.depth == 1 else rate
+    p = paired(current["runs"], cell.metric)
     reasons = []
     for name in ("reference", "candidate"):
         if p[f"{name}_spread_pct"] > MAX_SPREAD:
             reasons.append(f"{name} spread exceeds the project's {MAX_SPREAD:g}% stability boundary")
     # Positive loss always means regression, for both throughput and latency.
-    loss = p["delta_pct"] if cell.depth == 1 else -p["delta_pct"]
+    loss = -p["delta_pct"] if cell.metric == "rate" else p["delta_pct"]
     if loss > p["threshold_pct"]:
         reasons.append("paired regression exceeds measured reference spread")
+    long_tail = None
+    if cell.metric == "p999_ms":
+        # Short-command tail is the reorder benefit, but it may not be bought by
+        # starving long commands. Both class tails use the same ABBA decision law.
+        long_tail = paired(current["runs"], "long_p999_ms")
+        if any(long_tail[f"{arm}_spread_pct"] > MAX_SPREAD for arm in ("reference", "candidate")):
+            reasons.append("long-command p99.9 exceeds the stability boundary")
+        if long_tail["delta_pct"] > long_tail["threshold_pct"]:
+            reasons.append("long-command p99.9 regression exceeds measured reference spread")
     gain, plateau_noise = None, None
     if cell.depth > 1:
         # A peak is only a peak if something above it failed to beat it. Without a higher probe the
@@ -321,7 +383,7 @@ def assess(cell, rounds):
         if not (cell.instances and len(rounds) == 1) and any(
                 r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
             reasons.append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
-    return {**p, "throughput": rate, "instances": current["instances"],
+    return {**p, "throughput": rate, "long_tail": long_tail, "instances": current["instances"],
             "busy_pct_abba": [r["busy_pct"] for r in current["runs"]],
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
             "fastest_gain_pct": gain, "plateau_noise_pct": plateau_noise,
@@ -631,6 +693,27 @@ class Runner:
                 "--key-minimum=1", f"--key-maximum={KEYS}", "--key-pattern=P:P",
                 "-d", "64", "--distinct-client-seed", "--hide-histogram"]
 
+    def prepare_data(self, cell, arm, folder):
+        # Experiment hook, called before boot. Production retains wire population;
+        # snapshot experiments can copy their own fixture here without changing it.
+        pass
+
+    def populate(self, cell, arm, conn, folder):
+        population = self.memtier({"cpus": self.load_cpus, "threads": 8, "clients": 8})
+        population += ["--pipeline=32", "--ratio=1:0", "-n", "allkeys"]
+        pop = self.children.start(population, folder / "populate.log", folder)
+        if pop.wait(timeout=180):
+            raise RuntimeError("key population failed")
+        self.children.stop(pop)
+        if conn.must("DBSIZE") != KEYS:
+            raise RuntimeError(f"population did not create exactly {KEYS} keys")
+        if cell.op == "REORDER":
+            extra = prepare_long_keys(conn)
+            if conn.must("DBSIZE") != KEYS + extra["keys"]:
+                raise RuntimeError("long-blocker population changed the short-key population")
+            return extra
+        return None
+
     def measure(self, cell, arm, sequence, instances, knobs):
         folder = self.out / cell.id / f"n{instances}-{sequence}-{arm}"
         folder.mkdir(parents=True)
@@ -639,7 +722,7 @@ class Runner:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", self.args.port))
         command = ["taskset", "-c", cpu_string(self.server_cpus), self.binaries[arm],
-                   "--port", str(self.args.port), "--bind", "127.0.0.1", "--atomic", "1",
+                   "--port", str(self.args.port), "--bind", "127.0.0.1", "--atomic", str(cell.atomic),
                    "--enable-debug-command", "yes", "--save", "", "--appendonly", "no",
                    "--dir", str(folder)]
         # Defaults are made explicit so changes to placement cannot masquerade as code gains.
@@ -655,8 +738,9 @@ class Runner:
         result = {"arm": arm, "instances": instances, "complete": False,
                   "server_argv": [str(x) for x in command],
                   "load_layout": layout, "artifacts": str(folder.relative_to(self.out))}
-        print(f"  {cell.id} n={instances} {sequence}:{arm} boot/populate/20s", flush=True)
+        print(f"  {cell.id} n={instances} {sequence}:{arm} boot/populate/{WINDOW}s", flush=True)
         try:
+            self.prepare_data(cell, arm, folder)
             srv = self.children.start(command, log, folder)
             deadline = time.monotonic() + 30
             while True:
@@ -676,27 +760,19 @@ class Runner:
                         raise RuntimeError("server boot timed out")
                     time.sleep(0.1)
             result["pid"] = srv.pid
-            for name, value in {"atomic": 1, **knobs}.items():
+            for name, value in {"atomic": cell.atomic, **knobs}.items():
                 actual = conn.must("CONFIG", "GET", name)
                 if actual != [name.encode(), str(value).encode()]:
                     raise RuntimeError(f"boot did not apply {name}={value}: {actual!r}")
-            population = self.memtier({"cpus": self.load_cpus, "threads": 8, "clients": 8})
-            population += ["--pipeline=32", "--ratio=1:0", "-n", "allkeys"]
-            pop = self.children.start(population, folder / "populate.log", folder)
-            if pop.wait(timeout=180):
-                raise RuntimeError("key population failed")
-            self.children.stop(pop)
-            if conn.must("DBSIZE") != KEYS:
-                raise RuntimeError(f"population did not create exactly {KEYS} keys")
+            result["population"] = self.populate(cell, arm, conn, folder)
             result["populate_seconds"] = time.monotonic() - started
             for i, placement in enumerate(layout):
-                argv = self.memtier(placement) + [f"--pipeline={cell.depth}",
-                        "--ratio=" + ("0:1" if cell.op == "GET" else "1:0"),
+                argv = self.memtier(placement) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
                         f"--test-time={WARMUP + WINDOW + TAIL}",
                         f"--json-out-file={folder / f'load-{i}.json'}"]
                 generators.append(self.children.start(argv, folder / f"load-{i}.log", folder))
                 result.setdefault("load_argv", []).append(argv)
-            # The counter window excludes setup/teardown and observes the SAME 20 s for all LGs.
+            # The counter window excludes setup/teardown and is the SAME for all LGs.
             time.sleep(WARMUP)
             if any(p.poll() is not None for p in generators):
                 raise RuntimeError("load generator exited before the measurement window")
@@ -712,14 +788,18 @@ class Runner:
             if roles != expected_roles:
                 raise RuntimeError(f"actual thread roles {roles} differ from {expected_roles}")
             result["thread_roles"] = roles
+            before_mode = info(conn, "server") if cell.op == "REORDER" else {}
+            before_commands = info(conn, "commandstats")
             before = info(conn, "stats")
             before_cpu, t0 = cpu_seconds(srv.pid), time.monotonic()
             time.sleep(WINDOW)
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
             after_lb = lb_snapshot(conn, folder / "lb-after.txt")
+            after_commands = info(conn, "commandstats")
+            after_mode = info(conn, "server") if cell.op == "REORDER" else {}
             if any(p.poll() is not None for p in generators):
-                raise RuntimeError("load generator ended inside the 20-second window")
+                raise RuntimeError(f"load generator ended inside the {WINDOW}-second window")
             if int(info(conn, "clients")["connected_clients"]) != cell.conns + 1:
                 raise RuntimeError("load connections disappeared during measurement")
             commands = int(after["total_commands_processed"]) - int(before["total_commands_processed"]) - 1
@@ -733,6 +813,8 @@ class Runner:
                           midpoint_monotonic=(t0 + t1) / 2, busy_pct=busy, thread_busy_pct=per_thread,
                           cpu_pct=100 * (after_cpu - before_cpu) / ((t1 - t0) * len(self.server_cpus)),
                           info_before=before, info_after=after)
+            result["workload_witness"] = require_workload_witness(
+                cell, before_commands, after_commands, before_mode, after_mode)
             totals = []
             for i, p in enumerate(generators):
                 if p.wait(timeout=30):
@@ -741,6 +823,13 @@ class Runner:
             total_rate = sum(t["rate"] for t in totals)
             result.update(complete=True, memtier=totals, memtier_rate=total_rate,
                           latency_ms=sum(t["latency_ms"] * t["rate"] for t in totals) / total_rate)
+            if cell.metric == "p999_ms":
+                result.update(merged_tail([json.loads((folder / f"load-{i}.json").read_text())
+                                           for i in range(len(generators))]))
+                # Memtier's HDR spans its entire run. State that separately from the
+                # central counter window; startup/warmup/tail samples are not silently
+                # represented as a histogram of only WINDOW seconds.
+                result["histogram_window_seconds"] = WARMUP + WINDOW + TAIL
         except BaseException as e:
             result["error"] = f"{type(e).__name__}: {e}"
             raise
@@ -766,7 +855,8 @@ def print_cell(row):
         print(f"{c['id']} {row['verdict']}: {row['reason']}", flush=True)
         return
     a = row["assessment"]
-    units, scale = ("ms (depth-1 latency; saturation exempt)", 1) if c["depth"] == 1 else ("Mops/s", 1e6)
+    units, scale = (("ms (short-command p99.9)", 1) if a["metric"] == "p999_ms" else
+                    ("ms (depth-1 latency; saturation exempt)", 1) if c["depth"] == 1 else ("Mops/s", 1e6))
     av, bv = [v / scale for v in a["reference"]], [v / scale for v in a["candidate"]]
     print(f"{c['id']} A={av[0]:.6f},{av[1]:.6f} B={bv[0]:.6f},{bv[1]:.6f} {units} "
           f"paired={a['delta_pct']:+.4f}% spread A/B={a['reference_spread_pct']:.4f}/"
@@ -783,6 +873,9 @@ def print_cell(row):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
+    p.add_argument("--subset", choices=("smoke", "full"), default="full",
+                   help="smoke is the 15-cell iteration design; full is required for push/release")
+    p.add_argument("--list-cells", action="store_true", help="print selected coverage as JSON without CPU work")
     p.add_argument("--candidate-binary", "--candidate", dest="candidate", type=Path,
                    default=Path(os.getenv("GATE_ABBA_CANDIDATE", ROOT / "build/tomokv")))
     p.add_argument("--reference-binary", type=Path,
@@ -814,11 +907,16 @@ def parse_args():
 
 
 def main(args):
+    if args.list_cells:
+        cells = selected_cells(read_cells(args.cells), args.subset, args.only)
+        print(json.dumps({"subset": args.subset, **coverage(cells)}, indent=2))
+        return 0
     start = time.monotonic()
     out = (args.output or ROOT / "build" / f"abbagate-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}").resolve()
     out.mkdir(parents=True, exist_ok=False)
     report = {"schema": 1, "verdict": "FAIL", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "window_seconds": WINDOW, "order": ORDER, "cells": [], "output": str(out)}
+              "window_seconds": WINDOW, "order": ORDER, "cells": [], "output": str(out),
+              "subset": args.subset}
     children = Children()
 
     def interrupted(signum, _frame):
@@ -845,11 +943,12 @@ def main(args):
         cells = read_cells(args.cells)
         report["cell_source"] = {"path": str(args.cells.resolve()), "sha256": sha256(args.cells),
                                  "text": args.cells.read_text(), "total_cells": len(cells)}
-        if args.only:
-            selected = set(args.only.split(","))
-            if selected - {c.id for c in cells}:
-                raise ValueError("--only names a cell absent from the supplied headline file")
-            cells = [c for c in cells if c.id in selected]
+        cells = selected_cells(cells, args.subset, args.only)
+        report["coverage"] = coverage(cells)
+        pending = [cell.id for cell in cells if cell.pin_required and not cell.instances]
+        if pending and not args.escalate:
+            raise ValueError("unmeasured load floors for " + ",".join(pending) +
+                             "; calibrate with --escalate and record the validated pins before gating")
         reference, provenance = resolve_reference(args, out)
         report["reference"] = provenance
         if not args.candidate.is_file() or not os.access(args.candidate, os.X_OK):
@@ -876,7 +975,7 @@ def main(args):
                                  "load_instance_ceiling": min(args.max_instances, len(load_physical)),
                                  "load_cpus": load_cpus, "port": args.port,
                                  "permitted_ports": permitted_ports, "keys": KEYS,
-                                 "data_bytes": 64, "key_pattern": "P:P", "atomic": 1,
+                                 "data_bytes": 64, "key_pattern": "P:P", "atomic": "per-cell",
                                  "split_ratio": f"{len(server_cpus)-len(server_cpus)//2}:{len(server_cpus)//2}",
                                  "split_flip_auto": 0, "memtier_path": args.memtier,
                                  "memtier_sha256": sha256(Path(args.memtier)),
@@ -956,7 +1055,7 @@ def main(args):
         report["verdict"], report["worst_cell"] = overall(report["cells"])
         if args.only and report["verdict"] == "PASS":
             report["verdict"] = "PARTIAL"
-        print(f"ABBA {report['verdict']} worst={report['worst_cell']} "
+        print(f"ABBA {args.subset} {report['verdict']} worst={report['worst_cell']} "
               f"({len(cells)}/{report['cell_source']['total_cells']} cells); results={out / 'results.json'}", flush=True)
         return 1 if report["verdict"] == "FAIL" else 3 if report["verdict"] == "PARTIAL" else 0
     except Skip as e:
@@ -989,6 +1088,129 @@ def self_test():
     class ABBA(unittest.TestCase):
         def setUp(self):
             self.cell = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
+
+        def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
+            from itertools import product
+            cells = read_cells(ROOT / "tests/headline_cells.txt")
+            self.assertEqual(len(cells), 178)
+            original = [cell for cell in cells if cell.id.startswith("h")]
+            self.assertEqual(len(original), 64)
+            axes = lambda cell: (cell.mode, cell.read_local, cell.overlap, cell.reorder, cell.op, cell.depth)
+            self.assertEqual({axes(cell) for cell in original},
+                             set(product(("1s", "2s"), (0, 1), (0, 1), (0, 1), ("GET", "SET"), (1, 32))))
+            multi = [cell for cell in cells if cell.id.startswith("m")]
+            self.assertEqual({axes(cell) for cell in multi},
+                             set(product(("1s", "2s"), (0, 1), (0, 1), (0, 1), ("MGET", "MSET"), (1, 8, 32))))
+            self.assertEqual(len(multi), 96)
+            self.assertEqual({cell.atomic for cell in cells}, {0, 1})
+            self.assertEqual({cell.conns for cell in cells}, {512, 2048})
+
+        def test_smoke_is_fifteen_justified_cells_not_a_cross_product(self):
+            cells = selected_cells(read_cells(ROOT / "tests/headline_cells.txt"), "smoke")
+            self.assertEqual(len(cells), 15)
+            for mode in ("1s", "2s"):
+                sweep = [cell for cell in cells if cell.mode == mode and cell.op == "GET"]
+                self.assertEqual({(cell.read_local, cell.overlap, cell.reorder) for cell in sweep},
+                                 {(1, 1, 1), (0, 1, 1), (1, 0, 1), (0, 0, 0)})
+                self.assertTrue(all(cell.depth == 32 for cell in sweep))
+                tail = [cell for cell in cells if cell.mode == mode and cell.op == "REORDER"]
+                self.assertEqual({cell.reorder for cell in tail}, {0, 1})
+                self.assertTrue(all(cell.depth > 1 and cell.metric == "p999_ms" for cell in tail))
+            self.assertEqual({cell.op for cell in cells}, {"GET", "SET", "MGET", "MSET", "REORDER"})
+            self.assertIn(1, {cell.depth for cell in cells})
+
+        def test_arbitrary_workloads_issue_eight_keys_and_correct_mix_direction(self):
+            for op in ("MGET", "MSET"):
+                args = workload_arguments(replace(self.cell, op=op))
+                command = next(arg for arg in args if arg.startswith("--command="))
+                self.assertEqual(command.count("__key__"), 8)
+                self.assertEqual(command.count("__data__"), 8 if op == "MSET" else 0)
+            self.assertEqual(workload_arguments(replace(self.cell, op="MIX", mix="7:1")), ["--ratio=1:7"])
+            args = workload_arguments(replace(self.cell, op="MIX8", mix="18:14"))
+            self.assertEqual([arg for arg in args if arg.startswith("--command-ratio=")],
+                             ["--command-ratio=18", "--command-ratio=14"])
+            args = workload_arguments(replace(self.cell, op="REORDER", mix="95:5"))
+            self.assertIn("--command=BITCOUNT blocker:__key__", args)
+            self.assertFalse(any("BLPOP" in arg or "MGET" in arg for arg in args))
+
+        def test_missing_workload_or_scheduler_engagement_is_red(self):
+            cell = replace(self.cell, op="REORDER", score="p999", mix="95:5", reorder=1)
+            before = {"cmdstat_get": "calls=10", "cmdstat_bitcount": "calls=10"}
+            after = {"cmdstat_get": "calls=100", "cmdstat_bitcount": "calls=20"}
+            mode = {"reorder_permuted_runs": "0"}
+            with self.assertRaisesRegex(RuntimeError, "BITCOUNT did not execute"):
+                require_workload_witness(cell, before, {**after, "cmdstat_bitcount": "calls=10"}, mode, mode)
+            with self.assertRaisesRegex(RuntimeError, "permutation witness"):
+                require_workload_witness(cell, before, after, mode, mode)
+            evidence = require_workload_witness(cell, before, after, mode, {"reorder_permuted_runs": "1"})
+            self.assertEqual(evidence["BITCOUNT"]["calls"], 10)
+            with self.assertRaisesRegex(RuntimeError, "permutation witness"):
+                require_workload_witness(replace(cell, reorder=0), before, after, mode,
+                                         {"reorder_permuted_runs": "1"})
+
+        def test_long_tail_cannot_regress_behind_short_tail_improvement(self):
+            cell = replace(self.cell, op="REORDER", score="p999", mix="95:5", instances=1)
+            round_ = self.round([100] * 4)
+            for run in round_["runs"]:
+                run["p999_ms"] = 2 if run["arm"] == "A" else 1
+                run["long_p999_ms"] = 2 if run["arm"] == "A" else 3
+            result = assess(cell, [round_])
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertIn("long-command p99.9 regression exceeds measured reference spread", result["reasons"])
+            self.assertFalse(result["saturation_exempt"])
+
+        def test_hdr_decoder_matches_recorded_memtier_output_and_rejects_corruption(self):
+            from abba_workloads import decode_histogram, percentile
+            # Actual memtier GET HDR from the 2026-09-10 h01/n4-1-A artifact.
+            # Producer p99.90=1.575ms; this fixture is independent of our encoder.
+            encoded = (
+                'HISTFAAAA3d4nC2IbWxaZRhA+7wvhY4WuIxBK1m3qJlJY6axWaLR1I+pWzYzly7DzGxLdM50SY1xMXE/jMtkuNIrpRToHa3ISHdL'
+                'KaO0q5Qh62iHV0oI61hDWiQUkZKWkqwiYkPpDTFmnh/nJGe3yiCpqcHHap6A/i//Pz37y6GaNwpPBg9xm9ChdwKgxFpunu8QM7sD'
+                'LeRb5HnaBJMJ0HqRdRQXxjjetdr8NI+17jD/XG98IHAYiWpip+m6dHWzMXVbblE1k5m95bvP6O7tCxtb6KH9zP2XVvtfLv3YljO8'
+                'zYwcufLH8egDBb10Wkd+HEl1UJHP1L9+mfZ8rSqqwDzeBxtzFvBvOSGlmoHEykMwOldANfsPGMPdKGQ2I8rvQt6ZWVRcnkc5dhnp'
+                'E2uoPFlEyWAFLd6qorjyKo70d+GMphvbHvfghalevLrZi+lHRnyN1WNdTz92rPfhzY1unDeosJ/aRtX8OirlE8gTnEOV7Slk+96K'
+                'QgESFf/ahNV0BpjhRxCZmwF3Zhyy41ZQb+shf1sNuceXq8FLpRtfqJnOXKmD1p9XRs95fefo0CeusU9nf7hgX+vM3LrIJr8y3/lG'
+                '0/MdKP8mwdlngKJyANj7FiB/s4F9aQScG6PgsjjAPWQHOjoM4ewNsKcHYP66DmLDXRDsvRzLXSSXOsqhM36yPbN4WGVo0zgOxLee'
+                '99/dx+r3uibkSqfMcUfirBDWP4WpJYHWJoiwDfNXBaZuAUsL6C2BNilkR0WloMgUIEy94uqY2FMQa5fF1JZ4+qY4PipevEekvcTG'
+                'lCgWFiYHhJ6fBIPDDW5ffbTEn6zsoB7WxVd4iXVuleRah2uTUU71W87sAF4tINqHoiSy/Q5MCHQjUNABe0ndaT9t+bByZvFE8hil'
+                'yLSX31s4YW7PnUwqgsepU9mzDoXv5LTCddh6JH1U826xzfma6dX5V6ZbvS9a93tbSk9faw43U0+ZpSU5JbNKtYRjp4ZgiIzIJZok'
+                'GMmChJHSUr/U3WTcZZQxkpgkLrvSmJDlGgd3UY1UU1makLglKSJIMPKYvEIMiRKEsmGwjuUqeT7kQ2YUhTLEoAJJSMHRz33w0QcN'
+                'p4Ty1tY9By88d5APasB75G/y3q9/AeoA8RDvAJ+PujDinEXAmQHEVcMEciAf9nEieKI2WJfllfgBbhbnwAO1r/8LDBOjCQ=='
+            )
+            histogram = decode_histogram(encoded)
+            self.assertEqual(sum(histogram.values()), 165919453)
+            self.assertEqual(percentile(histogram, 99.9), 1.575)
+            for invalid in (encoded[:-8], "invalid", "AAAA"):
+                with self.subTest(invalid=invalid[:10]), self.assertRaises(Exception):
+                    decode_histogram(invalid)
+
+        def test_histograms_merge_counts_instead_of_averaging_percentiles(self):
+            documents = [{"short": {10: 100000}, "long": {20: 10000}},
+                         {"short": {1000: 1000}, "long": {2000: 1000}}]
+            with mock.patch("abba_workloads.command_histogram",
+                            side_effect=lambda doc, name: doc["short" if name == "GET" else "long"]):
+                tails = merged_tail(documents)
+            self.assertEqual(tails["p999_ms"], 1)
+            self.assertEqual(tails["long_p999_ms"], 2)
+            self.assertEqual(tails["short_count"], 101000)
+
+        def test_new_unmeasured_pins_fail_before_reference_or_measurement(self):
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                out = Path(tmp) / "out"
+                source = Path(tmp) / "unmeasured-cells"
+                source.write_text("u01 | 1s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1\n")
+                with mock.patch.object(sys, "argv", ["abbagate.py", "--subset", "smoke", "--output", str(out),
+                                                      "--cells", str(source)]):
+                    args = parse_args()
+                with mock.patch(__name__ + ".resolve_reference", side_effect=AssertionError("unmeasured pin reached reference")), \
+                     mock.patch(__name__ + ".check_placement"), mock.patch.object(os, "sched_setaffinity"), \
+                     mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(main(args), 1)
+                result = json.loads((out / "results.json").read_text())
+                self.assertIn("unmeasured load floors", result["reason"])
+                self.assertIn("--escalate", result["reason"])
+                self.assertEqual(result["cells"], [])
 
         def round(self, rates, n=1, busy=99.5, latency=None):
             return {"instances": n, "runs": [dict(arm=arm, rate=rate, busy_pct=busy,

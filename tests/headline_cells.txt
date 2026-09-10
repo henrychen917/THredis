@@ -1,79 +1,227 @@
-# Headline cells — the benches that produce this project's quoted numbers, and the regression set.
-# Format: id | thread-mode | read-local | overlap | reorder | op | depth | conns | measured | busy% | loadgen-inst
+# Headline regression cells. Rate/busy observations are provenance, never verdict inputs.
+# Format: id | mode | rl | ov | ro | op | depth | total-conns | observed-rate | observed-busy | loadgen-pin | atomic | score | mix | smoke
+# mix is READ:WRITE for MIX/MIX8 and short-GET:long-BITCOUNT for REORDER; - means pure.
+# MGET/MSET/MIX8 use eight independently generated keys per operation.
+# New deep cells deliberately have no pin: they FAIL preflight until --escalate measures
+# their load floor and that floor is recorded here. A guessed pin is not validation.
+# Full push/release design: retained64 + multi-key96 + mixed6 + connections4 + atomic4 + tail4 =178.
+# --subset full is the ABBA default. --subset smoke is a complete15-cell ITERATION result.
+# It cannot replace the full set at a push or release.
 #
-# FULL AXIS COVERAGE (owner ruling 2026-09-10): every regression check must cross 1s vs 2s,
-# read-local on/off, overlap on/off, AND depth p1 vs p32. Reorder on/off is carried too. That is
-# 2 modes x 2 read-local x 2 overlap x 2 reorder x 2 ops x 2 depths = 64 cells.
-# The p32 half was measured 2026-09-10 on cx-final (11-branch merge), 32 server cores, loopback,
-# atomics on, 2,000,000-key keyspace populated before every cell. The p1 half is UNMEASURED here:
-# depth 1 is round-trip bound by Little's law and is scored as LATENCY, not throughput, and is
-# exempt from the saturation rule. Nothing in this file is an input to a verdict — the ABBA tier
-# reads only the knob columns and measures both arms itself.
+# SMOKE JUSTIFICATION, EVERY CELL:
+# h15/h31: all-on111 GETp32, separately for fused/split shipped posture.
+# h07/h23: read-local off011, its marginal effect with overlap/reorder still on.
+# h11/h27: overlap off101, its marginal effect with read-local/reorder still on.
+# h01/h17: all-off000 baselines, each execution model; this also carries reorder-off throughput.
+# t01/t02 and t03/t04: reorder off/on in each mode, p8 mixed service costs, scored by
+# short GET p99.9 with a separate BITCOUNT p99.9 starvation guard. rl0 prevents GET
+# bypassing the owner scheduler; overlap1 exercises the actual shipped batch paths.
+# h48: fused all-on SETp1, covers write traffic and round-trip latency.
+# Multi-key smoke IDs are identified beside their rows: split all-on MGETp8 and fused
+# all-on MSETp8 restore BOTH multi-key paths at their measured congestion knee.
 #
-# THE GATE'S PERFORMANCE TIER MUST ABBA THESE CELLS: last-pushed binary vs candidate,
-# interleaved A/B/B/A in one session, and decide pass/fail on the comparison — never against
-# a stored number, which goes stale the moment the kernel, compiler or box changes.
-h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 26.38M | 91.89% | 4
-h02 | 1s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 24.36M | 91.85% | 4
-h03 | 1s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.70M | 91.90% | 4
-h04 | 1s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.84M | 91.87% | 4
-h05 | 1s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 21.88M | 75.45% | 4
-h06 | 1s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 20.74M | 75.38% | 4
-h07 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 20.89M | 75.42% | 4
-h08 | 1s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 20.19M | 75.54% | 3
-h09 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 52.95M | 91.78% | 4
-h10 | 1s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 21.68M | 91.89% | 4
-h11 | 1s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 52.32M | 89.03% | 3
-h12 | 1s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 21.34M | 91.90% | 4
-h13 | 1s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 52.03M | 75.48% | 3
-h14 | 1s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 19.16M | 80.35% | 3
-h15 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 52.29M | 74.34% | 3
-h16 | 1s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 18.68M | 75.53% | 3
-h17 | 2s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 24.79M | 92.06% | 3
-h18 | 2s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 23.39M | 92.05% | 3
-h19 | 2s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.04M | 92.06% | 3
-h20 | 2s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.76M | 92.07% | 3
-h21 | 2s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 27.52M | 91.94% | 2
-h22 | 2s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 26.27M | 91.94% | 2
-h23 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 27.26M | 91.96% | 2
-h24 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 25.89M | 91.96% | 2
-h25 | 2s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 31.37M | 46.59% | 2
-h26 | 2s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 22.68M | 92.06% | 3
-h27 | 2s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 32.48M | 45.83% | 2
-h28 | 2s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 22.73M | 92.05% | 3
-h29 | 2s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 32.70M | 45.92% | 2
-h30 | 2s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 24.10M | 92.01% | 2
-h31 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 30.37M | 46.62% | 2
-h32 | 2s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 23.34M | 91.94% | 2
-h33 | 1s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h34 | 1s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h35 | 1s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h36 | 1s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h37 | 1s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h38 | 1s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h39 | 1s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h40 | 1s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h41 | 1s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h42 | 1s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h43 | 1s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h44 | 1s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h45 | 1s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h46 | 1s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h47 | 1s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h48 | 1s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h49 | 2s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h50 | 2s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h51 | 2s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h52 | 2s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h53 | 2s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h54 | 2s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h55 | 2s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h56 | 2s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h57 | 2s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h58 | 2s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h59 | 2s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h60 | 2s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
-h61 | 2s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
-h62 | 2s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
-h63 | 2s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
-h64 | 2s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+# SMOKE GIVES UP: the other four knob combinations per mode and most knob/workload
+# interactions; SETp32 and split SETp1; other multi-key modes/depths/knob combinations;
+# mixed read/write, 2048 connections, atomic0, and read-local-on reorder-tail interactions.
+# Full retains/adds all of those throughput regimes; tail remains a directed four-cell design.
+# OFAT cannot prove interactions. No claim of full cross-product coverage belongs to smoke.
+#
+# ORIGINAL64: preserve both modes x all8knob combinations x GET/SET x p1/p32 at512connections.
+# Existing measured pin values are retained and must still satisfy live saturation checks.
+h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 26.38M | 91.89% | 4 | atomic=1 | score=rate | mix=- | smoke=1
+h02 | 1s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 24.36M | 91.85% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h03 | 1s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.70M | 91.90% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h04 | 1s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.84M | 91.87% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h05 | 1s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 21.88M | 75.45% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h06 | 1s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 20.74M | 75.38% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h07 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 20.89M | 75.42% | 4 | atomic=1 | score=rate | mix=- | smoke=1
+h08 | 1s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 20.19M | 75.54% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h09 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 52.95M | 91.78% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h10 | 1s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 21.68M | 91.89% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h11 | 1s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 52.32M | 89.03% | 3 | atomic=1 | score=rate | mix=- | smoke=1
+h12 | 1s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 21.34M | 91.90% | 4 | atomic=1 | score=rate | mix=- | smoke=0
+h13 | 1s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 52.03M | 75.48% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h14 | 1s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 19.16M | 80.35% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h15 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 52.29M | 74.34% | 3 | atomic=1 | score=rate | mix=- | smoke=1
+h16 | 1s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 18.68M | 75.53% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h17 | 2s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 24.79M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=1
+h18 | 2s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 23.39M | 92.05% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h19 | 2s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.04M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h20 | 2s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.76M | 92.07% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h21 | 2s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 27.52M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h22 | 2s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 26.27M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h23 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 27.26M | 91.96% | 2 | atomic=1 | score=rate | mix=- | smoke=1
+h24 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 25.89M | 91.96% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h25 | 2s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 31.37M | 46.59% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h26 | 2s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 22.68M | 92.06% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h27 | 2s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 32.48M | 45.83% | 2 | atomic=1 | score=rate | mix=- | smoke=1
+h28 | 2s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 22.73M | 92.05% | 3 | atomic=1 | score=rate | mix=- | smoke=0
+h29 | 2s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 32.70M | 45.92% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h30 | 2s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 24.10M | 92.01% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h31 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 30.37M | 46.62% | 2 | atomic=1 | score=rate | mix=- | smoke=1
+h32 | 2s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 23.34M | 91.94% | 2 | atomic=1 | score=rate | mix=- | smoke=0
+h33 | 1s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h34 | 1s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h35 | 1s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h36 | 1s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h37 | 1s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h38 | 1s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h39 | 1s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h40 | 1s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h41 | 1s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h42 | 1s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h43 | 1s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h44 | 1s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h45 | 1s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h46 | 1s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h47 | 1s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h48 | 1s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=1
+h49 | 2s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h50 | 2s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h51 | 2s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h52 | 2s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h53 | 2s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h54 | 2s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h55 | 2s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h56 | 2s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h57 | 2s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h58 | 2s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h59 | 2s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h60 | 2s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h61 | 2s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h62 | 2s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h63 | 2s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+h64 | 2s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | - | atomic=1 | score=latency | mix=- | smoke=0
+#
+ # MULTI-KEY96: required full interaction coverage across the original three knobs,
+# both modes, both operations, and p1/p8/p32. p8 samples the measured multi-key knee.
+m01 | 1s | rl=0 | ov=0 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m02 | 1s | rl=0 | ov=0 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m03 | 1s | rl=0 | ov=0 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m04 | 1s | rl=0 | ov=0 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m05 | 1s | rl=0 | ov=0 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m06 | 1s | rl=0 | ov=0 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m07 | 1s | rl=0 | ov=0 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m08 | 1s | rl=0 | ov=0 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m09 | 1s | rl=0 | ov=0 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m10 | 1s | rl=0 | ov=0 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m11 | 1s | rl=0 | ov=0 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m12 | 1s | rl=0 | ov=0 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m13 | 1s | rl=0 | ov=1 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m14 | 1s | rl=0 | ov=1 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m15 | 1s | rl=0 | ov=1 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m16 | 1s | rl=0 | ov=1 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m17 | 1s | rl=0 | ov=1 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m18 | 1s | rl=0 | ov=1 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m19 | 1s | rl=0 | ov=1 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m20 | 1s | rl=0 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m21 | 1s | rl=0 | ov=1 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m22 | 1s | rl=0 | ov=1 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m23 | 1s | rl=0 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m24 | 1s | rl=0 | ov=1 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m25 | 1s | rl=1 | ov=0 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m26 | 1s | rl=1 | ov=0 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m27 | 1s | rl=1 | ov=0 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m28 | 1s | rl=1 | ov=0 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m29 | 1s | rl=1 | ov=0 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m30 | 1s | rl=1 | ov=0 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m31 | 1s | rl=1 | ov=0 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m32 | 1s | rl=1 | ov=0 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m33 | 1s | rl=1 | ov=0 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m34 | 1s | rl=1 | ov=0 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m35 | 1s | rl=1 | ov=0 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m36 | 1s | rl=1 | ov=0 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m37 | 1s | rl=1 | ov=1 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m38 | 1s | rl=1 | ov=1 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m39 | 1s | rl=1 | ov=1 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m40 | 1s | rl=1 | ov=1 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m41 | 1s | rl=1 | ov=1 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m42 | 1s | rl=1 | ov=1 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m43 | 1s | rl=1 | ov=1 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m44 | 1s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m45 | 1s | rl=1 | ov=1 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m46 | 1s | rl=1 | ov=1 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+# m47: smoke spot check, 1s all-on MSET at p8; distinct from single-key GET/SET.
+m47 | 1s | rl=1 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+m48 | 1s | rl=1 | ov=1 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m49 | 2s | rl=0 | ov=0 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m50 | 2s | rl=0 | ov=0 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m51 | 2s | rl=0 | ov=0 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m52 | 2s | rl=0 | ov=0 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m53 | 2s | rl=0 | ov=0 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m54 | 2s | rl=0 | ov=0 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m55 | 2s | rl=0 | ov=0 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m56 | 2s | rl=0 | ov=0 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m57 | 2s | rl=0 | ov=0 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m58 | 2s | rl=0 | ov=0 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m59 | 2s | rl=0 | ov=0 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m60 | 2s | rl=0 | ov=0 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m61 | 2s | rl=0 | ov=1 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m62 | 2s | rl=0 | ov=1 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m63 | 2s | rl=0 | ov=1 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m64 | 2s | rl=0 | ov=1 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m65 | 2s | rl=0 | ov=1 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m66 | 2s | rl=0 | ov=1 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m67 | 2s | rl=0 | ov=1 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m68 | 2s | rl=0 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m69 | 2s | rl=0 | ov=1 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m70 | 2s | rl=0 | ov=1 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m71 | 2s | rl=0 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m72 | 2s | rl=0 | ov=1 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m73 | 2s | rl=1 | ov=0 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m74 | 2s | rl=1 | ov=0 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m75 | 2s | rl=1 | ov=0 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m76 | 2s | rl=1 | ov=0 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m77 | 2s | rl=1 | ov=0 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m78 | 2s | rl=1 | ov=0 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m79 | 2s | rl=1 | ov=0 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m80 | 2s | rl=1 | ov=0 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m81 | 2s | rl=1 | ov=0 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m82 | 2s | rl=1 | ov=0 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m83 | 2s | rl=1 | ov=0 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m84 | 2s | rl=1 | ov=0 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m85 | 2s | rl=1 | ov=1 | ro=0 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m86 | 2s | rl=1 | ov=1 | ro=0 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m87 | 2s | rl=1 | ov=1 | ro=0 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m88 | 2s | rl=1 | ov=1 | ro=0 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m89 | 2s | rl=1 | ov=1 | ro=0 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m90 | 2s | rl=1 | ov=1 | ro=0 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m91 | 2s | rl=1 | ov=1 | ro=1 | MGET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+# m92: smoke spot check, 2s all-on MGET at p8; distinct from single-key GET/SET.
+m92 | 2s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=1
+m93 | 2s | rl=1 | ov=1 | ro=1 | MGET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m94 | 2s | rl=1 | ov=1 | ro=1 | MSET | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=- | smoke=0
+m95 | 2s | rl=1 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+m96 | 2s | rl=1 | ov=1 | ro=1 | MSET | p32 | 512 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+#
+# MIXED6: read-local off/on at7:1p1 exposes the armed write tax in each mode.
+# The18:14 multi-key p128 pair adds deep same-connection congestion, without crossing every new axis.
+x01 | 1s | rl=0 | ov=1 | ro=1 | MIX | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=7:1 | smoke=0
+x02 | 1s | rl=1 | ov=1 | ro=1 | MIX | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=7:1 | smoke=0
+x03 | 2s | rl=0 | ov=1 | ro=1 | MIX | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=7:1 | smoke=0
+x04 | 2s | rl=1 | ov=1 | ro=1 | MIX | p1 | 512 | - | - | - | atomic=1 | score=latency | mix=7:1 | smoke=0
+x05 | 1s | rl=1 | ov=1 | ro=1 | MIX8 | p128 | 512 | - | - | - | atomic=1 | score=rate | mix=18:14 | smoke=0
+x06 | 2s | rl=1 | ov=1 | ro=1 | MIX8 | p128 | 512 | - | - | - | atomic=1 | score=rate | mix=18:14 | smoke=0
+#
+# CONNECTIONS4: GETp32 at2048connections, both modes and read-local off/on,
+# isolates the measured reversal above512 while holding overlap/reorder on.
+c01 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 2048 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+c02 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 2048 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+c03 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 2048 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+c04 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 2048 | - | - | - | atomic=1 | score=rate | mix=- | smoke=0
+#
+# ATOMIC4: atomic0 in both modes for MGET/MSETp8 all-on. The atomic group/scatter
+# paths distinguish this axis most strongly; matching atomic1 cells exist above.
+a01 | 1s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=0 | score=rate | mix=- | smoke=0
+a02 | 1s | rl=1 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=0 | score=rate | mix=- | smoke=0
+a03 | 2s | rl=1 | ov=1 | ro=1 | MGET | p8 | 512 | - | - | - | atomic=0 | score=rate | mix=- | smoke=0
+a04 | 2s | rl=1 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=0 | score=rate | mix=- | smoke=0
+#
+# TAIL4: real service blockers,95 GET64B +5 BITCOUNT256KiB, p8, manyconnections.
+# Ordinary long/short owner tasks can share a batch; BLPOP and scattered MGET are
+# scheduler barriers and would test the wrong mechanism. On cells require observed
+# nonidentity permutations; off cells require zero. All4are in smoke and full.
+t01 | 1s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
+t02 | 1s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
+t03 | 2s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
+t04 | 2s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
