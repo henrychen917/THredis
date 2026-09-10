@@ -214,7 +214,7 @@ class LedgerWiring(unittest.TestCase):
             end = gate.index('if [ "$TIER" = quick ]; then', start)
         else:
             marker = gate.index('# ---- B. mandatory headline performance')
-            start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
+            start = gate.index('ABBA_WATCH_START=missing\n', marker)
             end = gate.index('\nesac', start) + len('\nesac')
         definitions = ''
         if kind == 'feature':
@@ -228,6 +228,10 @@ PORT=19000
 CANDIDATE_BINARY=/unused
 GATE_RATIO=6:2
 ABBA_ARGS=()
+ABBA_OUTPUT="$TMPDIR/abba"
+# Dispatch uses an owned controller identity as the fixture's watchdog stand-in. The actual
+# watcher command/parent validation is covered by gate_quiet's real-process controls.
+ROW_WATCHDOG=$BASHPID
 FEATURE_OUTPUT="$GATE_FEATURE_OUTPUT"
 collect_job(){
   case "$1" in
@@ -240,7 +244,13 @@ py(){
   if [ "$1" = tests/abbagate.py ] || [ "$1" = tests/gate_history.py ]; then return "$WIRE_ABBA_RC"; fi
   return "$WIRE_RC"
 }
-python3(){ return "$WIRE_ABBA_RC"; }
+python3(){
+  if [ "$WIRE_KIND" = performance ]; then
+    printf '%s\\0' "$@" > "$WIRE_ARGV"
+    printf '%s\\n' "$GATE_QUIET_WATCHDOG" > "$WIRE_WATCHDOG"
+  fi
+  return "$WIRE_ABBA_RC"
+}
 quiet_wait(){ :; }
 row_begin(){ :; }
 ok(){ printf 'ok\\t%s\\t\\n' "$1" >> "$WIRE_LEDGER"; }
@@ -250,10 +260,17 @@ say(){ :; }
         with tempfile.TemporaryDirectory(dir=root / 'build') as directory:
             ledger = Path(directory) / 'rows.tsv'
             env = dict(os.environ, WIRE_RC=str(rc), WIRE_ABBA_RC=str(abba_rc),
-                       WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory)
+                       WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory,
+                       WIRE_KIND=kind, WIRE_ARGV=str(Path(directory) / 'argv'),
+                       WIRE_WATCHDOG=str(Path(directory) / 'watchdog'))
+            env.pop('GATE_QUIET_WATCHDOG', None)
             subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
                             prelude + definitions + gate[start:end]], cwd=root, env=env,
                            text=True, capture_output=True, check=True, timeout=10)
+            if kind == 'performance':
+                argv = (Path(directory) / 'argv').read_bytes().decode().rstrip('\0').split('\0')
+                self.assertEqual(argv, ['tests/abbagate.py', '--output', str(Path(directory) / 'abba')])
+                self.assertRegex((Path(directory) / 'watchdog').read_text().strip(), r'^[1-9][0-9]*:[1-9][0-9]*$')
             return [line.split('\t') for line in ledger.read_text().splitlines()]
 
     def test_feature_rows_precede_quick_exit(self):
@@ -277,7 +294,10 @@ say(){ :; }
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0][:2], ['FAIL' if rc else 'ok', 'headline ABBA vs last pushed binary'])
                 if rc == 3:
-                    self.assertIn('SKIPPED -- NOT A PASS', rows[0][2])
+                    # Missing references and successful untrusted/partial measurements both
+                    # return 3. Neither may become a green counted performance row.
+                    self.assertIn('no trusted comparison PASS', rows[0][2])
+                    self.assertIn('partial diagnostic or skipped', rows[0][2])
 
 
 class ABBATermination(unittest.TestCase):
@@ -286,7 +306,7 @@ class ABBATermination(unittest.TestCase):
         gate = (root / 'tests/gate.sh').read_text()
         cleanup = gate[gate.index('reap_children(){'):gate.index('\nport_listeners(){')]
         marker = gate.index('# ---- B. mandatory headline performance')
-        start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
+        start = gate.index('ABBA_WATCH_START=missing\n', marker)
         launch = gate[start:gate.index('\nesac', start) + len('\nesac')]
         with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
             directory = Path(tmp)
@@ -296,8 +316,17 @@ class ABBATermination(unittest.TestCase):
             driver.write_text('''import json, os, signal, sys, time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from abbagate import Children
-out=Path(sys.argv[2]); children=Children()
+from abbagate import Children, parse_args
+sys.argv=['abbagate.py', *sys.argv[2:]]
+args=parse_args(); out=args.output
+assert out == Path(os.environ['WIRE_OUTPUT']), 'production output argument was lost'
+token=os.environ['GATE_QUIET_WATCHDOG']
+parent,start=map(int, token.split(':'))
+assert parent == os.getppid(), 'fixture controller identity was not transmitted'
+fields=Path(f'/proc/{parent}/stat').read_text().rsplit(')',1)[1].split()
+assert int(fields[19]) == start, 'fixture controller start identity changed'
+(out/'dispatch.json').write_text(json.dumps({'argv':sys.argv, 'watchdog':token}))
+children=Children()
 def interrupted(signum, frame):
     raise InterruptedError(signum)
 signal.signal(signal.SIGTERM, interrupted)
@@ -313,10 +342,11 @@ finally:
 ''')
             prelude = '''set -u
 SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0; ABBA_PID=0; ABBA_ARGS=(); WORKER_PIDS=()
+ABBA_OUTPUT="$WIRE_OUTPUT"; ROW_WATCHDOG=$BASHPID
 stop_workers(){ :; }
 row_unwatch(){ :; }
 python3(){
-  if [ "$1" = tests/abbagate.py ]; then exec "$WIRE_PYTHON" "$WIRE_DRIVER" "$WIRE_TESTS" "$WIRE_OUTPUT"
+  if [ "$1" = tests/abbagate.py ]; then shift; exec "$WIRE_PYTHON" "$WIRE_DRIVER" "$WIRE_TESTS" "$@"
   else command "$WIRE_PYTHON" "$@"; fi
 }
 ok(){ printf 'ok\\n' >> "$WIRE_OUTPUT/verdict"; }
@@ -324,6 +354,7 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
 '''
             env = dict(os.environ, WIRE_PYTHON=sys.executable, WIRE_DRIVER=str(driver),
                        WIRE_TESTS=str(root / 'tests'), WIRE_OUTPUT=str(directory))
+            env.pop('GATE_QUIET_WATCHDOG', None)
             foreign = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
             process = subprocess.Popen(['bash', '-c', prelude + '\n' + cleanup + '\n' + launch],
                                        cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -337,7 +368,13 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
                         break
                     except (FileNotFoundError, json.JSONDecodeError):
                         time.sleep(.01)
+                if not pids and process.poll() is not None:
+                    stdout, stderr = process.communicate(timeout=1)
+                    self.fail(f'mock ABBA never reached its measurement boundary: {stdout!r} {stderr!r}')
                 self.assertTrue(pids, 'mock ABBA never reached its measurement boundary')
+                dispatch = json.loads((directory / 'dispatch.json').read_text())
+                self.assertEqual(dispatch['argv'], ['abbagate.py', '--output', str(directory)])
+                self.assertRegex(dispatch['watchdog'], r'^[1-9][0-9]*:[1-9][0-9]*$')
                 process.terminate()  # Only the gate PID receives TERM from the caller.
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 130, (stdout, stderr))
@@ -754,18 +791,23 @@ LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; : > "$LEDGER"; : > "$TIMIN
 phase(){ printf 'PHASE %s\n' "$1" >> "$EVENTS"; }
 program_state(){ :; }
 quiet_wait(){ :; }
-row_begin(){ :; }
+row_begin(){ ROW_WATCHDOG=$BASHPID; }
 collect_job(){
   case " ${JOB_NAMES[*]} " in *" $1 "*) ;; *) echo "unreached job $1" >&2; exit 71;; esac
   printf 'COLLECT %s\n' "$1" >> "$EVENTS"
 }
 join_workers(){ JOINED=1; printf 'JOIN\n' >> "$EVENTS"; }
 python3(){
+  # This new serverless output resolver is not an ABBA measurement. Let the actual parser
+  # resolve its destination before recording the one real background dispatch below.
+  if [ "$1" = - ]; then command "$WIRE_PYTHON" "$@"; return; fi
   if [ "$1" = tests/gate_history.py ]; then printf "fixture-context\n"; return 0; fi
+  [ "$1" = tests/abbagate.py ] || return 74
   [ "$JOINED" = 1 ] || { echo 'measurement before worker join' >&2; return 72; }
   case " ${JOB_NAMES[*]} " in *' abba '*|*' perf '*) return 73;; esac
   printf 'ABBA\n' >> "$EVENTS"
   printf '%s\0' "$@" > "$RUN_DIR/argv"
+  printf '%s\n' "$GATE_QUIET_WATCHDOG" > "$RUN_DIR/watchdog"
 }
 '''
         with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
@@ -778,8 +820,10 @@ python3(){
                                               check_available=False)
                     directory = Path(temporary) / purpose
                     directory.mkdir()
-                    env = dict(os.environ, RUN_DIR=str(directory), EVENTS=str(directory / 'events'))
+                    env = dict(os.environ, RUN_DIR=str(directory), EVENTS=str(directory / 'events'),
+                               WIRE_PYTHON=sys.executable)
                     env.pop('GATE_LEDGER', None)
+                    env.pop('GATE_QUIET_WATCHDOG', None)
                     script = gateplan.shell_plan(plan) + ledger + '\nprintf "%s\\n" "$LEDGER"\n'
                     result = subprocess.run(['bash', '-uc', script + stub + start + coordinator],
                         cwd=root, env=env, text=True, capture_output=True, timeout=5)
@@ -800,6 +844,8 @@ python3(){
                         self.assertEqual(argv[0], 'tests/abbagate.py')
                         self.assertEqual(argv[argv.index('--subset') + 1],
                                          'smoke' if purpose == 'iteration' else 'full')
+                        self.assertEqual(argv[-2:], ['--output', str(directory / 'abba')])
+                        self.assertRegex((directory / 'watchdog').read_text().strip(), r'^[1-9][0-9]*:[1-9][0-9]*$')
 
 
 class PerfCandidateDispatch(unittest.TestCase):
