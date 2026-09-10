@@ -131,6 +131,86 @@ def record(directory: Path, *, run_id: str, label: str, seconds: float,
         os.fsync(stream.fileno())
 
 
+def verdict_history(directory: Path) -> dict:
+    """Summarize immutable observations without conflating duplicate labels with runs.
+
+    Append order is the durable observation order. Per-run verdicts aggregate every context:
+    identical labels sometimes occur twice in one gate, and parallel completion order cannot
+    establish a temporal regression between those contexts. Such a mixed run is reported loudly,
+    separately from transitions between run aggregates. No final gate marker is required, so
+    observations from an interrupted run remain evidence instead of disappearing.
+    """
+    observations = read_history(directory)
+    grouped = defaultdict(dict)
+    run_order = {}
+    for index, observation in enumerate(observations):
+        run_id = observation["run_id"]
+        run_order.setdefault(run_id, index)
+        grouped[observation["label"]].setdefault(run_id, []).append(observation)
+    labels = {}
+    for label, runs in sorted(grouped.items()):
+        run_summaries = []
+        for run_id in sorted(runs, key=run_order.__getitem__):
+            rows = runs[run_id]
+            failures = sum(row["verdict"] == "FAIL" for row in rows)
+            verdict = "mixed" if 0 < failures < len(rows) else "FAIL" if failures else "ok"
+            run_summaries.append({"run_id": run_id, "verdict": verdict,
+                "observations": len(rows), "failures": failures,
+                "first_recorded_at": rows[0]["recorded_at"],
+                "last_recorded_at": rows[-1]["recorded_at"],
+                "last_observation_id": rows[-1]["observation_id"]})
+        transitions = []
+        for previous, current in zip(run_summaries, run_summaries[1:]):
+            if previous["verdict"] != current["verdict"]:
+                transitions.append({"from_run": previous["run_id"], "from_verdict": previous["verdict"],
+                    "to_run": current["run_id"], "to_verdict": current["verdict"],
+                    "recorded_at": current["last_recorded_at"]})
+        failures = sum(run["failures"] for run in run_summaries)
+        total = sum(run["observations"] for run in run_summaries)
+        failing_runs = sum(run["failures"] > 0 for run in run_summaries)
+        mixed = [run["run_id"] for run in run_summaries if run["verdict"] == "mixed"]
+        labels[label] = {"observations": total, "failures": failures,
+            "failure_fraction": failures / total, "runs": len(run_summaries),
+            "failing_runs": failing_runs, "failing_run_fraction": failing_runs / len(run_summaries),
+            "verdict_flipped": 0 < failures < total, "mixed_runs": mixed,
+            "transitions": transitions, "latest_transition": transitions[-1] if transitions else None,
+            "latest_run": run_summaries[-1], "run_history": run_summaries}
+    return {"schema": SCHEMA, "observations": len(observations), "runs": len(run_order),
+        "labels": labels, "flipping_labels": sum(row["verdict_flipped"] for row in labels.values())}
+
+
+def format_verdict_history(report: dict) -> str:
+    lines = [f"GATE HISTORY: {len(report['labels'])} labels, {report['observations']} observations, "
+             f"{report['runs']} runs; {report['flipping_labels']} verdict-changing labels"]
+    for label, row in report["labels"].items():
+        if not row["verdict_flipped"]:
+            continue
+        latest = row["latest_transition"]
+        transition = (f"{latest['from_verdict']} ({latest['from_run']}) -> "
+                      f"{latest['to_verdict']} ({latest['to_run']}) at "
+                      f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(latest['recorded_at']))}"
+                      if latest else "none between runs")
+        lines.append(f"  DEFECT NEEDS FIX: {label}; FAIL observations "
+            f"{row['failures']}/{row['observations']} ({100 * row['failure_fraction']:.2f}%); "
+            f"runs containing FAIL {row['failing_runs']}/{row['runs']}; "
+            f"between-run transitions={len(row['transitions'])}; latest {transition}")
+        if row["mixed_runs"]:
+            mixed = [run for run in row["run_history"] if run["verdict"] == "mixed"]
+            detail = ", ".join(f"{run['run_id']} ({run['failures']}/{run['observations']} FAIL)" for run in mixed)
+            lines.append("    DEFECT: mixed verdicts within the same run: " + detail +
+                "; repeated-label contexts are not distinguishable in this history, so these are "
+                "observation rates, not independent rerun probabilities")
+    if report["flipping_labels"]:
+        # Historical failures remain visible after a current pass. The current gate's rows own
+        # its verdict: history alone cannot say whether code changed and fixed an earlier defect.
+        # Never erase failures or silently reset history to resolve this message. If resolution
+        # tracking is added, require an explicit record naming the fix commit/code hash while
+        # retaining every original observation; no automatic grace period or tolerance applies.
+        lines.append("  Historical flips remain visible even when the latest run passes; "
+                     "the current gate verdict is determined by its current rows.")
+    return "\n".join(lines)
+
+
 def import_legacy(paths: list[Path]) -> tuple[dict[str, list[float]], list[str]]:
     rows = defaultdict(list)
     sources = []
@@ -508,6 +588,158 @@ quiet_wait(){ :; }
         self.assertEqual(float(rows[0][1]), history[0]['seconds'])
 
 
+class FlakeHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+
+    def add(self, run_id, verdict="ok", label="row", observation_id=None):
+        record(self.directory, run_id=run_id, label=label, seconds=1,
+               verdict=verdict, observation_id=observation_id)
+
+    def test_pass_fail_pass_across_runs_keeps_both_transitions_and_rate(self):
+        for run_id, verdict in (("run-1", "ok"), ("run-2", "FAIL"), ("run-3", "ok")):
+            self.add(run_id, verdict)
+        report = verdict_history(self.directory)
+        row = report["labels"]["row"]
+        self.assertEqual((row["failures"], row["observations"], row["runs"], row["failing_runs"]), (1, 3, 3, 1))
+        self.assertEqual(row["failure_fraction"], 1 / 3)
+        self.assertEqual(len(row["transitions"]), 2)
+        self.assertEqual(row["latest_transition"]["from_run"], "run-2")
+        self.assertEqual(row["latest_transition"]["to_verdict"], "ok")
+        text = format_verdict_history(report)
+        self.assertIn("DEFECT NEEDS FIX: row", text)
+        self.assertIn("FAIL observations 1/3 (33.33%)", text)
+        self.assertIn("runs containing FAIL 1/3", text)
+        self.assertIn("FAIL (run-2) -> ok (run-3)", text)
+
+    def test_stable_pass_and_stable_fail_are_not_verdict_flips(self):
+        for run_id in ("first", "second", "third"):
+            self.add(run_id, "ok", "passes")
+            self.add(run_id, "FAIL", "fails")
+        report = verdict_history(self.directory)
+        self.assertEqual(report["flipping_labels"], 0)
+        self.assertEqual(report["labels"]["fails"]["failures"], 3)
+        self.assertNotIn("DEFECT", format_verdict_history(report))
+
+    def test_same_run_duplicates_are_observations_not_extra_runs(self):
+        self.add("first", "ok")
+        self.add("first", "FAIL")
+        self.add("second", "ok")
+        row = verdict_history(self.directory)["labels"]["row"]
+        self.assertEqual((row["observations"], row["runs"], row["failing_runs"]), (3, 2, 1))
+        self.assertEqual(row["mixed_runs"], ["first"])
+        self.assertEqual(row["latest_transition"]["from_verdict"], "mixed")
+        self.assertIn("repeated-label contexts are not distinguishable", format_verdict_history(verdict_history(self.directory)))
+
+    def test_single_mixed_run_is_still_a_loud_defect(self):
+        self.add("only", "ok")
+        self.add("only", "FAIL")
+        report = verdict_history(self.directory)
+        row = report["labels"]["row"]
+        self.assertTrue(row["verdict_flipped"])
+        self.assertEqual(row["transitions"], [])
+        text = format_verdict_history(report)
+        self.assertIn("DEFECT NEEDS FIX: row", text)
+        self.assertIn("latest none between runs", text)
+        self.assertIn("only (1/2 FAIL)", text)
+
+    def test_every_flipping_label_is_printed_without_truncation(self):
+        for index in range(24):
+            self.add("first", "ok", f"row-{index:02}")
+            self.add("second", "FAIL", f"row-{index:02}")
+        report = verdict_history(self.directory)
+        self.assertEqual(report["flipping_labels"], 24)
+        self.assertEqual(format_verdict_history(report).count("DEFECT NEEDS FIX:"), 24)
+
+    def test_interrupted_run_keeps_completed_observations(self):
+        self.add("complete", "ok")
+        # There is deliberately no run-complete marker. An interrupted run's red row is evidence.
+        self.add("interrupted", "FAIL")
+        before = (self.directory / HISTORY_FILE).read_bytes()
+        row = verdict_history(self.directory)["labels"]["row"]
+        self.assertEqual((row["runs"], row["failures"]), (2, 1))
+        self.assertEqual((self.directory / HISTORY_FILE).read_bytes(), before)
+
+    def test_incomplete_append_is_loud_and_preserves_existing_bytes(self):
+        self.add("first", "ok")
+        self.add("second", "FAIL")
+        path = self.directory / HISTORY_FILE
+        path.write_bytes(path.read_bytes() + b'{"schema":1')
+        before = path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "incomplete final record"):
+            verdict_history(self.directory)
+        with self.assertRaisesRegex(ValueError, "incomplete final record"):
+            self.add("third", "ok")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_duplicate_event_is_rejected_without_changing_denominator(self):
+        self.add("first", "ok", observation_id="same-event")
+        before = (self.directory / HISTORY_FILE).read_bytes()
+        with self.assertRaisesRegex(ValueError, "duplicate observation_id"):
+            self.add("first", "FAIL", observation_id="same-event")
+        self.assertEqual((self.directory / HISTORY_FILE).read_bytes(), before)
+        self.assertEqual(verdict_history(self.directory)["labels"]["row"]["observations"], 1)
+
+    def test_parallel_process_appends_keep_every_observation(self):
+        import multiprocessing
+        context = multiprocessing.get_context("fork")
+        children = [context.Process(target=record, args=(self.directory,), kwargs={
+            "run_id": "parallel", "label": "row", "seconds": 1,
+            "verdict": "FAIL" if index % 3 == 0 else "ok", "observation_id": f"event-{index}"})
+            for index in range(12)]
+        for child in children:
+            child.start()
+        try:
+            for child in children:
+                child.join(timeout=10)
+                self.assertEqual(child.exitcode, 0)
+        finally:
+            for child in children:
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=5)
+        rows = read_history(self.directory)
+        self.assertEqual({row["observation_id"] for row in rows}, {f"event-{index}" for index in range(12)})
+        row = verdict_history(self.directory)["labels"]["row"]
+        self.assertEqual((row["observations"], row["failures"], row["runs"]), (12, 4, 1))
+        self.assertEqual(row["mixed_runs"], ["parallel"])
+
+    def test_run_order_uses_first_durable_observation_not_wall_clock(self):
+        self.add("first", "ok")
+        self.add("second", "FAIL")
+        self.add("first", "ok")  # Late parallel completion from the earlier run.
+        path = self.directory / HISTORY_FILE
+        rows = read_history(self.directory)
+        for index, row in enumerate(rows):
+            row["recorded_at"] = 300 - index
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        row = verdict_history(self.directory)["labels"]["row"]
+        self.assertEqual([run["run_id"] for run in row["run_history"]], ["first", "second"])
+        self.assertEqual(row["latest_transition"]["to_run"], "second")
+
+    def test_report_cli_surfaces_flips_without_overriding_current_gate_verdict(self):
+        import subprocess
+        self.add("before", "FAIL")
+        self.add("after", "ok")
+        command = [sys.executable, str(Path(__file__).resolve()), "report", "--history", str(self.directory)]
+        result = subprocess.run(command, check=True, text=True, capture_output=True)
+        self.assertIn("DEFECT NEEDS FIX", result.stdout)
+        data = json.loads(subprocess.check_output(command + ["--json"], text=True))
+        self.assertEqual(data["flipping_labels"], 1)
+        path = self.directory / HISTORY_FILE
+        path.write_bytes(path.read_bytes() + b'{')
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("GATE HISTORY ERROR", result.stderr)
+
+    def test_empty_history_reports_zero_without_creating_or_truncating_it(self):
+        report = verdict_history(self.directory)
+        self.assertEqual((report["observations"], report["runs"], report["flipping_labels"]), (0, 0, 0))
+        self.assertFalse((self.directory / HISTORY_FILE).exists())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -518,6 +750,9 @@ def main() -> int:
     p.add_argument("--multiplier", type=float, default=DEFAULT_MULTIPLIER)
     p.add_argument("--floor", "--floor-seconds", dest="floor", type=float, default=DEFAULT_FLOOR)
     p.add_argument("--fallback", "--fallback-seconds", dest="fallback", type=float, default=DEFAULT_FALLBACK)
+    p = sub.add_parser("report", help="surface verdict flips and observed failure rates across all runs")
+    p.add_argument("--history", type=Path, required=True)
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("record")
     p.add_argument("--history", type=Path, required=True)
     p.add_argument("--run-id", required=True)
@@ -551,6 +786,10 @@ def main() -> int:
                 atomic_json(args.output, result)
             else:
                 print(json.dumps(result, sort_keys=True, indent=2, allow_nan=False))
+        elif args.command == "report":
+            result = verdict_history(args.history)
+            print(json.dumps(result, sort_keys=True, indent=2, allow_nan=False)
+                  if args.json else format_verdict_history(result))
         elif args.command == "record":
             record(args.history, run_id=args.run_id, label=args.label, seconds=args.seconds,
                    verdict=args.verdict, timed_out=args.timed_out, observation_id=args.observation_id)
@@ -569,8 +808,9 @@ def main() -> int:
                 raise ValueError("PID does not exist")
             print(identity[1])
         else:
-            return 0 if unittest.TextTestRunner(verbosity=2).run(
-                unittest.defaultTestLoader.loadTestsFromTestCase(HistoryTests)).wasSuccessful() else 1
+            suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
+                                       for case in (HistoryTests, FlakeHistoryTests))
+            return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
     except (OSError, ValueError, TypeError, KeyError) as exc:
         print(f"GATE HISTORY ERROR: {exc}", file=sys.stderr)
         return 2
