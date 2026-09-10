@@ -666,6 +666,73 @@ pausable(){ printf '%s\0' "$@" > "$RUN_DIR/argv"; return "$BUILD_RC"; }
                 self.assertFalse(any(arg.endswith('.o') for arg in args))
 
 
+class CompleteTierDispatch(unittest.TestCase):
+    def test_real_coordinator_keeps_full_jobs_and_measures_only_after_join(self):
+        import gateplan
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        start = gate[gate.index('start_workers(){'):gate.index('\ncollect_job(){')]
+        # Keep the real quick exit, collectors and ABBA background/wait dispatch. Replace only
+        # the workload boundaries; a premature measurement, lost full job or wrong argv fails.
+        coordinator = gate[gate.index('\nstart_workers\n'):
+                           gate.index('\ncase "$ABBA_RC" in')]
+        ledger = next(line for line in gate.splitlines() if line.startswith('LEDGER=${GATE_LEDGER:'))
+        topology = {cpu: frozenset((cpu, cpu + 1000)) for cpu in range(16)}
+        topology.update({cpu + 1000: group for cpu, group in list(topology.items())})
+        full_only = {'asan_batteries', 'replyoff', 'zc', 'rldbg', 'rlcache',
+                     'differ-split', 'differ-armed', 'globcase'}
+        stub = r'''
+GATE_SLOTS=0; PASS=0; FAIL=0; EXPECT_QUICK=419; GATE_STARTED=$SECONDS; JOINED=0
+LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; : > "$LEDGER"; : > "$TIMINGS"
+phase(){ printf 'PHASE %s\n' "$1" >> "$EVENTS"; }
+program_state(){ :; }
+quiet_wait(){ :; }
+collect_job(){
+  case " ${JOB_NAMES[*]} " in *" $1 "*) ;; *) echo "unreached job $1" >&2; exit 71;; esac
+  printf 'COLLECT %s\n' "$1" >> "$EVENTS"
+}
+join_workers(){ JOINED=1; printf 'JOIN\n' >> "$EVENTS"; }
+python3(){
+  [ "$JOINED" = 1 ] || { echo 'measurement before worker join' >&2; return 72; }
+  case " ${JOB_NAMES[*]} " in *' abba '*|*' perf '*) return 73;; esac
+  printf 'ABBA\n' >> "$EVENTS"
+  printf '%s\0' "$@" > "$RUN_DIR/argv"
+}
+'''
+        with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+            for purpose in ('iteration', 'push', 'release', 'full', 'quick'):
+                with self.subTest(purpose=purpose):
+                    with patch.dict(os.environ, {}, clear=True):
+                        args = gateplan.parser().parse_args([purpose, '--server-cores', '0-7',
+                                                            '--load-cores', '8-15'])
+                    plan = gateplan.make_plan(args, topology=topology, available=set(topology),
+                                              check_available=False)
+                    directory = Path(temporary) / purpose
+                    directory.mkdir()
+                    env = dict(os.environ, RUN_DIR=str(directory), EVENTS=str(directory / 'events'))
+                    env.pop('GATE_LEDGER', None)
+                    script = gateplan.shell_plan(plan) + ledger + '\nprintf "%s\\n" "$LEDGER"\n'
+                    result = subprocess.run(['bash', '-uc', script + stub + start + coordinator],
+                        cwd=root, env=env, text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[0], str(root / f'build/gate-ledger-{purpose}.txt'))
+                    events = (directory / 'events').read_text().splitlines()
+                    collected = {event.removeprefix('COLLECT ') for event in events if event.startswith('COLLECT ')}
+                    if purpose == 'quick':
+                        self.assertFalse(collected & full_only)
+                        self.assertNotIn('ABBA', events)
+                    else:
+                        self.assertTrue(full_only <= collected)
+                        self.assertEqual(events.count('ABBA'), 1)
+                        self.assertLess(events.index('JOIN'), events.index('ABBA'))
+                        self.assertTrue(all(index < events.index('JOIN') for index, event in enumerate(events)
+                                            if event.startswith('COLLECT ')))
+                        argv = (directory / 'argv').read_bytes().decode().rstrip('\0').split('\0')
+                        self.assertEqual(argv[0], 'tests/abbagate.py')
+                        self.assertEqual(argv[argv.index('--subset') + 1],
+                                         'smoke' if purpose == 'iteration' else 'full')
+
+
 class PerfCandidateDispatch(unittest.TestCase):
     def dispatch(self, build_candidate, build_rc=0, unquiet=False):
         root = Path(__file__).resolve().parent.parent

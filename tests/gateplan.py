@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan disjoint correctness slots and the isolated release-gate measurement phase."""
+"""Plan the default iteration gate, full push/release gate, or correctness/perf diagnostics."""
 
 import argparse
 import json
@@ -163,6 +163,15 @@ def default_physical(available, topology):
 
 
 def make_plan(args, *, topology=None, available=None, check_available=True):
+    # The iteration budget changes only the measured cells. Normalize every complete gate to
+    # the existing full correctness path, so a new purpose cannot bypass full-only batteries.
+    purpose = args.tier
+    tier = purpose if purpose in ("quick", "perf") else "full"
+    subset = args.subset or ("smoke" if purpose == "iteration" else "full")
+    if purpose == "quick" and args.subset is not None:
+        raise ValueError("quick is correctness-only and does not accept --subset")
+    if purpose in ("push", "release", "full") and subset != "full":
+        raise ValueError(f"{purpose} requires --subset full; smoke is an iteration/perf diagnostic")
     if topology is None:
         topology = read_topology()
     if available is None:
@@ -188,7 +197,7 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
             server = remaining
         else:
             load = remaining
-    axes = validate_axes(server, args.server_smt, load, args.load_smt,
+    axes = validate_axes(server, args.server_smt, load, args.load_smt or "",
                          topology=topology, check_available=check_available)
     total = len(server) + len(load)
     if not MIN_PHYSICAL <= total <= MAX_PHYSICAL:
@@ -215,14 +224,24 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
                       "port": first + PORTS_PER_SLOT * index})
     # Correctness partitions and the headline measurement have different geometry. Once every
     # correctness child has exited, the measurement keeps at most 32 physical server cores and
-    # gives the surplus physical cores to its load generators. Only explicitly supplied SMT
-    # CPUs follow their physical core; omitted siblings stay reserved in both phases.
+    # gives every other selected physical core to its load generators. Correctness needs protocol
+    # traffic, not saturation: omitted load SMT stays unused there. Regression needs headroom:
+    # omission enables available load siblings, while an explicitly empty --load-smt reserves
+    # them. Server SMT is never automatic, and no server physical sibling can enter the load set.
     perf_server = server[:32]
     perf_load = sorted(load + server[32:])
     server_groups = {topology[cpu] for cpu in perf_server}
     perf_server_smt = [cpu for cpu in axes["server_smt"] if topology[cpu] in server_groups]
     perf_load_smt = sorted(axes["load_smt"] + [cpu for cpu in axes["server_smt"]
                                                if topology[cpu] not in server_groups])
+    if args.load_smt is None:
+        load_groups = {topology[cpu] for cpu in perf_load}
+        perf_load_smt = sorted({cpu for group in load_groups for cpu in group
+                                if cpu in available and cpu in topology} - set(perf_load))
+    # Validate the derived phase as well as the user axes: topology/availability filtering must
+    # never turn the headroom default into physical-core contention with a server thread.
+    validate_axes(perf_server, perf_server_smt, perf_load, perf_load_smt,
+                  topology=topology, check_available=check_available)
     perf = {"server_cores": cpu_string(perf_server), "server_smt": cpu_string(perf_server_smt),
             "load_cores": cpu_string(perf_load), "load_smt": cpu_string(perf_load_smt),
             "server_cpus": cpu_string(perf_server + perf_server_smt),
@@ -233,11 +252,15 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
     build_cpus = sorted(cpu for values in axes.values() for cpu in values)
     header = (f"{total} physical cores; {count} correctness slots = min({len(server)}/8 server, "
               f"{len(load)}/2 load), 8 server threads at ratio {os.getenv('GATE_RATIO', '6:2')} and 3 ports per slot; "
-              f"correctness server SMT reserved; isolated ABBA {len(perf_server)} server + "
-              f"{len(perf_load)} load physical cores, SMT only when explicitly supplied")
+              f"correctness load is modest protocol traffic (at least 2 physical cores per slot), "
+              f"server SMT reserved; isolated ABBA {subset}: {len(perf_server)} server + "
+              f"{len(perf_load)} load physical cores, {len(perf_load_smt)} load SMT threads "
+              f"({'automatic available siblings' if args.load_smt is None else 'explicit selection'}), "
+              f"{len(perf_server_smt)} explicit server SMT threads")
     if len(server) > len(perf_server):
         header += f" ({len(server)-len(perf_server)} surplus server cores move to ABBA load)"
-    return {"tier": args.tier, "physical_cores": total, "slot_count": count,
+    return {"tier": tier, "purpose": purpose, "subset": subset,
+            "physical_cores": total, "slot_count": count,
             "server_per_slot": SERVER_PER_SLOT, "load_min_per_slot": LOAD_PER_SLOT,
             "ports_per_slot": PORTS_PER_SLOT, "ports_first": first, "ports_last": last,
             "axes": {key: cpu_string(value) for key, value in axes.items()}, "slots": slots,
@@ -248,7 +271,8 @@ def make_plan(args, *, topology=None, available=None, check_available=True):
 
 
 def shell_plan(plan):
-    scalars = {"TIER": plan["tier"], "GATE_PHYSICAL_CORES": plan["physical_cores"],
+    scalars = {"TIER": plan["tier"], "GATE_PURPOSE": plan["purpose"],
+               "GATE_PHYSICAL_CORES": plan["physical_cores"],
                "GATE_SLOTS": plan["slot_count"], "GATE_PORT_FIRST": plan["ports_first"],
                "GATE_PORT_LAST": plan["ports_last"], "CANDIDATE_BINARY": plan["candidate_binary"],
                "REFERENCE_BINARY": plan["reference_binary"], "PERF_THREADS": plan["perf"]["threads"],
@@ -261,7 +285,7 @@ def shell_plan(plan):
                         ("SLOT_LOAD_PHYSICAL", "load_cores"), ("SLOT_LOAD_SMT", "load_smt"),
                         ("SLOT_PORTS", "port")):
         lines.append(f"{name}=(" + " ".join(shlex.quote(str(slot[field])) for slot in plan["slots"]) + ")")
-    abba = ["--candidate-binary", plan["candidate_binary"], "--ports",
+    abba = ["--subset", plan["subset"], "--candidate-binary", plan["candidate_binary"], "--ports",
             f"{plan['ports_first']}-{plan['ports_last']}", "--port", str(plan["perf"]["port"])]
     for key in ("server_cores", "server_smt", "load_cores", "load_smt"):
         abba += ["--" + key.replace("_", "-"), plan["perf"][key]]
@@ -274,11 +298,18 @@ def shell_plan(plan):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("tier", nargs="?", choices=("quick", "full", "perf"), default="quick")
+    result.add_argument("tier", nargs="?", choices=("iteration", "push", "release", "full", "quick", "perf"),
+                        default="iteration", help="iteration (default): full correctness + smoke; "
+                        "push/release/full: full correctness + all cells; quick: correctness only; "
+                        "perf: measurement diagnostic")
+    result.add_argument("--subset", choices=("smoke", "full"), help="iteration/perf override; "
+                        "push/release/full require full; quick has no measurements")
     result.add_argument("--server-cores", default=os.getenv("GATE_SERVER_CORES", os.getenv("GATE_CORES")))
     result.add_argument("--server-smt", default=os.getenv("GATE_SERVER_SMT", ""))
     result.add_argument("--load-cores", default=os.getenv("GATE_LOAD_CORES"))
-    result.add_argument("--load-smt", default=os.getenv("GATE_LOAD_SMT", ""))
+    result.add_argument("--load-smt", default=os.getenv("GATE_LOAD_SMT"),
+                        help="explicit load sibling CPUs; omitted: automatic for ABBA only; "
+                        "empty string: reserve omitted siblings")
     result.add_argument("--ports", default=os.getenv("GATE_PORTS", "7899-7998"))
     result.add_argument("--reference-binary", default="")
     result.add_argument("--candidate-binary", "--candidate", default="")
@@ -288,6 +319,7 @@ def parser():
 
 
 def self_test():
+    import subprocess
     import unittest
     from unittest import mock
 
@@ -306,12 +338,72 @@ def self_test():
 
         def test_default_full_box(self):
             plan = self.plan()
+            self.assertEqual((plan["purpose"], plan["tier"], plan["subset"]),
+                             ("iteration", "full", "smoke"))
             self.assertEqual(plan["physical_cores"], 128)
             self.assertEqual(plan["slot_count"], 12)
             self.assertEqual(plan["perf"]["server_cores"], "0-31")
             self.assertEqual(plan["perf"]["load_cores"], "32-127")
             self.assertEqual(plan["perf"]["server_smt"], "")
+            self.assertEqual(parse_cpu_range(plan["perf"]["load_smt"]),
+                             [1000 + 3 * cpu for cpu in range(32, 128)])
+            self.assertEqual(len(parse_cpu_range(plan["perf"]["load_cpus"])), 192)
+            self.assertTrue(all(slot["load_smt"] == "" for slot in plan["slots"]))
+            self.assertEqual(plan["axes"]["load_smt"], "")
+
+        def argv(self, plan):
+            # Execute the actual shell assignment/expansion used by gate.sh. These strings
+            # include empty explicit axes and must survive quoting exactly, not just look right.
+            script = shell_plan(plan) + 'printf "%s\\0" "$TIER" "$GATE_PURPOSE" "${ABBA_ARGS[@]}"'
+            result = subprocess.run(["bash", "-uc", script], check=True, capture_output=True)
+            return result.stdout.decode().rstrip("\0").split("\0")
+
+        def test_complete_tier_aliases_emit_full_correctness_and_actual_subset_argv(self):
+            import abbagate
+            for purpose, subset in (("iteration", "smoke"), ("push", "full"),
+                                    ("release", "full"), ("full", "full")):
+                with self.subTest(purpose=purpose):
+                    tier, label, *argv = self.argv(self.plan(purpose))
+                    self.assertEqual((tier, label), ("full", purpose))
+                    with mock.patch.object(sys, "argv", ["abbagate.py", *argv]):
+                        parsed = abbagate.parse_args()
+                    self.assertEqual(parsed.subset, subset)
+                    self.assertEqual(parsed.server_cores, "0-31")
+                    self.assertEqual(len(parse_cpu_range(parsed.load_smt)), 96)
+
+        def test_diagnostic_tiers_and_strengthening_iteration(self):
+            for purpose in ("quick", "perf"):
+                plan = self.plan(purpose)
+                self.assertEqual((plan["tier"], plan["purpose"]), (purpose, purpose))
+            for purpose in ("iteration", "perf"):
+                for subset in ("smoke", "full"):
+                    self.assertEqual(self.plan(purpose, "--subset", subset)["subset"], subset)
+            for purpose in ("push", "release", "full"):
+                with self.subTest(purpose=purpose), self.assertRaisesRegex(ValueError, "requires --subset full"):
+                    self.plan(purpose, "--subset", "smoke")
+            with self.assertRaisesRegex(ValueError, "correctness-only"):
+                self.plan("quick", "--subset", "full")
+
+        def test_explicit_empty_load_smt_reserves_siblings(self):
+            plan = self.plan("--load-smt", "")
             self.assertEqual(plan["perf"]["load_smt"], "")
+            self.assertEqual(len(parse_cpu_range(plan["perf"]["load_cpus"])), 96)
+            with mock.patch.dict(os.environ, {"GATE_LOAD_SMT": ""}, clear=True):
+                args = parser().parse_args([])
+            plan = make_plan(args, topology=topology, available=set(topology), check_available=False)
+            self.assertEqual(plan["perf"]["load_smt"], "")
+
+        def test_auto_smt_obeys_selected_budget_and_available_topology(self):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                args = parser().parse_args(["--server-cores", "0-15", "--load-cores", "32-47"])
+            available = set(range(128)) | {1000 + 3 * cpu for cpu in range(40, 64)}
+            plan = make_plan(args, topology=topology, available=available, check_available=False)
+            self.assertEqual(plan["perf"]["server_cores"], "0-15")
+            self.assertEqual(plan["perf"]["load_cores"], "32-47")
+            self.assertEqual(parse_cpu_range(plan["perf"]["load_smt"]),
+                             [1000 + 3 * cpu for cpu in range(40, 48)])
+            for cpu in parse_cpu_range(plan["perf"]["load_cpus"]):
+                self.assertFalse(topology[cpu] & set(range(16)))
 
         def test_minimum_budget(self):
             plan = self.plan("--server-cores", "0-7", "--load-cores", "8-15", "--ports", "9000-9002")
@@ -322,8 +414,7 @@ def self_test():
         def test_planned_port_overrides_stale_abba_environment(self):
             import abbagate
             plan = self.plan("--server-cores", "0-7", "--load-cores", "8-15", "--ports", "9000-9002")
-            line = next(line for line in shell_plan(plan).splitlines() if line.startswith("ABBA_ARGS=("))
-            argv = shlex.split(line[len("ABBA_ARGS=("):-1])
+            _, _, *argv = self.argv(plan)
             with mock.patch.dict(os.environ, {"GATE_ABBA_PORT": "65000"}, clear=True), \
                  mock.patch.object(sys, "argv", ["abbagate.py", *argv]):
                 parsed = abbagate.parse_args()

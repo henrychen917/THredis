@@ -1,24 +1,32 @@
 #!/bin/bash
 # RELEASE GATE for tomokv-cpp (split/fused correctness and performance).
 #
-#   tests/gate.sh quick   loopback only: build (release+ASAN), footprint locks, boot
+#   tests/gate.sh         iteration (default): ALL full correctness + the smoke ABBA subset.
+#   tests/gate.sh iteration   same default tier; the subset saves only regression cells.
+#   tests/gate.sh push    full correctness + ALL regression cells, required for push/release.
+#   tests/gate.sh release same as push. `full` is the legacy alias for the same complete gate.
+#   tests/gate.sh quick   legacy correctness-only diagnostic: build (release+ASAN), footprint locks, boot
 #                         matrix, smoke, torture, RYOW, atomic torn/mixed-write/window gates,
 #                         shutdown invariants, counter-fired feature matrix, idle-loop ceiling. Runs on
 #                         any machine with at least 16 physical cores.
-#   tests/gate.sh full    quick + the mandatory headline ABBA tier (the last pushed binary against
+#   Complete gates add torture-under-ASAN + the Redis 7.4 differential matrix and mandatory ABBA
+#                         (the last pushed binary against
 #                         the candidate, same session, same box, threshold derived from the
 #                         reference's own spread; a missing reference SKIPS LOUDLY and stays red)
-#                         + torture-under-ASAN + the Redis 7.4 differential matrix
 #                         + NIC regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
 #                         netns rig and its scratchpad binaries/procsafe helper).
 #
 #   Resource options (CPU lists accept ranges and commas):
 #     --server-cores LIST  --server-smt LIST  --load-cores LIST  --load-smt LIST
 #     --ports FIRST-LAST  --reference-binary PATH  --candidate-binary PATH
-#   Omitted physical ranges use the available topology (at most 128 physical cores); omitted
-#   SMT ranges reserve those siblings unused. Correctness uses eight physical server cores per
-#   slot and at least two separate physical load cores. ABBA runs after all correctness children
-#   are reaped, keeps at most 32 physical server cores, and moves surplus server cores to load.
+#   Omitted physical ranges use the available topology (at most 128 physical cores). Server SMT
+#   is enabled only when explicitly supplied. Correctness uses eight physical cores per slot and at
+#   least two separate physical load cores: modest protocol traffic is sufficient for these rows.
+#   ABBA runs after all correctness children are reaped, keeps at most 32 physical server cores,
+#   and gives all remaining selected physical cores plus their available SMT siblings to load.
+#   Explicit --load-smt (including an empty string) overrides that automatic ABBA sibling set.
+#   A load CPU must never share a physical core with a server CPU. --subset smoke is forbidden
+#   for push/release/full; iteration can opt into full, and perf can select either diagnostically.
 #   --candidate-binary bypasses only the release build; instrumented source builds still run.
 #
 #   Every feature battery runs on three boots: split (both atomic modes), fused, and fused with the
@@ -44,7 +52,7 @@ for gate_arg in "$@"; do
   esac
 done
 if [ "$GATE_SELF_TEST" = 1 ]; then
-  if [ "${1:-quick}" = perf ]; then
+  if [ "${1:-iteration}" = perf ]; then
     shift
     exec python3 tests/abbagate.py "$@"
   fi
@@ -76,7 +84,7 @@ set_slot(){
   taskset -pc "$LOAD_CORES" "$BASHPID" >/dev/null
 }
 set_slot 0
-printf 'GATE(%s): %s\n  artifacts: %s\n' "$TIER" "$PLAN_HEADER" "$RUN_DIR"
+printf 'GATE(%s): %s\n  artifacts: %s\n' "$GATE_PURPOSE" "$PLAN_HEADER" "$RUN_DIR"
 if [ "$TIER" = perf ]; then
   # An omitted candidate means the current tree in every tier. Otherwise a perf-only invocation
   # could measure stale release objects after a source edit and still label them the candidate.
@@ -115,7 +123,7 @@ export TOMO_GATE_STRICT=1
 # Ledger columns are verdict, the row's own elapsed seconds, and stable identity,
 # assembled in source order. Compare identities/verdicts after projecting out duration.
 # The sidecar retains observed labels/counters; families.tsv measures whole worker jobs.
-LEDGER=${GATE_LEDGER:-$PWD/build/gate-ledger-$TIER.txt}
+LEDGER=${GATE_LEDGER:-$PWD/build/gate-ledger-$GATE_PURPOSE.txt}
 [ -f "$LEDGER" ] && mv -f "$LEDGER" "$LEDGER.prev"
 TIMINGS="$LEDGER.timings"
 [ ! -f "$TIMINGS" ] || mv -f "$TIMINGS" "$TIMINGS.prev"
@@ -334,7 +342,7 @@ program_state(){
   else
     bad "PROGRAM-STATE ledger" "$actual/$expect checks"
     if [ -f "$LEDGER.prev" ]; then
-      echo "  rows that differ from the previous $TIER ledger (< only in previous run, > only now):"
+      echo "  rows that differ from the previous $GATE_PURPOSE ledger (< only in previous run, > only now):"
       diff <(ledger_labels "$LEDGER.prev") <(ledger_labels "$LEDGER") | grep '^[<>]' | sed 's/^/    /'
     fi
   fi
@@ -2623,5 +2631,5 @@ fi
 phase end
 program_state "$((EXPECT_FULL+NIC_CHECKED))"
 echo
-echo "GATE(full): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED, wall $((SECONDS-GATE_STARTED))s)"
+echo "GATE($GATE_PURPOSE): $PASS ok, $FAIL FAIL (ABBA rc=$ABBA_RC, NIC checked=$NIC_CHECKED, wall $((SECONDS-GATE_STARTED))s)"
 [ $FAIL -eq 0 ] || exit 1
