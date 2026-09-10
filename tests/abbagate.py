@@ -910,6 +910,7 @@ class Runner:
         self.load_cpus = sorted(cpus(args.load_cores) + cpus(args.load_smt))
         self.legacy_reorder_controls = {}
         self.legacy_reorder_failures = {}
+        self.profile_factory = None  # Diagnostic opt-in only: no default PMCs or profile objects.
 
     def legacy_reorder_control(self, cell, arm, knobs):
         if cell.op != 'REORDER' or arm != 'A' or 'x-ex-sched' not in knobs:
@@ -983,6 +984,7 @@ class Runner:
         return None
 
     def measure(self, cell, arm, sequence, instances, knobs):
+        profile = None
         legacy_control = self.legacy_reorder_control(cell, arm, knobs)
         folder = self.out / cell.id / f"n{instances}-{sequence}-{arm}"
         folder.mkdir(parents=True)
@@ -1075,11 +1077,20 @@ class Runner:
                               assigned_cpus=placement["cpus"], status="INCOMPLETE")
                 generator_cpu["processes"].append(sample)
                 sample["before"] = generator_cpu_endpoint(process)
+            if self.profile_factory is not None:
+                profile = self.profile_factory(folder)
+                result["cpu_profile"] = profile.record
+                profile.begin(srv, generators)
             before = info(conn, "stats")
             before_cpu, t0 = cpu_seconds(srv.pid), time.monotonic()
             time.sleep(WINDOW)
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
+            if profile is not None:
+                # The same unmodified central command count/window remains the rate.
+                # PMCs encompass it; every wider endpoint offset is retained explicitly.
+                profile.finish(t0, t1, int(after["total_commands_processed"]) -
+                               int(before["total_commands_processed"]) - 1)
             generator_cpu.update(central_start_monotonic=t0, central_end_monotonic=t1,
                                  central_window_seconds=t1 - t0)
             for sample, process in zip(generator_cpu["processes"], generators):
@@ -1140,20 +1151,31 @@ class Runner:
                 # represented as a histogram of only WINDOW seconds.
                 result["histogram_window_seconds"] = WARMUP + WINDOW + TAIL
         except BaseException as e:
+            if profile is not None and profile.record.get("status") == "INCOMPLETE":
+                profile.fail(e)
             if result.get("generator_cpu", {}).get("status") == "INCOMPLETE":
                 result["generator_cpu"].update(status="INVALID", error=f"{type(e).__name__}: {e}")
             result["complete"] = False
             result["error"] = f"{type(e).__name__}: {e}"
             raise
         finally:
-            if conn:
-                conn.close()
-            for p in generators:
-                self.children.stop(p)
-            if srv:
-                self.children.stop(srv)
-            result["wall_seconds"] = time.monotonic() - started
-            (folder / "measurement.json").write_text(json.dumps(result, indent=2) + "\n")
+            try:
+                if profile is not None:
+                    profile.close()
+            except BaseException as error:
+                result.update(complete=False, error=f"profile cleanup: {type(error).__name__}: {error}")
+                profile.fail(error)
+                raise
+            finally:
+                # A failed counter/artifact close must never strand owned children.
+                if conn:
+                    conn.close()
+                for p in generators:
+                    self.children.stop(p)
+                if srv:
+                    self.children.stop(srv)
+                result["wall_seconds"] = time.monotonic() - started
+                (folder / "measurement.json").write_text(json.dumps(result, indent=2) + "\n")
         print(f"    {result['rate']/1e6:.5f}M/s busy={result['busy_pct']:.3f}% "
               f"CPU={result['cpu_pct']:.3f}% latency={result['latency_ms']:.5f}ms", flush=True)
         return result
@@ -1233,7 +1255,7 @@ def parse_args():
     return p.parse_args()
 
 
-def main(args, *, diagnostic_monitor=None):
+def main(args, *, diagnostic_monitor=None, diagnostic_profile=0):
     if args.list_cells:
         cells = selected_cells(read_cells(args.cells), args.subset, args.only)
         print(json.dumps({"subset": args.subset, **coverage(cells)}, indent=2))
@@ -1271,6 +1293,11 @@ def main(args, *, diagnostic_monitor=None):
     for sig in old_handlers:
         signal.signal(sig, interrupted)
     try:
+        if diagnostic_profile not in (0, 1) or diagnostic_profile and diagnostic_monitor is None:
+            report.update(measurement_valid=False, normal_gate_eligible=False)
+            raise ValueError("CPU profiling requires the permanently untrusted diagnostic runner")
+        if diagnostic_profile:
+            report["cpu_profile_requested"] = True
         quiet_file = os.getenv("GATE_QUIET_FILE")
         if quiet_file:
             quiet_path = Path(quiet_file)
@@ -1346,6 +1373,11 @@ def main(args, *, diagnostic_monitor=None):
             raise RuntimeError("memtier_benchmark not available")
         args.memtier = str(Path(args.memtier).resolve())
         runner = Runner(args, out, binaries, children)
+        if diagnostic_profile:
+            # Dormant imports are included in the instrument fingerprint. The normal
+            # path neither imports the helper nor allocates any perf/profile state.
+            from abba_profile import WindowProfile
+            runner.profile_factory = WindowProfile
         report["environment"] = {"uname": list(os.uname()),
                                  "python_runtime": report["instrument_fingerprint"]["python"],
                                  "server_cpus": server_cpus,
@@ -1763,9 +1795,11 @@ def self_test():
             # Exercise Runner.measure itself, including argv production, generator
             # waits, JSON parsing, both endpoint reads and failure artifacts. Only
             # process/network/time boundaries are fake; the accounting is real.
-            for corruption in (0, -1, 10000, "cpu-reset", "cpu-exit"):
-                with self.subTest(corruption=corruption), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+            for corruption, profile_mode in [(value, 0) for value in (0, -1, 10000, "cpu-reset", "cpu-exit")] + [
+                    (0, value) for value in ("on", "begin-fail", "finish-fail", "close-fail")]:
+                with self.subTest(corruption=corruption, profile=profile_mode), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                     directory, events, generators = Path(tmp), [], []
+                    stopped, profiles = [], []
                     phase = {"window": 0, "finished": 0}
                     srv = SimpleNamespace(pid=123, poll=lambda: None)
                     def start(argv, log, cwd):
@@ -1781,7 +1815,7 @@ def self_test():
                         process = SimpleNamespace(pid=124 + len(generators), poll=lambda: None, wait=wait)
                         generators.append(process)
                         return process
-                    children = SimpleNamespace(start=start, stop=lambda process: None)
+                    children = SimpleNamespace(start=start, stop=lambda process: stopped.append(process.pid))
                     conn = SimpleNamespace(must=lambda *args: [args[-1].encode(), b"1"], close=lambda: None)
                     def snapshot(_conn, section):
                         if section == "server":
@@ -1812,6 +1846,34 @@ def self_test():
                     args = SimpleNamespace(server_cores="0-1", server_smt="", load_cores="2-3", load_smt="",
                                            port=9090, memtier="never-executed-memtier")
                     runner = Runner(args, directory, {"A": Path("never-executed-server")}, children)
+                    class Profile:
+                        def __init__(inner, folder):
+                            profiles.append(inner)
+                            inner.record = {"status": "INCOMPLETE", "normal_gate_eligible": False}
+                        def begin(inner, server, loads):
+                            self.assertIs(server, srv)
+                            self.assertEqual(loads, generators)
+                            self.assertEqual(phase["window"], 1)
+                            inner.before = time.monotonic()
+                            if profile_mode == "begin-fail":
+                                raise RuntimeError("profile injected begin failure")
+                        def finish(inner, first, last, count):
+                            self.assertEqual(phase["window"], 2)
+                            self.assertLessEqual(inner.before, first)
+                            self.assertLess(first, last)
+                            self.assertLessEqual(last, time.monotonic())
+                            self.assertEqual(count, 4000)
+                            if profile_mode == "finish-fail":
+                                raise RuntimeError("profile injected finish failure")
+                            inner.record["status"] = "COMPLETE"
+                        def fail(inner, error):
+                            inner.record.update(status="INVALID", error=str(error))
+                        def close(inner):
+                            if profile_mode == "close-fail":
+                                raise RuntimeError("profile injected close failure")
+                    self.assertIsNone(runner.profile_factory)
+                    if profile_mode:
+                        runner.profile_factory = Profile
                     lb = SimpleNamespace(threads={i: {"role": "fused", "busy": 10, "idle": 0} for i in (0, 1)})
                     with mock.patch.multiple(__name__, require_unbound_port=mock.Mock(), Conn=mock.Mock(return_value=conn),
                             info=mock.Mock(side_effect=snapshot), lb_snapshot=mock.Mock(return_value=lb),
@@ -1820,7 +1882,10 @@ def self_test():
                             busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={})), \
                          mock.patch.object(runner, "populate", return_value=None), \
                          mock.patch.object(time, "sleep", side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
-                        if isinstance(corruption, str):
+                        if profile_mode not in (0, "on"):
+                            with self.assertRaisesRegex(RuntimeError, "profile injected"):
+                                runner.measure(cell, "A", 1, 2, {})
+                        elif isinstance(corruption, str):
                             with self.assertRaisesRegex(RuntimeError, "CPU counter reset|exited during CPU endpoint"):
                                 runner.measure(cell, "A", 1, 2, {})
                         elif corruption:
@@ -1832,7 +1897,17 @@ def self_test():
                             self.assertEqual(result["whole_run_accounting"]["commands"]["GET"]["server_calls"], 10000)
                     self.assertEqual(events[0], ("commandstats", 0, 0))
                     retained = json.loads((directory / cell.id / "n2-1-A/measurement.json").read_text())
-                    self.assertEqual(retained["complete"], not bool(corruption))
+                    self.assertEqual(retained["complete"], not bool(corruption) and profile_mode in (0, "on"))
+                    self.assertEqual(stopped, [124, 125, 123])
+                    if profile_mode:
+                        self.assertEqual(len(profiles), 1)
+                        self.assertEqual(retained["cpu_profile"]["status"], "COMPLETE" if profile_mode == "on" else "INVALID")
+                        self.assertFalse(retained["cpu_profile"]["normal_gate_eligible"])
+                    else:
+                        self.assertEqual(profiles, [])
+                        self.assertNotIn("cpu_profile", retained)
+                    if profile_mode not in (0, "on"):
+                        continue
                     cpu = retained["generator_cpu"]
                     self.assertFalse(cpu["decision_input"])
                     self.assertEqual(cpu["generator_headroom"], "UNPROVEN")
@@ -2172,7 +2247,7 @@ def self_test():
 
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
                       climbing=False, ceiling=16, contend_after=None, reference_error=None, rates=None,
-                      run_overrides=None, load_cores="32-127", load_smt="160-255"):
+                      run_overrides=None, load_cores="32-127", load_smt="160-255", diagnostic_profile=0):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
             # pin=3/512 fixture also catches silently skipping a non-doubling pin.
@@ -2223,8 +2298,17 @@ def self_test():
                      mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(stream):
-                    rc = main(args)
+                    rc = main(args, diagnostic_profile=diagnostic_profile)
                 return rc, order, layouts, json.loads((output / "results.json").read_text()), stream.getvalue()
+
+        def test_profile_cannot_be_enabled_in_normal_gate_or_cli(self):
+            rc, calls, _, report, _ = self.fake_main(pin=4, diagnostic_profile=1)
+            self.assertEqual((rc, calls), (1, []))
+            self.assertIn("permanently untrusted diagnostic", report["reason"])
+            self.assertFalse(report["measurement_valid"])
+            with mock.patch.object(sys, "argv", ["abbagate.py", "--profile", "1"]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args()
 
         def test_contender_invalidates_real_loop_without_retry_or_threshold_change(self):
             threshold_before = paired(self.round([100, 100, 100, 100])["runs"])["threshold_pct"]

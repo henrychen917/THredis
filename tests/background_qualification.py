@@ -504,7 +504,7 @@ def run(args):
         output = options.output.resolve()
         (output / "reviewed-background.json").write_bytes(inventory_bytes)
         return QualificationMonitor(*positional, reviewed=reviewed, document=document, output=output, **keywords)
-    rc = abba.main(options, diagnostic_monitor=monitor)
+    rc = abba.main(options, diagnostic_monitor=monitor, diagnostic_profile=getattr(args, "profile", 0))
     report = json.loads((options.output / "results.json").read_text())
     sample_file = options.output / "background-samples.jsonl"
     events = [json.loads(line) for line in sample_file.read_text().splitlines()] if sample_file.exists() else []
@@ -918,7 +918,19 @@ def self_test():
             self.assertEqual(result[0]["sample_lines"], [1, 2, 3])
             self.assertEqual(result[0]["foreign_user_activity"][0]["cpu_ticks"], 9)
 
-        def test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(self):
+        def test_profile_cli_is_numeric_and_default_off(self):
+            argv = ["background_qualification.py", "run", "--inventory", "x", "--candidate", "y", "--output", "z"]
+            for flags, expected in (([], 0), (["--profile", "1"], 1)):
+                with mock.patch.object(sys, "argv", argv + flags):
+                    self.assertEqual(parse_args().profile, expected)
+            with mock.patch.object(sys, "argv", argv + ["--profile", "2"]), \
+                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parse_args()
+
+        def test_profiled_real_loop_stays_permanently_untrusted(self):
+            self.test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(profile=1)
+
+        def test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(self, profile=0):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 candidate = root / "candidate"
@@ -929,12 +941,17 @@ def self_test():
                 cells = root / "cells"
                 cells.write_text("".join(f"{name} | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | - | - | 4\n" for name in CELLS))
                 args = SimpleNamespace(inventory=manifest, candidate=candidate, output=root / "output", cells=cells,
-                    memtier=sys.executable, server_cores="0-31", load_cores="32-63", server_smt="", load_smt="", ports=None, port="9079")
+                    profile=profile, memtier=sys.executable, server_cores="0-31", load_cores="32-63", server_smt="", load_smt="", ports=None, port="9079")
                 phases, calls, writes = [], [], []
                 fake = SimpleNamespace(start=lambda: None, check=lambda: None, set_phase=phases.append,
                     evidence=lambda: {"complete": False, "scope": "background-qualification"},
                     close=lambda: {"complete": False, "scope": "background-qualification"})
                 def measure(runner, cell, arm, sequence, instances, knobs):
+                    if profile:
+                        from abba_profile import WindowProfile
+                        self.assertIs(runner.profile_factory, WindowProfile)
+                    else:
+                        self.assertIsNone(runner.profile_factory)
                     calls.append((cell.id, instances, sequence, arm))
                     return {"arm": arm, "rate": 100, "busy_pct": 99.9, "latency_ms": 1,
                             "instances": instances, "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
@@ -965,6 +982,7 @@ def self_test():
                 self.assertEqual(len([phase for phase in phases if phase.startswith("measurement:")]), 12)
                 self.assertGreaterEqual(len(writes), 4)
                 result = writes[-1]
+                self.assertEqual(result.get("cpu_profile_requested", False), bool(profile))
                 self.assertEqual(result["statistical_verdict"], "PASS")
                 self.assertEqual(result["null_control"]["verdict"], "UNTRUSTED")
                 counts = json.loads((args.output / "qualification-windows.json").read_text())
@@ -992,6 +1010,8 @@ def parse_args():
     launch.add_argument("--output", required=True, type=Path)
     launch.add_argument("--cells", type=Path, default=abba.ROOT / "tests/headline_cells.txt")
     launch.add_argument("--memtier", default="memtier_benchmark")
+    launch.add_argument("--profile", type=int, choices=(0, 1), default=0,
+                        help="1 records owned task/PMC diagnostics; remains ineligible as gate/null evidence")
     for name in ("server-cores", "load-cores", "server-smt", "load-smt", "ports", "port"):
         launch.add_argument("--" + name)
     commands.add_parser("self-test", help="serverless identity and real-loop controls")
