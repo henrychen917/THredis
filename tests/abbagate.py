@@ -68,7 +68,29 @@ WINDOW = 20
 WARMUP = 3
 TAIL = 5
 KEYS = 2_000_000
-MIN_BUSY = 98.0
+MIN_BUSY = 98.0        # the busy level we PREFER, and still record; no longer a hard gate
+BUSY_FLOOR = 95.0      # below this a cell is rejected outright, plateau or not
+#
+# SATURATION IS ESTABLISHED BY A RATE PLATEAU, NOT BY A BUSY PERCENTAGE ALONE (owner ruling
+# 2026-09-10). Demanding >=98% busy in every run fails a candidate FOR BEING FASTER: a quicker
+# server does the same offered work with less CPU, so on 2026-09-10 the h12 SET cell sat at 97.1%
+# busy while delivering 24.6 Mops/s against the reference's 22.2 at 98.4% -- an 11% gain the gate
+# refused to certify. Adding 50% more load generator threads did not move it; the server simply
+# could not be pinned at 98% by any load this box can offer.
+#
+# The evidence that no headroom is absorbing a regression is that MORE LOAD NO LONGER RAISES THE
+# RATE. That is measured directly, and it also fixes a second defect: escalation used to judge on
+# the HIGHEST instance count, but past the optimum a write cell falls into congestion collapse --
+# h12 peaked at 26.6 Mops/s with 2 instances and decayed to 24.6 by 16, so the verdict was being
+# taken on a deliberately degraded block. The peak block is the measurement; blocks above it exist
+# to PROVE it is a peak.
+# Load-generator escalation ladder. 8 was not enough: on 2026-09-10 the h12 SET cell left the
+# CANDIDATE arm at 97.1% busy while the reference sat at 98.4%, because the candidate was 10.7%
+# faster and therefore did the same offered work with less CPU. A faster server needs MORE load to
+# saturate, so capping the ladder at 8 makes an improvement fail the saturation precondition -- the
+# gate would reject exactly the changes it exists to certify. The 98% floor itself is correct and
+# stays: it is the project's "escalate until the fastest arm stops gaining AND server idle <= 2%".
+LADDER = (1, 2, 4, 8, 16)
 # Project measurement-integrity boundary, NOT the regression tolerance.
 MAX_SPREAD = 2.0
 ORDER = ("A", "B", "B", "A")
@@ -208,8 +230,22 @@ def paired(runs, metric="rate"):
             "threshold_pct": spread(a1, a2)}
 
 
+def fastest_mean(round_):
+    p = paired(round_["runs"])
+    return max(p["reference_mean"], p["candidate_mean"])
+
+
+def peak_index(rounds):
+    """Index of the block where the fastest arm peaked.
+
+    Escalating past the peak is congestion, not saturation, so the peak block is what gets judged.
+    """
+    return max(range(len(rounds)), key=lambda i: fastest_mean(rounds[i]))
+
+
 def assess(cell, rounds):
-    current = rounds[-1]
+    peak = peak_index(rounds)
+    current = rounds[peak]
     rate = paired(current["runs"])
     p = paired(current["runs"], "latency_ms") if cell.depth == 1 else rate
     reasons = []
@@ -222,22 +258,20 @@ def assess(cell, rounds):
         reasons.append("paired regression exceeds measured reference spread")
     gain, plateau_noise = None, None
     if cell.depth > 1:
-        if len(rounds) < 2:
-            reasons.append("no higher-instance saturation probe")
+        # A peak is only a peak if something above it failed to beat it. Without a higher probe the
+        # curve may still be climbing and this block is simply the last one we happened to run.
+        if peak == len(rounds) - 1:
+            reasons.append("no higher-instance saturation probe above the peak block")
         else:
-            previous = paired(rounds[-2]["runs"])
+            above = paired(rounds[peak + 1]["runs"])
             fast = max(rate["reference_mean"], rate["candidate_mean"])
-            before = max(previous["reference_mean"], previous["candidate_mean"])
-            gain = 100 * (fast / before - 1)
-            plateau_noise = max(previous["reference_spread_pct"], rate["reference_spread_pct"])
-            if previous["reference_spread_pct"] > MAX_SPREAD:
-                reasons.append("previous saturation probe was unstable")
-            if previous["candidate_spread_pct"] > MAX_SPREAD:
-                reasons.append("previous candidate saturation probe was unstable")
+            beyond = max(above["reference_mean"], above["candidate_mean"])
+            gain = 100 * (beyond / fast - 1)
+            plateau_noise = max(above["reference_spread_pct"], rate["reference_spread_pct"])
             if gain > plateau_noise:
                 reasons.append("fastest arm is still gaining with more load instances")
-        if any(r["busy_pct"] < MIN_BUSY for r in current["runs"]):
-            reasons.append(f"server not at least {MIN_BUSY:g}% busy in every ABBA run")
+        if any(r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
+            reasons.append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
     return {**p, "throughput": rate, "instances": current["instances"],
             "busy_pct_abba": [r["busy_pct"] for r in current["runs"]],
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
@@ -247,16 +281,22 @@ def assess(cell, rounds):
 
 
 def saturation_done(cell, rounds):
+    """Stop escalating once the peak block is proven -- i.e. a HIGHER instance count exists and did
+    not beat it -- and that peak block is itself stable. Escalating further only walks deeper into
+    congestion and cannot change the verdict, since the peak is what gets judged."""
     if cell.depth == 1:
         return True
+    if len(rounds) < 2:
+        return False
+    peak = peak_index(rounds)
+    if peak == len(rounds) - 1:
+        return False                      # still climbing; the top block is the best so far
     a = assess(cell, rounds)
     return (a["fastest_gain_pct"] is not None
             and a["fastest_gain_pct"] <= a["plateau_noise_pct"]
-            and min(a["busy_pct_abba"]) >= MIN_BUSY
+            and min(a["busy_pct_abba"]) >= BUSY_FLOOR
             and a["throughput"]["reference_spread_pct"] <= MAX_SPREAD
-            and a["throughput"]["candidate_spread_pct"] <= MAX_SPREAD
-            and paired(rounds[-2]["runs"])["reference_spread_pct"] <= MAX_SPREAD
-            and paired(rounds[-2]["runs"])["candidate_spread_pct"] <= MAX_SPREAD)
+            and a["throughput"]["candidate_spread_pct"] <= MAX_SPREAD)
 
 
 def overall(rows):
@@ -370,6 +410,32 @@ def accepted(binary, name, value):
     raise RuntimeError(f"cannot probe {binary.name} --{name}: {p.stdout[:500]}")
 
 
+# --overlap and --reorder are RENAMES of knobs the pushed reference already has, not new features.
+# The reference at c8e61f646 accepts --x-overlap and --x-ex-sched; they are simply absent from its
+# --help, so probing by name reports them missing. Translating lets every headline cell run against
+# the reference instead of being dropped -- and dropping was the dangerous option: silently omitting
+# --overlap 1 compared overlap-on against overlap-off and reported "+17.02%" as a code win.
+LEGACY_KNOBS = {"overlap": "x-overlap", "reorder": "x-ex-sched"}
+
+
+def legacy_value(name, value, mode):
+    """Translate a candidate knob value into the reference's older grammar.
+
+    reorder maps directly (both accept 0|1), and so does 2s overlap. 1s overlap does NOT: the older
+    binary accepted 0|1|2 there, and the knob work collapsed 1s to 0|1 by mapping "on" to the
+    FULLEST schedule, which was old value 2. Old 1 was measured as a loser and no current knob
+    preserves it, so mapping 1s "on" to --x-overlap 1 would compare the candidate's surviving
+    schedule against an arm that was deleted for losing -- flattering the candidate.
+    """
+    if name == "overlap" and value and mode == "1s":
+        return 2
+    return value
+
+
+class NotComparable(RuntimeError):
+    """The reference cannot run this cell's knobs, so no verdict is meaningful."""
+
+
 def knob_plan(cell, support):
     wanted = {"thread-mode": cell.mode, "read-local": cell.read_local,
               "overlap": cell.overlap, "reorder": cell.reorder}
@@ -379,8 +445,28 @@ def knob_plan(cell, support):
         for name, value in wanted.items():
             if support[arm][name]:
                 plans[arm][name] = value
+            elif arm == "A" and name in LEGACY_KNOBS and support[arm].get(LEGACY_KNOBS[name]):
+                old, translated = LEGACY_KNOBS[name], legacy_value(name, value, cell.mode)
+                plans[arm][old] = translated
+                notes.append(f"reference takes --{name} {value} as --{old} {translated} "
+                             f"({cell.mode}); a rename, so the arms run the same configuration")
+            elif arm == "A" and name != "thread-mode" and not value:
+                # Omitting a knob the reference lacks is only sound when the cell asked for it OFF,
+                # because 0 IS this project's legacy behaviour for every knob ("0 means off and must
+                # allocate nothing"). Then both arms really are running the same experiment.
+                notes.append(f"reference predates --{name}; requested {value} is its legacy "
+                             f"behaviour, so the arms remain comparable")
             elif arm == "A" and name != "thread-mode":
-                notes.append(f"reference predates --{name}; omitted requested {value}; legacy behavior")
+                # Requested ON, and the reference cannot do it. Silently dropping the flag here
+                # compares the FEATURE against its own absence and reports the difference as if it
+                # were a code change. On 2026-09-10 that turned h12 (2s, --overlap 1) into a
+                # "+17.02%" candidate win that was nothing but overlap-on versus overlap-off: the
+                # reference c8e61f646 predates the knob. A cell whose knobs the reference cannot
+                # honour is NOT COMPARABLE against that reference, and must skip loudly rather than
+                # produce a verdict -- the note alone was printed and then ignored.
+                raise NotComparable(
+                    f"cell needs --{name} {value} but the reference predates that knob; "
+                    f"comparing against its legacy behaviour would measure the feature, not the code")
             else:
                 raise RuntimeError(f"{arm} does not accept required --{name}")
     return plans, notes
@@ -602,7 +688,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--self-test", action="store_true")
     p.add_argument("--candidate", type=Path, default=Path(os.getenv("GATE_ABBA_CANDIDATE", ROOT / "build/tomokv")))
-    p.add_argument("--cells", type=Path, default=Path(os.getenv("GATE_ABBA_CELLS", "/home/user/Projects/headline-cells.txt")))
+    p.add_argument("--cells", type=Path, default=Path(os.getenv("GATE_ABBA_CELLS", ROOT / "tests" / "headline_cells.txt")))
     p.add_argument("--bench-bins", type=Path, default=Path(os.getenv("GATE_ABBA_BINS", "/home/user/Projects/bench-bins")))
     p.add_argument("--build-reference", type=int, choices=(0, 1), default=int(os.getenv("GATE_ABBA_BUILD_REFERENCE", "1")))
     p.add_argument("--server-cores", default=os.getenv("GATE_ABBA_CORES", "8-31"))
@@ -611,7 +697,7 @@ def parse_args():
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--only", default="", help="comma-separated IDs; partial diagnostic, never a full-tier PASS")
-    p.add_argument("--max-instances", type=int, choices=(1, 2, 4, 8), default=8,
+    p.add_argument("--max-instances", type=int, choices=LADDER, default=16,
                    help="bounded doubling search (default 8); 1 cannot prove deep-pipeline saturation")
     return p.parse_args()
 
@@ -680,7 +766,8 @@ def main(args):
               "source headline file records 32 server cores; actual geometry recorded above. "
               "Cell connections are TOTAL, shared across load instances. Split uses fixed even ratio, flip=0.", flush=True)
         support = {arm: {name: accepted(binary, name, value) for name, value in
-                        (("thread-mode", "1s"), ("read-local", 0), ("overlap", 0), ("reorder", 0))}
+                        (("thread-mode", "1s"), ("read-local", 0), ("overlap", 0), ("reorder", 0),
+                         ("x-overlap", 0), ("x-ex-sched", 0))}
                    for arm, binary in binaries.items()}
         report["accepted_knobs"] = support
         runner = Runner(args, out, binaries, children)
@@ -692,7 +779,7 @@ def main(args):
                 row["knobs"] = plans
                 for note in row["notes"]:
                     print(f"  {cell.id} COMPATIBILITY: {note}", flush=True)
-                for n in (1, 2, 4, 8):
+                for n in LADDER:
                     if n > args.max_instances or n > cell.conns:
                         break
                     if cell.conns % n:
@@ -708,6 +795,13 @@ def main(args):
                         break
             except InterruptedError:
                 raise
+            except NotComparable as e:
+                # Distinct from a measurement error: nothing went wrong with the box, the cell just
+                # cannot be posed to this reference at all. Still a counted failure -- a tier that
+                # skipped these quietly would report a clean gate while silently not testing them.
+                row.pop("assessment", None)
+                row.update(verdict="FAIL", reason=f"not comparable against this reference: {e}")
+                print_cell(row)
             except Exception as e:
                 row.pop("assessment", None)
                 row.update(verdict="FAIL", reason=f"measurement error: {e}")
@@ -778,9 +872,55 @@ def self_test():
             self.assertGreater(a["loss_pct"], a["threshold_pct"])
             self.assertTrue(saturation_done(self.cell, rounds))
 
-        def test_unsaturated_equal_arms_fail(self):
-            rounds = [self.round([100] * 4, n, busy=97.99) for n in (1, 2, 4, 8)]
+        def test_flat_rate_just_under_98_busy_is_saturated(self):
+            # The 2026-09-10 h12 shape: more load stops raising the rate while the server sits a
+            # little under 98% busy, because the candidate is FASTER and needs less CPU for the
+            # same offered work. That is a plateau, not an unsaturated cell, and it must not fail.
+            rounds = [self.round([100] * 4, n, busy=97.1) for n in (1, 2, 4, 8)]
+            self.assertEqual(assess(self.cell, rounds)["verdict"], "PASS")
+
+        def test_flat_rate_below_the_busy_floor_still_fails(self):
+            # A plateau does not excuse an idle server: below the floor the cell is rejected even
+            # though more load changes nothing, because that much headroom can absorb a regression.
+            rounds = [self.round([100] * 4, n, busy=BUSY_FLOOR - 1) for n in (1, 2, 4, 8)]
             self.assertEqual(assess(self.cell, rounds)["verdict"], "FAIL")
+            self.assertFalse(saturation_done(self.cell, rounds))
+
+        def test_verdict_is_taken_at_the_peak_not_the_last_block(self):
+            # Congestion collapse: h12 peaked at 2 instances and decayed by 16. Judging the last
+            # block scores a deliberately degraded measurement. The peak is the measurement; the
+            # block above it exists only to prove it is a peak.
+            rounds = [self.round([100, 100, 100, 100], 1),
+                      self.round([200, 240, 240, 200], 2),   # peak, candidate clearly ahead
+                      self.round([150, 150, 150, 150], 4)]   # congestion past the peak
+            a = assess(self.cell, rounds)
+            self.assertEqual(a["instances"], 2)
+            self.assertGreater(a["delta_pct"], 15)
+            self.assertEqual(a["verdict"], "PASS")
+
+        def test_reference_lacking_a_requested_on_knob_is_not_comparable(self):
+            # h12 (2s, --overlap 1) against c8e61f646, which predates --overlap: dropping the flag
+            # measured overlap-on vs overlap-off and called it a "+17.02%" code win.
+            support = {"A": {"thread-mode": True, "read-local": True, "overlap": False,
+                             "reorder": False},
+                       "B": {"thread-mode": True, "read-local": True, "overlap": True,
+                             "reorder": True}}
+            on = Cell("h12", "2s", 0, 1, 0, "SET", 32, 512)
+            with self.assertRaises(NotComparable):
+                knob_plan(on, support)
+            # ... but a knob requested OFF is exactly the reference's legacy behaviour, so that
+            # cell stays comparable and only earns a note.
+            off = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
+            plans, notes = knob_plan(off, support)
+            self.assertTrue(any("legacy behaviour" in n for n in notes))
+            self.assertNotIn("overlap", plans["A"])
+
+        def test_a_peak_at_the_top_is_not_yet_proven(self):
+            # Still climbing: without a higher probe that fails to beat it, the top block might
+            # simply be the last one we ran.
+            rounds = [self.round([100] * 4, 1), self.round([200] * 4, 2)]
+            self.assertIn("no higher-instance saturation probe above the peak block",
+                          assess(self.cell, rounds)["reasons"])
             self.assertFalse(saturation_done(self.cell, rounds))
 
         def test_fastest_arm_still_gaining_fails(self):
@@ -791,10 +931,13 @@ def self_test():
         def test_one_probe_cannot_prove_plateau(self):
             self.assertEqual(assess(self.cell, [self.round([100] * 4)])["verdict"], "FAIL")
 
-        def test_busy_is_required_in_every_run(self):
+        def test_busy_floor_applies_to_every_run_of_the_judged_block(self):
+            # One idle run inside the block being judged is enough to reject it.
             rounds = [self.round([100] * 4, n) for n in (1, 2)]
-            rounds[1]["runs"][2]["busy_pct"] = 50
+            self.assertEqual(peak_index(rounds), 0)
+            rounds[0]["runs"][2]["busy_pct"] = 50
             self.assertFalse(saturation_done(self.cell, rounds))
+            self.assertEqual(assess(self.cell, rounds)["verdict"], "FAIL")
 
         def test_reference_noise_cannot_turn_a_bad_session_green(self):
             rounds = [self.round([100, 99, 99, 103], n) for n in (1, 2)]

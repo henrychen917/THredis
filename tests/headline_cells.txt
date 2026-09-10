@@ -1,0 +1,79 @@
+# Headline cells — the benches that produce this project's quoted numbers, and the regression set.
+# Format: id | thread-mode | read-local | overlap | reorder | op | depth | conns | measured | busy% | loadgen-inst
+#
+# FULL AXIS COVERAGE (owner ruling 2026-09-10): every regression check must cross 1s vs 2s,
+# read-local on/off, overlap on/off, AND depth p1 vs p32. Reorder on/off is carried too. That is
+# 2 modes x 2 read-local x 2 overlap x 2 reorder x 2 ops x 2 depths = 64 cells.
+# The p32 half was measured 2026-09-10 on cx-final (11-branch merge), 32 server cores, loopback,
+# atomics on, 2,000,000-key keyspace populated before every cell. The p1 half is UNMEASURED here:
+# depth 1 is round-trip bound by Little's law and is scored as LATENCY, not throughput, and is
+# exempt from the saturation rule. Nothing in this file is an input to a verdict — the ABBA tier
+# reads only the knob columns and measures both arms itself.
+#
+# THE GATE'S PERFORMANCE TIER MUST ABBA THESE CELLS: last-pushed binary vs candidate,
+# interleaved A/B/B/A in one session, and decide pass/fail on the comparison — never against
+# a stored number, which goes stale the moment the kernel, compiler or box changes.
+h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 26.38M | 91.89% | 4
+h02 | 1s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 24.36M | 91.85% | 4
+h03 | 1s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.70M | 91.90% | 4
+h04 | 1s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.84M | 91.87% | 4
+h05 | 1s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 21.88M | 75.45% | 4
+h06 | 1s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 20.74M | 75.38% | 4
+h07 | 1s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 20.89M | 75.42% | 4
+h08 | 1s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 20.19M | 75.54% | 3
+h09 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 52.95M | 91.78% | 4
+h10 | 1s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 21.68M | 91.89% | 4
+h11 | 1s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 52.32M | 89.03% | 3
+h12 | 1s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 21.34M | 91.90% | 4
+h13 | 1s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 52.03M | 75.48% | 3
+h14 | 1s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 19.16M | 80.35% | 3
+h15 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 52.29M | 74.34% | 3
+h16 | 1s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 18.68M | 75.53% | 3
+h17 | 2s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | 24.79M | 92.06% | 3
+h18 | 2s | rl=0 | ov=0 | ro=0 | SET | p32 | 512 | 23.39M | 92.05% | 3
+h19 | 2s | rl=0 | ov=0 | ro=1 | GET | p32 | 512 | 25.04M | 92.06% | 3
+h20 | 2s | rl=0 | ov=0 | ro=1 | SET | p32 | 512 | 23.76M | 92.07% | 3
+h21 | 2s | rl=0 | ov=1 | ro=0 | GET | p32 | 512 | 27.52M | 91.94% | 2
+h22 | 2s | rl=0 | ov=1 | ro=0 | SET | p32 | 512 | 26.27M | 91.94% | 2
+h23 | 2s | rl=0 | ov=1 | ro=1 | GET | p32 | 512 | 27.26M | 91.96% | 2
+h24 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | 25.89M | 91.96% | 2
+h25 | 2s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | 31.37M | 46.59% | 2
+h26 | 2s | rl=1 | ov=0 | ro=0 | SET | p32 | 512 | 22.68M | 92.06% | 3
+h27 | 2s | rl=1 | ov=0 | ro=1 | GET | p32 | 512 | 32.48M | 45.83% | 2
+h28 | 2s | rl=1 | ov=0 | ro=1 | SET | p32 | 512 | 22.73M | 92.05% | 3
+h29 | 2s | rl=1 | ov=1 | ro=0 | GET | p32 | 512 | 32.70M | 45.92% | 2
+h30 | 2s | rl=1 | ov=1 | ro=0 | SET | p32 | 512 | 24.10M | 92.01% | 2
+h31 | 2s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | 30.37M | 46.62% | 2
+h32 | 2s | rl=1 | ov=1 | ro=1 | SET | p32 | 512 | 23.34M | 91.94% | 2
+h33 | 1s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h34 | 1s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h35 | 1s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h36 | 1s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h37 | 1s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h38 | 1s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h39 | 1s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h40 | 1s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h41 | 1s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h42 | 1s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h43 | 1s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h44 | 1s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h45 | 1s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h46 | 1s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h47 | 1s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h48 | 1s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h49 | 2s | rl=0 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h50 | 2s | rl=0 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h51 | 2s | rl=0 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h52 | 2s | rl=0 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h53 | 2s | rl=0 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h54 | 2s | rl=0 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h55 | 2s | rl=0 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h56 | 2s | rl=0 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h57 | 2s | rl=1 | ov=0 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h58 | 2s | rl=1 | ov=0 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h59 | 2s | rl=1 | ov=0 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h60 | 2s | rl=1 | ov=0 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
+h61 | 2s | rl=1 | ov=1 | ro=0 | GET | p1 | 512 | unmeasured | unmeasured | -
+h62 | 2s | rl=1 | ov=1 | ro=0 | SET | p1 | 512 | unmeasured | unmeasured | -
+h63 | 2s | rl=1 | ov=1 | ro=1 | GET | p1 | 512 | unmeasured | unmeasured | -
+h64 | 2s | rl=1 | ov=1 | ro=1 | SET | p1 | 512 | unmeasured | unmeasured | -
