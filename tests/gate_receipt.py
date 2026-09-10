@@ -655,14 +655,17 @@ def self_test():
             self.save_results()
 
         def make_report(self, started, candidate, reference, *, is_null=False):
+            from _abba_test_fixtures import saturation_record
             background = canonical_contract(None)
             rows = []
             for cell in self.state["inventory"]["cells"]:
                 runs = [dict(arm=arm, complete=True, artifacts=f"{cell['id']}/n1-{i}-{arm}", pid=100 + i,
                              rate=100., latency_ms=1., p999_ms=2., long_p999_ms=3., commands=2000,
-                             window_seconds=20., busy_pct=99.) for i, arm in enumerate(ORDER, 1)]
+                             midpoint_monotonic=11,
+                             window_seconds=20., busy_pct=99., saturation=saturation_record(cell["mode"], threads=2))
+                        for i, arm in enumerate(ORDER, 1)]
                 rows.append(dict(cell=cell, verdict="PASS", rounds=[dict(instances=1, runs=runs)],
-                                 assessment=dict(verdict="PASS", reasons=[], loss_pct=-.1, threshold_pct=.1,
+                                 assessment=dict(verdict="PASS", reasons=[], loss_pct=-.1, threshold_pct=.1, instances=1,
                                                  saturation_exempt=cell["depth"] == 1)))
             report = dict(schema=1, verdict="PARTIAL" if is_null else "PASS", subset="full", measurement_valid=True, order=ORDER,
                 statistical_verdict="PASS", comparison_trusted=not is_null, run_kind="null-control" if is_null else "comparison", only="",
@@ -892,6 +895,28 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
                 seconds=2., verdict="ok", timed_out=False, recorded_at=self.start_time + 100))
             self.save_results()
             self.assertTrue(finish(self.root, self.finish_args).is_file())
+
+        def test_standing_null_replays_saturation_instead_of_cached_pass(self):
+            from _abba_test_fixtures import saturation_record
+            mutations = (
+                lambda run, mode: run.pop("saturation"),
+                lambda run, mode: run["saturation"].update(score_pct=100),
+                lambda run, mode: run["saturation"]["threads"][0].update(ops_delta=0),
+                lambda run, mode: run.update(saturation=saturation_record(mode, score=90, threads=2)),
+                lambda run, mode: run.update(saturation=saturation_record(mode, threads=1)),
+                lambda run, mode: run.update(saturation=saturation_record(mode, threads=2, window_seconds=19)),
+                lambda run, mode: run.update(midpoint_monotonic=31),
+                lambda run, mode: run.pop("midpoint_monotonic"),
+                lambda run, mode: run.update(
+                    saturation=saturation_record(mode, score=98, threads=2, window_seconds=1000),
+                    midpoint_monotonic=501),
+            )
+            for mutate in mutations:
+                control = copy.deepcopy(self.control)
+                row = next(row for row in control["cells"] if row["cell"]["depth"] > 1)
+                mutate(row["rounds"][0]["runs"][1], row["cell"]["mode"])
+                with self.subTest(mutation=mutate), self.assertRaisesRegex(ValueError, "saturation|productive-role"):
+                    validate_null(control, now=time.time())
 
         def test_prior_null_may_have_other_correctness_harness_but_comparison_cannot(self):
             self.control["receipt_harness_sha256"] = "c" * 64

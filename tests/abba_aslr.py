@@ -402,6 +402,7 @@ def main(args):
 
 
 def self_test():
+    from _abba_test_fixtures import saturation_record
     import contextlib
     import io
     import unittest
@@ -562,6 +563,8 @@ def self_test():
                         capture.begin(server, generators)
                         capture.finish(1, 21, 2000)
                         result = {"arm": arm, "rate": 90 if broken and len(calls) == 4 else 100,
+                            "saturation": saturation_record(cell.mode, window_seconds=20.001),
+                            "midpoint_monotonic": 11.0005,
                             "latency_ms": 1, "busy_pct": 99.9, "instances": instances,
                             "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
                             "complete": True, "window_seconds": 20.001, "cpu_profile": capture.record}

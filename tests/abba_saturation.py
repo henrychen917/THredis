@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""UNVALIDATED productive-role saturation diagnostics; never a gate verdict.
+"""Replayable productive-role occupancy, one necessary saturation witness.
 
-The original all-thread busy ratio remains the gate's decision input. This module
-prepares a competing criterion for controlled live validation, without changing
-the 95% floor or certifying saturation from contaminated saved measurements.
+Neither CPU occupancy nor this score proves capacity alone. ABBA additionally
+requires a stable per-arm throughput plateau under a higher-worker-capacity
+probe. The diagnostic wrapper cannot turn retained experiments into gate proof.
 """
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+
+SATURATION_FLOOR = 95.0
 
 
 @dataclass(frozen=True)
@@ -47,8 +49,8 @@ def parse_snapshot(raw: bytes) -> LbSnapshot:
     return LbSnapshot(stamp, rows)
 
 
-def productive_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: float) -> dict:
-    """Return an UNVALIDATED hypothesis, preserving the exact counters behind it.
+def bottleneck_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: float) -> dict:
+    """Preserve the exact counters behind a productive-role occupancy score.
 
     flipctl.cc:684 documents I/O submit/reap work outside busy_ns. Its wall-idle
     demand signal includes that missing work. ex_loop.h:788 books empty polling
@@ -63,13 +65,15 @@ def productive_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: floa
     divide work between roles by counters that have different units. Clients is
     an ownership gauge and EX always exports zero, not evidence of an idle owner.
 
-    This necessary evidence does not prove a throughput plateau. Adoption needs
-    quiet live loaded/underloaded/polling controls in both modes and every relevant
-    path, then the standing null. No validation switch or inferred approval lives
-    here; the existing gate decisions continue to use legacy busy_pct.
+    An idle role is legitimate: split read-local GET need not issue executor
+    tasks. Averaging that idle role into the busy role caps a saturated server at
+    50%. The maximum ROLE average identifies the bottleneck; it never drops idle
+    peers within that role. The unchanged floor must hold separately in every
+    reference and candidate measurement, alongside the independent plateau.
     """
     if not math.isfinite(floor_pct) or not 0 < floor_pct <= 100:
         raise ValueError("invalid diagnostic saturation floor")
+    floor_pct = float(floor_pct)  # One JSON representation for the fixed numeric criterion.
     wall = end.stamp_ns - start.stamp_ns
     if wall <= 0 or start.threads.keys() != end.threads.keys():
         raise RuntimeError("changed LBSIGNALS topology or nonpositive capture interval")
@@ -80,7 +84,9 @@ def productive_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: floa
     role_rows = {role: dict(threads=0, productive_threads=0, ops=0,
                            work_pct=0.0, cpu_pct=0.0, score_pct=0.0) for role in sorted(roles)}
     clamp = lambda value: min(1.0, max(0.0, value))
-    for tid, before in start.threads.items():
+    # JSON writers may sort string thread IDs lexically (0,1,10,...,2). Sum in
+    # numeric TID order so receipt replay has identical floating-point reductions.
+    for tid, before in sorted(start.threads.items()):
         after = end.threads[tid]
         role = before["role"]
         if after["role"] != role:
@@ -116,13 +122,119 @@ def productive_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: floa
             summary[key] /= summary["threads"]
     role = max(role_rows, key=lambda name: role_rows[name]["score_pct"])
     score = role_rows[role]["score_pct"]
-    return dict(criterion="productive-role-v1", validation="UNVALIDATED", decision_input=False,
+    return dict(schema=1, criterion="productive-role-v1",
         stamp_before_ns=start.stamp_ns, stamp_after_ns=end.stamp_ns, window_seconds=wall / 1e9,
-        floor_pct=floor_pct, score_pct=score, proposed_floor_met=score >= floor_pct,
+        floor_pct=floor_pct, score_pct=score, floor_met=score >= floor_pct,
         highest_scoring_role=role, roles=role_rows, threads=thread_rows)
 
 
+def productive_saturation(start: LbSnapshot, end: LbSnapshot, *, floor_pct: float) -> dict:
+    """Historical diagnostic shape; replay never retroactively certifies a run."""
+    result = bottleneck_saturation(start, end, floor_pct=floor_pct)
+    result.pop("schema")
+    result["proposed_floor_met"] = result.pop("floor_met")
+    return dict(result, validation="UNVALIDATED", decision_input=False)
+
+
+def replay_saturation(record, *, floor_pct, mode=None, thread_count=None):
+    """Recompute from raw same-window deltas; cached scores are never evidence.
+
+    JSON changes integer dictionary keys to strings. Reconstruct the counters
+    with zero baselines, preserving both client gauges and the actual stamps.
+    A reset, missing thread, foreign role, or changed derived value fails closed.
+    No legacy busy ratio or process CPU value substitutes for missing evidence.
+    """
+    integer = lambda value: type(value) is int and value >= 0
+    try:
+        if (not isinstance(record, dict) or record.get("schema") != 1 or
+                record.get("criterion") != "productive-role-v1" or
+                record.get("floor_pct") != floor_pct or
+                not integer(record.get("stamp_before_ns")) or
+                not integer(record.get("stamp_after_ns"))):
+            raise ValueError("missing or unsupported saturation evidence")
+        rows = record.get("threads")
+        if not isinstance(rows, dict) or not rows:
+            raise ValueError("missing saturation thread evidence")
+        before, after = {}, {}
+        for key, row in rows.items():
+            tid = int(key)
+            if (str(tid) != str(key) or tid < 0 or tid in before or not isinstance(row, dict) or
+                    row.get("role") not in ("io", "ex", "fused")):
+                raise ValueError("invalid or duplicate saturation thread")
+            fields = ("clients_before", "clients_after", "ops_delta", "busy_ns_delta",
+                      "idle_ns_delta", "cpu_ns_delta")
+            if any(not integer(row.get(field)) for field in fields):
+                raise ValueError("invalid/reset saturation counter")
+            if row["role"] == "ex" and (row["clients_before"] or row["clients_after"]):
+                raise ValueError("executor saturation evidence owns clients")
+            before[tid] = dict(role=row["role"], clients=row["clients_before"],
+                               ops=0, busy=0, idle=0, cpu=0)
+            after[tid] = dict(role=row["role"], clients=row["clients_after"],
+                **{name: row[field] for name, field in
+                   (("ops", "ops_delta"), ("busy", "busy_ns_delta"),
+                    ("idle", "idle_ns_delta"), ("cpu", "cpu_ns_delta"))})
+        if set(before) != set(range(len(before))) or thread_count is not None and len(before) != thread_count:
+            raise ValueError("saturation thread inventory differs from server geometry")
+        roles = {row["role"] for row in before.values()}
+        if mode is not None and (mode not in ("1s", "2s") or
+                roles != ({"fused"} if mode == "1s" else {"io", "ex"})):
+            raise ValueError("saturation roles differ from measured cell")
+        if mode == "2s" and sum(row["role"] == "ex" for row in before.values()) != len(before) // 2:
+            raise ValueError("saturation roles differ from fixed split geometry")
+        replayed = bottleneck_saturation(LbSnapshot(record["stamp_before_ns"], before),
+            LbSnapshot(record["stamp_after_ns"], after), floor_pct=floor_pct)
+        # Compare canonical JSON after normalizing thread keys; this rejects unknown
+        # fields and forged role averages/flags as well as a forged overall score.
+        canonical = lambda value: json.dumps(value, sort_keys=True, allow_nan=False)
+        normalized = lambda value: dict(value, threads={str(k): v for k, v in value["threads"].items()})
+        if canonical(normalized(record)) != canonical(normalized(replayed)):
+            raise ValueError("saturation summary differs from raw same-window counters")
+        return replayed
+    except (KeyError, TypeError, OverflowError, RuntimeError) as error:
+        raise ValueError(f"invalid saturation evidence: {error}") from error
+
+
+def require_saturation_window(record, run):
+    # src/core/signal.h now_ns() and Python time.monotonic() both use
+    # CLOCK_MONOTONIC. Bind the interval as well as its length: population or
+    # another run's occupied interval cannot certify this run's workload.
+    midpoint, seconds = run.get("midpoint_monotonic"), run.get("window_seconds")
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+           for value in (midpoint, seconds)):
+        raise ValueError("missing/invalid saturation workload interval")
+    first_ns = round((midpoint - seconds / 2) * 1e9)
+    last_ns = round((midpoint + seconds / 2) * 1e9)
+    if not record["stamp_before_ns"] <= first_ns < last_ns <= record["stamp_after_ns"]:
+        raise ValueError("saturation snapshots do not span the measured workload window")
+    raw_ns = record["stamp_after_ns"] - record["stamp_before_ns"]
+    central_ns = last_ns - first_ns
+    outside_ns = raw_ns - central_ns
+    roles = {role: dict(threads=0, score_pct=0.0) for role in sorted(record["roles"])}
+    threads = {}
+    # Containment alone is insufficient: INFO/proc capture or a scheduling pause
+    # can widen the bracket. Charge ALL time outside the central interval against
+    # every thread's observed work AND CPU. The remaining durations are lower
+    # bounds inside the scored interval, with no empirical skew allowance.
+    for tid, row in sorted(record["threads"].items(), key=lambda item: int(item[0])):
+        work_ns = max(0, raw_ns - row["idle_ns_delta"] - outside_ns)
+        cpu_ns = max(0, min(raw_ns, row["cpu_ns_delta"]) - outside_ns)
+        score = 100 * min(work_ns, cpu_ns) / central_ns if row["productive"] else 0.0
+        threads[str(tid)] = dict(work_ns_lower_bound=work_ns, cpu_ns_lower_bound=cpu_ns, score_pct=score)
+        roles[row["role"]]["threads"] += 1
+        roles[row["role"]]["score_pct"] += score
+    for row in roles.values():
+        row["score_pct"] /= row["threads"]
+    role = max(roles, key=lambda name: roles[name]["score_pct"])
+    score = roles[role]["score_pct"]
+    return dict(criterion="central-productive-role-v1", first_ns=first_ns, last_ns=last_ns,
+        outside_before_ns=first_ns - record["stamp_before_ns"],
+        outside_after_ns=record["stamp_after_ns"] - last_ns,
+        score_pct=score, floor_met=score >= record["floor_pct"], highest_scoring_role=role,
+        roles=roles, threads=threads)
+
+
 def self_test():
+    import copy
     import unittest
 
     class Controls(unittest.TestCase):
@@ -186,6 +298,62 @@ def self_test():
             for bad in bads:
                 with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                     productive_saturation(before, bad, floor_pct=95)
+
+        def test_raw_saturation_replays_after_json_round_trip(self):
+            before, after = self.pair([("io", 16, 10000, 10, 0, 20)] * 16 +
+                                      [("ex", 0, 0, 0, 20, 1)] * 16)
+            record = bottleneck_saturation(before, after, floor_pct=95)
+            serialized = dict(record, threads={str(k): v for k, v in record["threads"].items()})
+            replayed = replay_saturation(json.loads(json.dumps(serialized, sort_keys=True)), floor_pct=95,
+                                          mode="2s", thread_count=32)
+            self.assertEqual(replayed, record)
+            self.assertEqual(replayed["score_pct"], 100)
+            self.assertEqual(replayed["roles"]["ex"]["score_pct"], 0)
+
+        def test_cached_saturation_cannot_hide_missing_or_unproductive_threads(self):
+            before, after = self.pair([("fused", 16, 10000, 20, 0, 20)] * 32)
+            record = bottleneck_saturation(before, after, floor_pct=95)
+            mutations = [lambda value: value.update(score_pct=99),
+                         lambda value: value.update(floor_pct=1),
+                         lambda value: value.update(stamp_after_ns=value["stamp_before_ns"]),
+                         lambda value: value["threads"].pop(31),
+                         lambda value: value["threads"][0].update(ops_delta=0),
+                         lambda value: value["threads"][0].update(cpu_ns_delta=-1),
+                         lambda value: value["threads"][0].update(ops_delta=True),
+                         lambda value: value["roles"]["fused"].update(score_pct=float("nan"))]
+            for mutate in mutations:
+                bad = copy.deepcopy(record)
+                mutate(bad)
+                with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                    replay_saturation(bad, floor_pct=95, mode="1s", thread_count=32)
+            for bad in (None, {}, productive_saturation(before, after, floor_pct=95)):
+                with self.subTest(record=bad), self.assertRaises(ValueError):
+                    replay_saturation(bad, floor_pct=95, mode="1s", thread_count=32)
+            with self.assertRaisesRegex(ValueError, "roles differ"):
+                replay_saturation(record, floor_pct=95, mode="2s", thread_count=32)
+
+        def test_saturation_is_bound_to_this_workload_interval(self):
+            before, after = self.pair([("fused", 16, 10000, 20, 0, 20)] * 32)
+            record = bottleneck_saturation(before, after, floor_pct=95)
+            require_saturation_window(record, dict(midpoint_monotonic=11, window_seconds=20))
+            for run in (dict(midpoint_monotonic=31, window_seconds=20),
+                        dict(midpoint_monotonic=11, window_seconds=21),
+                        dict(window_seconds=20),
+                        dict(midpoint_monotonic=float("nan"), window_seconds=20)):
+                with self.subTest(run=run), self.assertRaises(ValueError):
+                    require_saturation_window(record, run)
+
+        def test_wide_capture_cannot_borrow_outside_window_occupancy(self):
+            # 980 occupied seconds surround an entirely idle central20 seconds.
+            # The enclosing98% snapshot is valid arithmetic, but has no central
+            # occupancy. Merely checking that it contains the window passes it.
+            before, after = self.pair([("fused", 16, 10000, 980, 20, 980)] * 32)
+            after = LbSnapshot(1_001_000_000_000, after.threads)
+            record = bottleneck_saturation(before, after, floor_pct=95)
+            self.assertTrue(record["floor_met"])
+            central = require_saturation_window(record, dict(midpoint_monotonic=501, window_seconds=20))
+            self.assertFalse(central["floor_met"])
+            self.assertEqual(central["score_pct"], 0)
 
     return 0 if unittest.TextTestRunner(verbosity=2).run(
         unittest.defaultTestLoader.loadTestsFromTestCase(Controls)).wasSuccessful() else 1

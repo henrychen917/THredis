@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare loaded probes or capture idle controls; productive-role-v1 stays UNVALIDATED.
+"""Prepare loaded probes or capture idle controls; the campaign stays UNVALIDATED.
 
 plan writes commands only. They use abbagate's real producer and measurement loop,
 20-second windows, the verified stored reference, and the candidate. Diagnostic cell copies do not establish
-pins, retire inventory, or earn a gate receipt. Legacy saturation FAIL remains FAIL.
+pins, retire inventory, or earn a gate receipt. Preserve every original verdict.
 
 idle captures real LBSIGNALS without pretending idle sockets completed memtier work.
 It shares the production ownership/cleanup and quiet observer helpers. --spin-role
@@ -23,7 +23,8 @@ import time
 
 import abbagate as abba
 from _gate_process import Conn, install_signals, pin_driver, server
-from abba_saturation import parse_snapshot, productive_saturation
+from abba_saturation import (parse_snapshot, productive_saturation, bottleneck_saturation,
+                             replay_saturation, require_saturation_window)
 from gate_receipt import harness_fingerprint
 from gate_quiet import QuietMonitor
 
@@ -99,7 +100,7 @@ def plan(args):
                     window_seconds=abba.WINDOW, blocks=len(rows), measurements=4 * len(rows),
                     notes=["No commands were launched or CPUs reserved.",
                            "Every probe compares stored reference A with candidate B; it is not a null.",
-                           "Each single-connection negative must show real GET progress and reject the proposed95% role floor.",
+                           "Each single-connection negative must show real GET progress and reject the central95% role floor.",
                            "n1 is reduced load, not a promised underload. Active single GET cannot validate SET/multi-key pacing.",
                            "If a family's n1 still saturates, require that family's explicit paced follow-up; no current pacing hook is silently enabled.",
                            "Compare each arm's n8-to-n12 gain with its own observed repeatability; 192 workers does not establish generator headroom.",
@@ -135,6 +136,22 @@ def plan(args):
     (args.output / "plan.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"PLAN ONLY: {len(rows)} blocks / {4 * len(rows)} measurements; no launches", file=sys.stderr)
     return 0
+
+
+def replay_capture(before, after, run, mode):
+    # The live control must exercise the production decision, not its historical
+    # diagnostic wrapper. Bind every raw counter to the retained captures, replay
+    # the complete geometry, then bind/project it onto this workload's interval.
+    canonical = lambda value: json.loads(json.dumps(value, allow_nan=False))
+    raw = bottleneck_saturation(before, after, floor_pct=abba.BUSY_FLOOR)
+    if canonical(raw) != run.get("saturation"):
+        raise ValueError("saved saturation evidence differs from raw LBSIGNALS")
+    replayed = replay_saturation(run["saturation"], floor_pct=abba.BUSY_FLOOR,
+                                 mode=mode, thread_count=32)
+    central = require_saturation_window(replayed, run)
+    if canonical(central) != run.get("central_saturation"):
+        raise ValueError("saved central saturation differs from replayed workload interval")
+    return replayed, central
 
 
 def review_probe(probe, manifest):
@@ -185,8 +202,10 @@ def review_probe(probe, manifest):
                     run.get("load_layout") != probe["load_layout"]):
                 raise ValueError("incomplete measurement or changed generator layout")
             folder = output / cell.id / f"n{cell.instances}-{seq}-{run['arm']}"
-            diagnostic = productive_saturation(parse_snapshot((folder / "lb-before.txt").read_bytes()),
-                parse_snapshot((folder / "lb-after.txt").read_bytes()), floor_pct=abba.BUSY_FLOOR)
+            before = parse_snapshot((folder / "lb-before.txt").read_bytes())
+            after = parse_snapshot((folder / "lb-after.txt").read_bytes())
+            saturation, central = replay_capture(before, after, run, cell.mode)
+            diagnostic = productive_saturation(before, after, floor_pct=abba.BUSY_FLOOR)
             if diagnostic != run.get("diagnostic_saturation"):
                 # JSON stringifies integer thread IDs; canonicalize both sides.
                 if json.loads(json.dumps(diagnostic)) != run.get("diagnostic_saturation"):
@@ -196,11 +215,12 @@ def review_probe(probe, manifest):
                     accounting.get("completed_hdr_count") != accounting.get("server_calls") or
                     run.get("commands", 0) <= 0):
                 raise ValueError("active probe lacks completed workload command accounting")
-            if not any(role["ops"] > 0 for role in diagnostic["roles"].values()):
+            if not any(role["ops"] > 0 for role in saturation["roles"].values()):
                 raise ValueError("active probe recorded no workload progress")
             scores.append(dict(arm=run["arm"], rate=run["rate"], legacy_busy_pct=run["busy_pct"],
-                               score_pct=diagnostic["score_pct"], proposed_floor_met=diagnostic["proposed_floor_met"],
-                               roles=diagnostic["roles"], generator_cpu=run.get("generator_cpu")))
+                               score_pct=central["score_pct"], floor_met=central["floor_met"],
+                               central_saturation=central, saturation=saturation,
+                               diagnostic_saturation=diagnostic, generator_cpu=run.get("generator_cpu")))
         evidence = abba.load_block_evidence(cell, block)
         # Only repeatability failures allow independent families to continue. A
         # bad layout/count/counter is infrastructure failure, never mere noise.
@@ -211,12 +231,13 @@ def review_probe(probe, manifest):
                       continuation_permitted=True, evidence=evidence, measurements=scores,
                       original_assessment=row.get("assessment"))
         if probe["phase"] == "single":
-            result["active_negative_witness"] = all(not score["proposed_floor_met"] for score in scores)
+            result["active_negative_witness"] = all(not score["floor_met"] for score in scores)
             if not result["active_negative_witness"]:
                 result["status"] = "CONTROL-FAIL"
+                result["continuation_permitted"] = False
         elif probe["phase"] == "reduced":
             result["paced_followup_required_arms"] = [arm for arm in ("A", "B")
-                if any(score["proposed_floor_met"] for score in scores if score["arm"] == arm)]
+                if any(score["floor_met"] for score in scores if score["arm"] == arm)]
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         result.update(status="INVALID-INFRASTRUCTURE", reason=str(error))
     return result
@@ -266,20 +287,26 @@ def review(args):
     return 1 if report["status"] == "INVALID" else 3  # never a gate or metric PASS
 
 
-def control_witness(diagnostic, spin_role=None):
-    if diagnostic["proposed_floor_met"]:
-        raise RuntimeError("nonproductive control met the proposed saturation floor")
+def control_witness(saturation, central, spin_role=None):
+    if central["floor_met"]:
+        raise RuntimeError("nonproductive control met the central saturation floor")
     if spin_role is not None:
-        role = diagnostic["roles"].get(spin_role)
+        role = saturation["roles"].get(spin_role)
         if role is None:
             raise RuntimeError(f"spinner role {spin_role} absent from the actual topology")
         # A DEBUG/INFO observer may advance its one owner. It cannot certify a
         # role, and every other role member must witness zero operation progress.
-        members = [row for row in diagnostic["threads"].values() if row["role"] == spin_role]
+        members = [row for row in saturation["threads"].values() if row["role"] == spin_role]
         if len(members) < 2 or sum(row["ops_delta"] != 0 for row in members) > 1:
             raise RuntimeError("spinner had non-observer operation progress; negative is not armed")
-        if role["cpu_pct"] < abba.BUSY_FLOOR:
-            raise RuntimeError(f"spinner not armed: {spin_role} CPU {role['cpu_pct']:.3f}% "
+        # High CPU must occur inside the control's own window too; an earlier
+        # spin cannot arm a later sleeping interval. Keep legacy CPU in the raw
+        # diagnostic, but use the conservative central lower bound here.
+        span_ns = central["last_ns"] - central["first_ns"]
+        cpu_pct = sum(100 * central["threads"][str(tid)]["cpu_ns_lower_bound"] / span_ns
+                      for tid, row in saturation["threads"].items() if row["role"] == spin_role) / len(members)
+        if cpu_pct < abba.BUSY_FLOOR:
+            raise RuntimeError(f"spinner not armed: {spin_role} central CPU {cpu_pct:.3f}% "
                                f"< {abba.BUSY_FLOOR:g}%")
     return "CONTROL-PASS"
 
@@ -302,7 +329,8 @@ def idle(args):
     if args.seconds != abba.WINDOW or not 0 <= args.connections <= 512:
         raise ValueError("controls use the unchanged 20-second window and 0..512 idle sockets")
     args.output.mkdir(parents=True, exist_ok=False)
-    report = dict(validation="UNVALIDATED", comparison_trusted=False, verdict="FAIL",
+    report = dict(validation="UNVALIDATED", comparison_trusted=False, normal_gate_eligible=False,
+                  calibration_eligible=False, verdict="FAIL",
                   measurement_valid=False, mode=args.mode, spin_role=args.spin_role,
                   idle_connections=args.connections, binary_sha256=abba.sha256(args.candidate_binary),
                   observer_commands=["INFO", "DEBUG LBSIGNALS"], window_seconds=args.seconds)
@@ -341,7 +369,9 @@ def idle(args):
                     raise RuntimeError("negative control needs a fresh empty store")
                 before_commands = abba.info(conn, "commandstats")
                 before = abba.lb_snapshot(conn, args.output / "lb-before.txt")
+                t0 = time.monotonic()
                 time.sleep(args.seconds)
+                t1 = time.monotonic()
                 after = abba.lb_snapshot(conn, args.output / "lb-after.txt")
                 after_commands = abba.info(conn, "commandstats")
                 if int(abba.info(conn, "clients")["connected_clients"]) != expected:
@@ -355,9 +385,15 @@ def idle(args):
                     raise RuntimeError(f"unexpected negative-control topology: {actual_roles}")
                 diagnostic = productive_saturation(before, after, floor_pct=abba.BUSY_FLOOR)
                 report.update(command_deltas=command_deltas(before_commands, after_commands),
+                              midpoint_monotonic=(t0 + t1) / 2, window_seconds=t1 - t0,
+                              saturation=bottleneck_saturation(before, after, floor_pct=abba.BUSY_FLOOR),
                               diagnostic_saturation=diagnostic,
                               legacy_busy_pct=abba.busy_between(before.threads, after.threads)[0])
-                report["control_witness"] = control_witness(diagnostic, args.spin_role)
+                report["central_saturation"] = require_saturation_window(report["saturation"], report)
+                # Normalize in-memory integer TIDs exactly as on-disk replay.
+                saved = json.loads(json.dumps(report))
+                saturation, central = replay_capture(before, after, saved, args.mode)
+                report["control_witness"] = control_witness(saturation, central, args.spin_role)
         quiet.close()
         quiet.check()
         if harness_fingerprint(abba.ROOT)["sha256"] != fingerprint:
@@ -463,10 +499,14 @@ def self_test():
                     # First family n1 deliberately unstable, but every later
                     # independently planned family/rung still reaches four calls.
                     rate = 120 if cell.id == "diag-h09-n1" and seq == 3 else 100
-                    return dict(arm=arm, rate=rate, instances=instances, complete=True, busy_pct=99,
+                    result = dict(arm=arm, rate=rate, instances=instances, complete=True, busy_pct=99,
+                        saturation=abba.bottleneck_saturation(*(parse_snapshot(x) for x in raw), floor_pct=95),
+                        window_seconds=20, midpoint_monotonic=11,
                         load_layout=abba.load_layout(runner.load_cpus, instances, cell.conns), commands=1000,
                         diagnostic_saturation=productive_saturation(*(parse_snapshot(x) for x in raw), floor_pct=95),
                         whole_run_accounting={"commands": {cell.op: {"server_calls": 1000, "completed_hdr_count": 1000}}})
+                    result["central_saturation"] = require_saturation_window(result["saturation"], result)
+                    return result
                 quiet = mock.Mock()
                 evidence = dict(complete=True, interference=None,
                     background_environment={"contract": canonical_contract(None)})
@@ -496,7 +536,8 @@ def self_test():
                 probe = manifest["probes"][-1]
                 output = Path(probe["argv"][probe["argv"].index("--output") + 1]) / "results.json"
                 retained = json.loads(output.read_text())
-                for poison in ("missing-run", "reference", "quiet", "no-work", "raw-score", "instrument", "geometry", "window"):
+                for poison in ("missing-run", "reference", "quiet", "no-work", "raw-score", "instrument", "geometry", "window",
+                               "raw-evidence", "central-score", "missing-central", "interval"):
                     broken = copy.deepcopy(retained)
                     if poison == "missing-run": broken["cells"][0]["rounds"][0]["runs"].pop()
                     elif poison == "reference": broken["reference"]["sha256"] = "different"
@@ -505,6 +546,10 @@ def self_test():
                     elif poison == "instrument": broken["instrument_fingerprint"] = {}
                     elif poison == "geometry": broken["environment"]["load_cpus"] = []
                     elif poison == "window": broken["window_seconds"] = 10
+                    elif poison == "raw-evidence": broken["cells"][0]["rounds"][0]["runs"][0]["saturation"]["threads"]["0"]["ops_delta"] += 1
+                    elif poison == "central-score": broken["cells"][0]["rounds"][0]["runs"][0]["central_saturation"]["score_pct"] = 0
+                    elif poison == "missing-central": del broken["cells"][0]["rounds"][0]["runs"][0]["central_saturation"]
+                    elif poison == "interval": broken["cells"][0]["rounds"][0]["runs"][0]["midpoint_monotonic"] = 31
                     else: broken["cells"][0]["rounds"][0]["runs"][0]["diagnostic_saturation"]["score_pct"] = 0
                     output.write_text(json.dumps(broken))
                     row = review_probe(probe, manifest)
@@ -523,21 +568,40 @@ def self_test():
 
 
         def test_unarmed_spinner_and_productive_control_are_not_passes(self):
-            diagnostic = dict(proposed_floor_met=False,
-                roles={"ex": {"cpu_pct": 99.5}},
-                threads={n: dict(role="ex", ops_delta=0) for n in range(16)})
-            self.assertEqual(control_witness(diagnostic, "ex"), "CONTROL-PASS")
-            diagnostic["roles"]["ex"]["cpu_pct"] = 20
+            def captured(cpu_fraction=0.995, productive=(), seconds=20):
+                before = "lbver 1 stamp_ns 1000000000\n"
+                after = f"lbver 1 stamp_ns {int((seconds + 1) * 1e9)}\n"
+                for tid in range(32):
+                    role = "io" if tid < 16 else "ex"
+                    clients = int(role == "io")
+                    ops = 5 if tid in productive else 0
+                    idle = 0 if ops else int(seconds * 1e9)
+                    cpu = int(seconds * 1e9 * cpu_fraction) if role == "ex" else 0
+                    before += f"thread {tid} {role} 0 {clients} 1 0 0 0 0\n"
+                    after += f"thread {tid} {role} 0 {clients} 2 {ops} 0 {idle} {cpu}\n"
+                record = bottleneck_saturation(parse_snapshot(before.encode()), parse_snapshot(after.encode()), floor_pct=95)
+                replayed = replay_saturation(record, floor_pct=95, mode="2s", thread_count=32)
+                central = require_saturation_window(replayed, dict(window_seconds=20, midpoint_monotonic=1 + seconds / 2))
+                return replayed, central
+
+            saturation, central = captured()
+            self.assertEqual(saturation["roles"]["ex"]["ops"], 0)
+            self.assertEqual(control_witness(saturation, central, "ex"), "CONTROL-PASS")
+            saturation, central = captured(cpu_fraction=0.20)
             with self.assertRaisesRegex(RuntimeError, "spinner not armed"):
-                control_witness(diagnostic, "ex")
-            diagnostic["roles"]["ex"]["cpu_pct"] = 99.5
-            diagnostic["threads"][0]["ops_delta"] = 5
-            diagnostic["threads"][1]["ops_delta"] = 5
+                control_witness(saturation, central, "ex")
+            saturation, central = captured(productive=(16, 17))
             with self.assertRaisesRegex(RuntimeError, "non-observer operation progress"):
-                control_witness(diagnostic, "ex")
-            diagnostic["proposed_floor_met"] = True
-            with self.assertRaisesRegex(RuntimeError, "met the proposed"):
-                control_witness(diagnostic)
+                control_witness(saturation, central, "ex")
+            saturation, central = captured(productive=range(16, 32))
+            with self.assertRaisesRegex(RuntimeError, "met the central"):
+                control_witness(saturation, central)
+            # A long high-CPU envelope cannot arm a short central spinner. This
+            # also distinguishes the live control from its old diagnostic path.
+            saturation, central = captured(seconds=1000)
+            self.assertGreater(saturation["roles"]["ex"]["cpu_pct"], 95)
+            with self.assertRaisesRegex(RuntimeError, "spinner not armed"):
+                control_witness(saturation, central, "ex")
 
         def test_actual_idle_dispatch_requires_raw_captures_and_quiet_completion(self):
             for contaminated, changed in ((False, False), (True, False), (False, True)):
@@ -585,7 +649,8 @@ def self_test():
                     with mock.patch.object(abba, "check_placement"), mock.patch(__name__ + ".pin_driver"), \
                          mock.patch(__name__ + ".install_signals"), mock.patch(__name__ + ".server", owned_server), \
                          mock.patch(__name__ + ".QuietMonitor", Quiet), mock.patch.object(abba, "info", info), \
-                         mock.patch.object(time, "sleep"), mock.patch(__name__ + ".harness_fingerprint",
+                         mock.patch.object(time, "sleep"), mock.patch.object(time, "monotonic", side_effect=[1, 21]), \
+                         mock.patch(__name__ + ".harness_fingerprint",
                              side_effect=[{"sha256": "stable"}, {"sha256": "changed" if changed else "stable"}]), \
                          redirect_stdout(io.StringIO()):
                         self.assertEqual(idle(args), int(contaminated or changed))
@@ -594,6 +659,11 @@ def self_test():
                     self.assertTrue((output / "lb-after.txt").is_file())
                     report = json.loads((output / "result.json").read_text())
                     self.assertFalse(report["comparison_trusted"])
+                    self.assertEqual(report["validation"], "UNVALIDATED")
+                    self.assertEqual(report["central_saturation"]["score_pct"], 0)
+                    self.assertFalse(report["central_saturation"]["floor_met"])
+                    self.assertEqual(report["saturation"]["stamp_before_ns"], 1_000_000_000)
+                    self.assertEqual(report["midpoint_monotonic"], 11)
                     self.assertEqual(report["measurement_valid"], not (contaminated or changed))
 
         def test_nonobserver_commands_and_counter_resets_fail(self):

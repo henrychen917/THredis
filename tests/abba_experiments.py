@@ -489,6 +489,7 @@ def self_test():
     import unittest
     from unittest import mock
     from background_environment import canonical_contract
+    from _abba_test_fixtures import saturation_record
 
     def write_snapshot(path, *, seed=7, epoch=1, cut=123, shards=256):
         # Synthetic header fixtures only; real priming always uses the server's SAVE.
@@ -543,6 +544,8 @@ def self_test():
                     calls.append((abba.WINDOW, arm, sequence, instances, runner.population_by_arm[arm]))
                     ticks[0] += abba.WINDOW + 8
                     return {"arm": arm, "rate": 90 if first_null_fail and len(calls) == (failed_index + 1) * 4 else 100,
+                            "saturation": saturation_record(cell.mode, window_seconds=abba.WINDOW + .001),
+                            "midpoint_monotonic": 1 + (abba.WINDOW + .001) / 2,
                             "latency_ms": 1, "busy_pct": 99.9,
                             "instances": instances,
                             "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),

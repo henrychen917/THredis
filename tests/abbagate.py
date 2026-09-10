@@ -34,8 +34,10 @@ pass, and the best of several runs is never selected.
 
 SATURATION IS A PRECONDITION, not a nice-to-have: an unsaturated cell has headroom that absorbs a
 regression, so it cannot detect one at any repetition count. Pinned load levels run one ABBA block
-and must still satisfy the busy floor. Unpinned cells, or --escalate, search until the fastest arm
-stops gaining AND measured busy is at the required level. Depth 1 is exempt and
+and must still satisfy the productive-role occupancy floor. Unpinned cells, or --escalate,
+search until EACH arm stops gaining AND its productive bottleneck role meets the floor.
+Raw legacy all-thread busy is retained but cannot penalize legitimate idle executors.
+Depth 1 is exempt and
 scored as latency -- it is round-trip bound by Little's law. Process CPU is NOT substituted for busy
 percentage: doing so hides exactly the unsaturated case this check exists to catch.
 
@@ -69,7 +71,9 @@ import time
 from _lib import Conn
 from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
 from gate_quiet import QuietMonitor, QuietViolation
-from abba_saturation import parse_snapshot, productive_saturation, self_test as saturation_self_test
+from abba_saturation import (parse_snapshot, productive_saturation, bottleneck_saturation,
+                            replay_saturation, require_saturation_window, SATURATION_FLOOR,
+                            self_test as saturation_self_test)
 from gate_receipt import harness_fingerprint, read_json
 from abba_evidence import match_null, null_result
 from abba_instrument import instrument_fingerprint
@@ -83,7 +87,7 @@ WARMUP = 3
 TAIL = 5
 KEYS = 2_000_000
 MIN_BUSY = 98.0        # the busy level we PREFER, and still record; no longer a hard gate
-BUSY_FLOOR = 95.0      # below this a cell is rejected outright, plateau or not
+BUSY_FLOOR = SATURATION_FLOOR  # productive-role occupancy; plateau remains independently required
 #
 # SATURATION IS ESTABLISHED BY A RATE PLATEAU, NOT BY A BUSY PERCENTAGE ALONE (owner ruling
 # 2026-09-10). Demanding >=98% busy in every run fails a candidate FOR BEING FASTER: a quicker
@@ -374,6 +378,11 @@ def peak_index(rounds):
     return max(range(len(rounds)), key=lambda i: fastest_mean(rounds[i]))
 
 
+def saturation_score(run, cell):
+    evidence = replay_saturation(run.get("saturation"), floor_pct=BUSY_FLOOR, mode=cell.mode)
+    return require_saturation_window(evidence, run)["score_pct"]
+
+
 def load_block_evidence(cell, block):
     """Validate every measured block, including probes not selected for the comparison.
 
@@ -400,6 +409,12 @@ def load_block_evidence(cell, block):
     if any(not isinstance(run.get("busy_pct"), (int, float)) or
            not math.isfinite(run["busy_pct"]) or not 0 <= run["busy_pct"] <= 100 for run in runs):
         reasons.append("invalid server busy measurement")
+    saturation = []
+    for index, run in enumerate(runs, 1):
+        try:
+            saturation.append(saturation_score(run, cell))
+        except (ValueError, TypeError) as error:
+            reasons.append(f"run {index}:{run.get('arm', '?')}: {error}")
     layout = runs[0].get("load_layout")
     if not isinstance(layout, list) or len(layout) != n or any(
             run.get("load_layout") != layout for run in runs):
@@ -425,6 +440,7 @@ def load_block_evidence(cell, block):
             reasons.append("generator layout changes total connections or shares assigned CPUs")
     return {"instances": n, "valid": not reasons, "validation_reasons": reasons,
             "minimum_busy_pct": min(run["busy_pct"] for run in runs),
+            "minimum_saturation_pct": min(saturation) if len(saturation) == 4 else None,
             "rate": rate, "worker_threads": workers, "load_layout": layout}
 
 
@@ -456,8 +472,8 @@ def select_load_floor(cell, rounds):
             if not invalid:
                 selected = index
             continue
-        if current["minimum_busy_pct"] < BUSY_FLOOR:
-            row["rejection_reasons"].append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
+        if current["minimum_saturation_pct"] is None or current["minimum_saturation_pct"] < BUSY_FLOOR:
+            row["rejection_reasons"].append(f"server below the {BUSY_FLOOR:g}% productive-role floor in some ABBA run")
         if index + 1 == len(evidence):
             row["rejection_reasons"].append("no higher-instance confirmation block")
             continue
@@ -519,10 +535,11 @@ def assess(cell, rounds):
     gain, plateau_noise = None, None
     if cell.depth > 1:
         if selection["status"] == "PINNED":
-            if any(r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
+            occupancy = [saturation_score(run, cell) for run in current["runs"]]
+            if any(value < BUSY_FLOOR for value in occupancy):
                 reasons.append(
                     f"pinned load level {cell.instances} no longer saturates this cell "
-                    f"(busy {min(r['busy_pct'] for r in current['runs']):.1f}% < {BUSY_FLOOR:g}%); "
+                    f"(productive-role occupancy {min(occupancy):.1f}% < {BUSY_FLOOR:g}%); "
                     f"re-pin it with --escalate and update the cells file")
         elif selected is None:
             reasons.append("no lowest tested load rung has valid saturation and higher-capacity plateau confirmation")
@@ -536,6 +553,8 @@ def assess(cell, rounds):
             plateau_noise = max(chosen["arm_repeatability_pct"].values())
     return {**p, "throughput": rate, "long_tail": long_tail, "instances": current["instances"],
             "busy_pct_abba": [r["busy_pct"] for r in current["runs"]],
+            "saturation_pct_abba": [saturation_score(run, cell) if not selection["measurement_failures"]
+                                    else None for run in current["runs"]],
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
             "fastest_gain_pct": gain, "plateau_noise_pct": plateau_noise,
             "load_selection": selection, "measurement_valid": selection["measurement_valid"],
@@ -705,11 +724,11 @@ def accepted(binary, name, value):
     raise RuntimeError(f"cannot probe {binary.name} --{name}: {p.stdout[:500]}")
 
 
-# --overlap and --reorder are RENAMES of knobs the pushed reference already has, not new features.
-# The reference at c8e61f646 accepts --x-overlap and --x-ex-sched; they are simply absent from its
-# --help, so probing by name reports them missing. Translating lets every headline cell run against
-# the reference instead of being dropped -- and dropping was the dangerous option: silently omitting
-# --overlap 1 compared overlap-on against overlap-off and reported "+17.02%" as a code win.
+# Translate names and schedule values only. c8e61f646 accepts --x-overlap and
+# --x-ex-sched, but acceptance does not prove an equivalent effective state:
+# read-local is inert there outside fused overlap 0. Runner checks INFO SERVER
+# before population. Silently omitting --overlap 1 previously compared on against
+# off and reported "+17.02%" as a code win; a mapping cannot excuse that mismatch.
 LEGACY_KNOBS = {"overlap": "x-overlap", "reorder": "x-ex-sched"}
 
 
@@ -744,7 +763,7 @@ def knob_plan(cell, support):
                 old, translated = LEGACY_KNOBS[name], legacy_value(name, value, cell.mode)
                 plans[arm][old] = translated
                 notes.append(f"reference takes --{name} {value} as --{old} {translated} "
-                             f"({cell.mode}); a rename, so the arms run the same configuration")
+                             f"({cell.mode}); name/value mapping only; effective boot state is checked separately")
             elif arm == "A" and name != "thread-mode" and not value:
                 # Omitting a knob the reference lacks is only sound when the cell asked for it OFF,
                 # because 0 IS this project's legacy behaviour for every knob ("0 means off and must
@@ -1032,7 +1051,22 @@ class Runner:
                     if time.monotonic() >= deadline:
                         raise RuntimeError("server boot timed out")
                     time.sleep(0.1)
-            result["pid"] = srv.pid
+            result.update(pid=srv.pid, boot_info=identity)
+            # CONFIG GET echoes the requested knob even when the old reference
+            # cannot arm it (split, or fused overlap on). INFO SERVER read_local
+            # has always reported the effective lane. Check both arms before SET
+            # population or measured load, including write cells: arming also
+            # changes immutable replacement and retirement obligations.
+            effective_read_local = identity.get("read_local")
+            if effective_read_local not in ("0", "1"):
+                raise RuntimeError(f"{arm} boot lacks valid effective INFO SERVER read_local: "
+                                   f"{effective_read_local!r}")
+            if int(effective_read_local) != cell.read_local:
+                reason = (f"{arm} boot effective read_local={effective_read_local} does not match "
+                          f"cell read-local={cell.read_local}; CONFIG GET alone cannot prove arming")
+                if arm == "A":
+                    raise NotComparable(reason)
+                raise RuntimeError(reason)
             for name, value in {"atomic": cell.atomic, **knobs}.items():
                 actual = conn.must("CONFIG", "GET", name)
                 if actual != [name.encode(), str(value).encode()]:
@@ -1149,12 +1183,16 @@ class Runner:
                           midpoint_monotonic=(t0 + t1) / 2, busy_pct=busy, thread_busy_pct=per_thread,
                           thread_activity_deltas=busy_deltas(before_lb.threads, after_lb.threads),
                           lb_snapshot_window_seconds=after_lb_at - before_lb_at,
-                          # Preparation only: the old busy_pct still controls assess()
-                          # and pin failure. This field can never validate its own rule.
+                          # Preserve legacy busy separately: idle executors are correct
+                          # under split read-local, and cannot dilute its IO bottleneck.
+                          # Raw same-window deltas are replayed before either arm earns
+                          # the floor. No process CPU substitution or missing-data fallback.
+                          saturation=bottleneck_saturation(before_lb, after_lb, floor_pct=BUSY_FLOOR),
                           diagnostic_saturation=productive_saturation(
                               before_lb, after_lb, floor_pct=BUSY_FLOOR),
                           cpu_pct=100 * (after_cpu - before_cpu) / ((t1 - t0) * len(self.server_cpus)),
                           info_before=before, info_after=after)
+            result["central_saturation"] = require_saturation_window(result["saturation"], result)
             result["workload_witness"] = require_workload_witness(
                 cell, before_commands, after_commands, before_mode, after_mode, legacy_control)
             totals = result["memtier"] = []
@@ -1221,7 +1259,8 @@ class Runner:
                     self.children.stop(srv)
                 result["wall_seconds"] = time.monotonic() - started
                 (folder / "measurement.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(f"    {result['rate']/1e6:.5f}M/s busy={result['busy_pct']:.3f}% "
+        print(f"    {result['rate']/1e6:.5f}M/s legacy-busy={result['busy_pct']:.3f}% "
+              f"productive-role={result['central_saturation']['score_pct']:.3f}% "
               f"CPU={result['cpu_pct']:.3f}% latency={result['latency_ms']:.5f}ms", flush=True)
         return result
 
@@ -1240,7 +1279,8 @@ def print_cell(row):
     print(f"{c['id']} A={av[0]:.6f},{av[1]:.6f} B={bv[0]:.6f},{bv[1]:.6f} {units} "
           f"paired={a['delta_pct']:+.4f}% spread A/B={a['reference_spread_pct']:.4f}/"
           f"{a['candidate_spread_pct']:.4f}% threshold={a['threshold_pct']:.4f}% "
-          f"busy(ABBA)={','.join(f'{x:.3f}' for x in a['busy_pct_abba'])}% "
+          f"legacy-busy(ABBA)={','.join(f'{x:.3f}' for x in a['busy_pct_abba'])}% "
+          f"productive-role(ABBA)={','.join('?' if x is None else f'{x:.3f}' for x in a['saturation_pct_abba'])}% "
           f"instances={a['instances']} {a['verdict']}", flush=True)
     selection = a["load_selection"]
     if selection["status"] not in ("PINNED", "EXEMPT"):
@@ -1628,6 +1668,7 @@ def self_test():
     import unittest
     from unittest import mock
     from background_environment import canonical_contract
+    from _abba_test_fixtures import saturation_record
     (ROOT / "build").mkdir(exist_ok=True)
 
     class ABBA(unittest.TestCase):
@@ -1900,7 +1941,7 @@ def self_test():
                     conn = SimpleNamespace(must=lambda *args: [args[-1].encode(), b"1"], close=lambda: None)
                     def snapshot(_conn, section):
                         if section == "server":
-                            return {"process_id": "123"}
+                            return {"process_id": "123", "read_local": str(cell.read_local)}
                         if section == "clients":
                             return {"connected_clients": "1" if not generators or phase["finished"] == 2 else "5"}
                         if section == "commandstats":
@@ -2001,7 +2042,9 @@ def self_test():
                             info=mock.Mock(side_effect=snapshot), lb_snapshot=mock.Mock(return_value=lb),
                             cpu_seconds=mock.Mock(return_value=0), generator_cpu_endpoint=mock.Mock(side_effect=endpoint),
                             busy_between=mock.Mock(return_value=(99, {})),
-                            busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={})), \
+                            busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={}),
+                            bottleneck_saturation=mock.Mock(return_value=saturation_record(threads=2)),
+                            require_saturation_window=mock.Mock(return_value={"score_pct": 99.9})), \
                          mock.patch.object(runner, "populate", return_value=None), \
                          mock.patch.object(time, "sleep", side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
                         if affinity_mode not in (0, "fixed", "floating"):
@@ -2069,6 +2112,56 @@ def self_test():
                             self.assertLessEqual(row["before"]["read_finished_monotonic"], cpu["central_start_monotonic"])
                             self.assertGreaterEqual(row["after"]["read_started_monotonic"], cpu["central_end_monotonic"])
                             self.assertEqual(row["cpu_seconds_delta"], 1)
+
+        def test_real_runner_checks_effective_read_local_before_population(self):
+            from types import SimpleNamespace
+            # The mock CONFIG endpoint faithfully echoes the requested knob,
+            # including inert legacy boots. Removing the INFO check reaches the
+            # population tripwire and makes every mismatched/missing case fail.
+            cases = ((0, "0", True), (1, "1", True), (1, "0", False), (0, "1", False),
+                     (0, None, False), (1, None, False), (1, "", False),
+                     (1, "01", False), (1, "2", False), (1, 1, False), (1, True, False))
+            for mode, op in ((mode, op) for mode in ("1s", "2s") for op in ("GET", "SET", "MSET")):
+                for arm in ("A", "B"):
+                    for requested, effective, matches in cases:
+                        with self.subTest(mode=mode, op=op, arm=arm, requested=requested, effective=effective), \
+                             tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+                            folder = Path(tmp)
+                            cell = replace(self.cell, mode=mode, op=op, read_local=requested)
+                            knobs = {"thread-mode": mode, "read-local": requested}
+                            configured = {"atomic": cell.atomic, **knobs}
+                            identity = {"process_id": "123"}
+                            if effective is not None:
+                                identity["read_local"] = effective
+                            conn = SimpleNamespace(close=mock.Mock(), must=mock.Mock(
+                                side_effect=lambda *args: [args[-1].encode(), str(configured[args[-1]]).encode()]))
+                            srv = SimpleNamespace(pid=123, poll=lambda: None)
+                            children = SimpleNamespace(start=mock.Mock(return_value=srv), stop=mock.Mock())
+                            args = SimpleNamespace(server_cores="0-7", server_smt="", load_cores="8-15",
+                                                   load_smt="", port=9090)
+                            runner = Runner(args, folder, {arm: Path("never-executed-server")}, children)
+                            population = mock.Mock(side_effect=RuntimeError("population boundary reached"))
+                            with mock.patch.multiple(__name__, require_unbound_port=mock.Mock(),
+                                    Conn=mock.Mock(return_value=conn), info=mock.Mock(return_value=identity)), \
+                                 mock.patch.object(runner, "populate", population), \
+                                 contextlib.redirect_stdout(io.StringIO()):
+                                error = ("population boundary reached" if matches else
+                                         "effective read_local" if effective in ("0", "1") else
+                                         "valid effective INFO SERVER read_local")
+                                with self.assertRaisesRegex(RuntimeError, error):
+                                    runner.measure(cell, arm, 1, 1, knobs)
+                            if matches:
+                                population.assert_called_once_with(cell, arm, conn, folder / cell.id / f"n1-1-{arm}")
+                            else:
+                                population.assert_not_called()
+                            children.start.assert_called_once()  # No population or load child.
+                            children.stop.assert_called_once_with(srv)
+                            conn.close.assert_called_once()
+                            retained = json.loads((folder / cell.id / f"n1-1-{arm}/measurement.json").read_text())
+                            self.assertEqual(retained["boot_info"], identity)
+                            self.assertFalse(retained["complete"])
+                            self.assertNotIn("populate_seconds", retained)
+                            self.assertNotIn("load_argv", retained)
 
         def test_legacy_control_requires_both_live_verdicts_and_caches_only_success(self):
             from types import SimpleNamespace
@@ -2164,9 +2257,11 @@ def self_test():
                 self.assertIn("--escalate", result["reason"])
                 self.assertEqual(result["cells"], [])
 
-        def round(self, rates, n=1, busy=99.5, latency=None):
+        def round(self, rates, n=1, busy=99.5, latency=None, mode="1s"):
             layout = load_layout(list(range(32, 128)) + list(range(160, 256)), n, self.cell.conns)
             return {"instances": n, "runs": [dict(arm=arm, rate=rate, busy_pct=busy,
+                    saturation=saturation_record(mode, busy),
+                    window_seconds=20, midpoint_monotonic=11,
                     complete=True, instances=n, load_layout=layout,
                     latency_ms=(latency or [1, 1, 1, 1])[i])
                     for i, (arm, rate) in enumerate(zip(ORDER, rates))]}
@@ -2272,13 +2367,13 @@ def self_test():
 
         def test_a_pinned_cell_needs_no_second_rung(self):
             pinned = Cell("hp", "2s", 0, 1, 0, "SET", 32, 512, instances=2)
-            rounds = [self.round([100, 100, 100, 100], 2)]
+            rounds = [self.round([100, 100, 100, 100], 2, mode="2s")]
             self.assertEqual(assess(pinned, rounds)["verdict"], "PASS")
 
         def test_a_pin_that_stops_saturating_fails_and_says_how_to_fix_it(self):
             # A candidate fast enough to outgrow its pinned load must not be measured in headroom.
             pinned = Cell("hp", "2s", 0, 1, 0, "SET", 32, 512, instances=2)
-            rounds = [self.round([100] * 4, 2, busy=BUSY_FLOOR - 5)]
+            rounds = [self.round([100] * 4, 2, busy=BUSY_FLOOR - 5, mode="2s")]
             a = assess(pinned, rounds)
             self.assertEqual(a["verdict"], "FAIL")
             self.assertTrue(any("re-pin" in r for r in a["reasons"]), a["reasons"])
@@ -2300,11 +2395,53 @@ def self_test():
 
         def test_busy_floor_applies_to_every_run_of_the_judged_block(self):
             # One idle run inside the block being judged is enough to reject it.
-            rounds = [self.round([100] * 4, n) for n in (1, 2)]
-            self.assertEqual(peak_index(rounds), 0)
-            rounds[0]["runs"][2]["busy_pct"] = 50
-            self.assertFalse(saturation_done(self.cell, rounds))
-            self.assertEqual(assess(self.cell, rounds)["verdict"], "FAIL")
+            for index in range(4):
+                for pinned in (False, True):
+                    with self.subTest(index=index, pinned=pinned):
+                        cell = replace(self.cell, instances=1 if pinned else 0)
+                        rounds = [self.round([100] * 4, n) for n in ((1,) if pinned else (1, 2))]
+                        rounds[0]["runs"][index]["saturation"] = saturation_record(score=50)
+                        self.assertEqual(assess(cell, rounds)["verdict"], "FAIL")
+
+        def test_split_local_io_can_saturate_with_idle_executors(self):
+            cell = replace(self.cell, mode="2s", instances=1)
+            block = self.round([100] * 4, mode="2s")
+            for run in block["runs"]:
+                run["busy_pct"] = 49.5
+                run["saturation"] = saturation_record("2s", inactive_roles=("ex",))
+            result = assess(cell, [block])
+            self.assertEqual(result["verdict"], "PASS", result["reasons"])
+            self.assertEqual(result["busy_pct_abba"], [49.5] * 4)
+            self.assertTrue(all(value >= BUSY_FLOOR for value in result["saturation_pct_abba"]))
+            # The corrected role witness does not remove the higher-capacity probe.
+            self.assertEqual(assess(replace(cell, instances=0), [block])["verdict"], "FAIL")
+
+        def test_legacy_busy_cannot_replace_missing_or_forged_saturation_evidence(self):
+            for absent in (True, False):
+                block = self.round([100] * 4)
+                if absent:
+                    block["runs"][1].pop("saturation")
+                else:
+                    block["runs"][1]["saturation"]["threads"][0]["ops_delta"] = 0
+                result = assess(replace(self.cell, instances=1), [block])
+                self.assertEqual(result["verdict"], "FAIL")
+                self.assertFalse(result["measurement_valid"])
+
+        def test_saturation_from_another_window_is_rejected(self):
+            block = self.round([100] * 4)
+            block["runs"][0]["window_seconds"] = 21
+            result = assess(replace(self.cell, instances=1), [block])
+            self.assertFalse(result["measurement_valid"])
+            self.assertTrue(any("do not span" in reason for reason in result["reasons"]))
+
+        def test_pinned_floor_cannot_borrow_occupancy_outside_central_window(self):
+            block = self.round([100] * 4)
+            for run in block["runs"]:
+                run.update(saturation=saturation_record(score=98, window_seconds=1000),
+                           midpoint_monotonic=501)
+            result = assess(replace(self.cell, instances=1), [block])
+            self.assertEqual(result["verdict"], "FAIL")
+            self.assertEqual(result["saturation_pct_abba"], [0] * 4)
 
         def test_reference_noise_cannot_turn_a_bad_session_green(self):
             rounds = [self.round([100, 99, 99, 103], n) for n in (1, 2)]
@@ -2317,13 +2454,13 @@ def self_test():
 
         def test_depth_one_uses_latency_and_is_exempt(self):
             c = Cell("p1", "2s", 0, 0, 0, "GET", 1, 512)
-            a = assess(c, [self.round([100] * 4, busy=10, latency=[1, 1.1, 1.1, 1.001])])
+            a = assess(c, [self.round([100] * 4, busy=10, latency=[1, 1.1, 1.1, 1.001], mode="2s")])
             self.assertEqual(a["verdict"], "FAIL")
             self.assertTrue(a["saturation_exempt"])
             self.assertGreater(a["loss_pct"], 9)
-            self.assertEqual(assess(c, [self.round([100] * 4, busy=10)])["verdict"], "PASS")
+            self.assertEqual(assess(c, [self.round([100] * 4, busy=10, mode="2s")])["verdict"], "PASS")
             # This escalation repair must not add a throughput score to the p1 latency gate.
-            self.assertEqual(assess(c, [self.round([100, 100, 100, 120], busy=10)])["verdict"], "PASS")
+            self.assertEqual(assess(c, [self.round([100, 100, 100, 120], busy=10, mode="2s")])["verdict"], "PASS")
 
         def test_worst_failure_not_an_average(self):
             rows = [{"cell": {"id": "slow"}, "verdict": "FAIL", "assessment": {"margin_pct": 3}}]
@@ -2427,7 +2564,9 @@ def self_test():
                         self.quiet.close.return_value = witness
                     value = rates[instances][sequence - 1] if rates else instances * 100 if climbing else 100
                     result = dict(arm=arm, rate=value, complete=True, instances=instances,
-                                  load_layout=layouts[-1], busy_pct=busy, latency_ms=1)
+                                  load_layout=layouts[-1], busy_pct=busy, latency_ms=1,
+                                  window_seconds=20, midpoint_monotonic=11,
+                                  saturation=saturation_record(cell.mode, busy))
                     if run_overrides:
                         result.update(run_overrides(instances, sequence))
                     return result
@@ -2870,7 +3009,8 @@ def self_test():
                         return dict(arm=arm, rate=100 if arm == "A" else candidate_rate,
                                     complete=True, instances=instances,
                                     load_layout=load_layout(_self.load_cpus, instances, cell.conns),
-                                    busy_pct=99.9, latency_ms=1)
+                                    busy_pct=99.9, latency_ms=1, saturation=saturation_record(cell.mode),
+                                    window_seconds=20, midpoint_monotonic=11)
 
                     provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
                     with mock.patch.object(Runner, "measure", measure), \
@@ -2939,6 +3079,8 @@ def self_test():
                         calls.append((cell.id, instances, arm))
                         ticks[0] += WINDOW + 8
                         return dict(arm=arm, rate=100 if arm == "A" else candidate_rate, busy_pct=99.9,
+                            saturation=saturation_record(cell.mode),
+                            midpoint_monotonic=11,
                             latency_ms=1, complete=True, commands=2000, pid=123, window_seconds=WINDOW,
                             instances=instances, load_layout=load_layout(_runner.load_cpus, instances, cell.conns),
                             artifacts=f"{cell.id}/n{instances}-{index}-{arm}")
@@ -3063,6 +3205,8 @@ def self_test():
                     if instances > 8:
                         raise RuntimeError("SMT cannot manufacture a ninth physical load group")
                     return dict(arm=arm, rate=instances * 100, busy_pct=99.9, latency_ms=1,
+                                saturation=saturation_record(cell.mode, threads=len(_self.server_cpus)),
+                                window_seconds=20, midpoint_monotonic=11,
                                 complete=True, instances=instances,
                                 load_layout=load_layout(_self.load_cpus, instances, cell.conns))
 

@@ -7,6 +7,7 @@ import math
 import re
 
 from abba_instrument import validate_fingerprint
+from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
 from background_environment import canonical_contract, validate_contract
 
 ORDER = ["A", "B", "B", "A"]
@@ -165,6 +166,8 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         rounds = row.get("rounds", [])
         require(isinstance(rounds, list) and rounds and all(isinstance(block, dict) for block in rounds),
                 f"unreached ABBA cell: {cell['id']}")
+        require(sum(block.get("instances") == assessment.get("instances") for block in rounds) == 1,
+                "assessment does not identify exactly one measured load block")
         for block in rounds:
             runs = block.get("runs", [])
             require(isinstance(runs, list) and all(isinstance(run, dict) for run in runs), "invalid ABBA runs")
@@ -176,6 +179,14 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
                 for field in ("rate", "latency_ms", "window_seconds", "commands"):
                     number(run.get(field), "measurement " + field, positive=True)
                 require(run["window_seconds"] >= report["window_seconds"], "shortened measurement window")
+                # A standing null cannot borrow a cached PASS or scalar CPU reading.
+                # Recompute the productive-role witness from the same raw deltas
+                # used by the live driver, for both arms and all retained probes.
+                saturation = replay_saturation(run.get("saturation"), floor_pct=SATURATION_FLOOR,
+                    mode=cell["mode"], thread_count=len(environment["server_cpus"]))
+                central_saturation = require_saturation_window(saturation, run)
+                if cell["depth"] > 1 and block["instances"] == assessment["instances"]:
+                    require(central_saturation["floor_met"], "judged block is below the productive-role floor")
                 require(type(run.get("pid")) is int and run["pid"] > 0, "measurement never booted a server")
                 if cell["op"] == "REORDER":
                     number(run.get("p999_ms"), "short p99.9", positive=True)

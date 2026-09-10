@@ -309,6 +309,7 @@ def run(args):
 
 
 def self_test():
+    from _abba_test_fixtures import saturation_record
     import contextlib
     from dataclasses import replace
     import io
@@ -779,8 +780,9 @@ def self_test():
                         self.assertIsNone(runner.worker_affinity_factory)
                     calls.append((cell.id, instances, sequence, arm))
                     return {"arm": arm, "rate": 100, "busy_pct": 99.9, "latency_ms": 1,
+                            "saturation": saturation_record(cell.mode),
                             "instances": instances, "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
-                            "complete": True, "midpoint_monotonic": 20 + len(calls) * 30,
+                            "complete": True, "midpoint_monotonic": 11,
                             "window_seconds": 20, "artifacts": f"{cell.id}/n{instances}-{sequence}-{arm}"}
                 real_write = Path.write_text
                 def write(path, value, *args, **kwargs):
