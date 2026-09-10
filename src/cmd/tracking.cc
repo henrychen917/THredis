@@ -93,8 +93,12 @@ void IoLoop::tracking_note_prefix_registered(const std::string& prefix, bool add
 // at all -- its prefix registry is the whole subscription -- so only default (per-key
 // remembering) mode registers here.
 void IoLoop::tracking_register_read(Client* client, ClimonConn& state, Op& op) {
+    // Redis preserves CACHING across every CLIENT command, including introspection and errors.
+    // Consuming it before TRACKINGINFO both hides the flag and loses the following OPTIN read's
+    // invalidation (or wrongly subscribes an exempted OPTOUT read). CLIENT has no keys to enroll.
+    if (op.cmd_name().eq_icase("client")) return;
     const bool caching = state.caching_armed;
-    state.caching_armed = false;   // CLIENT CACHING covers exactly the next command
+    state.caching_armed = false;   // CLIENT subcommands above do not consume the choice
     if (state.bcast) return;
     const CommandSpec* spec = op.spec;
     if (!spec) return;
@@ -631,11 +635,11 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
         }
     }
 
-    // ORACLE-DERIVED CHECK ORDER (each step is pinned by a differ case):
+    // Mode checks precede prefix validation; seed 20 pins prefix-collision precedence below.
     //   1 OPTIN+OPTOUT together        4 OPTIN/OPTOUT switch on an already-on client
     //   2 PREFIX without BCAST         5 BCAST combined with OPTIN/OPTOUT
-    //   3 BCAST switch on an           6 overlap against prefixes this client already holds
-    //     already-on client            7 overlap among the prefixes this command provides
+    //   3 BCAST switch on an           6 for each supplied prefix, overlap with held prefixes,
+    //     already-on client              then with later prefixes supplied by this command
     // `CLIENT TRACKING off <anything>` is accepted by redis, so every rule is enable-gated.
     ClimonConn* existing = climon_conn_find(client->id());
     const bool live = existing != nullptr && existing->tracking_on && enable;
@@ -668,19 +672,20 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
             "ERR OPTIN and OPTOUT are not compatible with BCAST");
         return ClimonStartResult::Sync;
     }
-    if (live)
-        for (const std::string& fresh : prefixes)
+    // Validation is ordered by the supplied prefix, not by collision category: with held "a"
+    // and supplied "b", "", Redis reports the supplied b/empty collision before empty/held a.
+    for (size_t a = 0; enable && a < prefixes.size(); a++) {
+        if (live)
             for (const std::string& held : existing->prefixes)
-                if (track_prefix_overlaps(fresh, held)) {
+                if (track_prefix_overlaps(prefixes[a], held)) {
                     std::string error = "ERR Prefix '";
-                    error += fresh;
+                    error += prefixes[a];
                     error += "' overlaps with an existing prefix '";
                     error += held;
                     error += "'. Prefixes for a single client must not overlap.";
                     reply_err(op.sink(), error.c_str());
                     return ClimonStartResult::Sync;
                 }
-    for (size_t a = 0; enable && a < prefixes.size(); a++)
         for (size_t b = a + 1; b < prefixes.size(); b++)
             if (track_prefix_overlaps(prefixes[a], prefixes[b])) {
                 // Oracle wording: the FIRST-listed prefix is named first.
@@ -692,6 +697,7 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
                 reply_err(op.sink(), error.c_str());
                 return ClimonStartResult::Sync;
             }
+    }
 
     if (!enable) {
         if (existing) {
