@@ -92,18 +92,17 @@ BUSY_FLOOR = 95.0      # below this a cell is rejected outright, plateau or not
 # refused to certify. Adding 50% more load generator threads did not move it; the server simply
 # could not be pinned at 98% by any load this box can offer.
 #
-# The evidence that no headroom is absorbing a regression is that MORE LOAD NO LONGER RAISES THE
-# RATE. That is measured directly, and it also fixes a second defect: escalation used to judge on
-# the HIGHEST instance count, but past the optimum a write cell falls into congestion collapse --
-# h12 peaked at 26.6 Mops/s with 2 instances and decayed to 24.6 by 16, so the verdict was being
-# taken on a deliberately degraded block. The peak block is the measurement; blocks above it exist
-# to PROVE it is a peak.
+# Escalation judges the lowest TESTED saturated rung whose two arms stop gaining beyond
+# their own measured repeatability under a stable, higher-worker-capacity probe. A stable
+# decline may confirm the earlier saturated rung but is explicitly labeled congestion:
+# h12 peaked at 26.6 Mops/s with 2 instances and decayed to 24.6 by 16. Neither that decline
+# nor a worker-count increase proves unused generator headroom. Never pad a pin into it.
 # Load-generator escalation ladder. 8 was not enough: on 2026-09-10 the h12 SET cell left the
 # CANDIDATE arm at 97.1% busy while the reference sat at 98.4%, because the candidate was 10.7%
 # faster and therefore did the same offered work with less CPU. A faster server needs MORE load to
 # saturate, so capping the ladder at 8 makes an improvement fail the saturation precondition -- the
-# gate would reject exactly the changes it exists to certify. The 98% floor itself is correct and
-# stays: it is the project's "escalate until the fastest arm stops gaining AND server idle <= 2%".
+# gate would reject exactly the changes it exists to certify. The preferred diagnostic
+# level remains 98%; the enforced BUSY_FLOOR above is unchanged.
 LADDER = (1, 2, 4, 8, 16)
 # Project measurement-integrity boundary, NOT the regression tolerance.
 MAX_SPREAD = 2.0
@@ -366,89 +365,182 @@ def fastest_mean(round_):
 
 
 def peak_index(rounds):
-    """Index of the block where the fastest arm peaked.
-
-    Escalating past the peak is congestion, not saturation, so the peak block is what gets judged.
-    """
+    """Numerical throughput peak, retained as a diagnostic rather than a load floor."""
     return max(range(len(rounds)), key=lambda i: fastest_mean(rounds[i]))
 
 
+def load_block_evidence(cell, block):
+    """Validate every measured block, including probes not selected for the comparison.
+
+    A noisy probe must not certify a quieter neighbor. Keep its failure even if a later
+    rung would have looked better; searching again cannot erase a bad measurement.
+    """
+    n, runs = block["instances"], block["runs"]
+    reasons = []
+    rate = paired(runs)
+    metrics = [cell.metric]
+    if cell.depth > 1:
+        metrics.append("rate")  # Escalation's plateau needs stable throughput too.
+    if cell.metric == "p999_ms":
+        metrics.append("long_p999_ms")
+    for metric in dict.fromkeys(metrics):
+        values = paired(runs, metric)
+        for arm in ("reference", "candidate"):
+            if values[f"{arm}_spread_pct"] > MAX_SPREAD:
+                reasons.append(f"{arm} {metric} spread exceeds the project's {MAX_SPREAD:g}% stability boundary")
+    if any(run.get("complete") is not True or run.get("error") for run in runs):
+        reasons.append("incomplete or failed ABBA measurement")
+    if any(run.get("instances") != n for run in runs):
+        reasons.append("measurement instance count differs from its block")
+    if any(not isinstance(run.get("busy_pct"), (int, float)) or
+           not math.isfinite(run["busy_pct"]) or not 0 <= run["busy_pct"] <= 100 for run in runs):
+        reasons.append("invalid server busy measurement")
+    layout = runs[0].get("load_layout")
+    if not isinstance(layout, list) or len(layout) != n or any(
+            run.get("load_layout") != layout for run in runs):
+        reasons.append("missing or inconsistent generator layouts across ABBA arms")
+        workers = None
+    else:
+        workers = 0
+        connections = 0
+        assigned = []
+        for placement in layout:
+            threads, clients, cpus_ = (placement.get(key) for key in ("threads", "clients", "cpus"))
+            if (type(threads) is not int or type(clients) is not int or
+                    threads <= 0 or clients <= 0 or not isinstance(cpus_, list) or
+                    not cpus_ or threads > len(cpus_) or
+                    any(type(cpu) is not int or cpu < 0 for cpu in cpus_)):
+                reasons.append("invalid generator thread/client/CPU layout")
+                workers = None
+                break
+            workers += threads
+            connections += threads * clients
+            assigned.extend(cpus_)
+        if workers is not None and (connections != cell.conns or len(assigned) != len(set(assigned))):
+            reasons.append("generator layout changes total connections or shares assigned CPUs")
+    return {"instances": n, "valid": not reasons, "validation_reasons": reasons,
+            "minimum_busy_pct": min(run["busy_pct"] for run in runs),
+            "rate": rate, "worker_threads": workers, "load_layout": layout}
+
+
+def select_load_floor(cell, rounds):
+    """Choose the lowest TESTED stable plateau, with a larger worker-capacity probe.
+
+    Compare each arm with itself at the next rung. Taking max(A,B) before comparing can
+    hide one arm still climbing behind the other's different knee. Choosing a numerical
+    maximum first also makes the later gain test tautological: its successor cannot win.
+    Neither a worker-count increase nor a plateau proves unused generator capacity; that
+    remains explicitly unproven until the separate live load controls establish it.
+    """
+    if any(type(block["instances"]) is not int or block["instances"] <= 0 for block in rounds):
+        raise ValueError("invalid load rung")
+    if any(a["instances"] >= b["instances"] for a, b in zip(rounds, rounds[1:])):
+        raise ValueError("load escalation must use increasing distinct rungs")
+    evidence = [load_block_evidence(cell, block) for block in rounds]
+    invalid = [f"measurement n={row['instances']}: {reason}"
+               for row in evidence for reason in row["validation_reasons"]]
+    numerical_peak = peak_index(rounds)
+    pinned = bool(cell.depth > 1 and cell.instances and len(rounds) == 1 and
+                  rounds[0]["instances"] == cell.instances)
+    selected, confirmation = None, None
+    tested = []
+    for index, current in enumerate(evidence):
+        row = {**current, "rejection_reasons": list(current["validation_reasons"])}
+        tested.append(row)
+        if cell.depth == 1 or pinned:
+            if not invalid:
+                selected = index
+            continue
+        if current["minimum_busy_pct"] < BUSY_FLOOR:
+            row["rejection_reasons"].append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
+        if index + 1 == len(evidence):
+            row["rejection_reasons"].append("no higher-instance confirmation block")
+            continue
+        above = evidence[index + 1]
+        row["confirmation_instances"] = above["instances"]
+        row["confirmation_worker_threads"] = above["worker_threads"]
+        if not above["valid"]:
+            row["rejection_reasons"].append("higher-instance confirmation measurement is invalid")
+        if (current["worker_threads"] is None or above["worker_threads"] is None or
+                above["worker_threads"] <= current["worker_threads"]):
+            row["rejection_reasons"].append("higher instance count did not increase generator worker capacity")
+        row["arm_gains_pct"], row["arm_repeatability_pct"], row["arm_shapes"] = {}, {}, {}
+        for arm in ("reference", "candidate"):
+            gain = 100 * (above["rate"][f"{arm}_mean"] / current["rate"][f"{arm}_mean"] - 1)
+            noise = max(current["rate"][f"{arm}_spread_pct"], above["rate"][f"{arm}_spread_pct"])
+            row["arm_gains_pct"][arm], row["arm_repeatability_pct"][arm] = gain, noise
+            row["arm_shapes"][arm] = ("gaining" if gain > noise else
+                                      "congestion" if gain < -noise else "plateau")
+            if gain > noise:
+                row["rejection_reasons"].append(f"{arm} still gains beyond its measured repeatability")
+        # A stable decline can confirm the earlier saturated peak, as before. It proves
+        # congestion at the probe, not spare generator capacity or a reason to pad the pin.
+        shapes = row["arm_shapes"].values()
+        row["confirmation_shape"] = ("gaining" if "gaining" in shapes else
+                                      "congestion" if "congestion" in shapes else "plateau")
+        if selected is None and not invalid and not row["rejection_reasons"]:
+            selected, confirmation = index, index + 1
+    chosen = tested[selected] if selected is not None else None
+    return {"method": "lowest-tested-confirmed-rung-v1", "measurement_valid": not invalid,
+            "measurement_failures": invalid,
+            "status": "INVALID" if invalid else "EXEMPT" if cell.depth == 1 else
+                      "PINNED" if pinned else "CONFIRMED" if chosen else "UNPROVEN",
+            "selected_index": selected, "confirmation_index": confirmation,
+            "lowest_tested_qualifying_instances": chosen["instances"] if chosen and not pinned and cell.depth > 1 else None,
+            "confirmation_instances": evidence[confirmation]["instances"] if confirmation is not None else None,
+            "numerical_peak_instances": rounds[numerical_peak]["instances"],
+            "generator_headroom": "UNPROVEN", "tested_rungs": tested,
+            "lower_rung_rejections": [dict(instances=row["instances"], reasons=row["rejection_reasons"])
+                                       for row in tested[:selected if selected is not None else len(tested)]]}
+
+
 def assess(cell, rounds):
-    peak = peak_index(rounds)
-    current = rounds[peak]
+    selection = select_load_floor(cell, rounds)
+    selected = selection["selected_index"]
+    # An unqualified peak is retained for diagnosis only. Its row stays FAIL and cannot
+    # become a pin recommendation, standing null, or trusted performance result.
+    current = rounds[selected if selected is not None else peak_index(rounds)]
     rate = paired(current["runs"])
     p = paired(current["runs"], cell.metric)
-    reasons = []
-    for name in ("reference", "candidate"):
-        if p[f"{name}_spread_pct"] > MAX_SPREAD:
-            reasons.append(f"{name} spread exceeds the project's {MAX_SPREAD:g}% stability boundary")
-    # Positive loss always means regression, for both throughput and latency.
+    reasons = list(selection["measurement_failures"])
     loss = -p["delta_pct"] if cell.metric == "rate" else p["delta_pct"]
     if loss > p["threshold_pct"]:
         reasons.append("paired regression exceeds measured reference spread")
     long_tail = None
     if cell.metric == "p999_ms":
-        # Short-command tail is the reorder benefit, but it may not be bought by
-        # starving long commands. Both class tails use the same ABBA decision law.
         long_tail = paired(current["runs"], "long_p999_ms")
-        if any(long_tail[f"{arm}_spread_pct"] > MAX_SPREAD for arm in ("reference", "candidate")):
-            reasons.append("long-command p99.9 exceeds the stability boundary")
         if long_tail["delta_pct"] > long_tail["threshold_pct"]:
             reasons.append("long-command p99.9 regression exceeds measured reference spread")
     gain, plateau_noise = None, None
     if cell.depth > 1:
-        # A peak is only a peak if something above it failed to beat it. Without a higher probe the
-        # curve may still be climbing and this block is simply the last one we happened to run.
-        if cell.instances and len(rounds) == 1 and rounds[0]["instances"] == cell.instances:
-            # PINNED: the search was run once and its outcome recorded in the cells file, so this
-            # run does not re-derive it. What it must still prove is that the pin STILL HOLDS --
-            # otherwise a candidate that outgrows the pinned load is silently measured in headroom,
-            # which is the exact failure this tier exists to prevent. Busy is the only saturation
-            # evidence available without a second rung, so it is checked and its failure names the
-            # remedy rather than just reporting a number.
+        if selection["status"] == "PINNED":
             if any(r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
                 reasons.append(
                     f"pinned load level {cell.instances} no longer saturates this cell "
                     f"(busy {min(r['busy_pct'] for r in current['runs']):.1f}% < {BUSY_FLOOR:g}%); "
                     f"re-pin it with --escalate and update the cells file")
-        elif peak == len(rounds) - 1:
-            reasons.append("no higher-instance saturation probe above the peak block")
+        elif selected is None:
+            reasons.append("no lowest tested load rung has valid saturation and higher-capacity plateau confirmation")
+            reasons.extend(f"n={row['instances']}: {reason}"
+                           for row in selection["lower_rung_rejections"] for reason in row["reasons"])
         else:
-            above = paired(rounds[peak + 1]["runs"])
-            fast = max(rate["reference_mean"], rate["candidate_mean"])
-            beyond = max(above["reference_mean"], above["candidate_mean"])
-            gain = 100 * (beyond / fast - 1)
-            plateau_noise = max(above["reference_spread_pct"], rate["reference_spread_pct"])
-            if gain > plateau_noise:
-                reasons.append("fastest arm is still gaining with more load instances")
-        if not (cell.instances and len(rounds) == 1) and any(
-                r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
-            reasons.append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
+            chosen = selection["tested_rungs"][selected]
+            # Retain the old display fields for raw consumers; decisions use BOTH arm-specific
+            # comparisons above, never the envelope of whichever arm happens to be fastest.
+            gain = max(chosen["arm_gains_pct"].values())
+            plateau_noise = max(chosen["arm_repeatability_pct"].values())
     return {**p, "throughput": rate, "long_tail": long_tail, "instances": current["instances"],
             "busy_pct_abba": [r["busy_pct"] for r in current["runs"]],
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
             "fastest_gain_pct": gain, "plateau_noise_pct": plateau_noise,
+            "load_selection": selection, "measurement_valid": selection["measurement_valid"],
             "saturation_exempt": cell.depth == 1,
             "verdict": "FAIL" if reasons else "PASS", "reasons": reasons}
 
 
 def saturation_done(cell, rounds):
-    """Stop escalating once the peak block is proven -- i.e. a HIGHER instance count exists and did
-    not beat it -- and that peak block is itself stable. Escalating further only walks deeper into
-    congestion and cannot change the verdict, since the peak is what gets judged."""
-    if cell.depth == 1:
-        return True
-    if len(rounds) < 2:
-        return False
-    peak = peak_index(rounds)
-    if peak == len(rounds) - 1:
-        return False                      # still climbing; the top block is the best so far
-    a = assess(cell, rounds)
-    return (a["fastest_gain_pct"] is not None
-            and a["fastest_gain_pct"] <= a["plateau_noise_pct"]
-            and min(a["busy_pct_abba"]) >= BUSY_FLOOR
-            and a["throughput"]["reference_spread_pct"] <= MAX_SPREAD
-            and a["throughput"]["candidate_spread_pct"] <= MAX_SPREAD)
+    selection = select_load_floor(cell, rounds)
+    return selection["measurement_valid"] and selection["status"] in ("EXEMPT", "CONFIRMED")
 
 
 def overall(rows):
@@ -992,9 +1084,18 @@ def print_cell(row):
           f"{a['candidate_spread_pct']:.4f}% threshold={a['threshold_pct']:.4f}% "
           f"busy(ABBA)={','.join(f'{x:.3f}' for x in a['busy_pct_abba'])}% "
           f"instances={a['instances']} {a['verdict']}", flush=True)
-    if a["fastest_gain_pct"] is not None:
-        print(f"  fastest-arm gain at higher instance count={a['fastest_gain_pct']:+.4f}% "
-              f"vs measured plateau noise={a['plateau_noise_pct']:.4f}%", flush=True)
+    selection = a["load_selection"]
+    if selection["status"] not in ("PINNED", "EXEMPT"):
+        print(f"  load floor={selection['lowest_tested_qualifying_instances']} "
+              f"({selection['status']}, lowest TESTED qualifying rung); "
+              f"confirmation={selection['confirmation_instances']} "
+              f"numerical peak={selection['numerical_peak_instances']}; generator headroom UNPROVEN", flush=True)
+        if selection["selected_index"] is not None:
+            chosen = selection["tested_rungs"][selection["selected_index"]]
+            print(f"  workers {chosen['worker_threads']} -> {chosen['confirmation_worker_threads']}; "
+                  f"per-arm gains={chosen['arm_gains_pct']} "
+                  f"repeatability={chosen['arm_repeatability_pct']} "
+                  f"shape={chosen['confirmation_shape']}", flush=True)
     for reason in a["reasons"]:
         print(f"  FAIL: {reason}", flush=True)
 
@@ -1190,10 +1291,11 @@ def main(args, *, diagnostic_monitor=None):
                 for note in row["notes"]:
                     print(f"  {cell.id} COMPATIBILITY: {note}", flush=True)
                 pinned = cell.depth > 1 and cell.instances and not args.escalate
-                ladder = (cell.instances,) if pinned else LADDER
+                ladder = ((cell.instances,) if pinned else
+                          tuple(sorted(set(LADDER) | ({cell.instances} if args.escalate and cell.instances else set()))))
                 row["load_ladder"] = list(ladder)
                 # Clearing the assessment pin matters even at --max-instances=1:
-                # --escalate must prove its peak with a higher probe, never borrow
+                # --escalate must prove its load floor with a higher probe, never borrow
                 # the very stored saturation evidence the caller asked to ignore.
                 assessed_cell = replace(cell, instances=0) if args.escalate else cell
                 if pinned:
@@ -1213,8 +1315,6 @@ def main(args, *, diagnostic_monitor=None):
                     # plateau remains FAIL instead of attempting an impossible placement.
                     if n > args.max_instances or n > cell.conns or n > len(load_physical):
                         break
-                    if cell.conns % n and not pinned:
-                        continue
                     round_ = {"instances": n, "runs": []}
                     row["rounds"].append(round_)
                     for sequence, arm in enumerate(ORDER, 1):
@@ -1228,7 +1328,9 @@ def main(args, *, diagnostic_monitor=None):
                     row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
-                    if saturation_done(assessed_cell, row["rounds"]):
+                    # An unstable measured block is permanent evidence, never an excuse to
+                    # search for a later block that happens to pass.
+                    if not row["assessment"]["measurement_valid"] or saturation_done(assessed_cell, row["rounds"]):
                         break
             except (InterruptedError, QuietViolation):
                 raise
@@ -1665,7 +1767,9 @@ def self_test():
                 self.assertEqual(result["cells"], [])
 
         def round(self, rates, n=1, busy=99.5, latency=None):
+            layout = load_layout(list(range(32, 128)) + list(range(160, 256)), n, self.cell.conns)
             return {"instances": n, "runs": [dict(arm=arm, rate=rate, busy_pct=busy,
+                    complete=True, instances=n, load_layout=layout,
                     latency_ms=(latency or [1, 1, 1, 1])[i])
                     for i, (arm, rate) in enumerate(zip(ORDER, rates))]}
 
@@ -1749,8 +1853,7 @@ def self_test():
             # Still climbing: without a higher probe that fails to beat it, the top block might
             # simply be the last one we ran.
             rounds = [self.round([100] * 4, 1), self.round([200] * 4, 2)]
-            self.assertIn("no higher-instance saturation probe above the peak block",
-                          assess(self.cell, rounds)["reasons"])
+            self.assertIn("n=2: no higher-instance confirmation block", assess(self.cell, rounds)["reasons"])
             self.assertFalse(saturation_done(self.cell, rounds))
 
         def test_fastest_arm_still_gaining_fails(self):
@@ -1785,6 +1888,8 @@ def self_test():
             self.assertTrue(a["saturation_exempt"])
             self.assertGreater(a["loss_pct"], 9)
             self.assertEqual(assess(c, [self.round([100] * 4, busy=10)])["verdict"], "PASS")
+            # This escalation repair must not add a throughput score to the p1 latency gate.
+            self.assertEqual(assess(c, [self.round([100, 100, 100, 120], busy=10)])["verdict"], "PASS")
 
         def test_worst_failure_not_an_average(self):
             rows = [{"cell": {"id": "slow"}, "verdict": "FAIL", "assessment": {"margin_pct": 3}}]
@@ -1847,7 +1952,8 @@ def self_test():
                 self.assertEqual(len(assigned), len(set(assigned)))
 
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
-                      climbing=False, ceiling=16, contend_after=None, reference_error=None):
+                      climbing=False, ceiling=16, contend_after=None, reference_error=None, rates=None,
+                      run_overrides=None):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
             # pin=3/512 fixture also catches silently skipping a non-doubling pin.
@@ -1861,8 +1967,8 @@ def self_test():
                 output = directory / "out"
                 argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
                         "--output", str(output), "--memtier", sys.executable,
-                        "--server-cores", "0-31", "--load-cores", "32-127",
-                        "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
+                        "--server-cores", "0-31", "--server-smt", "", "--load-cores", "32-127",
+                        "--load-smt", "160-255", "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
                 with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                     args = parse_args()
                 order, layouts = [], []
@@ -1881,8 +1987,12 @@ def self_test():
                                    "samples": 4, "complete": False}
                         self.quiet.evidence.return_value = witness
                         self.quiet.close.return_value = witness
-                    return dict(arm=arm, rate=instances * 100 if climbing else 100,
-                                busy_pct=busy, latency_ms=1)
+                    value = rates[instances][sequence - 1] if rates else instances * 100 if climbing else 100
+                    result = dict(arm=arm, rate=value, complete=True, instances=instances,
+                                  load_layout=layouts[-1], busy_pct=busy, latency_ms=1)
+                    if run_overrides:
+                        result.update(run_overrides(instances, sequence))
+                    return result
 
                 provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
                 stream = io.StringIO()
@@ -1985,18 +2095,98 @@ def self_test():
 
         def test_escalate_ignores_pin_and_drives_full_ladder(self):
             rc, order, _, result, output = self.fake_main(pin=3, escalate=True, climbing=True)
-            self.assertEqual(order, [(n, arm) for n in LADDER for arm in ORDER])
-            self.assertEqual(len(order), 20)
+            self.assertEqual(order, [(n, arm) for n in (1, 2, 3, 4, 8, 16) for arm in ORDER])
+            self.assertEqual(len(order), 24)
             self.assertEqual(rc, 1, output)  # Still rising at the ceiling is unproven saturation.
             self.assertIn("ESCALATE ignores pin=3", output)
-            self.assertIn("no higher-instance saturation probe above the peak block",
+            self.assertIn("n=16: no higher-instance confirmation block",
                           result["cells"][0]["assessment"]["reasons"])
+
+        def test_real_escalation_accepts_positive_gain_inside_each_arms_repeatability(self):
+            rates = {1: [99.9, 99.9, 100.1, 100.1], 2: [100, 100, 100.2, 100.2]}
+            rc, order, layouts, result, output = self.fake_main(escalate=True, rates=rates)
+            self.assertEqual(rc, 3, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2) for arm in ORDER])
+            selection = result["cells"][0]["assessment"]["load_selection"]
+            self.assertEqual(selection["lowest_tested_qualifying_instances"], 1)
+            self.assertEqual(selection["numerical_peak_instances"], 2)
+            self.assertEqual(selection["confirmation_instances"], 2)
+            self.assertEqual(selection["generator_headroom"], "UNPROVEN")
+            self.assertEqual(selection["tested_rungs"][0]["load_layout"], layouts[0])
+            for arm in ("reference", "candidate"):
+                self.assertGreater(selection["tested_rungs"][0]["arm_gains_pct"][arm], 0)
+                self.assertLess(selection["tested_rungs"][0]["arm_gains_pct"][arm],
+                                selection["tested_rungs"][0]["arm_repeatability_pct"][arm])
+
+        def test_real_escalation_cannot_discard_an_unstable_higher_probe(self):
+            rates = {1: [100] * 4, 2: [99, 99, 102, 102], 4: [100] * 4}
+            rc, order, _, result, output = self.fake_main(escalate=True, rates=rates)
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2) for arm in ORDER])
+            row = result["cells"][0]
+            self.assertEqual(row["assessment"]["load_selection"]["status"], "INVALID")
+            self.assertFalse(row["assessment"]["measurement_valid"])
+            self.assertTrue(any("measurement n=2" in reason and "stability boundary" in reason
+                                for reason in row["assessment"]["reasons"]))
+            self.assertIsNone(row["assessment"]["load_selection"]["lowest_tested_qualifying_instances"])
+            self.assertEqual(len(row["rounds"][1]["runs"]), 4)
+
+        def test_real_escalation_retests_existing_non_ladder_pin(self):
+            rates = {1: [100] * 4, 2: [200] * 4, 3: [300] * 4, 4: [300] * 4}
+            rc, order, layouts, result, output = self.fake_main(pin=3, escalate=True, rates=rates)
+            self.assertEqual(rc, 3, output)
+            self.assertEqual(order, [(n, arm) for n in (1, 2, 3, 4) for arm in ORDER])
+            selection = result["cells"][0]["assessment"]["load_selection"]
+            self.assertEqual(selection["lowest_tested_qualifying_instances"], 3)
+            self.assertEqual(selection["confirmation_instances"], 4)
+            self.assertEqual([r["instances"] for r in selection["lower_rung_rejections"]], [1, 2])
+            self.assertTrue(all(r["reasons"] for r in selection["lower_rung_rejections"]))
+            self.assertTrue(all(sum(p["threads"] * p["clients"] for p in layout) == 512 for layout in layouts))
+
+        def test_real_escalation_does_not_hide_either_arms_different_knee(self):
+            for slower in ("A", "B"):
+                with self.subTest(slower=slower):
+                    means = {1: (100, 90), 2: (200, 100), 4: (198, 150), 8: (197, 149)}
+                    rates = {n: [pair[1 if arm == slower else 0] for arm in ORDER]
+                             for n, pair in means.items()}
+                    rc, order, _, result, output = self.fake_main(escalate=True, rates=rates)
+                    self.assertEqual(order, [(n, arm) for n in (1, 2, 4, 8) for arm in ORDER])
+                    self.assertEqual(rc, 1 if slower == "B" else 3, output)
+                    selection = result["cells"][0]["assessment"]["load_selection"]
+                    self.assertEqual(selection["numerical_peak_instances"], 2)
+                    self.assertEqual(selection["lowest_tested_qualifying_instances"], 4)
+                    self.assertEqual(selection["confirmation_instances"], 8)
+                    reason = ("reference" if slower == "A" else "candidate") + " still gains"
+                    self.assertTrue(any(reason in text for text in selection["lower_rung_rejections"][1]["reasons"]))
+                    chosen = selection["tested_rungs"][selection["selected_index"]]
+                    self.assertEqual(chosen["confirmation_shape"], "congestion")
+                    self.assertEqual(selection["generator_headroom"], "UNPROVEN")
+
+        def test_real_escalation_cannot_call_same_worker_count_more_capacity(self):
+            rates = {n: [min(n, 8) * 100] * 4 for n in LADDER}
+            rc, order, layouts, result, output = self.fake_main(escalate=True, rates=rates)
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [(n, arm) for n in LADDER for arm in ORDER])
+            workers = {n: sum(p["threads"] for p in layout)
+                       for (n, _), layout in zip(order, layouts)}
+            self.assertEqual(workers, {1: 16, 2: 32, 4: 64, 8: 128, 16: 128})
+            selection = result["cells"][0]["assessment"]["load_selection"]
+            self.assertIsNone(selection["lowest_tested_qualifying_instances"])
+            self.assertIn("higher instance count did not increase generator worker capacity",
+                          selection["tested_rungs"][-2]["rejection_reasons"])
+
+        def test_real_escalation_incomplete_measurement_is_permanent_failure(self):
+            rc, order, _, result, output = self.fake_main(escalate=True,
+                run_overrides=lambda n, sequence: {"complete": False} if n == 1 and sequence == 2 else {})
+            self.assertEqual(rc, 1, output)
+            self.assertEqual(order, [(1, arm) for arm in ORDER])
+            self.assertFalse(result["cells"][0]["assessment"]["measurement_valid"])
 
         def test_escalate_cannot_borrow_pin_for_a_single_block(self):
             rc, order, _, result, _ = self.fake_main(pin=1, escalate=True, ceiling=1)
             self.assertEqual(order, [(1, arm) for arm in ORDER])
             self.assertEqual(rc, 1)
-            self.assertIn("no higher-instance saturation probe above the peak block",
+            self.assertIn("n=1: no higher-instance confirmation block",
                           result["cells"][0]["assessment"]["reasons"])
 
         def test_pin_that_outgrows_load_fails_after_four_and_names_remedy(self):
@@ -2152,6 +2342,8 @@ def self_test():
                     def measure(_self, cell, arm, sequence, instances, knobs):
                         order.append((instances, arm))
                         return dict(arm=arm, rate=100 if arm == "A" else candidate_rate,
+                                    complete=True, instances=instances,
+                                    load_layout=load_layout(_self.load_cpus, instances, cell.conns),
                                     busy_pct=99.9, latency_ms=1)
 
                     provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
@@ -2217,6 +2409,7 @@ def self_test():
                         ticks[0] += WINDOW + 8
                         return dict(arm=arm, rate=100 if arm == "A" else candidate_rate, busy_pct=99.9,
                             latency_ms=1, complete=True, commands=2000, pid=123, window_seconds=WINDOW,
+                            instances=instances, load_layout=load_layout(_runner.load_cpus, instances, cell.conns),
                             artifacts=f"{cell.id}/n{instances}-{index}-{arm}")
                     provenance = dict(source="fake reference", commit="0" * 40, sha256=sha256(binary))
                     with mock.patch.object(Runner, "measure", measure), \
@@ -2324,7 +2517,9 @@ def self_test():
                     order.append((instances, arm))
                     if instances > 8:
                         raise RuntimeError("SMT cannot manufacture a ninth physical load group")
-                    return dict(arm=arm, rate=instances * 100, busy_pct=99.9, latency_ms=1)
+                    return dict(arm=arm, rate=instances * 100, busy_pct=99.9, latency_ms=1,
+                                complete=True, instances=instances,
+                                load_layout=load_layout(_self.load_cpus, instances, cell.conns))
 
                 provenance = dict(source="test", commit="0" * 40, sha256=sha256(binary))
                 with mock.patch.object(Runner, "measure", measure), \
@@ -2341,8 +2536,7 @@ def self_test():
                 self.assertEqual(result["verdict"], "FAIL")
                 self.assertEqual(result["environment"]["load_instance_ceiling"], 8)
                 self.assertNotIn("reason", row)  # no placement exception replaces measurement evidence
-                self.assertIn("no higher-instance saturation probe above the peak block",
-                              row["assessment"]["reasons"])
+                self.assertIn("n=8: no higher-instance confirmation block", row["assessment"]["reasons"])
 
         def test_only_owned_children_are_stopped(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
