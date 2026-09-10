@@ -1797,8 +1797,14 @@ def self_test():
                 for candidate_rate, expected in ((100, 3), (98, 1)):
                     output = directory / str(candidate_rate)
                     argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
-                            "--output", str(output), "--memtier", sys.executable, "--max-instances", "2"]
-                    with mock.patch.object(sys, "argv", argv):
+                            "--output", str(output), "--memtier", sys.executable, "--max-instances", "2",
+                            "--server-cores", "0-31", "--server-smt", "",
+                            "--load-cores", "32-127", "--load-smt", ""]
+                    # A correctness worker has only its small load affinity. Defaulting this
+                    # serverless fixture to that affinity prevented main() from reaching even
+                    # one fake measurement; an expected setup error proves no regression check.
+                    # Keep fixture geometry and parser defaults independent of the live gate.
+                    with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                         args = parse_args()
                     order = []
 
