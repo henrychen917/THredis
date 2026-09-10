@@ -299,9 +299,12 @@ STRAYS=$(pgrep -x tomokv 2>/dev/null | paste -sd, -)
 pausable make -j12 >/tmp/gate-build.txt 2>&1 \
     && ok "release build (+footprint locks)" || bad "release build" "see /tmp/gate-build.txt"
 ASAN=/tmp/tomokv-gate-asan
-pausable g++ -std=c++20 -O1 -g -fsanitize=address -march=native -pthread -I. \
-    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc \
-    -o $ASAN -luring -pthread -lssl -lcrypto 2>/tmp/gate-asan-build.txt \
+# 42 translation units: compiled in parallel with a header-aware object cache rather than in one
+# serial g++, which cost 365s and was the largest row in the gate.
+pausable tests/parbuild.sh $ASAN /tmp/gate-obj-asan \
+    "-std=c++20 -O1 -g -fsanitize=address -march=native -pthread -I." \
+    "-luring -pthread -lssl -lcrypto" \
+    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>/tmp/gate-asan-build.txt \
     && ok "ASAN build" || bad "ASAN build" "see /tmp/gate-asan-build.txt"
 quiet_wait
 g++ -std=c++20 -O2 -I. tests/config_parser_test.cc -o /tmp/tomokv-config-parser-test \
@@ -1518,9 +1521,10 @@ else bad "zc ASAN clean" "ASAN server never reached its shutdown dump; see $SRVL
 # enough that the load balancer moves no shards at all. So this row supplies both missing halves:
 # a debug build that states the ownership laws as assertions, and traffic that forces shard moves.
 RLDBG=/tmp/tomokv-gate-rlcachedbg
-pausable g++ -std=c++20 -O2 -g -march=native -pthread -DTOMO_JEMALLOC -DTOMO_RL_CACHE_DEBUG -I. \
-    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc \
-    -o $RLDBG -ljemalloc -luring -pthread -lssl -lcrypto -lm 2>/tmp/gate-rlcachedbg-build.txt \
+pausable tests/parbuild.sh $RLDBG /tmp/gate-obj-rlcachedbg \
+    "-std=c++20 -O2 -g -march=native -pthread -DTOMO_JEMALLOC -DTOMO_RL_CACHE_DEBUG -I." \
+    "-ljemalloc -luring -pthread -lssl -lcrypto -lm" \
+    src/main.cc src/net/tls.cc src/core/*.cc src/cmd/*.cc src/snapshot/*.cc src/persist/*.cc 2>/tmp/gate-rlcachedbg-build.txt \
     && ok "read-local ownership-invariant build" \
     || bad "read-local ownership-invariant build" "see /tmp/gate-rlcachedbg-build.txt"
 quiet_wait

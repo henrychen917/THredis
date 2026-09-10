@@ -110,6 +110,7 @@ class Cell:
     op: str
     depth: int
     conns: int
+    instances: int = 0     # PINNED load-generator instance count; 0 = unpinned, search for it
 
 
 def read_cells(path):
@@ -120,15 +121,21 @@ def read_cells(path):
         fields = [x.strip() for x in line.split("|")]
         if len(fields) != 11:
             raise ValueError(f"{path}:{lineno}: expected 11 pipe-separated fields")
-        ident, mode, rl, ov, ro, op, depth, conns, *_historical = fields
+        ident, mode, rl, ov, ro, op, depth, conns, _measured, _busy, pinned = fields
         if (not re.fullmatch(r"[A-Za-z0-9_-]+", ident) or mode not in ("1s", "2s")
                 or op not in ("GET", "SET") or not re.fullmatch(r"p[1-9][0-9]*", depth)
                 or not re.fullmatch(r"[1-9][0-9]*", conns)
                 or any(not re.fullmatch(prefix + "=[01]", value)
                        for prefix, value in (("rl", rl), ("ov", ov), ("ro", ro)))):
             raise ValueError(f"{path}:{lineno}: unsupported/malformed cell: {line}")
+        # The last column PINS the load level. It is a test parameter, like the connection count
+        # beside it -- NOT a stored performance number, which this tier refuses on principle. It
+        # exists because escalating from one instance on every cell of every run re-derives a search
+        # whose answer we already have, at four measurements a rung. Unpinned ("-") falls back to
+        # the search, and the run says so.
         cells.append(Cell(ident, mode, int(rl[-1]), int(ov[-1]), int(ro[-1]),
-                          op, int(depth[1:]), int(conns)))
+                          op, int(depth[1:]), int(conns),
+                          int(pinned) if re.fullmatch(r"[1-9][0-9]*", pinned) else 0))
     if not cells or len({c.id for c in cells}) != len(cells):
         raise ValueError("headline cells must be nonempty with unique IDs")
     return cells
@@ -260,7 +267,19 @@ def assess(cell, rounds):
     if cell.depth > 1:
         # A peak is only a peak if something above it failed to beat it. Without a higher probe the
         # curve may still be climbing and this block is simply the last one we happened to run.
-        if peak == len(rounds) - 1:
+        if cell.instances and len(rounds) == 1 and rounds[0]["instances"] == cell.instances:
+            # PINNED: the search was run once and its outcome recorded in the cells file, so this
+            # run does not re-derive it. What it must still prove is that the pin STILL HOLDS --
+            # otherwise a candidate that outgrows the pinned load is silently measured in headroom,
+            # which is the exact failure this tier exists to prevent. Busy is the only saturation
+            # evidence available without a second rung, so it is checked and its failure names the
+            # remedy rather than just reporting a number.
+            if any(r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
+                reasons.append(
+                    f"pinned load level {cell.instances} no longer saturates this cell "
+                    f"(busy {min(r['busy_pct'] for r in current['runs']):.1f}% < {BUSY_FLOOR:g}%); "
+                    f"re-pin it with --escalate and update the cells file")
+        elif peak == len(rounds) - 1:
             reasons.append("no higher-instance saturation probe above the peak block")
         else:
             above = paired(rounds[peak + 1]["runs"])
@@ -270,7 +289,8 @@ def assess(cell, rounds):
             plateau_noise = max(above["reference_spread_pct"], rate["reference_spread_pct"])
             if gain > plateau_noise:
                 reasons.append("fastest arm is still gaining with more load instances")
-        if any(r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
+        if not (cell.instances and len(rounds) == 1) and any(
+                r["busy_pct"] < BUSY_FLOOR for r in current["runs"]):
             reasons.append(f"server below the {BUSY_FLOOR:g}% busy floor in some ABBA run")
     return {**p, "throughput": rate, "instances": current["instances"],
             "busy_pct_abba": [r["busy_pct"] for r in current["runs"]],
@@ -701,6 +721,9 @@ def parse_args():
     p.add_argument("--port", type=int, default=int(os.getenv("GATE_ABBA_PORT", "8700")))
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--output", type=Path, default=None)
+    p.add_argument("--escalate", action="store_true",
+                   help="ignore pinned load levels and search the ladder; use this to RE-PIN a cell "
+                        "after the gate reports its pinned level no longer saturates")
     p.add_argument("--only", default="", help="comma-separated IDs; partial diagnostic, never a full-tier PASS")
     p.add_argument("--max-instances", type=int, choices=LADDER, default=16,
                    help="bounded doubling search (default 8); 1 cannot prove deep-pipeline saturation")
@@ -919,6 +942,19 @@ def self_test():
             plans, notes = knob_plan(off, support)
             self.assertTrue(any("legacy behaviour" in n for n in notes))
             self.assertNotIn("overlap", plans["A"])
+
+        def test_a_pinned_cell_needs_no_second_rung(self):
+            pinned = Cell("hp", "2s", 0, 1, 0, "SET", 32, 512, instances=2)
+            rounds = [self.round([100, 100, 100, 100], 2)]
+            self.assertEqual(assess(pinned, rounds)["verdict"], "PASS")
+
+        def test_a_pin_that_stops_saturating_fails_and_says_how_to_fix_it(self):
+            # A candidate fast enough to outgrow its pinned load must not be measured in headroom.
+            pinned = Cell("hp", "2s", 0, 1, 0, "SET", 32, 512, instances=2)
+            rounds = [self.round([100] * 4, 2, busy=BUSY_FLOOR - 5)]
+            a = assess(pinned, rounds)
+            self.assertEqual(a["verdict"], "FAIL")
+            self.assertTrue(any("re-pin" in r for r in a["reasons"]), a["reasons"])
 
         def test_a_peak_at_the_top_is_not_yet_proven(self):
             # Still climbing: without a higher probe that fails to beat it, the top block might
