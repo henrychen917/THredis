@@ -108,6 +108,47 @@ def stop_process(process):
     return forced
 
 
+def quiesce_connections(conn, process, timeout=8):
+    # Closing the load sockets only sends FIN; SIGTERM can stop an owner before it consumes
+    # that EOF, leaving otherwise completed work in shutdown_report.live_conns. Require the
+    # actual server-side release count, then retire the sole observer with QUIT. Its server
+    # close removes the Client from the live inventory before close(fd), so peer EOF fences
+    # that last removal. A sleep, local close(), or the QUIT reply alone proves none of this.
+    # A retained client or a missing close still fails within the bound; do not relax the
+    # shutdown report or let an already failed row become green through cleanup.
+    start = time.monotonic()
+    deadline = start + timeout
+    samples = []
+    original_timeout = conn.sock.gettimeout()
+
+    def remaining():
+        left = deadline - time.monotonic()
+        require(left > 0, f'connection quiescence timed out after {timeout}s; samples={samples}')
+        require(process.poll() is None, 'server exited before connection quiescence')
+        conn.sock.settimeout(left)
+        return left
+
+    try:
+        while True:
+            remaining()
+            clients = number(info(conn, 'CLIENTS'), 'connected_clients')
+            samples.append(dict(seconds=time.monotonic() - start, connected_clients=clients))
+            require(clients >= 1, 'connection quiescence omitted its live observer')
+            if clients == 1:
+                break
+            time.sleep(min(.01, remaining()))
+        remaining()
+        require(conn.must('QUIT') == b'OK', 'connection quiescence QUIT did not reply OK')
+        remaining()
+        try:
+            reply = conn.read()
+        except EOFError:
+            return dict(seconds=time.monotonic() - start, samples=samples, observer_eof=True)
+        raise AssertionError(f'connection quiescence expected peer EOF after QUIT; got {reply!r}')
+    finally:
+        conn.sock.settimeout(original_timeout)
+
+
 @contextlib.contextmanager
 def server(binary, server_cpus, port, directory, args):
     directory = Path(directory).resolve()
@@ -148,6 +189,8 @@ def server(binary, server_cpus, port, directory, args):
                     time.sleep(.025)
             require(conn is not None, f'boot timeout on port {port}')
             yield conn, process
+            quiescence = quiesce_connections(conn, process)
+            (directory / 'quiescence.json').write_text(json.dumps(quiescence, indent=2) + '\n')
         finally:
             if conn:
                 conn.close()

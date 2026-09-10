@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -162,6 +163,68 @@ def fold(plan, group, run_directory):
                 seconds=max(ends)-min(starts), comparisons=total, complete=True)
 
 
+def failed_span(group, run_directory):
+    """Retain completed work's duration even when its comparison evidence is red.
+
+    Completion and family timestamps are independent of the success-only matrix fold.
+    Every child must have finalized both artifacts; missing timing remains an explicit
+    infrastructure failure, never an invented successful row or an incomplete wall span.
+    """
+    selected = [f'{group}-0', f'{group}-1'] + (['equivalence'] if group == 'split' else [])
+    starts, ends = [], []
+    for part in selected:
+        directory = run_directory / 'jobs' / ('differ-' + part)
+        completion = directory.joinpath('done').read_text()
+        require(re.fullmatch(r'(0|[1-9][0-9]{0,2})\t[0-9]+\t[0-9]+\n', completion) and
+                int(completion.split('\t')[0]) <= 255, f'{part}: malformed worker completion')
+        lines = directory.joinpath('family.tsv').read_text().splitlines()
+        require(len(lines) == 1, f'{part}: missing or duplicate family timing')
+        family = lines[0].split('\t')
+        require(len(family) == 4 and family[0] == 'differ-' + part and family[1].isdecimal(),
+                f'{part}: wrong family timing identity')
+        start, end = map(float, family[2:])
+        require(math.isfinite(start) and math.isfinite(end) and 0 < start <= end,
+                f'{part}: invalid start/finish duration')
+        starts.append(start); ends.append(end)
+    return dict(schema=1, group=group, parts=selected, start=min(starts), end=max(ends),
+                seconds=max(ends)-min(starts), complete=False)
+
+
+def publish_fold(args):
+    # A frozen plan may fail current inventory checks after a source edit. Its original
+    # run identity still binds completed failure timing; it cannot authorize a PASS.
+    raw_plan = json.loads(args.plan.read_text())
+    require(raw_plan.get('schema') == 1 and args.row_run == raw_plan['manifest']['run'],
+            'fold run identity differs from frozen plan')
+    failure = None
+    try:
+        result = fold(load_plan(args.plan), args.group, args.run_directory)
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        failure = str(error)
+        print(f'DIFFER FANOUT FAIL: {failure}', file=sys.stderr)
+        result = failed_span(args.group, args.run_directory)
+        result['error'] = failure
+    from gate_history import budget, record
+    label = LABELS[args.group]
+    policy = budget(json.loads(args.row_plan.read_text()), label)
+    expired = result['seconds'] >= policy['timeout_seconds']
+    verdict = 'FAIL' if failure is not None or expired else 'ok'
+    # The original row spans earliest child start through latest child cleanup, including
+    # failed comparisons. Collection delay and sums of overlapping lifetimes are excluded.
+    if expired:
+        print(f'DIFFER TIMEOUT: {label}: {policy["timeout_seconds"]}s; '
+              f'median={policy["median_seconds"]}; {policy["basis"]}', file=sys.stderr)
+    result['verdict'] = verdict
+    write_json(args.run_directory / ('differ-' + args.group + '-fold.json'), result)
+    # Receipt validation compares these values exactly: history must record the same
+    # six-decimal duration emitted to the ledger, not hidden sub-microsecond float bits.
+    duration = f'{result["seconds"]:.6f}'
+    record(args.row_history, run_id=args.row_run, label=label, seconds=float(duration),
+           verdict=verdict, timed_out=expired, ledger_label=label)
+    print(f'{verdict}\t{duration}\t{label}')
+    return int(verdict == 'FAIL')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='action', required=True)
@@ -179,6 +242,8 @@ def main():
     q.add_argument('--row-history', type=Path, required=True); q.add_argument('--row-run', required=True)
     args = p.parse_args()
     try:
+        if args.action == 'fold':
+            return publish_fold(args)
         if args.action == 'plan':
             make_plan(args.output, args.run, args.repeats)
         else:
@@ -189,24 +254,6 @@ def main():
                 print(plan['repeats'])
             elif args.action == 'finish':
                 finish(plan, args.part, args.directory, args.failures, args.passed)
-            else:
-                require(args.row_run == plan['manifest']['run'], 'fold run identity differs from frozen plan')
-                result = fold(plan, args.group, args.run_directory)
-                write_json(args.run_directory / ('differ-' + args.group + '-fold.json'), result)
-                from gate_history import budget, record
-                label = LABELS[args.group]
-                policy = budget(json.loads(args.row_plan.read_text()), label)
-                expired = result['seconds'] >= policy['timeout_seconds']
-                verdict = 'FAIL' if expired else 'ok'
-                # Child watchdogs bound the work while it runs. This already-finished public row
-                # also retains its historical whole-row budget, without charging collection delay
-                # or pretending that durations of simultaneous children should be added together.
-                if expired:
-                    print(f'DIFFER TIMEOUT: {label}: {policy["timeout_seconds"]}s; '
-                          f'median={policy["median_seconds"]}; {policy["basis"]}', file=sys.stderr)
-                record(args.row_history, run_id=args.row_run, label=label, seconds=result['seconds'],
-                       verdict=verdict, timed_out=expired, ledger_label=label)
-                print(f'{verdict}\t{result["seconds"]:.6f}\t{label}')
         return 0
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         print(f'DIFFER FANOUT FAIL: {error}', file=sys.stderr)

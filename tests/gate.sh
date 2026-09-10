@@ -1001,7 +1001,7 @@ start_workers(){
   done
 }
 collect_differ_group(){
-  local group=$1 name dir p live row verdict duration label
+  local group=$1 name dir p live row verdict duration label fold_rc=0
   local parts=("differ-$group-0" "differ-$group-1")
   [ "$group" != split ] || parts+=(differ-equivalence)
   label=$(job_label "differ-$group")
@@ -1018,9 +1018,14 @@ collect_differ_group(){
   # Fold only after every named child's normal finalizer has published its real exit and cleanup
   # result. The helper revalidates ordered leg inventories and coverage, including failed-seed
   # replays; a missing/unreached child is one failed original row, never a smaller passing matrix.
-  if ! row=$(python3 tests/differ_fanout.py fold --plan "$RUN_DIR/differ-plan.json" --group "$group" \
-      --run-directory "$RUN_DIR" --row-plan "$ROW_PLAN" --row-history "$ROW_HISTORY" --row-run "$ROW_RUN_ID"); then
-    bad "$label" "incomplete differential children; see $RUN_DIR/jobs/differ-*"
+  row=$(python3 tests/differ_fanout.py fold --plan "$RUN_DIR/differ-plan.json" --group "$group" \
+      --run-directory "$RUN_DIR" --row-plan "$ROW_PLAN" --row-history "$ROW_HISTORY" --row-run "$ROW_RUN_ID") || fold_rc=$?
+  # A completed failed matrix still has real elapsed time and public-label history. Accept
+  # that nonzero helper result only as one exact FAIL row for this group; malformed/empty
+  # output or an error accompanied by an ok fragment remains an infrastructure failure.
+  if ! [[ "$row" =~ ^(ok|FAIL)$'\t'[0-9]+([.][0-9]+)?$'\t'"$label"$ ]] ||
+      { [ "$fold_rc" -ne 0 ] && [[ "$row" != FAIL$'\t'* ]]; }; then
+    bad "$label" "incomplete differential children or malformed fold; see $RUN_DIR/jobs/differ-*"
     return
   fi
   IFS=$'\t' read -r verdict duration label <<< "$row"
@@ -2298,10 +2303,13 @@ job_feature_cell(){
 job_abba_selftest(){
 # The ABBA tier's own decision logic, saturation rules and rejection paths, exercised serverless so
 # a broken comparator is caught on any machine and before any measurement is trusted.
+# Owned-server teardown must retain its drain/identity witnesses too: a success followed by
+# unfinished connection cleanup is failed evidence, including in the parallel feature cells.
 row_begin "ABBA comparison + saturation negative controls"
 py tests/abbagate.py --self-test > $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/background_environment_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_history.py self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
+    && py tests/gate_process_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && ok "ABBA comparison + saturation negative controls" \
     || bad "ABBA comparison + saturation negative controls" "see $TMPDIR/gate-abbagate-unit.txt"
 }

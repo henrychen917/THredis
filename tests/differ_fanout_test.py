@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Serverless negative controls driving the real differential shell selection and loop."""
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import differ_fanout as fanout
 from _differ_history import write_json
@@ -187,6 +190,122 @@ quiet_stop(){ :; }
         (jobs / 'differ-armed-1/done').unlink()
         with self.assertRaises(FileNotFoundError):
             fanout.fold(self.plan, 'armed', self.directory)
+
+
+class FailedFoldTiming(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT / 'build')
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.plan = fixture_plan()
+        write_json(self.directory / 'plan.json', self.plan)
+        write_json(self.directory / 'timeouts.json',
+                   dict(schema=1, rows={}, defaults=dict(fallback_seconds=900)))
+        for index, part in enumerate(fanout.PARTS):
+            job = self.directory / 'jobs' / ('differ-' + part)
+            job.mkdir(parents=True)
+            (job / 'done').write_text('0\t0\t1\n')
+            (job / 'ledger').write_text(f'FAIL\t10\tprivate {part}\n')
+            (job / 'family.tsv').write_text(f'differ-{part}\t{index}\t{100+index}\t{110+index}\n')
+
+    def publish(self, group='split', **overrides):
+        argv = ['differ_fanout.py', 'fold', '--plan', str(self.directory / 'plan.json'),
+                '--group', group, '--run-directory', str(self.directory),
+                '--row-plan', str(self.directory / 'timeouts.json'),
+                '--row-history', str(self.directory / 'history'), '--row-run', 'fixture']
+        output, errors = io.StringIO(), io.StringIO()
+        loader_options = overrides or {'return_value': self.plan}
+        with patch.object(sys, 'argv', argv), patch.object(fanout, 'load_plan', **loader_options), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            rc = fanout.main()
+        return rc, output.getvalue(), errors.getvalue()
+
+    def observations(self):
+        path = self.directory / 'history/row-observations.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_completed_failure_keeps_each_public_duration_and_history(self):
+        for group, seconds in (('split', 14), ('armed', 11)):
+            with self.subTest(group=group):
+                with self.assertRaisesRegex(ValueError, 'worker completion'):
+                    fanout.fold(self.plan, group, self.directory)
+                rc, output, errors = self.publish(group)
+                self.assertEqual(rc, 1)
+                self.assertEqual(output, f'FAIL\t{seconds:.6f}\t{fanout.LABELS[group]}\n')
+                self.assertIn('worker completion', errors)
+                record = self.observations()[-1]
+                self.assertEqual((record['verdict'], record['seconds'], record['ledger_label']),
+                                 ('FAIL', seconds, fanout.LABELS[group]))
+                self.assertTrue(record['scored'])
+                self.assertFalse(record['timed_out'])
+
+    def test_inventory_failure_retains_original_run_timing_without_authorizing_success(self):
+        rc, output, errors = self.publish(side_effect=ValueError('permanent seed source changed'))
+        self.assertEqual(rc, 1)
+        self.assertTrue(output.startswith('FAIL\t14.000000\t'))
+        self.assertIn('permanent seed source changed', errors)
+        self.assertEqual(self.observations()[0]['verdict'], 'FAIL')
+
+    def test_missing_or_malformed_completion_timing_cannot_manufacture_a_row(self):
+        job = self.directory / 'jobs/differ-split-0'
+        for filename, poison in (('done', ''), ('done', '0\t0\t1\n0\t0\t1\n'),
+                                 ('family.tsv', ''), ('family.tsv', 'differ-armed-0\t0\t100\t110\n'),
+                                 ('family.tsv', 'differ-split-0\t0\tNaN\t110\n'),
+                                 ('family.tsv', 'differ-split-0\t0\t110\t100\n')):
+            path = job / filename; original = path.read_text()
+            with self.subTest(filename=filename, poison=poison):
+                path.write_text(poison)
+                rc, output, _errors = self.publish()
+                self.assertEqual((rc, output), (1, ''))
+                self.assertEqual(self.observations(), [])
+                path.write_text(original)
+        (job / 'family.tsv').unlink()
+        self.assertEqual(self.publish()[:2], (1, ''))
+        self.assertEqual(self.observations(), [])
+
+    def test_another_run_cannot_donate_timing_or_history(self):
+        changed = copy.deepcopy(self.plan)
+        changed['manifest']['run'] = 'another-run'
+        write_json(self.directory / 'plan.json', changed)
+        self.assertEqual(self.publish()[:2], (1, ''))
+        self.assertEqual(self.observations(), [])
+
+    def test_success_and_timeout_history_match_emitted_six_decimal_duration(self):
+        for seconds, expected in ((14.123456789, 'ok'), (901.123456789, 'FAIL')):
+            with self.subTest(seconds=seconds), patch.object(fanout, 'fold',
+                    return_value=dict(schema=1, seconds=seconds, complete=True)):
+                rc, output, _errors = self.publish()
+                verdict, duration, label = output.strip().split('\t')
+                self.assertEqual((rc, verdict, label), (int(expected == 'FAIL'), expected, fanout.LABELS['split']))
+                self.assertEqual(float(duration), self.observations()[-1]['seconds'])
+                self.assertEqual(self.observations()[-1]['timed_out'], expected == 'FAIL')
+
+    def test_real_collector_accepts_only_exact_failed_rows_after_helper_error(self):
+        gate = (ROOT / 'tests/gate.sh').read_text()
+        collector = gate[gate.index('collect_differ_group(){'):gate.index('\ncollect_job(){')]
+        label = fanout.LABELS['split']
+        cases = [(1, f'FAIL\t14.000000\t{label}\n', True),
+                 (0, f'ok\t14.000000\t{label}\n', True),
+                 (1, f'ok\t14.000000\t{label}\n', False), (1, '', False),
+                 (1, f'FAIL\tNaN\t{label}\n', False), (1, 'FAIL\t14\twrong label\n', False),
+                 (1, f'FAIL\t14\t{label}\nFAIL\t14\t{label}\n', False),
+                 (1, f'FAIL\t14\t{label}\textra\n', False)]
+        stub = r'''
+set -u
+PASS=0; FAIL=0; WORKER_PIDS=(); ROW_PLAN=unused; ROW_HISTORY=unused; ROW_RUN_ID=fixture
+LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; : > "$LEDGER"; : > "$TIMINGS"
+job_label(){ printf '%s\n' "$EXPECTED_LABEL"; }
+python3(){ printf '%s' "$FOLD_OUTPUT"; return "$FOLD_RC"; }
+bad(){ printf 'FAIL\t0\t%s\n' "$1" >> "$LEDGER"; FAIL=$((FAIL+1)); }
+say(){ :; }
+'''
+        for rc, output, accepted in cases:
+            with self.subTest(rc=rc, output=output):
+                result = subprocess.run(['bash', '-c', stub + collector + '\ncollect_differ_group split\n'],
+                    cwd=ROOT, env=dict(os.environ, RUN_DIR=str(self.directory), EXPECTED_LABEL=label,
+                                      FOLD_RC=str(rc), FOLD_OUTPUT=output), capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.directory / 'ledger').read_text(), output if accepted else f'FAIL\t0\t{label}\n')
 
 
 if __name__ == '__main__':

@@ -241,8 +241,14 @@ collect_job(){
   esac
 }
 py(){
-  if [ "$1" = tests/abbagate.py ] || [ "$1" = tests/gate_history.py ]; then return "$WIRE_ABBA_RC"; fi
-  return "$WIRE_RC"
+  # Feature failures and the shared comparator controls are independent rows.
+  # New control helpers must not accidentally inherit the feature-cell verdict.
+  case "$1" in
+    tests/feature_gate.py) return "$WIRE_RC";;
+    tests/abbagate.py|tests/background_environment_test.py|tests/gate_history.py|tests/gate_process_test.py)
+      return "$WIRE_ABBA_RC";;
+    *) return 90;;
+  esac
 }
 python3(){
   if [ "$WIRE_KIND" = performance ]; then
@@ -563,7 +569,12 @@ printf(){
         # or machine scheduling. No stub opens a socket or invokes a server/build/benchmark.
         stub = '''
 job_body(){
-  local current=$1 dependency
+  local current=$1 dependency status_key status_value affinity=
+  while read -r status_key status_value; do
+    if [ "$status_key" = Cpus_allowed_list: ]; then affinity=$status_value; break; fi
+  done < "/proc/$BASHPID/status"
+  [ "$affinity" = "$LOAD_CORES" ] || { echo "fixture slot affinity differs: $affinity/$LOAD_CORES" >&2; exit 22; }
+  printf '%s\t%s\n' "$slot" "$affinity" > "$TMPDIR/fixture-affinity"
   : > "$RUN_DIR/started/$current"
   if ! job_ready "$current"; then echo "started $current before dependency completed" >&2; exit 18; fi
   if [ "$current" = atomic_batteries ]; then
@@ -659,13 +670,20 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                        REMOVE_ATOMIC_DEPENDENCY=str(int(remove_atomic_dependency)),
                        GATE_FEATURE_OUTPUT=str(directory / 'features'))
             count = slots or len(self.canonical) + 1
-            cpu = str(min(os.sched_getaffinity(0)))
+            # The full-inventory order probes synchronize about 100 real shells. Pinning
+            # all of them to one CPU serialized their watchdog/ledger work and exhausted
+            # the unchanged 45s deadline under correctness contention. Use up to four
+            # permitted CPUs so publication is exercised concurrently, while an explicit
+            # caller affinity still limits the fixture. No jobs or assertions are removed.
+            fixture_cpus = list(map(str, sorted(os.sched_getaffinity(0))[:min(4, count)]))
+            cpu_list = ','.join(fixture_cpus)
+            slot_cpus = [fixture_cpus[index % len(fixture_cpus)] for index in range(count)]
             arrays = '\n'.join([
                 f'GATE_SLOTS={count}',
                 'CANONICAL=(' + ' '.join(map(shlex.quote, self.canonical)) + ')',
                 'COMPLETION_ORDER=(' + ' '.join(map(shlex.quote, order)) + ')',
-                'SLOT_CORES=(' + ' '.join([cpu] * count) + ')',
-                'SLOT_LOAD_CORES=(' + ' '.join([cpu] * count) + ')',
+                'SLOT_CORES=(' + ' '.join(slot_cpus) + ')',
+                'SLOT_LOAD_CORES=(' + ' '.join(slot_cpus) + ')',
                 'SLOT_PORTS=(' + ' '.join(str(19000 + 3 * index) for index in range(count)) + ')',
             ])
             script = '\n'.join((prelude, arrays, ledger_functions, placement, scheduler,
@@ -674,7 +692,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                 saved = preserve_scheduler_failure(root, directory, script, stdout, stderr)
                 return f'\nScheduler failure artifacts: {saved}\n'
             try:
-                result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu,
+                result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu_list,
                                          'bash', '-c', script], cwd=root, env=env,
                                         text=True, capture_output=True, timeout=50)
             except subprocess.TimeoutExpired as exc:
@@ -686,6 +704,11 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             if result.returncode:
                 output += preserve_failure(result.stdout, result.stderr)
             self.assertEqual(result.returncode, 0, output)
+            observed_cpus = set()
+            for job in (directory / 'jobs').iterdir():
+                assigned_slot, observed_cpu = (job / 'fixture-affinity').read_text().split()
+                self.assertEqual(observed_cpu, slot_cpus[int(assigned_slot)], job.name)
+                observed_cpus.add(observed_cpu)
             if delayed_completion:
                 try:
                     fired = directory / 'delayed-publication'
@@ -711,6 +734,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                 output += preserve_failure(result.stdout, result.stderr)
             return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
                         output=output, counts=counts,
+                        fixture_cpus=set(fixture_cpus), observed_cpus=observed_cpus,
                         atomic_boot_reached=(directory / 'atomic-boot-reached').exists(),
                         exclusivity_failure=((directory / 'exclusivity-failure').read_text()
                                              if (directory / 'exclusivity-failure').exists() else ''),
@@ -745,6 +769,8 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertEqual(reverse['completion'],
                          [name for name in self.canonical[::-1] if name != 'atomic_batteries'] + ['atomic_batteries'])
         self.assertEqual(forward['ledger'], reverse['ledger'], forward['output'] + reverse['output'])
+        self.assertEqual(forward['observed_cpus'], forward['fixture_cpus'])
+        self.assertEqual(reverse['observed_cpus'], reverse['fixture_cpus'])
         self.assertEqual(forward['counts'], (len(self.canonical), 0))
         self.assertEqual({row[0] for row in reverse['families']}, set(self.canonical))
         self.assertEqual(reverse['cleaned'], set(self.canonical))
