@@ -12,6 +12,7 @@ mutant. A reached green row is SURVIVED (vacuous for this particular mutation).
 """
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -48,7 +49,7 @@ ROWS = {
     'cache-churn': dict(label='armed block-cache churn battery', live='cache',
                         success='rlcache-churn PASS', timeout=180),
     'cache-invariants': dict(label='read-local ownership invariants', live='cache',
-                             success='rlcache-churn PASS', timeout=180),
+                             predicate='cache-invariants', success='PREDICATE ok', timeout=180),
     'xscript-0': dict(label='xscript battery (atomic 0)', live='xscript', atomic=0,
                       success='XSCRIPT all directed battery passed', timeout=300),
     'xscript-1': dict(label='xscript battery (atomic 1)', live='xscript', atomic=1,
@@ -445,6 +446,104 @@ def read_row_artifact(path):
         return {}, f'invalid row artifact {path}: {exc}'
 
 
+def cache_predicate_source(gate):
+    # Execute the selected revision's row, not a Python imitation of its grep. Keep the
+    # shutdown parser too: accepting a log that merely contains an old dump weakens this row.
+    # Source movement is a stale extraction, never permission to fall back to churn's verdict.
+    jobs = re.findall(r'^job_rlcache\(\)\{\n(.*?)^\}\s*$', gate, re.M | re.S)
+    helpers = re.findall(r'^shutdown_present\(\)\{[^\n]*\}\s*$', gate, re.M)
+    marker = '  row_begin "read-local ownership invariants"\n'
+    if len(jobs) != 1 or len(helpers) != 1 or jobs[0].count(marker) != 1:
+        raise ValueError('STALE cache-invariants: gate predicate/helper extraction is ambiguous')
+    suffix = marker + jobs[0].split(marker, 1)[1]
+    end = re.search(r'^else\s*$', suffix, re.M)
+    if end is None:
+        raise ValueError('STALE cache-invariants: boot-failure boundary is missing')
+    return helpers[0], suffix[:end.start()]
+
+
+def run_cache_predicate(tree, output):
+    label = ROWS['cache-invariants']['label']
+    helper, fragment = cache_predicate_source((tree / 'tests/gate.sh').read_text())
+    directory = output / 'predicate'
+    directory.mkdir()
+    log = (output / 'server/server.log').resolve()
+    events = directory / 'events.tsv'
+    script = directory / 'row.sh'
+    # Ledger emitters are the only substitutes. They preserve the gate's non-aborting bad()
+    # behavior and record exactly which verdict the actual Bash predicate emitted.
+    source = '''#!/usr/bin/env bash
+set -u
+SRVLOG=$1
+PREDICATE_EVENTS=$2
+row_begin(){ printf 'BEGIN\\t%s\\t\\n' "$1" >>"$PREDICATE_EVENTS"; }
+ok(){ printf 'ok\\t%s\\t%s\\n' "$1" "${2-}" >>"$PREDICATE_EVENTS"; }
+bad(){ printf 'FAIL\\t%s\\t%s\\n' "$1" "${2-}" >>"$PREDICATE_EVENTS"; }
+'''
+    source += helper + '\n' + fragment
+    script.write_text(source)
+    result = command(['bash', script.resolve(), log, events.resolve()], tree,
+                     directory / 'output.log', 10)
+    emitted = [line.split('\t') for line in events.read_text().splitlines()] if events.exists() else []
+    reached = (result['returncode'] == 0 and not result['expired'] and not result['leaked_pids'] and
+               len(emitted) == 2 and emitted[0] == ['BEGIN', label, ''] and
+               len(emitted[1]) == 3 and emitted[1][0] in ('ok', 'FAIL') and emitted[1][1] == label)
+    verdict, reason = (emitted[1][0], emitted[1][2]) if reached else (None, 'missing/invalid predicate events')
+    violations = re.findall(r'RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION',
+                            log.read_text(errors='replace')) if log.exists() else []
+    # The violation branch has its own pinned diagnostic. Missing shutdown data or a broken
+    # helper must remain an instrument error even if some unrelated log text contains a match.
+    mechanism_failure = reached and verdict == 'FAIL' and reason == f'see {log}' and bool(violations)
+    report = dict(schema=1, reached=reached, verdict=verdict, reason=reason,
+                  mechanism_failure=mechanism_failure, violations=violations, events=emitted,
+                  script_sha256=hashlib.sha256(source.encode()).hexdigest(),
+                  returncode=result['returncode'], expired=result['expired'],
+                  leaked_pids=result['leaked_pids'], seconds=result['seconds'])
+    write_json(directory / 'result.json', report)
+    return report
+
+
+def cache_predicate_evidence(output, live):
+    predicate, error = read_row_artifact(output / 'predicate/result.json')
+    if error:
+        return False, False, '', error
+    reached = predicate.get('reached') is True
+    battery = live.get('battery', {})
+    # A mutant may abort during churn. The real ownership violation is its engagement witness;
+    # a positive clean churn remains mandatory for the unmutated control and a green row.
+    prerequisite = (live.get('reached') is True and live.get('cleanup_complete') is True and
+                    isinstance(battery, dict) and isinstance(battery.get('returncode'), int) and
+                    battery.get('expired') is False and battery.get('leaked_pids') == [])
+    if not prerequisite:
+        return reached, False, '', 'churn was not reached/completed or owned cleanup failed'
+    if not reached:
+        return False, False, '', 'actual invariant predicate did not emit one complete verdict'
+    if predicate.get('verdict') == 'ok':
+        if live.get('arming_passed') is True and live.get('clean_shutdown') is True:
+            return True, True, 'PREDICATE ok', None
+        return True, False, '', 'invariant predicate stayed green but churn/clean shutdown failed'
+    log = output / 'server/server.log'
+    violations = re.findall(r'RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION',
+                            log.read_text(errors='replace')) if log.exists() else []
+    if (predicate.get('verdict') == 'FAIL' and predicate.get('mechanism_failure') is True and
+            predicate.get('reason') == f'see {log.resolve()}' and violations and
+            predicate.get('violations') == violations):
+        # Only this red predicate supplies failure evidence. Never append the entire server log
+        # for this row: doing so made an always-green predicate look like a killed mutant.
+        return True, False, 'PREDICATE FAIL ' + ' '.join(violations), None
+    return True, False, '', 'invariant predicate failed without its named ownership violation'
+
+
+def owned_cleanup_complete(output):
+    try:
+        exit_data = json.loads((output / 'server/exit.json').read_text())
+        pid = int((output / 'server/pid').read_text())
+        return (exit_data.get('pid') == pid and isinstance(exit_data.get('returncode'), int) and
+                exit_data.get('forced_kill') is False)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def run_row(args, tree, row, output, control=False):
     output.mkdir(parents=True, exist_ok=False)
     result = row_command(args, tree, row, output)
@@ -474,11 +573,16 @@ def run_row(args, tree, row, output, control=False):
             data, artifact_error = read_row_artifact(artifact)
             reached = (data.get('reached', False) and (output / 'server/pid').is_file() and
                        (output / 'battery.log').is_file())
-            passed = data.get('passed', False) and bool(re.search(row['success'], evidence))
-            evidence += '\n' + data.get('reason', '')
-            log = output / 'server' / 'server.log'
-            if log.exists():
-                evidence += '\n' + log.read_text(errors='replace')
+            if row.get('predicate') == 'cache-invariants':
+                predicate_reached, passed, evidence, predicate_error = cache_predicate_evidence(output, data)
+                reached = reached and predicate_reached
+                artifact_error = artifact_error or predicate_error
+            else:
+                passed = data.get('passed', False) and bool(re.search(row['success'], evidence))
+                evidence += '\n' + data.get('reason', '')
+                log = output / 'server' / 'server.log'
+                if log.exists():
+                    evidence += '\n' + log.read_text(errors='replace')
     else:
         passed = bool(re.search(row['success'], evidence))
         reached = passed or bool(re.search(row['failure'], evidence))
@@ -500,7 +604,8 @@ def run_row(args, tree, row, output, control=False):
 def live_row(args):
     row = ROWS[args._live_row]
     output = Path(args.output)
-    report = dict(reached=False, passed=False)
+    report = dict(reached=False, passed=False, arming_passed=False,
+                  clean_shutdown=False, cleanup_complete=False)
     argv = ['--shards', '16', '--ratio', '6:2', '--atomic', str(row.get('atomic', 1))]
     if row['live'] == 'cache':
         argv = ['--thread-mode', '1s', '--shards', '64', '--atomic', '1', '--read-local', '1']
@@ -519,13 +624,30 @@ def live_row(args):
                              ROOT, output / 'battery.log', row['timeout'] - 30,
                              dict(os.environ, TOMO_GATE_STRICT='1'))
             print(result['output'], end='', flush=True)
-            report['passed'] = (result['returncode'] == 0 and not result['expired'] and
-                                bool(re.search(row['success'], result['output'])))
+            report['battery'] = {key: result[key] for key in ('returncode', 'expired', 'leaked_pids', 'seconds')}
+            success = ROWS['cache-churn']['success'] if row['live'] == 'cache' else row['success']
+            report['arming_passed'] = (result['returncode'] == 0 and not result['expired'] and
+                                       not result['leaked_pids'] and bool(re.search(success, result['output'])))
+            report['passed'] = report['arming_passed']
             if result['expired']:
                 report['reason'] = 'battery deadline expired'
+        report['clean_shutdown'] = True
     except Exception as exc:
         report.update(passed=False, reason=str(exc))
     finally:
+        # server() writes this only after waiting for its owned child. Run the gate's subsequent
+        # log predicate even when that context raises because the mutant aborted during churn.
+        report['cleanup_complete'] = owned_cleanup_complete(output)
+        if row.get('predicate') == 'cache-invariants':
+            try:
+                report['predicate'] = run_cache_predicate(Path(args._tree), output)
+                _, report['passed'], evidence, error = cache_predicate_evidence(output, report)
+                if error:
+                    report['reason'] = error
+                elif evidence:
+                    print(evidence, flush=True)
+            except Exception as exc:
+                report.update(passed=False, reason=f'invariant predicate: {exc}')
         write_json(output / 'live-result.json', report)
     return 0 if report['passed'] else 1
 
@@ -558,6 +680,73 @@ def cpu_geometry(args):
     args.build_cpus = args.build_cpus or ','.join(map(str, sorted(allowed)))
     if not set(cpus(args.build_cpus)) <= allowed:
         raise ValueError('build CPUs escape process affinity')
+
+
+def cache_predicate_self_test(output):
+    # Drive row_command -> real selected-tree Python process -> battery process -> extracted Bash
+    # predicate -> artifact parser/classifier. Only server() is replaced with a file fixture;
+    # no listener, C++ binary, gate, or production workload runs in these controls.
+    clean_log = 'shutdown_report ' + json.dumps(dict(schema=1, stuck=dict(
+        live_conns=0, rob_not_quiesced=0, unsent_bytes_pending=0))) + '\n'
+    gate = (ROOT / 'tests/gate.sh').read_text()
+    helper, fragment = cache_predicate_source(gate)
+    marker = '  row_begin "read-local ownership invariants"\n'
+    always_pass = gate.replace(fragment, marker + '  ok "read-local ownership invariants"\n', 1)
+    cases = [
+        ('clean', gate, clean_log, True, False, True, 'CONTROL-PASS'),
+        ('missing-dump', gate, 'server started\n', True, True, False, 'ERROR'),
+        *[(name.lower(), gate, name + ' injected owner mismatch\n', False, True, False, 'KILLED')
+          for name in ('RLSINK-VIOLATION', 'RLCACHE-VIOLATION', 'RLRING-VIOLATION')],
+        ('always-pass-abort', always_pass, 'RLSINK-VIOLATION\n', False, True, False, 'ERROR'),
+        ('always-pass-survives', always_pass, 'RLSINK-VIOLATION\n' + clean_log,
+         True, False, False, 'SURVIVED'),
+        ('raw-output-is-not-predicate', gate, 'server started\n', False, True, False, 'ERROR'),
+        ('broken-shutdown-helper', gate.replace(helper, 'shutdown_present(){ return 99; }'),
+         clean_log, True, False, False, 'ERROR'),
+    ]
+    args = argparse.Namespace(server_cpus='0-7', load_cpus='8-15', port=8990)
+    row = dict(ROWS['cache-invariants'], id='cache-invariants',
+               failure='RLSINK-VIOLATION|RLCACHE-VIOLATION|RLRING-VIOLATION')
+    for name, source, log, armed, cleanup_error, control, expected in cases:
+        tree = output / name / 'tree'
+        tests = tree / 'tests'
+        tests.mkdir(parents=True)
+        (tests / 'gate.sh').write_text(source)
+        (tests / 'shutdown_report.py').write_text((ROOT / 'tests/shutdown_report.py').read_text())
+        (tests / 'mutants.py').write_text(Path(__file__).read_text())
+        (tests / 'rlcache_churn.py').write_text(
+            'import sys\nprint(' + repr('rlcache-churn PASS' if armed else
+                                       'rlcache-churn FAIL RLSINK-VIOLATION') + ')\n' +
+            f'sys.exit({0 if armed else 1})\n')
+        (tests / '_gate_process.py').write_text('''import contextlib,json,os
+from pathlib import Path
+def cpus(value): return [0]
+def install_signals(): pass
+def pin_driver(*args): pass
+@contextlib.contextmanager
+def server(binary, cpus, port, directory, args):
+    directory=Path(directory)
+    directory.mkdir(parents=True)
+    (directory/'pid').write_text(str(os.getpid()))
+    (directory/'server.log').write_text(''' + repr(log) + ''')
+    try:
+        yield None,None
+    finally:
+        (directory/'exit.json').write_text(json.dumps(dict(pid=os.getpid(),
+            returncode=''' + str(-6 if cleanup_error else 0) + ''', forced_kill=False)))
+    if ''' + repr(cleanup_error) + ''': raise RuntimeError('fixture server aborted after churn')
+''')
+        report = run_row(args, tree, row, output / name / 'result', control=control)
+        if report['status'] != expected:
+            raise AssertionError(f'{name}: wanted {expected}, got {report}')
+        predicate = json.loads((output / name / 'result/predicate/result.json').read_text())
+        if not predicate['reached']:
+            raise AssertionError(f'{name}: actual Bash predicate was not reached')
+        # Changing the actual helper must affect the row even though the fixture log is valid.
+        # An extractor that accidentally runs ROOT's helper will turn this ERROR into SURVIVED.
+        if name == 'broken-shutdown-helper' and predicate['verdict'] != 'FAIL':
+            raise AssertionError('selected-tree shutdown_present helper was bypassed')
+    print(f'MUTANTS invariant predicate: {len(cases)} actual Bash/subprocess controls passed')
 
 
 def self_test():
@@ -593,6 +782,7 @@ def self_test():
     (ROOT / 'build').mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='mutants-self-test-', dir=ROOT / 'build') as temporary:
         output = Path(temporary)
+        cache_predicate_self_test(output / 'cache-predicate')
         # Exercise row_command -> actual child -> artifact parser -> classifier, not just made-up
         # classify() inputs. The selected tree's fake driver exits 0 without running any server.
         # It must remain UNREACHED, proving both immutable-script selection and missing evidence.
