@@ -2626,7 +2626,7 @@ ABBA_RC=$?
 ABBA_PID=0
 case "$ABBA_RC" in
   0) ok "headline ABBA vs last pushed binary";;
-  3) bad "headline ABBA vs last pushed binary" "SKIPPED -- NOT A PASS; see ABBA output";;
+  3) bad "headline ABBA vs last pushed binary" "no trusted comparison PASS (partial diagnostic or skipped); see ABBA output";;
   *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
 esac
 
@@ -2752,10 +2752,12 @@ if [ "$RECEIPT_REQUIRED" = 1 ]; then
       --abba-rc "$ABBA_RC" --cleanup-rc "$GATE_CLEANUP_RC" --nic "$NIC_CHECKED" \
       --output "$RUN_DIR/gate-result.json" || RECEIPT_RC=1
   if [ -n "$RECEIPT_START" ] && [ "$RECEIPT_RC" = 0 ]; then
+    # ABBA freezes its accepted standing control here, including an explicit --null-result
+    # override. Re-reading a mutable default could certify or reject against another control.
     python3 tests/gate_receipt.py finish --start "$RECEIPT_START" --gate-result "$RUN_DIR/gate-result.json" \
         --ledger "$LEDGER" --observations "$ROW_HISTORY/row-observations.jsonl" \
         --abba-result "$ABBA_OUTPUT/results.json" \
-        --null-result "${GATE_RECEIPT_NULL:-$PWD/.gate-history/receipts/baselines/full-null.json}" || RECEIPT_RC=1
+        --null-result "$ABBA_OUTPUT/null-control.json" || RECEIPT_RC=1
   else
     echo "GATE RECEIPT WITHHELD: start/binding evidence was unavailable; full gate work has completed; see $RUN_DIR/receipt-begin.log" >&2
     RECEIPT_RC=1

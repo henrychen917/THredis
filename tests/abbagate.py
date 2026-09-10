@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Same-session headline ABBA gate. No historical rate is an input to any verdict.
+"""Same-session headline ABBA gate. No historical rate is a performance target.
 
 WHY NOT STORED REFERENCE NUMBERS. A stored rate goes stale the moment the kernel, compiler,
 microcode or machine changes; this tree's old tests/gate_refs.txt was pinned to a kernel that no
@@ -44,6 +44,9 @@ SET, thread modes or cells can hide the one cell that fails. A failed preconditi
 cells. --only is a diagnostic selection and yields PARTIAL with exit 3, never a complete-tier pass.
 
 Exit 0: every cell passed; 1: failure; 3: loud skip or successful partial diagnostic.
+Comparison PASS additionally requires a recent matching standing null. Missing/invalid controls
+leave successful measurements PARTIAL and untrusted. --collect-null 1 freezes identical arms and
+collects its own null verdict without a prior control; its outer PARTIAL/3 cannot gate a push.
 --self-test is serverless. All other runs own and reap only their subprocess PIDs.
 """
 import argparse
@@ -66,7 +69,8 @@ import time
 from _lib import Conn
 from gateplan import validate_axes, read_topology, permitted_cpus, default_physical
 from gate_quiet import QuietMonitor, QuietViolation
-from gate_receipt import harness_fingerprint
+from gate_receipt import harness_fingerprint, read_json
+from abba_evidence import match_null, null_result
 from abba_workloads import (workload_arguments, prepare_long_keys, merged_tail,
                             require_workload_witness, workload_command_names)
 
@@ -732,6 +736,9 @@ class Runner:
         self.server_cpus = sorted(cpus(args.server_cores) + cpus(args.server_smt))
         self.load_cpus = sorted(cpus(args.load_cores) + cpus(args.load_smt))
 
+    def population_environment(self):
+        return {"population_by_arm": {"A": "wire", "B": "wire"}}
+
     def memtier(self, layout):
         return ["taskset", "-c", cpu_string(layout["cpus"]), self.args.memtier,
                 "-s", "127.0.0.1", "-p", str(self.args.port), "--protocol=redis",
@@ -948,6 +955,11 @@ def parse_args():
                    help="optional single port inside --ports; standalone default 8700")
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
     p.add_argument("--output", type=Path, default=None)
+    p.add_argument("--collect-null", type=int, choices=(0, 1), default=0,
+                   help="1 freezes one executable into identical arms and collects a null; always PARTIAL/exit 3")
+    p.add_argument("--null-result", type=Path, default=Path(os.getenv("GATE_ABBA_NULL", os.getenv(
+        "GATE_RECEIPT_NULL", ROOT / ".gate-history/receipts/baselines/full-null.json"))),
+                   help="recent matched null required for comparison PASS; missing controls retain untrusted diagnostics")
     p.add_argument("--escalate", action="store_true",
                    help="ignore pinned load levels and search the ladder; use this to RE-PIN a cell "
                         "after the gate reports its pinned level no longer saturates")
@@ -966,15 +978,18 @@ def main(args):
     out = (args.output or ROOT / "build" / f"abbagate-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}").resolve()
     out.mkdir(parents=True, exist_ok=False)
     report = {"schema": 1, "verdict": "FAIL", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "window_seconds": WINDOW, "order": ORDER, "cells": [], "output": str(out),
-              "subset": args.subset}
+              "window_seconds": WINDOW, "order": list(ORDER), "cells": [], "output": str(out),
+              "subset": args.subset, "only": args.only,
+              "run_kind": "null-control" if args.collect_null else "comparison", "comparison_trusted": False}
+    if args.collect_null:
+        report["null_control"] = {"verdict": "FAIL", "reason": "control has not completed"}
     children = Children()
     quiet = None
     rc = 1
     original_affinity = os.sched_getaffinity(0)
 
     def invalidate_instrument(reason):
-        report.update(verdict="FAIL", reason=reason, measurement_valid=False)
+        report.update(verdict="FAIL", reason=reason, measurement_valid=False, comparison_trusted=False)
         for row in report["cells"]:
             row["instrument_valid"] = False
             row["instrument_failure"] = reason
@@ -1014,15 +1029,36 @@ def main(args):
         # Capture before the quiet observer starts, and check again after its final sample so
         # fingerprinting itself never becomes foreign CPU work inside a measurement interval.
         report["receipt_harness_sha256"] = harness_fingerprint(ROOT)["sha256"]
+        # Freeze the chosen artifact before measurements. A missing control does not remove any
+        # authorized workload; successful raw observations remain explicitly untrusted instead.
+        control, control_error = None, None
+        if not args.collect_null:
+            try:
+                control = read_json(args.null_result)
+            except (OSError, ValueError) as error:
+                control_error = f"standing null unavailable: {args.null_result}: {error}"
+                print("ABBA UNTRUSTED: " + control_error + "; all measurements still run", flush=True)
         quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid())
         quiet.start()  # Fail before reference builds, capability probes, or server boots.
         report["quiet_box"] = quiet.evidence()
-        reference, provenance = resolve_reference(args, out)
-        report["reference"] = provenance
         if not args.candidate.is_file() or not os.access(args.candidate, os.X_OK):
             raise RuntimeError(f"candidate executable unavailable: {args.candidate}")
         binaries = {}
-        for arm, source in (("A", reference), ("B", args.candidate.resolve())):
+        if args.collect_null:
+            # Copy the candidate ONCE, then derive the other arm from that frozen file. Resolving
+            # a pushed reference here would create a circular prerequisite and could compare
+            # different bytes. A null proves repeatability of this instrument, not source identity.
+            binaries["B"] = out / "binary-B"
+            shutil.copy2(args.candidate.resolve(), binaries["B"])
+            reference = binaries["B"]
+            provenance = {"source": "byte-identical null control", "commit": "not-a-code-comparison",
+                          "sha256": sha256(reference)}
+            copies = (("A", reference),)
+        else:
+            reference, provenance = resolve_reference(args, out)
+            copies = (("A", reference), ("B", args.candidate.resolve()))
+        report["reference"] = provenance
+        for arm, source in copies:
             dest = out / f"binary-{arm}"
             shutil.copy2(source, dest)
             binaries[arm] = dest
@@ -1037,6 +1073,7 @@ def main(args):
         if not args.memtier:
             raise RuntimeError("memtier_benchmark not available")
         args.memtier = str(Path(args.memtier).resolve())
+        runner = Runner(args, out, binaries, children)
         report["environment"] = {"uname": list(os.uname()), "server_cpus": server_cpus,
                                  "server_physical": server_physical, "server_smt": server_smt,
                                  "load_physical": load_physical, "load_smt": load_smt,
@@ -1047,7 +1084,8 @@ def main(args):
                                  "split_ratio": f"{len(server_cpus)-len(server_cpus)//2}:{len(server_cpus)//2}",
                                  "split_flip_auto": 0, "memtier_path": args.memtier,
                                  "memtier_sha256": sha256(Path(args.memtier)),
-                                 "memtier_version": capture([args.memtier, "--version"]).stdout.strip()}
+                                 "memtier_version": capture([args.memtier, "--version"]).stdout.strip(),
+                                 **runner.population_environment()}
         print(f"GEOMETRY server={args.server_cores} ({len(server_physical)} physical cores) "
               f"server-smt={args.server_smt or '(reserved)'} ({len(server_cpus)} threads) "
               f"load={args.load_cores} load-smt={args.load_smt or '(reserved)'} "
@@ -1061,7 +1099,6 @@ def main(args):
                    for arm, binary in binaries.items()}
         quiet.check()
         report["accepted_knobs"] = support
-        runner = Runner(args, out, binaries, children)
         for cell in cells:
             row = {"cell": asdict(cell), "verdict": "FAIL", "rounds": []}
             report["cells"].append(row)
@@ -1133,9 +1170,28 @@ def main(args):
             invalidate_instrument("measurement harness changed during the ABBA tier")
             raise RuntimeError(report["reason"])
         report["measurement_valid"] = True
-        report["verdict"], report["worst_cell"] = overall(report["cells"])
-        if args.only and report["verdict"] == "PASS":
+        report["elapsed_seconds"] = time.monotonic() - start
+        report["statistical_verdict"], report["worst_cell"] = overall(report["cells"])
+        report["verdict"] = report["statistical_verdict"]
+        if report["statistical_verdict"] == "PASS":
             report["verdict"] = "PARTIAL"
+            if args.collect_null:
+                report["null_control"] = null_result(report, now=time.time())
+                print("NULL CONTROL PASS: selected cells passed with byte-identical arms; not a code-comparison PASS", flush=True)
+            else:
+                try:
+                    if control_error:
+                        raise ValueError(control_error)
+                    report["standing_null"] = match_null(report, control, now=time.time())
+                    # Retain the exact accepted control beside this comparison. Receipts use this
+                    # frozen file, never a default path that another successful run may replace.
+                    (out / "null-control.json").write_text(json.dumps(control, indent=2) + "\n")
+                    if not args.only:
+                        report["comparison_trusted"] = True
+                        report["verdict"] = "PASS"
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    report["standing_null"] = {"status": "UNTRUSTED", "reason": str(error)}
+                    print(f"ABBA UNTRUSTED: {error}; raw assessments retained", flush=True)
         print(f"ABBA {args.subset} {report['verdict']} worst={report['worst_cell']} "
               f"({len(cells)}/{report['cell_source']['total_cells']} cells); results={out / 'results.json'}", flush=True)
         rc = 1 if report["verdict"] == "FAIL" else 3 if report["verdict"] == "PARTIAL" else 0
@@ -1144,7 +1200,7 @@ def main(args):
         print(f"ABBA SKIP — NOT A PASS: {e}", file=sys.stderr, flush=True)
         rc = 3
     except (Exception, KeyboardInterrupt) as e:
-        report.update(verdict="FAIL", reason=f"{type(e).__name__}: {e}")
+        report.update(verdict="FAIL", reason=f"{type(e).__name__}: {e}", comparison_trusted=False)
         if isinstance(e, QuietViolation):
             invalidate_instrument(report["reason"])
         print(f"ABBA FAIL: {report['reason']}", file=sys.stderr, flush=True)
@@ -1609,7 +1665,8 @@ def self_test():
             for pin in (3, 4):
                 with self.subTest(pin=pin):
                     rc, order, layouts, result, output = self.fake_main(pin=pin)
-                    self.assertEqual(rc, 0, output)
+                    self.assertEqual(rc, 3, output)  # No standing null: raw success cannot be trusted PASS.
+                    self.assertEqual(result["statistical_verdict"], "PASS")
                     self.assertEqual(order, [(pin, arm) for arm in ORDER])
                     self.assertEqual(len(result["cells"][0]["rounds"]), 1)
                     self.assertIn("PINNED", output)
@@ -1644,13 +1701,13 @@ def self_test():
 
         def test_unpinned_real_loop_searches_and_says_so(self):
             rc, order, _, _, output = self.fake_main()
-            self.assertEqual(rc, 0, output)
+            self.assertEqual(rc, 3, output)
             self.assertEqual(order, [(n, arm) for n in (1, 2) for arm in ORDER])
             self.assertIn("UNPINNED", output)
 
         def test_depth_one_ignores_deep_pipeline_pin(self):
             rc, order, _, result, output = self.fake_main(pin=3, depth=1, busy=1)
-            self.assertEqual(rc, 0, output)
+            self.assertEqual(rc, 3, output)
             self.assertEqual(order, [(1, arm) for arm in ORDER])
             self.assertTrue(result["cells"][0]["assessment"]["saturation_exempt"])
 
@@ -1730,7 +1787,7 @@ def self_test():
                 binary.chmod(0o700)
                 source = directory / "cells"
                 source.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | stale\n")
-                for candidate_rate, expected in ((100, 0), (98, 1)):
+                for candidate_rate, expected in ((100, 3), (98, 1)):
                     output = directory / str(candidate_rate)
                     argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
                             "--output", str(output), "--memtier", sys.executable, "--max-instances", "2"]
@@ -1755,7 +1812,138 @@ def self_test():
                     self.assertEqual(order, [(n, a) for n in (1, 2) for a in ORDER])
                     result = json.loads((output / "results.json").read_text())
                     self.assertEqual(result["worst_cell"], "h01")
-                    self.assertEqual(result["verdict"], "PASS" if expected == 0 else "FAIL")
+                    self.assertEqual(result["verdict"], "PARTIAL" if expected == 3 else "FAIL")
+
+        def test_real_null_collection_comparison_and_subset_controls(self):
+            import copy
+            from abba_evidence import validate_comparison
+            # Both control and comparison are produced by main's real measurement loop. A fake
+            # clock replaces only elapsed workload time; boot/generator calls remain fake. This
+            # observes counts and verdict publication rather than constructing rounds for assess.
+            with tempfile.TemporaryDirectory(dir=ROOT / "build") as temporary:
+                directory = Path(temporary)
+                binary = directory / "candidate"
+                binary.write_bytes(b"frozen identity, never executed")
+                binary.chmod(0o700)
+                source = directory / "cells"
+                source.write_text(
+                    "n1 | 1s | rl=1 | ov=1 | ro=1 | GET | p32 | 512 | - | - | 4 | atomic=1 | score=rate | mix=- | smoke=1\n"
+                    "n2 | 2s | rl=0 | ov=1 | ro=1 | SET | p32 | 512 | - | - | 4 | atomic=1 | score=rate | mix=- | smoke=0\n")
+                epoch, ticks = int(time.time()) - 10000, [0.]
+                original_gmtime = time.gmtime
+                sequence = [0]
+
+                def run(*, collect=False, subset="full", control=None, candidate_rate=100, only=""):
+                    sequence[0] += 1
+                    out = directory / f"run-{sequence[0]}"
+                    null_path = directory / "standing.json"
+                    if control is not None:
+                        null_path.write_text(json.dumps(control))
+                    else:
+                        null_path.unlink(missing_ok=True)
+                    argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source), "--output", str(out),
+                        "--memtier", sys.executable, "--server-cores", "0-31", "--load-cores", "32-127", "--load-smt", "",
+                        "--subset", subset, "--collect-null", str(int(collect)), "--null-result", str(null_path)]
+                    if only:
+                        argv += ["--only", only]
+                    with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
+                        args = parse_args()
+                    calls = []
+                    quiet_started = epoch + ticks[0]
+                    cpus_ = list(range(128))
+                    quiet = mock.Mock()
+                    def evidence():
+                        return dict(complete=True, interference=None, started_at=quiet_started,
+                            finished_at=epoch + ticks[0], samples=max(2, int(epoch + ticks[0] - quiet_started)),
+                            sample_interval_seconds=1, cpus=cpus_, requested_cpus=cpus_)
+                    quiet.evidence.side_effect = evidence
+                    quiet.close.side_effect = evidence
+                    def measure(_runner, cell, arm, index, instances, knobs):
+                        calls.append((cell.id, instances, arm))
+                        ticks[0] += WINDOW + 8
+                        return dict(arm=arm, rate=100 if arm == "A" else candidate_rate, busy_pct=99.9,
+                            latency_ms=1, complete=True, commands=2000, pid=123, window_seconds=WINDOW,
+                            artifacts=f"{cell.id}/n{instances}-{index}-{arm}")
+                    provenance = dict(source="fake reference", commit="0" * 40, sha256=sha256(binary))
+                    with mock.patch.object(Runner, "measure", measure), \
+                         mock.patch(__name__ + ".resolve_reference", return_value=(binary, provenance)) as resolve, \
+                         mock.patch(__name__ + ".accepted", return_value=True), \
+                         mock.patch(__name__ + ".check_placement"), \
+                         mock.patch(__name__ + ".QuietMonitor", return_value=quiet), \
+                         mock.patch.object(os, "sched_setaffinity"), \
+                         mock.patch.object(time, "time", side_effect=lambda: epoch + ticks[0]), \
+                         mock.patch.object(time, "monotonic", side_effect=lambda: ticks[0]), \
+                         mock.patch.object(time, "gmtime", side_effect=lambda seconds=None:
+                             original_gmtime(epoch + ticks[0] if seconds is None else seconds)), \
+                         mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
+                         contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        rc = main(args)
+                    if collect:
+                        resolve.assert_not_called()
+                    return rc, calls, json.loads((out / "results.json").read_text()), out
+
+                rc, calls, control, control_out = run(collect=True)
+                self.assertIn("null_control", control, control)
+                self.assertEqual((rc, len(calls), control["verdict"], control["null_control"]["verdict"]),
+                                 (3, 8, "PARTIAL", "PASS"))
+                self.assertFalse(control["comparison_trusted"])
+                self.assertEqual((control_out / "binary-A").read_bytes(), (control_out / "binary-B").read_bytes())
+                binary.write_bytes(b"a later candidate may reuse this instrument control")
+                rc, calls, report, _ = run()
+                self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
+                                 (3, 8, "PASS", "PARTIAL"))
+                self.assertTrue(report["measurement_valid"])
+                self.assertFalse(report["comparison_trusted"])
+                for subset, count in (("full", 8), ("smoke", 4)):
+                    rc, calls, report, out = run(control=control, subset=subset)
+                    self.assertEqual((rc, len(calls), report["verdict"]), (0, count, "PASS"), report)
+                    self.assertTrue(report["comparison_trusted"])
+                    self.assertNotEqual(report["candidate"]["sha256"], control["candidate"]["sha256"])
+                    self.assertEqual(read_json(out / "null-control.json"), control)
+                    validate_comparison(report, control, now=epoch + ticks[0])
+                rc, calls, report, _ = run(control=control, only="n1")
+                self.assertEqual((rc, len(calls), report["verdict"], report["comparison_trusted"]),
+                                 (3, 4, "PARTIAL", False))
+                rc, calls, report, _ = run(control=[])
+                self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
+                                 (3, 8, "PASS", "PARTIAL"))
+                defects = {
+                    "failed unselected cell": lambda c: c["cells"][1].update(verdict="FAIL"),
+                    "harness": lambda c: c.update(receipt_harness_sha256="f" * 64),
+                    "generator": lambda c: c["environment"].update(memtier_sha256="f" * 64),
+                    "window": lambda c: c.update(window_seconds=10),
+                    "different bytes": lambda c: c["candidate"].update(sha256="f" * 64),
+                    "quiet": lambda c: c["quiet_box"].update(complete=False),
+                    "missing cell": lambda c: c["cells"].pop(),
+                    "population": lambda c: c["environment"]["population_by_arm"].update(B="snapshot"),
+                    "changed pin": lambda c: c["cells"][0]["cell"].update(instances=8),
+                }
+                for name, defect in defects.items():
+                    broken = copy.deepcopy(control)
+                    defect(broken)
+                    with self.subTest(defect=name):
+                        rc, calls, report, _ = run(control=broken, subset="smoke")
+                        self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
+                                         (3, 4, "PASS", "PARTIAL"))
+                        self.assertFalse(report["comparison_trusted"])
+                rc, calls, report, _ = run(control=control, candidate_rate=98)
+                self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
+                                 (1, 8, "FAIL", "FAIL"))
+                rc, calls, report, _ = run(collect=True, candidate_rate=98)
+                self.assertEqual((rc, len(calls), report["statistical_verdict"], report["null_control"]["verdict"]),
+                                 (1, 8, "FAIL", "FAIL"))
+                ticks[0] += 86401
+                rc, calls, report, _ = run(control=control)
+                self.assertEqual((rc, len(calls), report["verdict"]), (3, 8, "PARTIAL"))
+                self.assertIn("24 hours", report["standing_null"]["reason"])
+                # Execute the gate's actual ABBA exit classifier with the collection's exit 3.
+                # Its counted row must go red even though null_control itself passed.
+                gate = (ROOT / "tests/gate.sh").read_text()
+                block = gate[gate.index('case "$ABBA_RC" in'):gate.index("\nphase abba-end")]
+                script = 'PASS=0; FAIL=0; ABBA_RC=3\nok(){ PASS=$((PASS+1)); }; bad(){ FAIL=$((FAIL+1)); };\n'
+                checked = subprocess.run(["bash"], input=script + block + '\n[ "$PASS:$FAIL" = 0:1 ]\n',
+                    text=True, capture_output=True)
+                self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
         def test_physical_load_ceiling_keeps_unproven_saturation_red(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:

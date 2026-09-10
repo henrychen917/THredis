@@ -18,6 +18,8 @@ import sys
 import tempfile
 import time
 
+from abba_evidence import validate_measurements, validate_null, validate_comparison, match_null, null_result
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = 1
@@ -26,7 +28,6 @@ ABBA_LABEL = "headline ABBA vs last pushed binary"
 # including future additions. The structural checks below also preserve the 64 original cells,
 # restored 96 multi-key cells, and the 18 deliberate supplemental regimes.
 MIN_ROWS = 437
-NULL_MAX_AGE = 24 * 60 * 60
 ORDER = ["A", "B", "B", "A"]
 HARNESS_DIRS = ("tests/", ".githooks/", "bench/", "benchmarks/", "scripts/", "make/")
 
@@ -39,11 +40,6 @@ def require(condition, message):
 def number(value, label, *, positive=False):
     require(type(value) in (int, float) and math.isfinite(value) and
             (value > 0 if positive else value >= 0), f"invalid {label}")
-    return value
-
-
-def signed_number(value, label):
-    require(type(value) in (int, float) and math.isfinite(value), f"invalid {label}")
     return value
 
 
@@ -329,89 +325,18 @@ def bind(root, args):
     return path
 
 
-def utc_seconds(value):
-    require(isinstance(value, str), "missing ABBA start timestamp")
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-
-
-def validate_abba(report, state, *, now, candidate=None):
-    require(report.get("schema") == 1 and report.get("verdict") == "PASS" and
-            report.get("subset") == "full", "only a complete PASS of the full ABBA set can certify a push")
-    require(report.get("measurement_valid") is True, "ABBA measurement validity was not certified")
-    require(report.get("receipt_harness_sha256") == state["harness"]["sha256"], "ABBA harness differs")
-    require(report.get("order") == ORDER, "ABBA sequence changed")
-    started = utc_seconds(report.get("started_utc"))
-    elapsed = number(report.get("elapsed_seconds"), "ABBA elapsed seconds", positive=True)
-    require(started <= now and started + elapsed <= now + 1, "ABBA timestamps are incomplete or in the future")
-    number(report.get("window_seconds"), "ABBA window", positive=True)
-    source = report.get("cell_source", {})
-    inv = state["inventory"]
-    require(source.get("sha256") == inv["sha256"] and source.get("total_cells") == inv["count"] and
-            digest(source.get("text", "").encode()) == inv["sha256"], "ABBA inventory does not match current cell file")
-    ids = [cell["id"] for cell in inv["cells"]]
-    require(report.get("coverage", {}).get("ids") == ids and report["coverage"].get("count") == len(ids),
-            "ABBA coverage omits or repeats full-set cells")
-    require(not report["coverage"].get("pending_pins"), "ABBA still has unmeasured load floors")
-    for arm in ("candidate", "reference"):
-        require(re.fullmatch(r"[0-9a-f]{64}", report.get(arm, {}).get("sha256", "")), f"missing {arm} binary digest")
-    require(candidate is None or report["candidate"]["sha256"] == candidate["sha256"], "ABBA measured another candidate binary")
-    environment = report.get("environment", {})
-    for key in ("server_cpus", "load_cpus", "server_physical", "load_physical"):
-        value = environment.get(key)
-        require(isinstance(value, list) and value and all(type(cpu) is int and cpu >= 0 for cpu in value)
-                and len(value) == len(set(value)), f"invalid ABBA {key}")
-    require(len(environment["server_physical"]) <= 32 and
-            not set(environment["server_cpus"]) & set(environment["load_cpus"]), "invalid regression CPU allocation")
-    for key in ("uname", "memtier_sha256", "memtier_version", "keys", "data_bytes", "key_pattern", "split_ratio"):
-        require(environment.get(key), f"missing measurement environment: {key}")
-    quiet = report.get("quiet_box", {})
-    require(quiet.get("complete") is True and quiet.get("interference", "missing") is None,
-            "quiet-box evidence missing, incomplete, or contended")
-    qstart = number(quiet.get("started_at"), "quiet start", positive=True)
-    qend = number(quiet.get("finished_at"), "quiet end", positive=True)
-    interval = number(quiet.get("sample_interval_seconds"), "quiet sample interval", positive=True)
-    require(type(quiet.get("samples")) is int and quiet["samples"] >= 2 and qstart < qend <= now + 1,
-            "quiet observer did not complete its sampling interval")
-    monitored = quiet.get("cpus", [])
-    requested = quiet.get("requested_cpus", [])
-    require(set(requested) == set(environment["server_cpus"] + environment["load_cpus"]) and
-            set(requested) <= set(monitored), "quiet observer did not watch the measurement CPUs")
-    # The monitor sets complete only after its final sample. Sample iteration itself takes time,
-    # so samples*interval is not an elapsed-time bound; requiring that would reject healthy runs.
-    # Timestamp bounds and the aggregate window duration independently rule out preflight-only data.
-    require(started <= qstart and qend <= started + elapsed + 1, "quiet timestamps are outside this ABBA run")
-    rows = report.get("cells", [])
-    require(len(rows) == len(ids), "missing/extra ABBA cell results")
-    windows = 0
-    for cell, row in zip(inv["cells"], rows):
-        require(row.get("cell") == cell, f"ABBA parameters differ for {cell['id']}")
-        require(row.get("verdict") == "PASS" and row.get("instrument_valid", True) is True,
-                f"nonpassing ABBA cell: {cell['id']}")
-        assessment = row.get("assessment", {})
-        require(assessment.get("verdict") == "PASS" and assessment.get("reasons") == [],
-                f"unassessed/failed ABBA cell: {cell['id']}")
-        require(assessment.get("saturation_exempt") is (cell["depth"] == 1), "invalid saturation exemption")
-        require(signed_number(assessment.get("loss_pct"), "loss") <=
-                number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
-        rounds = row.get("rounds", [])
-        require(rounds, f"unreached ABBA cell: {cell['id']}")
-        for block in rounds:
-            runs = block.get("runs", [])
-            require([run.get("arm") for run in runs] == ORDER, "incomplete or reordered ABBA measurements")
-            for index, run in enumerate(runs, 1):
-                require(run.get("complete") is True and not run.get("error") and
-                        run.get("artifacts") == f"{cell['id']}/n{block['instances']}-{index}-{run['arm']}",
-                        f"incomplete measurement: {cell['id']}")
-                for field in ("rate", "latency_ms", "window_seconds", "commands"):
-                    number(run.get(field), "measurement " + field, positive=True)
-                require(run["window_seconds"] >= report["window_seconds"], "shortened measurement window")
-                require(type(run.get("pid")) is int and run["pid"] > 0, "measurement never booted a server")
-                if cell["op"] == "REORDER":
-                    number(run.get("p999_ms"), "short p99.9", positive=True)
-                    number(run.get("long_p999_ms"), "long p99.9", positive=True)
-                windows += run["window_seconds"]
-    require(qend - qstart >= windows, "quiet observer did not span all measurement windows")
-    return started, environment
+def validate_abba(report, state, *, now, candidate=None, null=False):
+    # Shared shape/null validation also guards standalone smoke. A push retains this stronger
+    # wrapper: every cell in the current full inventory, including future additions, is required.
+    require(report.get("subset") == "full", "only the full ABBA set can certify a push")
+    if null:
+        validate_null(report, now=now)
+    else:
+        require(report.get("verdict") == "PASS" and report.get("comparison_trusted") is True and
+                report.get("run_kind") == "comparison" and not report.get("only"),
+                "only a complete trusted comparison PASS can certify a push")
+    return validate_measurements(report, now=now, expected_source=state["inventory"],
+        expected_cells=state["inventory"]["cells"], harness=state["harness"]["sha256"], candidate=candidate)
 
 
 def observations(path, state, actual, finished):
@@ -477,14 +402,8 @@ def finish(root, args):
     report, control = read_json(args.abba_result), read_json(args.null_result)
     started, environment = validate_abba(report, state, now=ended, candidate=candidate)
     require(started + 1 >= candidate["bound_at"], "ABBA predates this candidate binding")
-    null_start, null_environment = validate_abba(control, state, now=ended)
-    require(control["candidate"]["sha256"] == control["reference"]["sha256"], "null arms are not byte-identical")
-    require(0 <= started - null_start <= NULL_MAX_AGE, "standing full null is from the future or more than 24 hours old")
-    require(report["window_seconds"] == control["window_seconds"], "null used another measurement window")
-    # Ports and executable pathname can differ without changing the instrument. All other
-    # environment settings, including any future population/geometry fields, must match exactly.
-    instrument = lambda env: {k: v for k, v in env.items() if k not in ("port", "permitted_ports", "memtier_path")}
-    require(instrument(environment) == instrument(null_environment), "null used another geometry or measurement environment")
+    validate_abba(control, state, now=ended, null=True)
+    validate_comparison(report, control, now=ended)
     require(source_fingerprint(root) == state["source"], "source changed while validating gate evidence")
     evidence = {"start": state, "candidate": candidate, "coordinator": completed,
                 "ledger": actual, "observations": observed, "abba": report, "null": control}
@@ -573,13 +492,10 @@ def validate_receipt(root, path, source):
     require(state["started_at"] <= binary["bound_at"] <= completed["finished_at"] <= time.time(),
             "receipt time ordering differs")
     begin_at, environment = validate_abba(evidence["abba"], state, now=completed["finished_at"], candidate=binary)
-    null_at, null_environment = validate_abba(evidence["null"], state, now=completed["finished_at"])
-    require(evidence["null"]["reference"]["sha256"] == evidence["null"]["candidate"]["sha256"] ==
-            receipt["null_control_sha256"], "receipt null arms differ")
-    require(0 <= begin_at - null_at <= NULL_MAX_AGE and begin_at + 1 >= binary["bound_at"], "receipt null is stale")
-    instrument = lambda env: {k: v for k, v in env.items() if k not in ("port", "permitted_ports", "memtier_path")}
-    require(instrument(environment) == instrument(null_environment) and
-            evidence["abba"]["window_seconds"] == evidence["null"]["window_seconds"], "receipt null instrument differs")
+    validate_abba(evidence["null"], state, now=completed["finished_at"], null=True)
+    validate_comparison(evidence["abba"], evidence["null"], now=completed["finished_at"])
+    require(evidence["null"]["candidate"]["sha256"] == receipt["null_control_sha256"], "receipt null arms differ")
+    require(begin_at + 1 >= binary["bound_at"], "receipt ABBA predates the candidate binding")
     require(object_file(root / binary["path"]) == ("100755", binary["sha256"]), "receipt candidate binary changed or is missing")
     return receipt
 
@@ -681,6 +597,7 @@ def self_test():
             (self.root / "tests/gate.sh").write_text("EXPECT_FULL=437\n")
             (self.root / "tests/headline_cells.txt").write_text(fixture_cells())
             shutil.copyfile(__file__, self.root / "tests/gate_receipt.py")
+            shutil.copyfile(ROOT / "tests/abba_evidence.py", self.root / "tests/abba_evidence.py")
             shutil.copyfile(ROOT / ".githooks/pre-push", self.root / ".githooks/pre-push")
             (self.root / ".githooks/pre-push").chmod(0o755)
             (self.root / "source.cc").write_text("int original;\n")
@@ -710,7 +627,7 @@ def self_test():
             self.state = read_json(self.start)
             self.binding = read_json(self.start.parent / "candidate.json")
             self.report = self.make_report(self.start_time + 100, self.binding["sha256"], "b" * 64)
-            self.control = self.make_report(self.start_time - 18000, "a" * 64, "a" * 64)
+            self.control = self.make_report(self.start_time - 18000, "a" * 64, "a" * 64, is_null=True)
             ended = self.start_time + 16200
             self.completed = dict(schema=1, run_id="fixture", tier="push", completed=True, verdict="PASS",
                                   exit_code=0, started_at=self.start_time, finished_at=ended, checks=437,
@@ -726,7 +643,7 @@ def self_test():
                 abba_result=self.root / "build/abba.json", null_result=self.root / "build/null.json")
             self.save_results()
 
-        def make_report(self, started, candidate, reference):
+        def make_report(self, started, candidate, reference, *, is_null=False):
             rows = []
             for cell in self.state["inventory"]["cells"]:
                 runs = [dict(arm=arm, complete=True, artifacts=f"{cell['id']}/n1-{i}-{arm}", pid=100 + i,
@@ -735,7 +652,8 @@ def self_test():
                 rows.append(dict(cell=cell, verdict="PASS", rounds=[dict(instances=1, runs=runs)],
                                  assessment=dict(verdict="PASS", reasons=[], loss_pct=-.1, threshold_pct=.1,
                                                  saturation_exempt=cell["depth"] == 1)))
-            return dict(schema=1, verdict="PASS", subset="full", measurement_valid=True, order=ORDER,
+            report = dict(schema=1, verdict="PARTIAL" if is_null else "PASS", subset="full", measurement_valid=True, order=ORDER,
+                statistical_verdict="PASS", comparison_trusted=not is_null, run_kind="null-control" if is_null else "comparison", only="",
                 started_utc=datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 elapsed_seconds=16000., window_seconds=20, receipt_harness_sha256=self.state["harness"]["sha256"],
                 cell_source=dict(sha256=self.state["inventory"]["sha256"], total_cells=178,
@@ -744,12 +662,21 @@ def self_test():
                 candidate=dict(sha256=candidate), reference=dict(sha256=reference),
                 environment=dict(server_cpus=[0, 1], load_cpus=[2, 3], server_physical=[0, 1],
                                  load_physical=[2, 3], uname=["fixture"], memtier_sha256="d" * 64,
-                                 memtier_version="fixture", keys=2000000, data_bytes=64, key_pattern="P:P", split_ratio="1:1"),
+                                 memtier_version="fixture", keys=2000000, data_bytes=64, key_pattern="P:P", split_ratio="1:1",
+                                 population_by_arm={"A": "wire", "B": "wire"}),
                 quiet_box=dict(complete=True, interference=None, started_at=started + 1, finished_at=started + 15999,
                                sample_interval_seconds=1, samples=15998, cpus=[0, 1, 2, 3], requested_cpus=[0, 1, 2, 3]),
                 cells=rows)
+            if is_null:
+                report["null_control"] = null_result(report, now=time.time())
+            return report
 
         def save_results(self):
+            if "standing_null" not in self.report:
+                try:
+                    self.report["standing_null"] = match_null(self.report, self.control, now=time.time())
+                except ValueError:
+                    pass  # Negative fixtures remain malformed until the real validator rejects them.
             write_json(self.finish_args.gate_result, self.completed)
             write_json(self.finish_args.abba_result, self.report)
             write_json(self.finish_args.null_result, self.control)
@@ -930,7 +857,7 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
             self.finish_args.start = self.start
             self.completed["run_id"] = self.args.run_id
             self.report = self.make_report(self.start_time + 100, self.binding["sha256"], "b" * 64)
-            self.control = self.make_report(self.start_time - 18000, "a" * 64, "a" * 64)
+            self.control = self.make_report(self.start_time - 18000, "a" * 64, "a" * 64, is_null=True)
             for row in self.observed:
                 row["run_id"] = self.args.run_id
             self.save_results()
@@ -972,7 +899,7 @@ ABBA_OUTPUT="$PWD/build/abba"; LEDGER="$PWD/build/ledger.tsv"
                     self.save_results()
                     with self.assertRaises(ValueError):
                         finish(self.root, self.finish_args)
-            self.report, self.control = baseline_report, self.make_report(self.start_time - 100000, "a" * 64, "a" * 64)
+            self.report, self.control = baseline_report, self.make_report(self.start_time - 100000, "a" * 64, "a" * 64, is_null=True)
             self.save_results()
             with self.assertRaisesRegex(ValueError, "24 hours old"):
                 finish(self.root, self.finish_args)

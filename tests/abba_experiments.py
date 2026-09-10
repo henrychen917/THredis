@@ -68,6 +68,11 @@ class ExperimentRunner(BASE_RUNNER):
         self.population_by_arm = population_by_arm
         self.attempts = attempts
 
+    def population_environment(self):
+        return {"population_by_arm": self.population_by_arm,
+                "population_snapshot_sha256": abba.sha256(self.snapshot)
+                    if "snapshot" in self.population_by_arm.values() else None}
+
     def prepare_data(self, cell, arm, folder):
         if self.population_by_arm[arm] == "snapshot":
             # Default dbfilename is explicitly checked on the priming boot. Copy
@@ -122,7 +127,8 @@ def arguments_for_block(args, fixture, output):
         server_cores=args.server_cores, server_smt=args.server_smt,
         load_cores=args.load_cores, load_smt=args.load_smt,
         ports=args.ports, port=args.port, memtier=args.memtier, output=output,
-        escalate=False, max_instances=16)
+        escalate=False, max_instances=16, collect_null=0,
+        null_result=fixture / "no-standing-experiment-control.json")
 
 
 def prime_snapshot(args, fixture, output, cell):
@@ -163,7 +169,12 @@ def run_block(args, fixture, output, cell, snapshot, specification):
     abba.Runner = lambda *a, **kw: ExperimentRunner(*a, snapshot=snapshot,
         population_by_arm={"A": method_a, "B": method_b}, attempts=attempts, **kw)
     try:
-        rc = abba.main(arguments_for_block(args, fixture, output / name))
+        block_args = arguments_for_block(args, fixture, output / name)
+        # Equal executable bytes are insufficient for wire-versus-snapshot: the store was built
+        # differently. Only equal-method blocks collect null evidence; the method comparison
+        # retains raw statistical facts and remains an explicitly untrusted gate diagnostic.
+        block_args.collect_null = int(method_a == method_b)
+        rc = abba.main(block_args)
     finally:
         abba.Runner, abba.WINDOW = original_runner, original_window
     report = json.loads((output / name / "results.json").read_text())
@@ -221,7 +232,11 @@ def describe_block(cell, specification, report, attempts, rc):
     result["elapsed_seconds"] = report["elapsed_seconds"]
     result["latency_window_seconds"] = abba.WARMUP + window + abba.TAIL
     if not result["reasons"]:
-        result["status"] = "PASS" if report["verdict"] == "PASS" else "FAIL"
+        if method_a == method_b:
+            passed = report.get("null_control", {}).get("verdict") == "PASS"
+        else:
+            passed = report.get("statistical_verdict") == "PASS" and report.get("run_kind") == "comparison"
+        result["status"] = "PASS" if passed else "FAIL"
     return result
 
 
@@ -326,11 +341,16 @@ def self_test():
                 args = parse_args(["--candidate-binary", str(binary), "--cells", str(source),
                                    "--output", str(directory / "experiment"), "--memtier", sys.executable])
                 calls = []
+                epoch, ticks, quiet_started = int(time.time()) - 10000, [0.], [0.]
+                original_gmtime = time.gmtime
                 def measure(runner, cell, arm, sequence, instances, knobs):
                     calls.append((abba.WINDOW, arm, sequence, instances, runner.population_by_arm[arm]))
+                    ticks[0] += abba.WINDOW + 8
                     return {"arm": arm, "rate": 100, "latency_ms": 1, "busy_pct": 99.9,
                             "complete": True, "window_seconds": abba.WINDOW + .001,
-                            "populate_seconds": 1, "wall_seconds": abba.WINDOW + 8}
+                            "populate_seconds": 1, "wall_seconds": abba.WINDOW + 8,
+                            "commands": 2000, "pid": 123,
+                            "artifacts": f"{cell.id}/n{instances}-{sequence}-{arm}"}
                 def prime(a, fixture, out, cell):
                     snapshot = fixture / "dump.tomo"
                     snapshot.write_bytes(b"snapshot fixture")
@@ -341,8 +361,14 @@ def self_test():
                 geometry = {"server_cores": "0-31", "server_smt": "",
                             "load_cores": "32-127", "load_smt": "160-255"}
                 monitor = mock.Mock()
-                monitor.evidence.return_value = {"interference": None, "samples": 2}
-                monitor.close.return_value = {"interference": None, "samples": 3, "complete": True}
+                monitor.start.side_effect = lambda: quiet_started.__setitem__(0, epoch + ticks[0])
+                def evidence():
+                    cpus = list(range(128)) + list(range(160, 256))
+                    return dict(complete=True, interference=None, started_at=quiet_started[0],
+                        finished_at=epoch + ticks[0], samples=max(2, int(epoch + ticks[0] - quiet_started[0])),
+                        sample_interval_seconds=1, cpus=cpus, requested_cpus=cpus)
+                monitor.evidence.side_effect = evidence
+                monitor.close.side_effect = evidence
                 original_window = abba.WINDOW
                 with mock.patch.object(BASE_RUNNER, "measure", measure), \
                      mock.patch(__name__ + ".prime_snapshot", side_effect=prime), \
@@ -352,6 +378,10 @@ def self_test():
                      mock.patch.object(abba, "resolve_reference", side_effect=reference), \
                      mock.patch.object(abba, "QuietMonitor", return_value=monitor), \
                      mock.patch.object(os, "sched_setaffinity"), \
+                     mock.patch.object(time, "time", side_effect=lambda: epoch + ticks[0]), \
+                     mock.patch.object(time, "monotonic", side_effect=lambda: ticks[0]), \
+                     mock.patch.object(time, "gmtime", side_effect=lambda seconds=None:
+                         original_gmtime(epoch + ticks[0] if seconds is None else seconds)), \
                      mock.patch.dict(sys.modules, {"gate_quiet": SimpleNamespace(
                          assert_quiet=mock.Mock(return_value={"status": "quiet"}))}), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
@@ -368,6 +398,13 @@ def self_test():
                 self.assertFalse(report["evaluation"]["defaults_changed"])
                 for block in report["blocks"]:
                     self.assertEqual(block["abba"]["reference"]["sha256"], block["abba"]["candidate"]["sha256"])
+                    self.assertEqual(block["abba"]["verdict"], "PARTIAL")
+                    self.assertFalse(block["abba"]["comparison_trusted"])
+                    if block["null"]:
+                        self.assertEqual(block["abba"]["null_control"]["verdict"], "PASS")
+                    else:
+                        self.assertEqual(block["abba"]["run_kind"], "comparison")
+                        self.assertNotIn("null_control", block["abba"])
 
         def test_contended_box_refuses_before_snapshot_priming(self):
             with tempfile.TemporaryDirectory() as tmp:
