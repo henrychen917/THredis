@@ -911,6 +911,8 @@ class Runner:
         self.legacy_reorder_controls = {}
         self.legacy_reorder_failures = {}
         self.profile_factory = None  # Diagnostic opt-in only: no default PMCs or profile objects.
+        self.worker_affinity_factory = None
+        self.load_startup_seconds = 0  # Diagnostic allowance; normal generator lifetime stays 28s.
 
     def legacy_reorder_control(self, cell, arm, knobs):
         if cell.op != 'REORDER' or arm != 'A' or 'x-ex-sched' not in knobs:
@@ -985,6 +987,7 @@ class Runner:
 
     def measure(self, cell, arm, sequence, instances, knobs):
         profile = None
+        worker_affinity = None
         legacy_control = self.legacy_reorder_control(cell, arm, knobs)
         folder = self.out / cell.id / f"n{instances}-{sequence}-{arm}"
         folder.mkdir(parents=True)
@@ -1041,14 +1044,30 @@ class Runner:
             # INFO/DEBUG and client protocol setup never become phantom workload ops.
             result["whole_run_commandstats_before"] = info(conn, "commandstats")
             result["whole_run_clients_before"] = info(conn, "clients")
+            load_lifetime = self.load_startup_seconds + WARMUP + WINDOW + TAIL
+            load_launch = time.monotonic() if self.load_startup_seconds else None
+            if self.load_startup_seconds:
+                result["load_timing"] = dict(startup_allowance_seconds=self.load_startup_seconds,
+                    first_launch_monotonic=load_launch, requested_lifetime_seconds=load_lifetime,
+                    fresh_warmup_seconds=WARMUP, central_window_seconds=WINDOW, tail_seconds=TAIL)
             for i, placement in enumerate(layout):
                 argv = self.memtier(placement) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
-                        f"--test-time={WARMUP + WINDOW + TAIL}",
+                        f"--test-time={load_lifetime}",
                         f"--json-out-file={folder / f'load-{i}.json'}"]
                 generators.append(self.children.start(argv, folder / f"load-{i}.log", folder))
                 result.setdefault("load_argv", []).append(argv)
+            if self.worker_affinity_factory is not None:
+                worker_affinity = self.worker_affinity_factory(folder)
+                result["load_worker_affinity"] = worker_affinity.record
+                worker_affinity.begin(generators, layout, load_launch, load_lifetime)
+            if self.load_startup_seconds:
+                if time.monotonic() >= load_launch + self.load_startup_seconds:
+                    raise RuntimeError("diagnostic load startup allowance expired before fresh warmup")
+                result["load_timing"]["warmup_started_monotonic"] = time.monotonic()
             # The counter window excludes setup/teardown and is the SAME for all LGs.
             time.sleep(WARMUP)
+            if worker_affinity is not None:
+                worker_affinity.verify("after-fresh-warmup")
             if any(p.poll() is not None for p in generators):
                 raise RuntimeError("load generator exited before the measurement window")
             if int(info(conn, "clients")["connected_clients"]) != cell.conns + 1:
@@ -1081,8 +1100,19 @@ class Runner:
                 profile = self.profile_factory(folder)
                 result["cpu_profile"] = profile.record
                 profile.begin(srv, generators)
+            if worker_affinity is not None:
+                worker_affinity.verify("before-central-window")
             before = info(conn, "stats")
             before_cpu, t0 = cpu_seconds(srv.pid), time.monotonic()
+            if self.load_startup_seconds:
+                # Use the earliest possible generator expiry. Setup consumes its
+                # allowance, never the central window or the reserved tail. Both
+                # floating and fixed diagnostics use the same requested lifetime.
+                remaining = load_launch + load_lifetime - t0
+                result["load_timing"].update(central_start_monotonic=t0,
+                    minimum_remaining_lifetime_seconds=remaining)
+                if remaining < WINDOW + TAIL:
+                    raise RuntimeError("insufficient diagnostic load lifetime for full central window and tail")
             time.sleep(WINDOW)
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
@@ -1091,6 +1121,8 @@ class Runner:
                 # PMCs encompass it; every wider endpoint offset is retained explicitly.
                 profile.finish(t0, t1, int(after["total_commands_processed"]) -
                                int(before["total_commands_processed"]) - 1)
+            if worker_affinity is not None:
+                worker_affinity.finish()
             generator_cpu.update(central_start_monotonic=t0, central_end_monotonic=t1,
                                  central_window_seconds=t1 - t0)
             for sample, process in zip(generator_cpu["processes"], generators):
@@ -1137,6 +1169,17 @@ class Runner:
             for i, placement in enumerate(layout):
                 totals.append(memtier_totals(folder / f"load-{i}.json", cell,
                                             placement["threads"] * placement["clients"]))
+            if self.load_startup_seconds:
+                # HDR includes setup/warmup/tail. Keep each actual memtier runtime
+                # (milliseconds in its JSON schema), not a fictional 20s HDR window.
+                from abba_worker_affinity import histogram_runtime
+                result["full_histogram_runtime"] = histogram_runtime(folder, len(generators), load_lifetime)
+                # Pinning pauses generators before their fresh warmup, but their
+                # full-run HDR still includes that pause. These diagnostics cannot
+                # justify adopting worker pinning for p1 or scored tail latency.
+                result["full_histogram_runtime"].update(includes_startup_sigstop=worker_affinity is not None,
+                    latency_scoring_eligible=False,
+                    limitation="exclude startup pause from scored latency or pin before traffic before any production adoption")
             result["whole_run_accounting"] = require_workload_accounting(
                 cell, result["whole_run_commandstats_before"], result["whole_run_commandstats_after"], totals)
             total_rate = sum(t["rate"] for t in totals)
@@ -1149,8 +1192,10 @@ class Runner:
                 # Memtier's HDR spans its entire run. State that separately from the
                 # central counter window; startup/warmup/tail samples are not silently
                 # represented as a histogram of only WINDOW seconds.
-                result["histogram_window_seconds"] = WARMUP + WINDOW + TAIL
+                result["histogram_window_seconds"] = load_lifetime
         except BaseException as e:
+            if worker_affinity is not None:
+                worker_affinity.fail(e)
             if profile is not None and profile.record.get("status") == "INCOMPLETE":
                 profile.fail(e)
             if result.get("generator_cpu", {}).get("status") == "INCOMPLETE":
@@ -1258,7 +1303,8 @@ def parse_args():
     return p.parse_args()
 
 
-def main(args, *, diagnostic_monitor=None, diagnostic_profile=0):
+def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
+         diagnostic_pin_load_workers=0, diagnostic_load_startup_seconds=0):
     if args.list_cells:
         cells = selected_cells(read_cells(args.cells), args.subset, args.only)
         print(json.dumps({"subset": args.subset, **coverage(cells)}, indent=2))
@@ -1301,6 +1347,15 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0):
             raise ValueError("CPU profiling requires the permanently untrusted diagnostic runner")
         if diagnostic_profile:
             report["cpu_profile_requested"] = True
+        if (diagnostic_pin_load_workers not in (0, 1) or diagnostic_load_startup_seconds not in (0, 5) or
+                (diagnostic_pin_load_workers or diagnostic_load_startup_seconds) and
+                (diagnostic_monitor is None or not args.collect_null) or
+                diagnostic_pin_load_workers and diagnostic_load_startup_seconds != 5):
+            report.update(measurement_valid=False, normal_gate_eligible=False)
+            raise ValueError("worker placement requires diagnostic null arms and explicit 5s startup allowance")
+        if diagnostic_load_startup_seconds:
+            report.update(pin_load_workers=diagnostic_pin_load_workers,
+                          load_startup_seconds=diagnostic_load_startup_seconds)
         quiet_file = os.getenv("GATE_QUIET_FILE")
         if quiet_file:
             quiet_path = Path(quiet_file)
@@ -1379,6 +1434,10 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0):
             raise RuntimeError("memtier_benchmark not available")
         args.memtier = str(Path(args.memtier).resolve())
         runner = Runner(args, out, binaries, children)
+        runner.load_startup_seconds = diagnostic_load_startup_seconds
+        if diagnostic_pin_load_workers:
+            from abba_worker_affinity import WorkerAffinity
+            runner.worker_affinity_factory = WorkerAffinity
         if diagnostic_profile:
             # Dormant imports are included in the instrument fingerprint. The normal
             # path neither imports the helper nor allocates any perf/profile state.
@@ -1809,9 +1868,12 @@ def self_test():
             # Exercise Runner.measure itself, including argv production, generator
             # waits, JSON parsing, both endpoint reads and failure artifacts. Only
             # process/network/time boundaries are fake; the accounting is real.
-            for corruption, profile_mode in [(value, 0) for value in (0, -1, 10000, "cpu-reset", "cpu-exit")] + [
-                    (0, value) for value in ("on", "begin-fail", "finish-fail", "close-fail")]:
-                with self.subTest(corruption=corruption, profile=profile_mode), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
+            cases = [(value, 0, 0) for value in (0, -1, 10000, "cpu-reset", "cpu-exit")] + [
+                    (0, value, 0) for value in ("on", "begin-fail", "finish-fail", "close-fail")] + [
+                    (0, "on", value) for value in ("fixed", "floating", "setup-fail", "warmup-fail",
+                                                  "before-fail", "finish-fail", "lifetime-fail")]
+            for corruption, profile_mode, affinity_mode in cases:
+                with self.subTest(corruption=corruption, profile=profile_mode, affinity=affinity_mode), tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                     directory, events, generators = Path(tmp), [], []
                     stopped, profiles = [], []
                     phase = {"window": 0, "finished": 0}
@@ -1821,7 +1883,12 @@ def self_test():
                             return srv
                         events.append("start")
                         path = Path(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--json-out-file=")))
-                        path.write_text(json.dumps(self.accounting_document({"GET": 5000})))
+                        requested = int(next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--test-time=")))
+                        self.assertEqual(requested, 33 if affinity_mode else 28)
+                        document = self.accounting_document({"GET": 5000})
+                        document["ALL STATS"]["Runtime"].update({"Time unit": "MILLISECONDS", "Start time": 1000,
+                            "Finish time": 1000 + requested * 1000, "Total duration": requested * 1000})
+                        path.write_text(json.dumps(document))
                         def wait(timeout):
                             phase["finished"] += 1
                             events.append("finish")
@@ -1860,6 +1927,47 @@ def self_test():
                     args = SimpleNamespace(server_cores="0-1", server_smt="", load_cores="2-3", load_smt="",
                                            port=9090, memtier="never-executed-memtier")
                     runner = Runner(args, directory, {"A": Path("never-executed-server")}, children)
+                    class Affinity:
+                        def __init__(inner, folder):
+                            inner.record = {"status": "INCOMPLETE", "normal_gate_eligible": False}
+                        def begin(inner, loads, layout, first, lifetime):
+                            self.assertEqual(loads, generators)
+                            self.assertEqual(phase["window"], 0)
+                            self.assertEqual(lifetime, 33)
+                            self.assertEqual(sum(p["threads"] * p["clients"] for p in layout), 4)
+                            events.append("affinity-setup")
+                            if affinity_mode == "setup-fail":
+                                raise RuntimeError("affinity injected setup failure")
+                        def verify(inner, stage):
+                            self.assertEqual(phase["window"], 1)
+                            events.append(stage)
+                            if (affinity_mode == "warmup-fail" and stage == "after-fresh-warmup" or
+                                    affinity_mode == "before-fail" and stage == "before-central-window"):
+                                raise RuntimeError("affinity injected mask failure")
+                            if affinity_mode == "lifetime-fail" and stage == "before-central-window":
+                                # Move only the actual central-start observation past its
+                                # budget; the real Runner must reject before WINDOW sleep.
+                                real_clock = time.monotonic
+                                delayed_clock = mock.patch.object(time, "monotonic", side_effect=lambda: real_clock() + 20)
+                                delayed_clock.start()
+                                self.addCleanup(delayed_clock.stop)
+                                inner.delayed_clock = delayed_clock
+                        def finish(inner):
+                            self.assertEqual(phase["window"], 2)
+                            events.append("affinity-finish")
+                            if affinity_mode == "finish-fail":
+                                raise RuntimeError("affinity injected end failure")
+                            inner.record["status"] = "COMPLETE"
+                        def fail(inner, error):
+                            inner.record.update(status="INVALID", error=str(error))
+                            if hasattr(inner, "delayed_clock"):
+                                inner.delayed_clock.stop()
+                    self.assertIsNone(runner.worker_affinity_factory)
+                    self.assertEqual(runner.load_startup_seconds, 0)
+                    if affinity_mode:
+                        runner.load_startup_seconds = 5
+                    if affinity_mode and affinity_mode != "floating":
+                        runner.worker_affinity_factory = Affinity
                     class Profile:
                         def __init__(inner, folder):
                             profiles.append(inner)
@@ -1896,7 +2004,10 @@ def self_test():
                             busy_deltas=mock.Mock(return_value={}), productive_saturation=mock.Mock(return_value={})), \
                          mock.patch.object(runner, "populate", return_value=None), \
                          mock.patch.object(time, "sleep", side_effect=sleep), contextlib.redirect_stdout(io.StringIO()):
-                        if profile_mode not in (0, "on"):
+                        if affinity_mode not in (0, "fixed", "floating"):
+                            with self.assertRaisesRegex(RuntimeError, "affinity injected|insufficient diagnostic load lifetime"):
+                                runner.measure(cell, "A", 1, 2, {})
+                        elif profile_mode not in (0, "on"):
                             with self.assertRaisesRegex(RuntimeError, "profile injected"):
                                 runner.measure(cell, "A", 1, 2, {})
                         elif isinstance(corruption, str):
@@ -1911,8 +2022,23 @@ def self_test():
                             self.assertEqual(result["whole_run_accounting"]["commands"]["GET"]["server_calls"], 10000)
                     self.assertEqual(events[0], ("commandstats", 0, 0))
                     retained = json.loads((directory / cell.id / "n2-1-A/measurement.json").read_text())
-                    self.assertEqual(retained["complete"], not bool(corruption) and profile_mode in (0, "on"))
+                    self.assertEqual(retained["complete"], not bool(corruption) and profile_mode in (0, "on") and
+                                     affinity_mode in (0, "fixed", "floating"))
                     self.assertEqual(stopped, [124, 125, 123])
+                    if affinity_mode:
+                        self.assertEqual(retained["load_timing"]["requested_lifetime_seconds"], 33)
+                        if affinity_mode in ("fixed", "floating"):
+                            self.assertEqual(retained["full_histogram_runtime"]["requested_seconds"], 33)
+                            self.assertEqual([row["duration_seconds"] for row in retained["full_histogram_runtime"]["processes"]], [33, 33])
+                            self.assertEqual(retained["full_histogram_runtime"]["includes_startup_sigstop"], affinity_mode == "fixed")
+                            self.assertFalse(retained["full_histogram_runtime"]["latency_scoring_eligible"])
+                        if affinity_mode != "floating":
+                            self.assertEqual(retained["load_worker_affinity"]["status"], "COMPLETE" if affinity_mode == "fixed" else "INVALID")
+                            if affinity_mode != "setup-fail":
+                                self.assertLess(events.index("affinity-setup"), events.index("after-fresh-warmup"))
+                        if affinity_mode not in ("fixed", "floating"):
+                            self.assertEqual(phase["window"], 2 if affinity_mode == "finish-fail" else 0 if affinity_mode == "setup-fail" else 1)
+                            continue
                     if profile_mode:
                         self.assertEqual(len(profiles), 1)
                         self.assertEqual(retained["cpu_profile"]["status"], "COMPLETE" if profile_mode == "on" else "INVALID")
@@ -2262,7 +2388,8 @@ def self_test():
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
                       climbing=False, ceiling=16, contend_after=None, reference_error=None, rates=None,
                       run_overrides=None, load_cores="32-127", load_smt="160-255",
-                      diagnostic_profile=0, background_environment=None):
+                      diagnostic_profile=0, background_environment=None,
+                      diagnostic_pin_load_workers=0, diagnostic_load_startup_seconds=0):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
             # pin=3/512 fixture also catches silently skipping a non-doubling pin.
@@ -2315,7 +2442,9 @@ def self_test():
                      mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(stream):
-                    rc = main(args, diagnostic_profile=diagnostic_profile)
+                    rc = main(args, diagnostic_profile=diagnostic_profile,
+                              diagnostic_pin_load_workers=diagnostic_pin_load_workers,
+                              diagnostic_load_startup_seconds=diagnostic_load_startup_seconds)
                 return rc, order, layouts, json.loads((output / "results.json").read_text()), stream.getvalue()
 
         def test_profile_cannot_be_enabled_in_normal_gate_or_cli(self):
@@ -2326,6 +2455,18 @@ def self_test():
             with mock.patch.object(sys, "argv", ["abbagate.py", "--profile", "1"]), \
                  contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args()
+
+        def test_worker_pinning_and_startup_allowance_cannot_enter_normal_gate(self):
+            for pin, allowance in ((1, 5), (0, 5), (1, 0)):
+                rc, calls, _, report, _ = self.fake_main(pin=4,
+                    diagnostic_pin_load_workers=pin, diagnostic_load_startup_seconds=allowance)
+                self.assertEqual((rc, calls), (1, []))
+                self.assertFalse(report["measurement_valid"])
+                self.assertFalse(report["normal_gate_eligible"])
+            for option, value in (("--pin-load-workers", "1"), ("--load-startup-seconds", "5")):
+                with mock.patch.object(sys, "argv", ["abbagate.py", option, value]), \
+                     contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parse_args()
 
         def test_contender_invalidates_real_loop_without_retry_or_threshold_change(self):
             threshold_before = paired(self.round([100, 100, 100, 100])["runs"])["threshold_pct"]

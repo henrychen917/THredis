@@ -272,7 +272,9 @@ def run(args):
         output = options.output.resolve()
         (output / "reviewed-background.json").write_bytes(inventory_bytes)
         return QualificationMonitor(*positional, reviewed=reviewed, document=document, output=output, **keywords)
-    rc = abba.main(options, diagnostic_monitor=monitor, diagnostic_profile=getattr(args, "profile", 0))
+    rc = abba.main(options, diagnostic_monitor=monitor, diagnostic_profile=getattr(args, "profile", 0),
+                   diagnostic_pin_load_workers=getattr(args, "pin_load_workers", 0),
+                   diagnostic_load_startup_seconds=getattr(args, "load_startup_seconds", 0))
     report = json.loads((options.output / "results.json").read_text())
     sample_file = options.output / "background-samples.jsonl"
     events = [json.loads(line) for line in sample_file.read_text().splitlines()] if sample_file.exists() else []
@@ -696,10 +698,26 @@ def self_test():
                  contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parse_args()
 
+        def test_worker_pinning_and_independent_startup_cli_are_numeric(self):
+            argv = ["background_qualification.py", "run", "--inventory", "x", "--candidate", "y", "--output", "z"]
+            for flags, expected in (([], (0, 0)), (["--load-startup-seconds", "5"], (0, 5)),
+                                    (["--pin-load-workers", "1", "--load-startup-seconds", "5"], (1, 5))):
+                with mock.patch.object(sys, "argv", argv + flags):
+                    args = parse_args()
+                    self.assertEqual((args.pin_load_workers, args.load_startup_seconds), expected)
+            for flags in (["--pin-load-workers", "2"], ["--load-startup-seconds", "4"]):
+                with mock.patch.object(sys, "argv", argv + flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    parse_args()
+
         def test_profiled_real_loop_stays_permanently_untrusted(self):
             self.test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(profile=1)
 
-        def test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(self, profile=0):
+        def test_fixed_and_floating_real_loops_share_allowance_and_stay_untrusted(self):
+            for pin in (0, 1):
+                self.test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(
+                    profile=1, pin=pin, allowance=5)
+
+        def test_real_main_takes_exactly_twelve_measurements_and_never_writes_trusted_evidence(self, profile=0, pin=0, allowance=0):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 candidate = root / "candidate"
@@ -710,7 +728,8 @@ def self_test():
                 cells = root / "cells"
                 cells.write_text("".join(f"{name} | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | - | - | 4\n" for name in CELLS))
                 args = SimpleNamespace(inventory=manifest, candidate=candidate, output=root / "output", cells=cells,
-                    profile=profile, memtier=sys.executable, server_cores="0-31", load_cores="32-63", server_smt="", load_smt="", ports=None, port="9079")
+                    profile=profile, pin_load_workers=pin, load_startup_seconds=allowance,
+                    memtier=sys.executable, server_cores="0-31", load_cores="32-63", server_smt="", load_smt="", ports=None, port="9079")
                 phases, calls, writes = [], [], []
                 fake = SimpleNamespace(start=lambda: None, check=lambda: None, set_phase=phases.append,
                     evidence=lambda: {"complete": False, "scope": "background-qualification"},
@@ -721,6 +740,12 @@ def self_test():
                         self.assertIs(runner.profile_factory, WindowProfile)
                     else:
                         self.assertIsNone(runner.profile_factory)
+                    self.assertEqual(runner.load_startup_seconds, allowance)
+                    if pin:
+                        from abba_worker_affinity import WorkerAffinity
+                        self.assertIs(runner.worker_affinity_factory, WorkerAffinity)
+                    else:
+                        self.assertIsNone(runner.worker_affinity_factory)
                     calls.append((cell.id, instances, sequence, arm))
                     return {"arm": arm, "rate": 100, "busy_pct": 99.9, "latency_ms": 1,
                             "instances": instances, "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
@@ -752,6 +777,8 @@ def self_test():
                 self.assertGreaterEqual(len(writes), 4)
                 result = writes[-1]
                 self.assertEqual(result.get("cpu_profile_requested", False), bool(profile))
+                self.assertEqual(result.get("pin_load_workers", 0), pin)
+                self.assertEqual(result.get("load_startup_seconds", 0), allowance)
                 self.assertEqual(result["statistical_verdict"], "PASS")
                 self.assertEqual(result["null_control"]["verdict"], "UNTRUSTED")
                 counts = json.loads((args.output / "qualification-windows.json").read_text())
@@ -781,6 +808,10 @@ def parse_args():
     launch.add_argument("--memtier", default="memtier_benchmark")
     launch.add_argument("--profile", type=int, choices=(0, 1), default=0,
                         help="1 records owned task/PMC diagnostics; remains ineligible as gate/null evidence")
+    launch.add_argument("--pin-load-workers", type=int, choices=(0, 1), default=0,
+                        help="1 fixes owned worker TIDs to physical-first load CPUs; requires --load-startup-seconds 5")
+    launch.add_argument("--load-startup-seconds", type=int, choices=(0, 5), default=0,
+                        help="diagnostic startup allowance; use 5 for BOTH floating and fixed controls (33s generators)")
     for name in ("server-cores", "load-cores", "server-smt", "load-smt", "ports", "port"):
         launch.add_argument("--" + name)
     commands.add_parser("self-test", help="serverless identity and real-loop controls")
