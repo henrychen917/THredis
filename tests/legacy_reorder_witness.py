@@ -44,7 +44,6 @@ import time
 import abbagate as abba
 from _lib import Conn, encode
 from _gate_process import server
-from gate_quiet import QuietMonitor
 
 
 OLD = b"0" + b"." * 63
@@ -238,14 +237,22 @@ def translated_knobs(binary, mode, reorder):
             translated = abba.legacy_value(name, value, mode)
             require(alias and abba.accepted(binary, alias, translated), f"binary cannot express {name}={value}")
             result[alias] = translated
+    # The stored reference predates independent key/client switches. Its --lb 0
+    # disables the shared controller and both collectors; verify the actual old
+    # configuration instead of passing new flags that prevent the control boot.
+    if abba.accepted(binary, 'key-lb', 0) and abba.accepted(binary, 'client-lb', 0):
+        result.update({'key-lb': 0, 'client-lb': 0})
+    else:
+        require(abba.accepted(binary, 'lb', 0), 'binary cannot disable load balancing')
+        result['lb'] = 0
     return result
 
 
-def run_control(args, binary, out, mode, reorder, quiet):
+def run_control(args, binary, out, mode, reorder):
     knobs = translated_knobs(binary, mode, reorder)
     nthreads = len(abba.cpus(args.server_cores) + abba.cpus(args.server_smt))
     ex = nthreads // 2
-    server_args = ["--atomic", "1", "--key-lb", "0", "--client-lb", "0", "--flip-auto", "0",
+    server_args = ["--atomic", "1", "--flip-auto", "0",
                    "--shards", str(min(256, 8 * (ex if mode == "2s" else nthreads)))]
     if mode == "2s":
         server_args += ["--ratio", f"{nthreads-ex}:{ex}"]
@@ -254,11 +261,10 @@ def run_control(args, binary, out, mode, reorder, quiet):
     row = {"mode": mode, "reorder": reorder, "knobs": knobs, "attempts": [], "verdict": "FAIL"}
     out.mkdir(parents=True)
     try:
-        quiet.check()
         with server(binary, abba.cpu_string(abba.cpus(args.server_cores) + abba.cpus(args.server_smt)),
                     args.port, out / "server", server_args) as (control, process), ExitStack() as stack:
             row["pid"] = process.pid
-            for name, value in {**knobs, "key-lb": 0, "client-lb": 0, "flip-auto": 0, "atomic": 1}.items():
+            for name, value in {**knobs, "flip-auto": 0, "atomic": 1}.items():
                 require(control.must("CONFIG", "GET", name) == [name.encode(), str(value).encode()],
                         f"boot did not apply {name}={value}")
             require(control.must("DBSIZE") == 0, "diagnostic boot is not fresh")
@@ -286,7 +292,6 @@ def run_control(args, binary, out, mode, reorder, quiet):
             counter_before = abba.info(control, "server").get("reorder_permuted_runs")
             peers = {name: producer for name in ("writer", "reader", "monitor", "blocker")}
             for attempt, (key, shard) in enumerate(fresh):
-                quiet.check()
                 require(control.must("GET", key) == OLD, "attempt did not start from its fresh old state")
                 versions_before = no_snapshot_versions(control)
                 before = topology(control)
@@ -319,7 +324,6 @@ def run_control(args, binary, out, mode, reorder, quiet):
                 if not reorder:
                     require(not record["inversion"], "FIFO negative control inverted; fixture/model is invalid")
                 (out / "result.json").write_text(json.dumps(row, indent=2) + "\n")
-                quiet.check()
             row.update(finish_control(row["attempts"], reorder))
             counter_after = abba.info(control, "server").get("reorder_permuted_runs")
             if counter_before is not None or counter_after is not None:
@@ -369,25 +373,24 @@ def main(args):
     report = {"schema": 1, "scope": "standalone preparatory witness; not accepted by the ABBA gate",
               "verdict": "FAIL", "controls": [], "binary_sha256": abba.sha256(args.binary)}
     previous_affinity = os.sched_getaffinity(0)
-    quiet = None
     try:
         os.sched_setaffinity(0, load_cpus)
-        quiet = QuietMonitor(server_cpus, load_cpus, own_root_pid=os.getpid())
-        quiet.start()
+        # This is a correctness observation of dispatch versus execution order, with no scored
+        # timing. Other work may make the bounded arm fail to open, but cannot manufacture its
+        # exactly-once command order and value transition. Keep all those witnesses mandatory;
+        # only the separate ABBA tier requires an exclusive quiet box.
+        report['quiet_box'] = {'required': False, 'reason': 'unscored correctness witness'}
         binary = out / "unchanged-binary"
         shutil.copy2(args.binary, binary)
         require(abba.sha256(binary) == report["binary_sha256"], "binary changed while copying")
         modes = ("1s", "2s") if args.mode == "both" else (args.mode,)
         for mode in modes:
             for reorder in (0, 1):
-                quiet.check()
-                row = run_control(args, binary, out / f"{mode}-reorder-{reorder}", mode, reorder, quiet)
+                row = run_control(args, binary, out / f"{mode}-reorder-{reorder}", mode, reorder)
                 report["controls"].append(row)
                 print(f"{mode} reorder={reorder}: {row['verdict']} armed={row.get('armed_attempts', 0)} "
                       f"inversions={row.get('inversions', 0)} {row.get('reason', '')}", flush=True)
                 require(row["verdict"] == "PASS", "control failed; never retry a failed fixture into green")
-        report["quiet_box"] = quiet.close()
-        quiet.check()
         require(abba.sha256(binary) == report["binary_sha256"], "copied binary bytes changed")
         report["verdict"] = "PASS"
         return 0
@@ -396,8 +399,6 @@ def main(args):
         print(f"LEGACY REORDER FAIL: {report['reason']}", file=sys.stderr, flush=True)
         return 1
     finally:
-        if quiet is not None:
-            report["quiet_box"] = quiet.close()
         os.sched_setaffinity(0, previous_affinity)
         (out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"Preparatory witness only; scored-window counter requirement unchanged. Artifacts: {out}")
@@ -597,7 +598,7 @@ def self_test():
                     with mock.patch(__name__ + ".Conn", FakeConn), \
                          mock.patch(__name__ + ".server", side_effect=fake_server), \
                          mock.patch(__name__ + ".translated_knobs", return_value=knobs):
-                        row = run_control(args, Path("/unexecuted"), Path(tmp) / "control", "1s", reorder, mock.Mock())
+                        row = run_control(args, Path("/unexecuted"), Path(tmp) / "control", "1s", reorder)
                     self.assertEqual(row["verdict"], expected, row.get("reason"))
                     self.assertEqual(engine.clients, 0)
                     keys = [request[1] for request in engine.requests if request[0] == b"SETRANGE"]
