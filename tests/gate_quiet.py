@@ -7,6 +7,8 @@ known compilers, load generators and ABBA drivers are competing experiments even
 while temporarily asleep between phases. An idle unrelated server is recorded,
 then subject to the same bounded CPU screening as other generic foreign processes.
 Every observed foreign CPU tick is recorded, including activity below the budget.
+PF_KTHREAD identifies kernel threads; their CPU activity is recorded separately
+and cannot be mistaken for a foreign user workload because exe access is denied.
 The gate's declared row watchdog is controller housekeeping only after its exact
 PID/start identity, script and captured controller parent are independently verified.
 The screening budget is not a regression tolerance or a bound on cache/tail effects;
@@ -48,6 +50,11 @@ COMPETING = ACTIVE_EXPERIMENTS | SERVERS
 # Shortening the measurement does not preserve this precondition automatically.
 GENERIC_CPU_FRACTION = 0.0015
 
+# Verified against the installed Linux 7.0.0-31 include/linux/sched.h:1781.
+# /proc/PID/stat field9 exports task flags. Neither comm nor an unreadable exe
+# distinguishes kernel workers from another user's process: both can give EPERM.
+PF_KTHREAD = 0x00200000
+
 
 class QuietViolation(RuntimeError):
     """An invalid instrument session; callers must stop the whole tier, not retry."""
@@ -62,6 +69,7 @@ class Process:
     ticks: int
     affinity: frozenset[int]
     experiment_driver: bool = False
+    kernel_thread: bool = False
 
     @property
     def identity(self):
@@ -101,16 +109,7 @@ def snapshot(proc_root=Path("/proc")) -> dict[int, Process]:
             raw = (entry / "stat").read_text()
             name, rest = raw.split("(", 1)[1].rsplit(")", 1)
             fields = rest.split()
-            # Kernel threads have no executable and cannot be a user workload. Do
-            # not suppress a process merely because it belongs to another user.
-            try:
-                (entry / "exe").readlink()
-            except PermissionError:
-                # Other users' executable links are commonly hidden even though
-                # stat and affinity are readable (including PID 1 on this box).
-                # Keep such processes in the observer as user workloads. Missing
-                # links still identify kernel threads through FileNotFoundError.
-                pass
+            kernel = bool(int(fields[6]) & PF_KTHREAD)
             pid = int(entry.name)
             # Linux permits each thread to have its own affinity. The leader can
             # sleep on a reserved CPU while workers contend with the measured
@@ -120,7 +119,8 @@ def snapshot(proc_root=Path("/proc")) -> dict[int, Process]:
                 continue  # The complete thread group exited while being read.
             result[pid] = Process(pid, int(fields[19]), int(fields[1]), name,
                                   int(fields[11]) + int(fields[12]),
-                                  affinity, experiment_driver((entry / "cmdline").read_bytes().split(b"\0")))
+                                  affinity, False if kernel else experiment_driver(
+                                      (entry / "cmdline").read_bytes().split(b"\0")), kernel)
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError as exc:
@@ -207,10 +207,13 @@ def controller_watchdog(rows, ancestors, spec, *, reader=None):
 
 
 def interference(before: dict[int, Process], after: dict[int, Process],
-                 root: tuple[int, int], cpus: set[int], excluded_ancestors=(), excluded_helpers=()) -> list[dict]:
+                 root: tuple[int, int], cpus: set[int], excluded_ancestors=(), excluded_helpers=(),
+                 *, kernel_only=False) -> list[dict]:
     owned = owned_processes(after, root) | set(excluded_ancestors) | set(excluded_helpers)
     offenders = []
     for row in after.values():
+        if row.kernel_thread != kernel_only:
+            continue
         prior = before.get(row.pid)
         same_process = prior and prior.identity == row.identity
         affinity = row.affinity | (prior.affinity if same_process else frozenset())
@@ -220,11 +223,12 @@ def interference(before: dict[int, Process], after: dict[int, Process],
         # Its own accumulated ticks still witness work; treating absence as zero
         # delta let a newly started Python workload evade the first observation.
         delta = max(0, row.ticks - prior.ticks) if same_process else row.ticks
-        active = row.name in ACTIVE_EXPERIMENTS or row.experiment_driver
+        active = not row.kernel_thread and (row.name in ACTIVE_EXPERIMENTS or row.experiment_driver)
         if active or delta:
             offenders.append({"pid": row.pid, "start_ticks": row.start, "comm": row.name,
                               "cpu_ticks": delta, "reason": "active foreign experiment" if active
-                              else "foreign CPU activity",
+                              else "kernel CPU activity (PF_KTHREAD)" if row.kernel_thread else "foreign CPU activity",
+                              "kernel_thread": row.kernel_thread,
                               "overlapping_cpus": sorted(cpus.intersection(affinity))})
     return offenders
 
@@ -264,6 +268,7 @@ class QuietMonitor:
             for identity in self.ancestors}
         self.known_programs = {}
         self.foreign_activity = {}
+        self.kernel_activity = {}
         self.activity_windows = deque()
         self.peak_rolling = None
         self.peak_core_concentration = None
@@ -289,6 +294,8 @@ class QuietMonitor:
         # process execing another program cannot retain the original helper exemption.
         controller_watchdog(current, self.ancestors, self.watchdog_spec)
         activity = interference(self.previous, current, self.root, self.cpus, self.ancestors, self.helpers)
+        kernel_activity = interference(self.previous, current, self.root, self.cpus,
+                                       self.ancestors, self.helpers, kernel_only=True)
         offenders = [row for row in activity if row["reason"] == "active foreign experiment"]
         # Every foreign tick contributes to one aggregate ceiling. Charging the
         # complete overlapping process also avoids hiding workers behind a leader
@@ -298,9 +305,13 @@ class QuietMonitor:
             self.activity_windows.popleft()
         self.max_sample_interval = max(self.max_sample_interval, elapsed)
         self.samples_longer_than_window += elapsed > self.window_seconds
-        for row in activity:
+        # Networking can run the measured server's own work in ksoftirqd/workqueues.
+        # Retain those ticks separately; they are not evidence of a foreign USER
+        # workload. Do not attribute them to this benchmark or claim they are free.
+        for row in activity + kernel_activity:
             identity = row["pid"], row["start_ticks"]
-            saved = self.foreign_activity.setdefault(identity, {
+            bucket = self.kernel_activity if row["kernel_thread"] else self.foreign_activity
+            saved = bucket.setdefault(identity, {
                 "pid": row["pid"], "start_ticks": row["start_ticks"], "comm": row["comm"],
                 "cpu_ticks": 0, "first_observed_monotonic": now, "last_observed_monotonic": now,
                 "possible_physical_cores": []})
@@ -342,7 +353,7 @@ class QuietMonitor:
                 self.excluded_activity[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
             if row.identity in self.helpers and prior and prior.identity == row.identity:
                 self.helpers[row.identity]["cpu_ticks"] += max(0, row.ticks - prior.ticks)
-            if row.identity in owned or not self.cpus.intersection(row.affinity):
+            if row.kernel_thread or row.identity in owned or not self.cpus.intersection(row.affinity):
                 continue
             if row.name in COMPETING or row.experiment_driver:
                 self.known_programs[row.identity] = {"pid": row.pid, "start_ticks": row.start,
@@ -366,6 +377,7 @@ class QuietMonitor:
                 "interference": self.failure,
                 "known_programs": list(self.known_programs.values()),
                 "foreign_cpu_activity": list(self.foreign_activity.values()),
+                "kernel_cpu_activity": list(self.kernel_activity.values()),
                 "generic_cpu_screening": {"server_physical_cores": self.server_physical_cores,
                     "capacity_fraction": GENERIC_CPU_FRACTION, "window_seconds": self.window_seconds,
                     "cpu_budget_seconds": self.cpu_budget_seconds, "peak_rolling": self.peak_rolling,
@@ -374,6 +386,7 @@ class QuietMonitor:
                     "samples_longer_than_window": self.samples_longer_than_window,
                     "preflight_seconds": self.preflight_seconds,
                     "accounting": "process CPU ticks; partial oldest samples charged in full",
+                    "kernel_classification": "PF_KTHREAD in /proc/PID/stat field9; excluded only from foreign-user CPU budget",
                     "limitation": "screening only; CPU fraction does not bound cache or tail effects"},
                 "excluded_controller_ancestors": list(self.excluded_activity.values()),
                 "excluded_controller_helpers": list(self.helpers.values()),
@@ -640,11 +653,50 @@ PY
                 fields[0], fields[1], fields[11], fields[12], fields[19] = "S", "1", "7", "3", "123"
                 (entry / "stat").write_text("100 (foreign service) " + " ".join(fields))
                 (entry / "cmdline").write_bytes(b"service\0")
-                with mock.patch.object(Path, "readlink", side_effect=PermissionError("hidden executable")), \
+                with mock.patch.object(Path, "readlink", side_effect=PermissionError("hidden executable")) as exe, \
                      mock.patch.object(os, "sched_getaffinity", side_effect=lambda pid: {8} if pid == 100 else {0}):
                     rows = snapshot(proc)
+                exe.assert_not_called()  # No permission-based exemption exists.
                 self.assertEqual(rows[100].ticks, 10)
                 self.assertEqual(rows[100].affinity, frozenset((0, 8)))
+                self.assertFalse(rows[100].kernel_thread)
+
+        def test_kernel_flag_uses_actual_stat_field_not_comm_or_exe_permissions(self):
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                proc = Path(tmp)
+                # 0x4208040 was read from this box's /proc/31/stat (ksoftirqd/2).
+                # Its other flags must not confuse the PF_KTHREAD mask. Deliberate
+                # misleading comm values prove that names do not classify a task.
+                for pid, flags, name in ((100, 0x4208040, "editor"), (101, 0x400040, "ksoftirqd/2")):
+                    entry = proc / str(pid)
+                    (entry / "task" / str(pid)).mkdir(parents=True)
+                    fields = ["0"] * 20
+                    fields[0], fields[1], fields[6] = "S", "1", str(flags)
+                    fields[11], fields[12], fields[19] = "7", "3", "123"
+                    (entry / "stat").write_text(f"{pid} ({name}) " + " ".join(fields))
+                    if pid == 101:
+                        (entry / "cmdline").write_bytes(b"user-service\0")
+                with mock.patch.object(Path, "readlink", side_effect=PermissionError("hidden executable")), \
+                     mock.patch.object(os, "sched_getaffinity", return_value={0}):
+                    rows = snapshot(proc)
+                self.assertTrue(rows[100].kernel_thread)
+                self.assertFalse(rows[101].kernel_thread)
+
+        def test_kernel_cpu_is_recorded_without_spending_foreign_user_budget(self):
+            from dataclasses import replace
+            monitor = self.budget_fixture()
+            kernel = Process(100, 55, 2, "ksoftirqd/2", 1000, frozenset((0,)), kernel_thread=True)
+            rows = {**self.before, 20: replace(self.other, ticks=102), 100: kernel}
+            self.budget_sample(monitor, 1, rows)
+            monitor.check()
+            evidence = monitor.evidence()
+            self.assertEqual(evidence["kernel_cpu_activity"][0]["cpu_ticks"], 1000)
+            self.assertEqual(sum(row["cpu_ticks"] for row in evidence["foreign_cpu_activity"]), 2)
+            self.assertAlmostEqual(evidence["generic_cpu_screening"]["peak_rolling"]["cpu_seconds"], .02)
+            self.budget_sample(monitor, 2, {**rows, 20: replace(self.other, ticks=202, name="kworker/0:1")})
+            with self.assertRaisesRegex(QuietViolation, "foreign CPU screening budget exceeded"):
+                monitor.check()  # A kernel-looking user comm is still foreign work.
 
         def test_reserved_smt_sibling_is_still_monitored(self):
             topology = {0: frozenset((0, 128)), 1: frozenset((1, 129))}
