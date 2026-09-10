@@ -4,6 +4,11 @@
 The 32 cells are mode x read-local x overlap x reorder x atomic; flip-auto is explicitly off
 because fused+flip-auto is a documented refusal, already covered by feature_gate. One connection
 carries the seeded p32 stream, so cross-client order cannot make a legal schedule look divergent.
+Cross-owner scripts are drain boundaries: the documented four-cut admission limit can legally
+refuse a script while earlier scatter reads occupy its IO's pool. Comparing those scheduling
+dependent BUSY replies would mistake admission timing for a data divergence. Every script still
+runs, serially after draining earlier replies, and any refusal fails this fixture. xscript.py
+separately requires the bounded-window refusal to fire and accounts for every refused activation.
 Fresh process/state per cell; no byte normalization. A separate disjoint-client long/short mix
 uses the existing feature witnesses to prove enabled lanes actually fired, with their unchanged
 bounded rearming and disabled-allocation controls. This helper adds no gate ledger row by itself.
@@ -117,18 +122,31 @@ def read_raw(file):
 
 def replay(sock, file, operations, expected=None, pipeline=32):
     transcript = []
-    for first in range(0, len(operations), pipeline):
-        chunk = operations[first:first + pipeline]
+    for first, chunk in replay_chunks(operations, pipeline):
         sock.sendall(b''.join(encode(*operation) for operation in chunk))
         for offset, operation in enumerate(chunk):
             reply = read_raw(file)
             index = first + offset
+            require(not reply.startswith(b'-BUSY '),
+                    f'unexpected admission refusal at op {index}: {reply!r}')
             if expected is not None and reply != expected[index]:
                 raise AssertionError(f'byte divergence at op {index} {operation[:4]!r}: '
                                      f'baseline={expected[index][:256]!r} actual={reply[:256]!r}')
             transcript.append(reply)
     require(len(transcript) == len(operations), 'comparison stream lost a reply')
     return transcript
+
+
+def replay_chunks(operations, pipeline):
+    require(pipeline > 0, 'pipeline must be positive')
+    first = 0
+    while first < len(operations):
+        end = first + 1
+        if operations[first][0] != 'EVAL':
+            while end < min(first + pipeline, len(operations)) and operations[end][0] != 'EVAL':
+                end += 1
+        yield first, operations[first:end]
+        first = end
 
 
 def configuration(cell):
@@ -175,6 +193,21 @@ def self_test():
         require('byte divergence at op 0' in str(exc), 'wrong negative control failure')
     else:
         raise AssertionError('changed reply survived the real replay comparator')
+    scripted = [['PING']] * 35 + [['EVAL', 'return 1', '0']] + [['PING']] * 35
+    script_raw = b'+PONG\r\n' * 35 + b':1\r\n' + b'+PONG\r\n' * 35
+    script_sink = Sink()
+    replay(script_sink, io.BytesIO(script_raw), scripted)
+    require([len(chunk) for _, chunk in replay_chunks(scripted, 32)] == [32, 3, 1, 32, 3],
+            'script drain discarded commands or lost p32 coverage')
+    require(b''.join(script_sink.sends) == b''.join(encode(*op) for op in scripted),
+            'real replay producer changed the command stream')
+    try:
+        replay(Sink(), io.BytesIO(b'-BUSY Cross-shard script snapshot window is full\r\n'),
+               [['EVAL', 'return 1', '0']])
+    except AssertionError as exc:
+        require('unexpected admission refusal' in str(exc), 'wrong BUSY negative-control failure')
+    else:
+        raise AssertionError('a refused script became the accepted equivalence baseline')
     def siblings(path):
         cpu = int(path.parent.parent.name.removeprefix('cpu'))
         return f'{cpu},{cpu + 128}'
@@ -231,6 +264,8 @@ def main(argv=None):
     operations = command_stream(args.seed)
     stream_hash = hashlib.sha256(b''.join(encode(*operation) for operation in operations)).hexdigest()
     manifest = dict(seed=args.seed, cells=CELLS, operation_count=len(operations), pipeline=32,
+                    script_drain_boundaries=sum(op[0] == 'EVAL' for op in operations),
+                    p32_batches=sum(len(chunk) == 32 for _, chunk in replay_chunks(operations, 32)),
                     stream_sha256=stream_hash, exact_byte_exclusions=EXCLUDED,
                     commands=sorted({operation[0] for operation in operations}))
     (args.output / 'stream.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -241,7 +276,7 @@ def main(argv=None):
         knobs, argv = configuration(cell)
         report = dict(cell=cell, knobs=knobs, verdict='FAIL', reached=False)
         try:
-            with server(args.binary, args.server_cpus, args.port, args.output / cell, argv) as (admin, _process):
+            with server(args.binary, args.server_cpus, args.port, args.output / cell / 'replay', argv) as (admin, _process):
                 actual = info(admin, 'SERVER', 'STATS', 'FLIPCTL')
                 check_config(actual, knobs, cell, args.server_cpus)
                 with contextlib.closing(socket.create_connection(('127.0.0.1', args.port), timeout=30)) as sock:
@@ -250,8 +285,14 @@ def main(argv=None):
                         report['reached'] = True
                         transcript = replay(sock, file, operations, baseline)
                 report['reply_sha256'] = hashlib.sha256(b''.join(transcript)).hexdigest()
-                # Existing witness assertions are reused verbatim, including three fresh-state
-                # arming attempts and exact zero-allocation checks for disabled features.
+                require(int(info(admin, 'STATS').get('script_crossshard_window_refusals', -1)) == 0,
+                        'drained script replay registered an admission refusal')
+            # MULTI and scripts force atomic admission even with --atomic 0. The feature witness
+            # requires lifetime atomic_groups==0 in that configuration and therefore needs its
+            # own fresh process. Preserve its exact assertions instead of subtracting legitimate
+            # replay activity or weakening the disabled-feature allocation controls.
+            with server(args.binary, args.server_cpus, args.port, args.output / cell / 'witness', argv) as (admin, _process):
+                check_config(info(admin, 'SERVER', 'STATS', 'FLIPCTL'), knobs, cell, args.server_cpus)
                 report['witnesses'] = smoke(admin, args.port, knobs)
             if baseline is None:
                 baseline, baseline_cell = transcript, cell
