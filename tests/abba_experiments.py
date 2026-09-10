@@ -387,34 +387,53 @@ def evaluate(blocks):
     by_name = {block["name"]: block for block in blocks}
     output = {"defaults_changed": False, "scope": "selected cell only; full-matrix null still required",
               "snapshot_scope": "requires fresh/seeded bridge and matched-seed construction comparison; no ordinary gate adoption"}
-    required = [spec[0] for spec in BLOCKS]
-    if any(name not in by_name for name in required) or any(block["status"] == "UNTESTABLE" for block in blocks):
-        return {**output, "window10": {"status": "UNTESTABLE"}, "snapshot": {"status": "UNTESTABLE"}}
-    fresh20, fresh10, bridge, seeded20, comparison, snapshot20 = [by_name[name] for name in required]
-    nulls = (fresh20, fresh10, seeded20, snapshot20)
-    output["observed_null_error_pct"] = {block["name"]: {
-        metric: abs(pair["delta_pct"]) for metric, pair in block["metrics"].items()} for block in nulls}
-    # Preserve the prior instrument-validity restriction: an unsuccessful null is
-    # never erased by a later block, nor used to widen a method's resolution.
-    if any(block["status"] != "PASS" for block in nulls):
-        reason = "the comparison instrument failed at least one byte-identical null"
-        return {**output, "window10": {"status": "UNTESTABLE", "reason": reason},
-                "snapshot": {"status": "UNTESTABLE", "reason": reason}}
-    # Both arm spreads and every scored latency class must hold up. These are the
-    # ordinary fresh-wire 20/10 paths, so no seeded-construction result substitutes.
-    window_checks = {metric: all(fresh10["metrics"][metric][f"{arm}_spread_pct"] <=
-                                pair[f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
-                     for metric, pair in fresh20["metrics"].items()}
-    output["window10"] = {"status": "MEETS_SELECTED_CELL_CRITERIA" if all(window_checks.values()) else "REJECT",
-                           "construction": "ordinary fresh boot plus wire population",
-                           "spread_did_not_degrade": window_checks}
-    bridge_checks = construction_checks(bridge, fresh20, seeded20)
-    bridge_checks["scope"] = "fresh/seeded bridge bundles random seed and empty-loader effects; not a seed-only control"
-    snapshot_checks = construction_checks(comparison, seeded20, snapshot20)
-    okay = all(check["status"] == "MEETS_SELECTED_CELL_CRITERIA" for check in (bridge_checks, snapshot_checks))
-    output["snapshot"] = {**snapshot_checks, "status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT",
-                           "fresh_seeded_bridge": bridge_checks,
-                           "matched_seed_comparison_status": snapshot_checks["status"]}
+    null_names = ("fresh20_null", "fresh10_null", "seeded20_null", "snapshot20_null")
+    output["observed_null_error_pct"] = {name: {
+        metric: abs(pair["delta_pct"]) for metric, pair in by_name[name].get("metrics", {}).items()}
+        for name in null_names if name in by_name}
+
+    def unavailable(required, nulls):
+        for name in required:
+            if name not in by_name or by_name[name]["status"] == "UNTESTABLE":
+                return {"status": "UNTESTABLE", "reason": f"required block unavailable: {name}"}
+        for name in nulls:
+            if by_name[name]["status"] != "PASS":
+                return {"status": "UNTESTABLE", "reason": f"required byte-identical null failed: {name}"}
+        return None
+
+    # Each lever has its own observed construction/window. Keep every failed block
+    # and the driver's nonzero exit, but never let an unrelated null erase usable
+    # evidence or widen this lever's resolution. Only fresh20 is shared by both.
+    window_required = ("fresh20_null", "fresh10_null")
+    window_failure = unavailable(window_required, window_required)
+    if window_failure:
+        output["window10"] = window_failure
+    else:
+        fresh20, fresh10 = (by_name[name] for name in window_required)
+        # Both arm spreads and every scored latency class must hold up on the
+        # ordinary fresh-wire20/10 paths; seeded construction cannot substitute.
+        checks = {metric: all(fresh10["metrics"][metric][f"{arm}_spread_pct"] <=
+                              pair[f"{arm}_spread_pct"] for arm in ("reference", "candidate"))
+                  for metric, pair in fresh20["metrics"].items()}
+        output["window10"] = {"status": "MEETS_SELECTED_CELL_CRITERIA" if all(checks.values()) else "REJECT",
+                              "construction": "ordinary fresh boot plus wire population",
+                              "spread_did_not_degrade": checks}
+
+    snapshot_nulls = ("fresh20_null", "seeded20_null", "snapshot20_null")
+    snapshot_required = (*snapshot_nulls, "fresh_seeded20", "seeded_snapshot20")
+    snapshot_failure = unavailable(snapshot_required, snapshot_nulls)
+    if snapshot_failure:
+        output["snapshot"] = snapshot_failure
+    else:
+        fresh20, seeded20, snapshot20 = (by_name[name] for name in snapshot_nulls)
+        bridge = construction_checks(by_name["fresh_seeded20"], fresh20, seeded20)
+        bridge["scope"] = "fresh/seeded bridge bundles random seed and empty-loader effects; not a seed-only control"
+        matched = construction_checks(by_name["seeded_snapshot20"], seeded20, snapshot20)
+        okay = all(check["status"] == "MEETS_SELECTED_CELL_CRITERIA" for check in (bridge, matched))
+        output["snapshot"] = {**matched, "status": "MEETS_SELECTED_CELL_CRITERIA" if okay else "REJECT",
+                              "fresh_seeded_bridge": bridge,
+                              "matched_seed_comparison_status": matched["status"]}
+
     return output
 
 
@@ -502,7 +521,12 @@ def self_test():
         def test_failed_first_null_is_retained_and_all_later_blocks_still_run(self):
             self.test_complete_driver_calls_real_abba_loop_twenty_four_times(first_null_fail=True)
 
-        def test_complete_driver_calls_real_abba_loop_twenty_four_times(self, first_null_fail=False):
+        def test_cross_lever_failure_keeps_real_driver_nonzero_and_every_block(self):
+            for index in (1, 5):
+                with self.subTest(index=index):
+                    self.test_complete_driver_calls_real_abba_loop_twenty_four_times(first_null_fail=True, failed_index=index)
+
+        def test_complete_driver_calls_real_abba_loop_twenty_four_times(self, first_null_fail=False, failed_index=0):
             with tempfile.TemporaryDirectory() as tmp:
                 directory = Path(tmp)
                 binary = directory / "input-binary"
@@ -518,7 +542,7 @@ def self_test():
                 def measure(runner, cell, arm, sequence, instances, knobs):
                     calls.append((abba.WINDOW, arm, sequence, instances, runner.population_by_arm[arm]))
                     ticks[0] += abba.WINDOW + 8
-                    return {"arm": arm, "rate": 90 if first_null_fail and len(calls) == 4 else 100,
+                    return {"arm": arm, "rate": 90 if first_null_fail and len(calls) == (failed_index + 1) * 4 else 100,
                             "latency_ms": 1, "busy_pct": 99.9,
                             "instances": instances,
                             "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
@@ -579,8 +603,12 @@ def self_test():
                 self.assertFalse(report["evaluation"]["defaults_changed"])
                 self.assertEqual(report["plan"]["scored_measurements"], 24)
                 self.assertEqual(report["plan"]["unscored_snapshot_priming_boots"], 2)
+                if first_null_fail and failed_index in (1, 5):
+                    blocked, usable = ("window10", "snapshot") if failed_index == 1 else ("snapshot", "window10")
+                    self.assertEqual(report["evaluation"][blocked]["status"], "UNTESTABLE")
+                    self.assertEqual(report["evaluation"][usable]["status"], "MEETS_SELECTED_CELL_CRITERIA")
                 for block in report["blocks"]:
-                    if first_null_fail and block["name"] == "fresh20_null":
+                    if first_null_fail and block["name"] == BLOCKS[failed_index][0]:
                         self.assertNotEqual(block["status"], "PASS")
                         self.assertEqual(len(block["abba"]["cells"][0]["rounds"][0]["runs"]), 4)
                         continue
@@ -883,6 +911,34 @@ def self_test():
                     self.assertEqual(result["snapshot"]["matched_seed_comparison_status"], "MEETS_SELECTED_CELL_CRITERIA")
                     self.assertEqual(result["window10"]["status"], "MEETS_SELECTED_CELL_CRITERIA")
                     self.assertFalse(result["defaults_changed"])
+
+        def test_each_null_only_blocks_its_own_lever_and_failed_blocks_stay_visible(self):
+            pair = {"delta_pct": 0, "reference_spread_pct": .1, "candidate_spread_pct": .1}
+            cases = (("fresh20_null", {"window10", "snapshot"}),
+                     ("fresh10_null", {"window10"}),
+                     ("seeded20_null", {"snapshot"}),
+                     ("snapshot20_null", {"snapshot"}))
+            for name, affected in cases:
+                for status in ("FAIL", "UNTESTABLE", "MISSING"):
+                    with self.subTest(name=name, status=status):
+                        blocks = [{"name": spec[0], "status": "PASS", "metrics": {"rate": dict(pair)}} for spec in BLOCKS]
+                        target = next(block for block in blocks if block["name"] == name)
+                        if status == "MISSING":
+                            blocks.remove(target)
+                        else:
+                            target["status"] = status
+                            target["metrics"]["rate"]["delta_pct"] = 7
+                        original = json.dumps(blocks, sort_keys=True)
+                        result = evaluate(blocks)
+                        self.assertEqual(json.dumps(blocks, sort_keys=True), original)
+                        for lever in ("window10", "snapshot"):
+                            self.assertEqual(result[lever]["status"],
+                                "UNTESTABLE" if lever in affected else "MEETS_SELECTED_CELL_CRITERIA")
+                            if lever in affected:
+                                self.assertIn(name, result[lever]["reason"])
+                        if status != "MISSING":
+                            self.assertEqual(result["observed_null_error_pct"][name]["rate"], 7)
+                        self.assertFalse(result["defaults_changed"])
 
         def test_snapshot_null_cannot_erase_a_bad_direct_comparison(self):
             pair = {"delta_pct": 0, "reference_spread_pct": .1, "candidate_spread_pct": .1}
