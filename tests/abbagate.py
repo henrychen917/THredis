@@ -1052,6 +1052,7 @@ class Runner:
                 # represented as a histogram of only WINDOW seconds.
                 result["histogram_window_seconds"] = WARMUP + WINDOW + TAIL
         except BaseException as e:
+            result["complete"] = False
             result["error"] = f"{type(e).__name__}: {e}"
             raise
         finally:

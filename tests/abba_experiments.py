@@ -353,6 +353,8 @@ def self_test():
                     calls.append((abba.WINDOW, arm, sequence, instances, runner.population_by_arm[arm]))
                     ticks[0] += abba.WINDOW + 8
                     return {"arm": arm, "rate": 100, "latency_ms": 1, "busy_pct": 99.9,
+                            "instances": instances,
+                            "load_layout": abba.load_layout(runner.load_cpus, instances, cell.conns),
                             "complete": True, "window_seconds": abba.WINDOW + .001,
                             "populate_seconds": 1, "wall_seconds": abba.WINDOW + 8,
                             "commands": 2000, "pid": 123,
