@@ -738,6 +738,48 @@ class Runner:
         self.args, self.out, self.binaries, self.children = args, out, binaries, children
         self.server_cpus = sorted(cpus(args.server_cores) + cpus(args.server_smt))
         self.load_cpus = sorted(cpus(args.load_cores) + cpus(args.load_smt))
+        self.legacy_reorder_controls = {}
+        self.legacy_reorder_failures = {}
+
+    def legacy_reorder_control(self, cell, arm, knobs):
+        if cell.op != 'REORDER' or arm != 'A' or 'x-ex-sched' not in knobs:
+            return None
+        # Only the known legacy grammar may use this fallback. The current candidate continues
+        # to require its during-window counter. Adding telemetry to an old binary would change
+        # the performance reference; instead observe actual dispatch/execution inversions on its
+        # unchanged bytes, with FIFO as the negative control. This precedes population/timing.
+        # LB is off in the witness to rule out producer/owner changes; measured cells retain their
+        # original LB settings. This proves engagement in the directed control, not in the scored
+        # interval, whose GET/BITCOUNT progress and long-service-cost checks remain mandatory.
+        digest = sha256(self.binaries[arm])
+        key = digest, cell.mode
+        if key in self.legacy_reorder_failures:
+            raise RuntimeError(self.legacy_reorder_failures[key])
+        if key not in self.legacy_reorder_controls:
+            from legacy_reorder_witness import run_control
+            folder = self.out / f'legacy-reorder-{arm}-{cell.mode}'
+            args = argparse.Namespace(server_cores=self.args.server_cores,
+                server_smt=self.args.server_smt, port=self.args.port,
+                attempts=16, blocker_bytes=16 * 1024 * 1024, blocker_count=4)
+            controls = []
+            for reorder in (0, 1):
+                row = run_control(args, self.binaries[arm], folder / f'reorder-{reorder}',
+                                  cell.mode, reorder)
+                controls.append(row)
+                if row['verdict'] != 'PASS':
+                    reason = (f'legacy {cell.mode} reorder={reorder} control failed: '
+                              + row.get('reason', 'no reason'))
+                    self.legacy_reorder_failures[key] = reason
+                    raise RuntimeError(reason)
+            if sha256(self.binaries[arm]) != digest:
+                raise RuntimeError('legacy reference changed during engagement controls')
+            artifact = folder / 'controls.json'
+            artifact.write_text(json.dumps(controls, indent=2) + '\n')
+            self.legacy_reorder_controls[key] = dict(verdict='PASS', mode=cell.mode,
+                controls=[0, 1], binary_sha256=digest, artifact=str(artifact.relative_to(self.out)),
+                artifact_sha256=sha256(artifact),
+                scope='live unscored OFF/ON execution-order control; no scored-window permutation count')
+        return self.legacy_reorder_controls[key]
 
     def population_environment(self):
         return {"population_by_arm": {"A": "wire", "B": "wire"}}
@@ -771,6 +813,7 @@ class Runner:
         return None
 
     def measure(self, cell, arm, sequence, instances, knobs):
+        legacy_control = self.legacy_reorder_control(cell, arm, knobs)
         folder = self.out / cell.id / f"n{instances}-{sequence}-{arm}"
         folder.mkdir(parents=True)
         layout = load_layout(self.load_cpus, instances, cell.conns)
@@ -877,7 +920,7 @@ class Runner:
                           cpu_pct=100 * (after_cpu - before_cpu) / ((t1 - t0) * len(self.server_cpus)),
                           info_before=before, info_after=after)
             result["workload_witness"] = require_workload_witness(
-                cell, before_commands, after_commands, before_mode, after_mode)
+                cell, before_commands, after_commands, before_mode, after_mode, legacy_control)
             totals = []
             for i, p in enumerate(generators):
                 if p.wait(timeout=30):
@@ -1314,6 +1357,47 @@ def self_test():
             with self.assertRaisesRegex(RuntimeError, "permutation witness"):
                 require_workload_witness(replace(cell, reorder=0), before, after, mode,
                                          {"reorder_permuted_runs": "1"})
+            control = dict(verdict='PASS', mode=cell.mode, controls=[0, 1])
+            evidence = require_workload_witness(cell, before, after, {}, {}, control)
+            self.assertEqual(evidence['legacy_reorder_control'], control)
+            for rejected in (None, {**control, 'verdict': 'FAIL'},
+                             {**control, 'mode': '2s' if cell.mode == '1s' else '1s'},
+                             {**control, 'controls': [1]}):
+                with self.subTest(control=rejected), self.assertRaisesRegex(RuntimeError, 'live legacy'):
+                    require_workload_witness(cell, before, after, {}, {}, rejected)
+            # A fallback cannot excuse an available counter which failed to advance,
+            # a disappearing counter, or a workload command that was never executed.
+            for start, end in ((mode, mode), (mode, {}), ({}, mode)):
+                with self.assertRaises(RuntimeError):
+                    require_workload_witness(cell, before, after, start, end, control)
+            with self.assertRaisesRegex(RuntimeError, 'BITCOUNT did not execute'):
+                require_workload_witness(cell, before, {**after, 'cmdstat_bitcount': 'calls=10'}, {}, {}, control)
+
+        def test_legacy_control_requires_both_live_verdicts_and_caches_only_success(self):
+            from types import SimpleNamespace
+            import legacy_reorder_witness
+            cell = replace(self.cell, op='REORDER', mode='1s')
+            with tempfile.TemporaryDirectory() as tmp:
+                folder = Path(tmp)
+                binary = folder / 'binary'
+                binary.write_bytes(b'exact legacy bytes')
+                runner = Runner(SimpleNamespace(server_cores='0-7', server_smt='',
+                    load_cores='8-15', load_smt='', port=9090), folder, {'A': binary, 'B': binary}, None)
+                self.assertIsNone(runner.legacy_reorder_control(cell, 'B', {'x-ex-sched': 1}))
+                self.assertIsNone(runner.legacy_reorder_control(cell, 'A', {'reorder': 1}))
+                calls = []
+                def run(args, exact_binary, out, mode, reorder):
+                    calls.append(reorder)
+                    out.mkdir(parents=True, exist_ok=False)
+                    return dict(verdict='PASS' if reorder == 0 else 'FAIL', reason='never permuted')
+                with mock.patch.object(legacy_reorder_witness, 'run_control', side_effect=run):
+                    with self.assertRaisesRegex(RuntimeError, 'reorder=1 control failed'):
+                        runner.legacy_reorder_control(cell, 'A', {'x-ex-sched': 1})
+                self.assertEqual(calls, [0, 1])
+                self.assertEqual(runner.legacy_reorder_controls, {})
+                with self.assertRaisesRegex(RuntimeError, 'reorder=1 control failed'):
+                    runner.legacy_reorder_control(cell, 'A', {'x-ex-sched': 1})
+                self.assertEqual(calls, [0, 1], 'failed engagement controls were retried into green')
 
         def test_long_tail_cannot_regress_behind_short_tail_improvement(self):
             cell = replace(self.cell, op="REORDER", score="p999", mix="95:5", instances=1)

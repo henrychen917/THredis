@@ -101,7 +101,7 @@ def command_stat(data, name):
     return int(fields.get("calls", 0)), float(fields.get("usec", 0))
 
 
-def require_workload_witness(cell, before, after, mode_before, mode_after):
+def require_workload_witness(cell, before, after, mode_before, mode_after, legacy_control=None):
     evidence = {}
     for name in workload_command_names(cell):
         bc, bt = command_stat(before, name)
@@ -112,7 +112,17 @@ def require_workload_witness(cell, before, after, mode_before, mode_after):
     if cell.op == "REORDER":
         field = "reorder_permuted_runs"
         if field not in mode_before or field not in mode_after:
-            raise RuntimeError("reorder engagement counter unavailable")
+            # The unchanged pushed reference predates this telemetry. Its fallback must be a
+            # live OFF/ON execution-order control on those exact bytes, run in this session.
+            # Both workload commands still MUST progress in the scored interval above. State
+            # the narrower engagement observation honestly: no inferred or synthetic counter.
+            if (field in mode_before or field in mode_after or not legacy_control or
+                    legacy_control.get('verdict') != 'PASS' or
+                    legacy_control.get('mode') != cell.mode or
+                    legacy_control.get('controls') != [0, 1]):
+                raise RuntimeError("reorder engagement counter unavailable; live legacy OFF/ON control required")
+            evidence['legacy_reorder_control'] = legacy_control
+            return evidence
         permutations = int(mode_after[field]) - int(mode_before[field])
         if permutations < 0 or (cell.reorder and permutations == 0) or (not cell.reorder and permutations):
             raise RuntimeError(f"reorder={cell.reorder} permutation witness failed: delta={permutations}")

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Unscored, standalone execution-order witness for an unchanged legacy binary.
 
-This does not replace the regression tier's during-window permutation counter.
-Live OFF/ON validation is required before anyone adopts this preparatory witness.
+The current candidate still requires its during-window permutation counter. The
+unchanged legacy reference, which has no such counter, uses this live OFF/ON
+control plus command progress in the measured interval; it makes no claim to
+count permutations in that interval. Both modes passed the OFF/ON live controls
+on c8e61f646 and the current binary on 2026-09-10, at32servercores.
 The exact same copied binary runs both controls; no debugger, binary patch, or
 instrumented build is used. MONITOR observes dispatch, while a conflicting GET
 observes execution: SETRANGE is Long and GET is Point in c8e61f646. With one IO
@@ -224,7 +227,7 @@ def finish_control(attempts, reorder):
     else:
         require(inversions == 0, "FIFO negative control inverted; fixture/model is invalid")
     return {"verdict": "PASS", "armed_attempts": armed, "inversions": inversions,
-            "scope": "preparatory engagement only; no during-measurement witness"}
+            "scope": "directed engagement only; no during-measurement permutation count"}
 
 
 def translated_knobs(binary, mode, reorder):
@@ -370,7 +373,7 @@ def main(args):
     args.port, _ = abba.select_port(args.ports, args.port)
     out = (args.output or abba.ROOT / "build" / f"legacy-reorder-{int(time.time())}-{os.getpid()}").resolve()
     out.mkdir(parents=True, exist_ok=False)
-    report = {"schema": 1, "scope": "standalone preparatory witness; not accepted by the ABBA gate",
+    report = {"schema": 1, "scope": "standalone engagement witness; no performance verdict",
               "verdict": "FAIL", "controls": [], "binary_sha256": abba.sha256(args.binary)}
     previous_affinity = os.sched_getaffinity(0)
     try:
@@ -401,7 +404,7 @@ def main(args):
     finally:
         os.sched_setaffinity(0, previous_affinity)
         (out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(f"Preparatory witness only; scored-window counter requirement unchanged. Artifacts: {out}")
+        print(f"Unscored execution-order controls only; no performance verdict. Artifacts: {out}")
 
 
 def self_test():
