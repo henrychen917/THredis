@@ -214,6 +214,9 @@ class LedgerWiring(unittest.TestCase):
             marker = gate.index('# ---- B. mandatory headline performance')
             start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}"', marker)
             end = gate.index('\nesac', start) + len('\nesac')
+        definitions = ''
+        if kind == 'feature':
+            definitions = gate[gate.index('job_feature_cell(){'):gate.index('job_asan_batteries(){')]
         # Execute the production shell verdict branches, replacing only the CPU-work boundary.
         # In the quick block the 35 feature rows and ABBA self-test remain separate assertions.
         prelude = '''PASS=0
@@ -223,8 +226,16 @@ PORT=19000
 CANDIDATE_BINARY=/unused
 GATE_RATIO=6:2
 ABBA_ARGS=()
+FEATURE_OUTPUT="$GATE_FEATURE_OUTPUT"
+collect_job(){
+  case "$1" in
+    feature-cell-*) job_feature_cell "$1";;
+    abba_selftest) job_abba_selftest;;
+    *) return 90;;
+  esac
+}
 py(){
-  if [ "$1" = tests/abbagate.py ]; then return "$WIRE_ABBA_RC"; fi
+  if [ "$1" = tests/abbagate.py ] || [ "$1" = tests/gate_history.py ]; then return "$WIRE_ABBA_RC"; fi
   return "$WIRE_RC"
 }
 python3(){ return "$WIRE_ABBA_RC"; }
@@ -239,7 +250,7 @@ say(){ :; }
             env = dict(os.environ, WIRE_RC=str(rc), WIRE_ABBA_RC=str(abba_rc),
                        WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory)
             subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
-                            prelude + gate[start:end]], cwd=root, env=env,
+                            prelude + definitions + gate[start:end]], cwd=root, env=env,
                            text=True, capture_output=True, check=True, timeout=10)
             return [line.split('\t') for line in ledger.read_text().splitlines()]
 
@@ -354,16 +365,23 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
 
 
 class SchedulerWiring(unittest.TestCase):
-    # This is the existing canonical ledger order, deliberately different from the queue's
-    # longest-first order. The actual scheduler still chooses and dispatches its own inventory.
-    canonical = (['core-watch']
-                 + [f'feature-{mode}-{atomic}' for mode in ('split', 'armed') for atomic in (0, 1)]
-                 + [f'evict-{section}-{mode}-{atomic}' for atomic in (0, 1)
-                    for section in ('lfu', 'lruclock') for mode in ('split', 'armed')]
-                 + ['flipctl', 'differ-split', 'differ-armed'])
+    # Enumerate the real collector loops, not a hand-maintained approximation of their inventory.
+    # This invokes only collect_job stubs: no compiler, server, battery or benchmark is started.
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        gate = (root / 'tests/gate.sh').read_text()
+        quick = gate[gate.index('\nstart_workers\n'):gate.index('\nif [ "$TIER" = quick ]; then\n  join_workers')]
+        full = gate[gate.index('\ncollect_job asan_batteries\n'):gate.index('\n# Every worker has reaped')]
+        stub = 'start_workers(){ :; }; collect_job(){ printf "%s\\n" "$1"; };\n'
+        result = subprocess.run(['bash', '-uc', stub + quick + full], cwd=root,
+                                text=True, capture_output=True, check=True)
+        cls.canonical = result.stdout.splitlines()
+        if len(cls.canonical) != len(set(cls.canonical)):
+            raise AssertionError('collector inventory repeats a job')
 
     def run_scheduler(self, *, reverse=False, slots=None, failure='', behavior='', ordered=True,
-                      delayed_completion=False):
+                      delayed_completion=False, dependency_probe=False):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         ledger_functions = gate[gate.index('say(){'):gate.index('\nledger_labels(){')]
@@ -400,12 +418,25 @@ printf(){
 job_body(){
   local current=$1 dependency
   : > "$RUN_DIR/started/$current"
+  if ! job_ready "$current"; then echo "started $current before dependency completed" >&2; exit 18; fi
+  if [ "$current" = production_units ]; then
+    : > "$RUN_DIR/completed/$current"
+    return 0
+  fi
+  if [ "$DEPENDENCY_PROBE" = 1 ]; then
+    if [ "$current" = release ]; then
+      while [ ! -f "$RUN_DIR/started/asan" ]; do pause; done
+    elif [ "$current" = asan ]; then
+      # Release-only correctness must be dispatched before the independent ASAN build finishes.
+      while [ ! -f "$RUN_DIR/started/release_batteries" ]; do pause; done
+    fi
+  fi
   if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
     for dependency in "${CANONICAL[@]}"; do
       while [ ! -f "$RUN_DIR/started/$dependency" ]; do pause; done
     done
   fi
-  if [ "$FORCE_ORDER" = 1 ]; then
+  if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
     for dependency in "${COMPLETION_ORDER[@]}"; do
       [ "$dependency" != "$current" ] || break
       while [ ! -f "$RUN_DIR/completed/$dependency" ]; do pause; done
@@ -423,6 +454,9 @@ job_body(){
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = return ]; then return 17; fi
   return 0
 }
+# Completion-order probes deliberately remove dependency edges; the separate two-slot probe
+# exercises the real readiness graph and proves release work does not wait for ASAN.
+if [ "$FORCE_ORDER" = 1 ]; then job_dependencies(){ :; }; fi
 start_workers
 for requested in "${CANONICAL[@]}"; do collect_job "$requested"; done
 join_workers
@@ -431,7 +465,8 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
             directory = Path(tmp)
             env = dict(os.environ, RUN_DIR=tmp, FAILED_JOB=failure, FAILURE_BEHAVIOR=behavior,
-                       FORCE_ORDER=str(int(ordered)))
+                       FORCE_ORDER=str(int(ordered)), DEPENDENCY_PROBE=str(int(dependency_probe)),
+                       GATE_FEATURE_OUTPUT=str(directory / 'features'))
             count = slots or len(self.canonical) + 1
             cpu = str(min(os.sched_getaffinity(0)))
             arrays = '\n'.join([
@@ -444,9 +479,9 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             ])
             script = '\n'.join((prelude, arrays, ledger_functions, placement, scheduler,
                                 'trap stop_workers EXIT', stub))
-            result = subprocess.run(['timeout', '--kill-after=2', '15', 'taskset', '-c', cpu,
+            result = subprocess.run(['timeout', '--kill-after=2', '45', 'taskset', '-c', cpu,
                                      'bash', '-c', script], cwd=root, env=env,
-                                    text=True, capture_output=True, timeout=20)
+                                    text=True, capture_output=True, timeout=50)
             self.assertEqual(result.returncode, 0, result.stdout[-1000:] + result.stderr[-2000:])
             timed_rows = [line.split('\t') for line in (directory / 'ledger').read_text().splitlines()]
             for row in timed_rows:
@@ -455,8 +490,12 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
                         counts=tuple(map(int, (directory / 'counts').read_text().split())),
                         completion=(directory / 'completion-order').read_text().splitlines(),
-                        families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()],
-                        cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')})
+                        families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()
+                                  if not line.startswith('production_units\t')],
+                        helpers={path.parent.name for path in (directory / 'jobs').glob('*/done')
+                                 if path.parent.name == 'production_units'},
+                        cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')
+                                 if path.parent.name != 'production_units'})
 
     def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
         forward = self.run_scheduler()
@@ -479,7 +518,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         # Last in completion order, so its deliberate exit cannot block another stub's barrier.
         result = self.run_scheduler(failure=self.canonical[-1], behavior='crash')
         self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
-        self.assertIn(b'FAIL\tRedis 7.4 differential matrix (armed fused + read-local)\n', result['ledger'])
+        self.assertIn(b'FAIL\tcorrectness family globcase\n', result['ledger'])
 
     def test_nonzero_worker_return_cannot_be_hidden_by_a_pass_fragment(self):
         result = self.run_scheduler(failure='flipctl', behavior='return')
@@ -495,14 +534,30 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertCountEqual(result['completion'], self.canonical)
         self.assertEqual(result['counts'], (len(self.canonical), 0))
         self.assertEqual(len(result['families']), len(self.canonical))
-        self.assertLessEqual({row[1] for row in result['families']}, {'1', '2'})
+        self.assertLessEqual({row[1] for row in result['families']}, {'0', '1', '2'})
 
-    def test_one_slot_executes_every_family_synchronously(self):
+    def test_one_slot_uses_the_same_queue_without_losing_coverage(self):
         result = self.run_scheduler(slots=1)
-        self.assertEqual(result['completion'], self.canonical)
+        self.assertCountEqual(result['completion'], self.canonical)
         self.assertEqual(result['counts'], (len(self.canonical), 0))
         self.assertEqual({row[1] for row in result['families']}, {'0'})
         self.assertEqual(result['cleaned'], set(self.canonical))
+
+    def test_failed_prerequisite_cannot_leave_the_queue_waiting_forever(self):
+        result = self.run_scheduler(slots=2, ordered=False, failure='release', behavior='crash')
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertIn(b'FAIL\tcorrectness family release\n', result['ledger'])
+        self.assertEqual(result['helpers'], {'production_units'})
+        self.assertCountEqual(result['completion'], [name for name in self.canonical if name != 'release'])
+
+    def test_release_boots_do_not_wait_for_independent_asan_build(self):
+        result = self.run_scheduler(slots=2, ordered=False, dependency_probe=True)
+        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['helpers'], {'production_units'})
+        self.assertCountEqual(result['completion'], self.canonical)
+        self.assertLess(result['completion'].index('release_batteries'), result['completion'].index('asan'))
+        families = {row[0]: row for row in result['families']}
+        self.assertGreaterEqual(float(families['release_batteries'][2]), float(families['release'][3]))
 
 
 class PerfCandidateDispatch(unittest.TestCase):
@@ -573,4 +628,5 @@ class EarlyGateDispatch(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    (Path(__file__).resolve().parents[1] / 'build').mkdir(exist_ok=True)
     unittest.main()
