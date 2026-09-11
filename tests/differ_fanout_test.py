@@ -3,6 +3,7 @@
 import copy
 import contextlib
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,49 @@ import differ_fanout as fanout
 from _differ_history import write_json
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class DifferentialTrackingReader(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Load the production connector/parser without opening any differential servers.
+        spec = importlib.util.spec_from_file_location('differ_tracking_controls', ROOT / 'tests/differ.py')
+        cls.differ = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'argv', ['differ.py', '--list-generators']), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                spec.loader.exec_module(cls.differ)
+            except SystemExit as stopped:
+                if stopped.code != 0:
+                    raise
+
+    def push_after_reply(self):
+        self.differ.climon_reader_control()
+
+    def test_push_after_reply_stays_visible_to_round_collector(self):
+        self.push_after_reply()
+
+    def test_buffered_reader_mutation_hides_push_and_is_rejected(self):
+        original = self.differ.conn_mode
+        def buffered(*args, **kwargs):
+            return original(*args, **dict(kwargs, buffering=-1))
+        with patch.object(self.differ, 'conn_mode', buffered):
+            with self.assertRaisesRegex(AssertionError, 'push hidden in reply buffer'):
+                self.push_after_reply()
+
+    def test_real_climon_suite_requires_reader_control_before_server_commands(self):
+        with patch.object(self.differ, 'climon_reader_control',
+                          side_effect=AssertionError('reader control mutant')):
+            with self.assertRaisesRegex(AssertionError, 'reader control mutant'):
+                self.differ.run_climon_suite(None)
+
+    def test_unbuffered_short_bulk_reads_are_assembled_and_truncation_fails(self):
+        class Fragmented(io.BytesIO):
+            def read(self, count=-1):
+                return super().read(min(count, 2))
+        wire = b'>2\r\n$10\r\ninvalidate\r\n*1\r\n$4\r\nck:2\r\n'
+        self.assertEqual(self.differ.read_reply(Fragmented(wire)), wire)
+        with self.assertRaises(EOFError):
+            self.differ.read_reply(Fragmented(wire[:-1]))
 
 
 def fixture_plan():

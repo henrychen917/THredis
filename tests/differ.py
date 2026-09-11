@@ -22,10 +22,10 @@ else:
 RESP3 = "-3" in EXTRA
 SEED = int(next((arg for arg in EXTRA if arg != "-3"), "7"))
 
-def conn_mode(h, p, resp3):
+def conn_mode(h, p, resp3, buffering=-1):
     s = socket.create_connection((h, p), timeout=30)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    f = s.makefile("rb")
+    f = s.makefile("rb", buffering=buffering)
     if resp3:
         s.sendall(enc(["HELLO", "3"]))
         hello = read_reply(f)
@@ -40,6 +40,13 @@ def enc(args):
         if isinstance(a, str): a = a.encode()
         o += b"$%d\r\n" % len(a) + a + b"\r\n"
     return o
+def read_exact(f, count):
+    out = b""
+    while len(out) < count:
+        chunk = f.read(count - len(out))
+        if not chunk: raise EOFError
+        out += chunk
+    return out
 def read_reply(f):
     line = f.readline()
     if not line: raise EOFError
@@ -48,7 +55,7 @@ def read_reply(f):
     if t in (b"$", b"=", b"!"):
         n = int(line[1:-2])
         if n == -1: return line
-        return line + f.read(n + 2)
+        return line + read_exact(f, n + 2)
     if t in (b"*", b"~", b">"):
         n = int(line[1:-2])
         if n == -1: return line
@@ -4478,8 +4485,34 @@ if SUITE == "wiredump":
 # invalidation arrives as an out-of-band push. So the suite drives a fixed pair of connections per
 # side, byte-compares every reply of an identity-independent grammar stream, and then compares the
 # invalidation frames a tracking connection receives for an identical write script.
+def climon_tracking_conn(h, p):
+    # Replies and out-of-band pushes share this socket. compare_pushes() drains the socket
+    # directly: a buffered reply reader can prefetch a push after the reply and hide it from
+    # select()/recv() until the NEXT round. Keep all unread bytes in the socket; read_exact()
+    # above still assembles bulk payloads when an unbuffered read ends at a TCP boundary.
+    # The caller explicitly negotiates HELLO 3 after constructing both tracking sockets.
+    return conn_mode(h, p, False, buffering=0)
+
+def climon_reader_control():
+    # Exercise the actual reader before every climon stream, so reverting to buffered reads
+    # turns the existing differential row red even when the live server's timing is benign.
+    # A reply and push written together force the old read-ahead window without any sleeps.
+    push = b">2\r\n$10\r\ninvalidate\r\n*1\r\n$4\r\nck:2\r\n"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0)); listener.listen()
+        client, file = climon_tracking_conn(*listener.getsockname())
+        with client, file, listener.accept()[0] as sender:
+            sender.sendall(b"$1\r\nv\r\n" + push)
+            if read_reply(file) != b"$1\r\nv\r\n":
+                raise AssertionError("climon reader control lost its command reply")
+            if not select.select([client], [], [], 0)[0]:
+                raise AssertionError("climon reader control: push hidden in reply buffer")
+            if read_exact(file, len(push)) != push:
+                raise AssertionError("climon reader control lost its invalidation push")
+
 def run_climon_suite(rng):
     import select as _select
+    climon_reader_control()
     diffs = 0
     checks = 0
     ts, tf = conn(TH, TP); os_, of = conn(OH, OP)
@@ -4546,7 +4579,7 @@ def run_climon_suite(rng):
         both(op, "grammar")
 
     # ---- invalidation stream. RESP3 tracking client + a writer, per side. --------------------
-    tt, ttf = conn(TH, TP); ot, otf = conn(OH, OP)
+    tt, ttf = climon_tracking_conn(TH, TP); ot, otf = climon_tracking_conn(OH, OP)
     for cs, cf in ((tt, ttf), (ot, otf)):
         cs.sendall(enc(["HELLO", "3"])); read_reply(cf)
     tw, twf = conn(TH, TP); ow, owf = conn(OH, OP)
