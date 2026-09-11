@@ -7,7 +7,8 @@ import math
 import re
 
 from abba_instrument import validate_fingerprint
-from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
+from abba_saturation import (replay_saturation, require_saturation_window, SATURATION_FLOOR,
+                             RUN_SATURATION_MARGIN)
 
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
@@ -108,11 +109,6 @@ def validate_quiet(quiet, environment, *, now, started, elapsed):
     require(started <= qstart and qend <= started + elapsed + 1,
             "quiet timestamps are outside this ABBA run")
     return qstart, qend
-
-
-# Run-to-run scatter of one binary on identical bytes, measured by the standing nulls.
-# Defined here rather than imported: abbagate imports this module, so importing back is a cycle.
-PLATEAU_TOLERANCE_PCT = 1.0
 
 
 def validate_measurements(report, *, now, expected_source=None, expected_cells=None, harness=None, candidate=None,
@@ -231,7 +227,7 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
             scores = [number(x.get("score_pct"), "productive-role occupancy", positive=True)
                       for x in judged_occupancy]
             mean = sum(scores) / len(scores)
-            require(mean >= SATURATION_FLOOR and min(scores) >= SATURATION_FLOOR - PLATEAU_TOLERANCE_PCT,
+            require(mean >= SATURATION_FLOOR and min(scores) >= SATURATION_FLOOR - RUN_SATURATION_MARGIN,
                     f"{cell['id']}: judged block is below the productive-role floor "
                     f"(mean {mean:.2f}%, worst {min(scores):.2f}%, floor {SATURATION_FLOOR:g}%)")
     require(qend - qstart >= windows, "quiet observer did not span all measurement windows")

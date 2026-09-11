@@ -73,7 +73,8 @@ from gateplan import validate_axes, read_topology, permitted_cpus, default_physi
 from gate_measurements import (load as load_measurements, ratio as measured_ratio,
                                apply_floor, configured_reference, instrument_digest)
 from gate_quiet import QuietMonitor, QuietViolation
-from abba_saturation import (parse_snapshot, productive_saturation, bottleneck_saturation,
+from abba_saturation import (RUN_SATURATION_MARGIN,
+                             parse_snapshot, productive_saturation, bottleneck_saturation,
                             replay_saturation, require_saturation_window, SATURATION_FLOOR,
                             self_test as saturation_self_test)
 from gate_receipt import harness_fingerprint, read_json
@@ -606,7 +607,7 @@ def assess(cell, rounds, bounds=None):
             # rise with load. A genuinely unsaturated rung moves the mean, and a single run far below
             # the floor still fails via the spread guard below.
             mean_occupancy = sum(occupancy) / len(occupancy)
-            worst_allowed = BUSY_FLOOR - PLATEAU_TOLERANCE_PCT
+            worst_allowed = BUSY_FLOOR - RUN_SATURATION_MARGIN
             if mean_occupancy < BUSY_FLOOR or min(occupancy) < worst_allowed:
                 reasons.append(
                     f"pinned load level {cell.instances} no longer saturates this cell "
