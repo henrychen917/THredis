@@ -206,7 +206,11 @@ class PerformanceFailures(unittest.TestCase):
 
 
 class LedgerWiring(unittest.TestCase):
-    def run_block(self, kind, rc=0, abba_rc=0):
+    instrument_helpers = ('tests/abbagate.py', 'tests/gate_measurements.py',
+                          'tests/background_environment_test.py', 'tests/gate_history.py',
+                          'tests/gate_process_test.py', 'tests/gates_test.py')
+
+    def run_block(self, kind, rc=0, abba_rc=0, abba_helper=''):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         if kind == 'feature':
@@ -245,8 +249,12 @@ py(){
   # New control helpers must not accidentally inherit the feature-cell verdict.
   case "$1" in
     tests/feature_gate.py) return "$WIRE_RC";;
-    tests/abbagate.py|tests/background_environment_test.py|tests/gate_history.py|tests/gate_process_test.py)
-      return "$WIRE_ABBA_RC";;
+    tests/abbagate.py|tests/gate_measurements.py|tests/background_environment_test.py|tests/gate_history.py|tests/gate_process_test.py|tests/gates_test.py)
+      printf '%s\\n' "$1" >> "$WIRE_CONTROLS"
+      if [ -z "$WIRE_ABBA_HELPER" ] || [ "$1" = "$WIRE_ABBA_HELPER" ]; then
+        return "$WIRE_ABBA_RC"
+      fi
+      return 0;;
     *) return 90;;
   esac
 }
@@ -268,11 +276,17 @@ say(){ :; }
             env = dict(os.environ, WIRE_RC=str(rc), WIRE_ABBA_RC=str(abba_rc),
                        WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory,
                        WIRE_KIND=kind, WIRE_ARGV=str(Path(directory) / 'argv'),
+                       WIRE_ABBA_HELPER=abba_helper, WIRE_CONTROLS=str(Path(directory) / 'controls'),
                        WIRE_WATCHDOG=str(Path(directory) / 'watchdog'))
             env.pop('GATE_QUIET_WATCHDOG', None)
             subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
                             prelude + definitions + gate[start:end]], cwd=root, env=env,
                            text=True, capture_output=True, check=True, timeout=10)
+            if kind == 'feature':
+                helpers = list(self.instrument_helpers)
+                if abba_rc:
+                    helpers = helpers[:helpers.index(abba_helper) + 1] if abba_helper else helpers[:1]
+                self.assertEqual((Path(directory) / 'controls').read_text().splitlines(), helpers)
             if kind == 'performance':
                 argv = (Path(directory) / 'argv').read_bytes().decode().rstrip('\0').split('\0')
                 self.assertEqual(argv, ['tests/abbagate.py', '--output', str(Path(directory) / 'abba')])
@@ -292,6 +306,16 @@ say(){ :; }
             rows = self.run_block('feature', abba_rc=rc)
             self.assertEqual([row[0] for row in rows], ['ok'] * 35 + ['FAIL'])
             self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
+
+    def test_each_instrument_helper_failure_reaches_the_same_gate_row(self):
+        # Every helper must be dispatched and propagate both failure and skip status. A
+        # newly included scheduler suite must not be hidden behind a permanently red stub.
+        for helper in self.instrument_helpers:
+            for rc in (1, 3):
+                with self.subTest(helper=helper, rc=rc):
+                    rows = self.run_block('feature', abba_rc=rc, abba_helper=helper)
+                    self.assertEqual([row[0] for row in rows], ['ok'] * 35 + ['FAIL'])
+                    self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
 
     def test_full_abba_counts_missing_refs_and_measurement_errors_as_failures(self):
         for rc in (0, 1, 3):
@@ -979,7 +1003,9 @@ class CompleteTierDispatch(unittest.TestCase):
         coordinator = gate[gate.index('\nstart_workers\n'):
                            gate.index('\ncase "$ABBA_RC" in')]
         ledger = next(line for line in gate.splitlines() if line.startswith('LEDGER=${GATE_LEDGER:'))
-        topology = {cpu: frozenset((cpu, cpu + 1000)) for cpu in range(16)}
+        # Exercise the reviewed 32-thread ABBA geometry. The planner correctly refuses an
+        # unreviewed 8-thread measurement before reaching this coordinator boundary.
+        topology = {cpu: frozenset((cpu, cpu + 1000)) for cpu in range(64)}
         topology.update({cpu + 1000: group for cpu, group in list(topology.items())})
         full_only = {'asan_batteries', 'replyoff', 'zc', 'rldbg', 'rlcache',
                      'differ-split', 'differ-armed', 'globcase'}
@@ -1020,8 +1046,8 @@ python3(){
             for purpose in ('iteration', 'push', 'release', 'full', 'quick'):
                 with self.subTest(purpose=purpose):
                     with patch.dict(os.environ, {}, clear=True):
-                        args = gateplan.parser().parse_args([purpose, '--server-cores', '0-7',
-                                                            '--load-cores', '8-15'])
+                        args = gateplan.parser().parse_args([purpose, '--server-cores', '0-31',
+                                                            '--load-cores', '32-63'])
                     plan = gateplan.make_plan(args, topology=topology, available=set(topology),
                                               check_available=False)
                     directory = Path(temporary) / purpose

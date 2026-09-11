@@ -2309,12 +2309,16 @@ job_abba_selftest(){
 # unfinished connection cleanup is failed evidence, including in the parallel feature cells.
 # Calibrated inputs must also reject changed shapes and forged completion evidence before
 # ABBA consumes a floor; keep those controls inside this existing instrument row.
-row_begin "ABBA comparison + saturation negative controls"
+# The actual scheduler controls also run on every gate: a premature performance start,
+# partial completion publication or leaked child invalidates every later measurement.
+# This expanded row has its own timing context; pre-scheduler samples measured less work.
+row_begin "ABBA comparison + saturation negative controls" "with-scheduler-controls"
 py tests/abbagate.py --self-test > $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_measurements.py --self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/background_environment_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_history.py self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_process_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
+    && py tests/gates_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && ok "ABBA comparison + saturation negative controls" \
     || bad "ABBA comparison + saturation negative controls" "see $TMPDIR/gate-abbagate-unit.txt"
 }
