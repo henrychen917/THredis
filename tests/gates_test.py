@@ -524,6 +524,8 @@ bad(){ printf 'FAIL\t0\t%s\n' "$1" >> "$LEDGER"; FAIL=$((FAIL+1)); }
 
 
 class SchedulerWiring(unittest.TestCase):
+    helper_jobs = frozenset(('production_units', 'core_tsan_build', 'waits_tsan_build'))
+
     # Enumerate the real collector loops, not a hand-maintained approximation of their inventory.
     # This invokes only collect_job stubs: no compiler, server, battery or benchmark is started.
     @classmethod
@@ -603,6 +605,10 @@ printf(){
         stub = '''
 job_body(){
   local current=$1 dependency status_key status_value affinity=
+  if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = before-affinity ]; then
+    echo 'deliberate fixture failure before affinity witness' >&2
+    return 17
+  fi
   while read -r status_key status_value; do
     if [ "$status_key" = Cpus_allowed_list: ]; then affinity=$status_value; break; fi
   done < "/proc/$BASHPID/status"
@@ -763,6 +769,16 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             self.assertEqual(result.returncode, 0, output)
             observed_cpus = set()
             try:
+                # Collector rows enumerate scored jobs. The three build prerequisites do
+                # not emit rows in this fixture, but must still run and finalize cleanly:
+                # inspecting only directories that happen to exist can miss a deleted job.
+                expected_jobs = set(self.canonical) | self.helper_jobs
+                self.assertEqual({job.name for job in (directory / 'jobs').iterdir()}, expected_jobs)
+                self.assertEqual({job.name for job in (directory / 'started').iterdir()}, expected_jobs)
+                for helper in self.helper_jobs:
+                    job = directory / 'jobs' / helper
+                    self.assertEqual((job / 'done').read_text(), '0\t0\t0\n', helper)
+                    self.assertTrue((job / 'cleaned').exists(), helper)
                 for job in (directory / 'jobs').iterdir():
                     assigned_slot, observed_cpu = (job / 'fixture-affinity').read_text().split()
                     self.assertEqual(observed_cpu, slot_cpus[int(assigned_slot)], job.name)
@@ -812,11 +828,11 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                                              if (directory / 'exclusivity-failure').exists() else ''),
                         completion=(directory / 'completion-order').read_text().splitlines(),
                         families=[line.split('\t') for line in (directory / 'families.tsv').read_text().splitlines()
-                                  if line.split('\t')[0] not in ('production_units', 'core_tsan_build', 'waits_tsan_build')],
+                                  if line.split('\t')[0] not in self.helper_jobs],
                         helpers={path.parent.name for path in (directory / 'jobs').glob('*/done')
-                                 if path.parent.name in ('production_units', 'core_tsan_build', 'waits_tsan_build')},
+                                 if path.parent.name in self.helper_jobs},
                         cleaned={path.parent.name for path in (directory / 'jobs').glob('*/cleaned')
-                                 if path.parent.name not in ('production_units', 'core_tsan_build', 'waits_tsan_build')})
+                                 if path.parent.name not in self.helper_jobs})
 
     def test_failure_evidence_survives_a_named_pipe_in_the_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,6 +848,26 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             self.assertEqual((saved / 'fixture.sh').read_text(), 'actual shell')
             self.assertEqual((saved / 'command.stdout').read_text(), 'actual stdout')
             self.assertEqual((saved / 'command.stderr').read_text(), 'actual stderr')
+
+    def test_missing_helper_witness_stays_red_and_keeps_its_explanation(self):
+        # Reproduce a helper failing before its first observation. Its recovered done
+        # marker still releases dependencies, so the ordinary scored rows can all pass;
+        # the helper inventory check must fail and preserve the otherwise lost cause.
+        with self.assertRaises(AssertionError) as failure:
+            self.run_scheduler(slots=3, ordered=False, failure='core_tsan_build',
+                               behavior='before-affinity')
+        message = str(failure.exception)
+        self.assertIn('core_tsan_build', message)
+        self.assertIn('Scheduler failure artifacts: ', message)
+        saved = Path(message.split('Scheduler failure artifacts: ', 1)[1].strip())
+        try:
+            helper = saved / 'jobs/core_tsan_build'
+            self.assertFalse((helper / 'fixture-affinity').exists())
+            self.assertIn('deliberate fixture failure before affinity witness',
+                          (helper / 'output.log').read_text())
+            self.assertEqual((helper / 'done').read_text(), '17\t0\t1\n')
+        finally:
+            shutil.rmtree(saved)
 
     def test_opposite_completion_orders_have_byte_identical_canonical_ledgers(self):
         forward = self.run_scheduler()
