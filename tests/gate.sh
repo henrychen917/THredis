@@ -14,7 +14,7 @@
 #                         the candidate, same session, same box, threshold derived from the
 #                         reference's own spread; a missing reference SKIPS LOUDLY and stays red)
 #                         + NIC regression cells vs tests/gate_refs.txt (the NIC cells need the 25GbE
-#                         netns rig and its scratchpad binaries/procsafe helper).
+#                         netns rig and its scratchpad CLI binary).
 #
 #   Resource options (CPU lists accept ranges and commas):
 #     --server-cores LIST  --server-smt LIST  --load-cores LIST  --load-smt LIST
@@ -2826,7 +2826,7 @@ ROW_T=$(date +%s.%N)
 # ---- 5. full tier: NIC regression cells vs pinned refs ----------------------------------------
 SPD=${GATE_SCRATCH:-/tmp/claude-1000/-home-user-Projects/ee6eb242-5302-49cf-b767-1a2d8d8f0f61/scratchpad}
 NIC_CHECKED=0
-if [ -f tests/niclib.sh ] && [ -f "$SPD/procsafe.sh" ] && [ -f tests/gate_refs.txt ]; then
+if [ -f tests/niclib.sh ] && [ -x "$SPD/bins/cli" ] && [ -f tests/gate_refs.txt ]; then
   # The refs are only comparable on the kernel they were measured on (the 2026-09-02 kernel
   # change shifted race geometry box-wide). A mismatch is a WARN, never a re-pin: re-pinning is
   # an owner action on the box, and the WARN is what says the -3% verdict below is provisional.
@@ -2837,8 +2837,21 @@ if [ -f tests/niclib.sh ] && [ -f "$SPD/procsafe.sh" ] && [ -f tests/gate_refs.t
   fi
   row_begin "NIC regression cells (all within -3%)"
   ( set -u
-    . tests/niclib.sh; . "$SPD/procsafe.sh"
+    # All process ownership/teardown is defined in the tracked helper below. The
+    # former scratchpad source supplied no called function and escaped this audit.
+    . tests/niclib.sh
     NIC_PORT=$PORT; NIC_CLI_BIN=$SPD/bins/cli; BL_LOGDIR=$(mktemp -d)
+    nic_gate_cleanup(){
+      local rc=$?
+      trap - EXIT INT TERM
+      # run_cell's command substitution can leave its namespace server reparented.
+      # Its private PID/start record retains ownership after that ancestry is gone;
+      # ordinary completion and cancellation must both consume that record.
+      nic_kill_srv "$NIC_PORT" || rc=1
+      exit "$rc"
+    }
+    trap nic_gate_cleanup EXIT
+    trap 'exit 130' INT TERM
     nic_assert_link || exit 9
     # These stored-reference cells keep their original thread, ratio, shard and load geometry.
     # Reuse the pinned CPU IDs when allowed; otherwise remap the same physical CPU counts into
@@ -2914,7 +2927,6 @@ print(f"  regression {name:<28} {got/1e6:.2f}M vs ref {ref/1e6:.2f}M ({d:+.1f}%)
 sys.exit(0 if d >= -3.0 else 1)
 PY
     done < "$BL_LOGDIR/refs.tsv"
-    nic_kill_srv $NIC_PORT || RC=1
     exit $RC
   )
   case $? in

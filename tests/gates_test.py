@@ -371,6 +371,73 @@ sleep(){ cp "$WIRE_AFTER" "$WIRE_STAT"; }
         self.assertIn('missing selected CPU counters', result.stderr)
 
 
+class NICOwnership(unittest.TestCase):
+    def launch_cleanup(self, directory, *, listener='', body='exit 0'):
+        root = Path(__file__).resolve().parents[1]
+        gate = (root / 'tests/gate.sh').read_text()
+        start = gate.index('    nic_gate_cleanup(){')
+        cleanup = gate[start:gate.index('    nic_assert_link || exit 9', start)]
+        # Namespace inspection is the only fake boundary. Keep the real ownership
+        # record, PID/start check, signal, and production cancellation trap.
+        stub = '''set -u
+. tests/niclib.sh
+NIC_PORT=19000
+nsrv_root(){ printf '%s' "$WIRE_LISTENER"; }
+'''
+        env = dict(os.environ, BL_LOGDIR=str(directory), WIRE_LISTENER=listener)
+        return subprocess.Popen(['bash', '-c', stub + cleanup + body], cwd=root, env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_unowned_listener_refuses_cleanup_without_signalling_its_pid(self):
+        root = Path(__file__).resolve().parents[1]
+        foreign = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        try:
+            with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+                process = self.launch_cleanup(Path(temporary), listener=f'LISTEN pid={foreign.pid}')
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 1, stdout + stderr)
+                self.assertIn('PORT-GUARD-FAIL unowned listener', stdout)
+                self.assertIsNone(foreign.poll(), 'unowned listener was signalled')
+        finally:
+            foreign.terminate()
+            foreign.wait(timeout=5)
+
+    def test_cancellation_reclaims_recorded_process_outside_driver_ancestry(self):
+        root = Path(__file__).resolve().parents[1]
+        owned = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        foreign = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        process = None
+        try:
+            with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+                directory = Path(temporary)
+                ticks = Path(f'/proc/{owned.pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+                (directory / 'owned-19000.pid').write_text(f'{owned.pid} {ticks}\n')
+                os.mkfifo(directory / 'pause')
+                process = self.launch_cleanup(directory, body='''
+exec 3<>"$BL_LOGDIR/pause"
+: > "$BL_LOGDIR/ready"
+read -r -t 60 -u 3 ignored || :
+''')
+                deadline = time.monotonic() + 5
+                while not (directory / 'ready').exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue((directory / 'ready').exists(), 'NIC cancellation boundary never opened')
+                process.terminate()
+                # The fixture deliberately owns the target as a sibling of the driver,
+                # modelling a namespace server reparented from run_cell's substitution.
+                owned.wait(timeout=5)
+                stdout, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 130, stdout + stderr)
+                self.assertFalse((directory / 'owned-19000.pid').exists())
+                self.assertIsNone(foreign.poll(), 'foreign sibling was signalled')
+        finally:
+            for child in (process, owned, foreign):
+                if child is not None:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+
+
 class ABBATermination(unittest.TestCase):
     def test_terminating_gate_reaps_driver_and_owned_child_but_not_foreign_process(self):
         root = Path(__file__).resolve().parent.parent
