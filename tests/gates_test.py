@@ -549,7 +549,7 @@ collect_job(){
 
     def run_scheduler(self, *, reverse=False, slots=None, failure='', behavior='', ordered=True,
                       delayed_completion=False, dependency_probe=False,
-                      remove_atomic_dependency=False):
+                      remove_atomic_dependency=False, add_asan_dependency=False):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         ledger_functions = gate[gate.index('say(){'):gate.index('\nledger_labels(){')]
@@ -633,8 +633,20 @@ job_body(){
     if [ "$current" = release ]; then
       while [ ! -f "$RUN_DIR/started/asan" ]; do pause; done
     elif [ "$current" = asan ]; then
-      # Release-only correctness must be dispatched before the independent ASAN build finishes.
-      while [ ! -f "$RUN_DIR/started/release_batteries" ]; do pause; done
+      # The old fixture released ASAN at correctness START, then asserted correctness
+      # COMPLETION preceded ASAN. Both legitimate completion orders were possible.
+      # Hold ASAN until the post-verdict token, and prove the production readiness
+      # predicate admits release correctness while this ASAN job is still unfinished.
+      while [ ! -f "$RUN_DIR/jobs/release/done" ]; do pause; done
+      : > "$RUN_DIR/dependency-probe-reached"
+      if ! job_ready release_batteries; then
+        printf 'release correctness blocked by unfinished ASAN\\n' > "$RUN_DIR/dependency-failure"
+        cat "$RUN_DIR/dependency-failure" >&2
+        exit 23
+      fi
+      while [ ! -f "$RUN_DIR/completed/release_batteries" ]; do pause; done
+      [ ! -f "$TMPDIR/done" ] || exit 24
+      : > "$RUN_DIR/dependency-handshake"
     fi
   fi
   if [ "$GATE_SLOTS" != 1 ] && [ "$FORCE_ORDER" = 1 ]; then
@@ -689,6 +701,17 @@ if [ "$FORCE_ORDER" = 1 ] || [ "$REMOVE_ATOMIC_DEPENDENCY" = 1 ]; then
     fi
   }
 fi
+# Poison only the release-correctness edge. The held ASAN job calls the real
+# readiness predicate above, emits an explicit failed row, then finalizes so
+# the queue can drain. The negative control never depends on a sleep or deadlock.
+if [ "$ADD_ASAN_DEPENDENCY" = 1 ]; then
+  original_dependencies=$(declare -f job_dependencies)
+  eval "${original_dependencies/job_dependencies/unpoisoned_job_dependencies}"
+  job_dependencies(){
+    unpoisoned_job_dependencies "$1"
+    [ "$1" != release_batteries ] || echo asan
+  }
+fi
 mkdir "$RUN_DIR/order"
 for requested in "${CANONICAL[@]}"; do mkfifo "$RUN_DIR/order/$requested"; done
 start_workers
@@ -701,6 +724,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             env = dict(os.environ, RUN_DIR=tmp, FAILED_JOB=failure, FAILURE_BEHAVIOR=behavior,
                        FORCE_ORDER=str(int(ordered)), DEPENDENCY_PROBE=str(int(dependency_probe)),
                        REMOVE_ATOMIC_DEPENDENCY=str(int(remove_atomic_dependency)),
+                       ADD_ASAN_DEPENDENCY=str(int(add_asan_dependency)),
                        GATE_FEATURE_OUTPUT=str(directory / 'features'))
             count = slots or len(self.canonical) + 1
             # The full-inventory order probes synchronize about 100 real shells. Pinning
@@ -761,13 +785,22 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                 self.assertGreaterEqual(float(row[1]), 0)
             counts = tuple(map(int, (directory / 'counts').read_text().split()))
             expected = ((len(self.canonical), 1) if behavior == 'return' else
-                        (len(self.canonical) - 1, 1) if behavior in ('empty', 'red', 'crash') or remove_atomic_dependency else
+                        (len(self.canonical) - 1, 1) if behavior in ('empty', 'red', 'crash') or remove_atomic_dependency or add_asan_dependency else
                         (len(self.canonical), 0))
-            if counts != expected:
+            dependency_reached = (directory / 'dependency-probe-reached').exists()
+            dependency_handshake = (directory / 'dependency-handshake').exists()
+            dependency_failure = ((directory / 'dependency-failure').read_text()
+                                  if (directory / 'dependency-failure').exists() else '')
+            if counts != expected or (dependency_probe and (not dependency_reached or
+                    (bool(dependency_failure) != add_asan_dependency) or
+                    (dependency_handshake == add_asan_dependency))):
                 output += preserve_failure(result.stdout, result.stderr)
             return dict(ledger=(''.join(f'{v}\t{label}\n' for v, duration, label in timed_rows)).encode(),
                         output=output, counts=counts,
                         fixture_cpus=set(fixture_cpus), observed_cpus=observed_cpus,
+                        dependency_reached=dependency_reached,
+                        dependency_handshake=dependency_handshake,
+                        dependency_failure=dependency_failure,
                         atomic_boot_reached=(directory / 'atomic-boot-reached').exists(),
                         exclusivity_failure=((directory / 'exclusivity-failure').read_text()
                                              if (directory / 'exclusivity-failure').exists() else ''),
@@ -880,9 +913,22 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertEqual(result['counts'], (len(self.canonical), 0))
         self.assertEqual(result['helpers'], {'production_units', 'core_tsan_build', 'waits_tsan_build'})
         self.assertCountEqual(result['completion'], self.canonical)
+        self.assertTrue(result['dependency_reached'], result['output'])
+        self.assertTrue(result['dependency_handshake'], result['output'])
+        self.assertEqual(result['dependency_failure'], '', result['output'])
         self.assertLess(result['completion'].index('release_batteries'), result['completion'].index('asan'))
         families = {row[0]: row for row in result['families']}
         self.assertGreaterEqual(float(families['release_batteries'][2]), float(families['release'][3]))
+
+        broken = self.run_scheduler(slots=2, ordered=False, dependency_probe=True,
+                                    add_asan_dependency=True)
+        self.assertEqual(broken['counts'], (len(self.canonical) - 1, 1), broken['output'])
+        self.assertTrue(broken['dependency_reached'], broken['output'])
+        self.assertFalse(broken['dependency_handshake'], broken['output'])
+        self.assertEqual(broken['dependency_failure'],
+                         'release correctness blocked by unfinished ASAN\n', broken['output'])
+        self.assertIn(b'FAIL\tcorrectness family asan\n', broken['ledger'])
+        self.assertCountEqual(broken['completion'], [name for name in self.canonical if name != 'asan'])
 
 
 class TSANWiring(unittest.TestCase):
