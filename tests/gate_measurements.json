@@ -819,7 +819,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -827,7 +827,7 @@
           "B"
         ],
         "values": [
-          23001840.54518662
+          22917297.252464287
         ]
       },
       "observed_busy": {
@@ -836,12 +836,12 @@
           "B"
         ],
         "values": [
-          99.9857274039274
+          99.98349443520827
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
       }
     },
     "h02": {
@@ -1212,7 +1212,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -1220,7 +1220,7 @@
           "B"
         ],
         "values": [
-          20375858.18231187
+          20396168.027059734
         ]
       },
       "observed_busy": {
@@ -1229,12 +1229,12 @@
           "B"
         ],
         "values": [
-          99.9971921344284
+          99.99599943558415
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
       }
     },
     "h08": {
@@ -1557,7 +1557,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -1565,7 +1565,7 @@
           "B"
         ],
         "values": [
-          52755190.5541593
+          56024957.80462288
         ]
       },
       "observed_busy": {
@@ -1574,12 +1574,12 @@
           "B"
         ],
         "values": [
-          99.99915807166282
+          99.99383884303955
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
       }
     },
     "h12": {
@@ -1902,7 +1902,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -1910,7 +1910,7 @@
           "B"
         ],
         "values": [
-          53866239.82763187
+          54059890.74740917
         ]
       },
       "observed_busy": {
@@ -1919,12 +1919,12 @@
           "B"
         ],
         "values": [
-          99.99960640140364
+          99.98186715185403
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
       }
     },
     "h16": {
@@ -2199,7 +2199,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -2207,7 +2207,7 @@
           "B"
         ],
         "values": [
-          23564522.953133877
+          23278287.333233546
         ]
       },
       "observed_busy": {
@@ -2216,12 +2216,12 @@
           "B"
         ],
         "values": [
-          97.1228708918885
+          97.69470458484432
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=2; confirmation=4"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=2; confirmation=4"
       }
     },
     "h18": {
@@ -2592,7 +2592,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -2600,7 +2600,7 @@
           "B"
         ],
         "values": [
-          27593332.89861498
+          27233452.417960227
         ]
       },
       "observed_busy": {
@@ -2609,12 +2609,12 @@
           "B"
         ],
         "values": [
-          98.36542027722426
+          98.27904104662505
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=2; confirmation=4"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=2; confirmation=4"
       }
     },
     "h24": {
@@ -2690,7 +2690,7 @@
       "instrument_sha256": null
     },
     "h27": {
-      "instances": 4,
+      "instances": 8,
       "shape": {
         "mode": "2s",
         "read_local": 1,
@@ -2937,7 +2937,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -2945,7 +2945,7 @@
           "B"
         ],
         "values": [
-          31840123.26569021
+          30267761.233080428
         ]
       },
       "observed_busy": {
@@ -2954,12 +2954,12 @@
           "B"
         ],
         "values": [
-          32.57262556843436
+          33.11307767579354
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=8; confirmation=12"
       }
     },
     "h28": {
@@ -3035,7 +3035,7 @@
       "instrument_sha256": null
     },
     "h31": {
-      "instances": 8,
+      "instances": 4,
       "shape": {
         "mode": "2s",
         "read_local": 1,
@@ -3282,7 +3282,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -3290,7 +3290,7 @@
           "B"
         ],
         "values": [
-          29131092.927394576
+          29634166.550885163
         ]
       },
       "observed_busy": {
@@ -3299,12 +3299,12 @@
           "B"
         ],
         "values": [
-          50.33068776214073
+          50.32633994370593
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=8; confirmation=12"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
       }
     },
     "h32": {
@@ -3579,7 +3579,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -3587,7 +3587,7 @@
           "B"
         ],
         "values": [
-          1559137.025538535
+          1547520.0553118729
         ]
       },
       "observed_busy": {
@@ -3596,12 +3596,12 @@
           "B"
         ],
         "values": [
-          99.84046381395365
+          99.79899065566772
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
       }
     },
     "m92": {
@@ -3852,7 +3852,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -3860,7 +3860,7 @@
           "B"
         ],
         "values": [
-          1749709.6067716887
+          1773861.7689373787
         ]
       },
       "observed_busy": {
@@ -3869,12 +3869,12 @@
           "B"
         ],
         "values": [
-          50.16451379109943
+          50.1627362022766
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
       }
     },
     "t01": {
@@ -4125,7 +4125,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -4133,7 +4133,7 @@
           "B"
         ],
         "values": [
-          3873608.7667979007
+          3894976.299224867
         ]
       },
       "observed_busy": {
@@ -4142,12 +4142,12 @@
           "B"
         ],
         "values": [
-          94.86248137161633
+          94.78816803463785
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
       }
     },
     "t02": {
@@ -4398,7 +4398,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -4406,7 +4406,7 @@
           "B"
         ],
         "values": [
-          3673875.3539147587
+          3681429.771974959
         ]
       },
       "observed_busy": {
@@ -4415,16 +4415,16 @@
           "B"
         ],
         "values": [
-          96.04491908824967
+          95.28719336424153
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=1; confirmation=2"
       }
     },
     "t03": {
-      "instances": 4,
+      "instances": 8,
       "shape": {
         "mode": "2s",
         "read_local": 0,
@@ -4671,7 +4671,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -4679,7 +4679,7 @@
           "B"
         ],
         "values": [
-          3911514.96408585
+          3862894.427967285
         ]
       },
       "observed_busy": {
@@ -4688,12 +4688,12 @@
           "B"
         ],
         "values": [
-          89.78352739192228
+          92.3016337790339
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=4; confirmation=8"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=8; confirmation=12"
       }
     },
     "t04": {
@@ -4944,7 +4944,7 @@
         ],
         "split_ratio": "16:16"
       },
-      "instrument_sha256": "9a1daede59178f031a221cce10f0b4308a0061ab76213b6f305b78fc23b52953",
+      "instrument_sha256": "32ed404aacb2a5c2d93f731c30fa09b0d04a5f78c6dd1be681d36ab913efa97e",
       "status": "calibrated",
       "observed_rate": {
         "unit": "ops_per_second",
@@ -4952,7 +4952,7 @@
           "B"
         ],
         "values": [
-          3831461.897728183
+          3811334.5532358666
         ]
       },
       "observed_busy": {
@@ -4961,12 +4961,12 @@
           "B"
         ],
         "values": [
-          94.29455962071027
+          94.12923089223463
         ]
       },
       "provenance": {
-        "when": "2026-09-11T18:46:42Z",
-        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-024642/results.json; sha256=bae67bdc9b807a5829ac85d4cc6c87156c09d4ed54e539fe209287bbabedb6db; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=8; confirmation=12"
+        "when": "2026-09-11T19:36:59Z",
+        "how": "abbagate --calibrate (single-arm, persistent server, PIN only); /home/user/Projects/cx-final/build/cal7-033659/results.json; sha256=4b8cc0fce46ac7f7768f53c32fff26b5dc6638f61337d7db1ea8cf0244aacd3d; candidate=93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8; lowest tested qualifying instances=8; confirmation=12"
       }
     }
   }
