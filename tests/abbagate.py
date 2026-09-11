@@ -1023,7 +1023,15 @@ class Runner:
             return extra
         return None
 
-    def measure(self, cell, arm, sequence, instances, knobs):
+    def measure(self, cell, arm, sequence, instances, knobs, *, _calibration=None, _window=None):
+        # Calibration reuses this exact load/counter/accounting path. Only its
+        # server lifetime and requested window differ; it cannot publish ABBA evidence.
+        if _window is not None and (_calibration is None or _window != 10):
+            raise ValueError("short windows require the isolated 10-second calibration session")
+        window = WINDOW if _window is None else _window
+        reused = bool(_calibration)
+        if reused and _calibration["cell"] != asdict(cell):
+            raise ValueError("calibration session cannot outlive its cell")
         profile = None
         worker_affinity = None
         legacy_control = self.legacy_reorder_control(cell, arm, knobs)
@@ -1031,7 +1039,8 @@ class Runner:
         folder.mkdir(parents=True)
         layout = load_layout(self.load_cpus, instances, cell.conns)
         # Never connect to or terminate an existing listener, even if it speaks TomoKV.
-        require_unbound_port(self.args.port)
+        if not reused:
+            require_unbound_port(self.args.port)
         command = ["taskset", "-c", cpu_string(self.server_cpus), self.binaries[arm],
                    "--port", str(self.args.port), "--bind", "127.0.0.1", "--atomic", str(cell.atomic),
                    "--enable-debug-command", "yes", "--save", "", "--appendonly", "no",
@@ -1051,60 +1060,74 @@ class Runner:
         result = {"arm": arm, "instances": instances, "complete": False,
                   "server_argv": [str(x) for x in command],
                   "load_layout": layout, "artifacts": str(folder.relative_to(self.out))}
-        print(f"  {cell.id} n={instances} {sequence}:{arm} boot/populate/{WINDOW}s", flush=True)
+        if _calibration is not None:
+            result.update(calibration_only=True, population_reused=reused)
+        print(f"  {cell.id} n={instances} {sequence}:{arm} "
+              f"{'reuse populated server' if reused else 'boot/populate'}/{window}s", flush=True)
         try:
-            self.prepare_data(cell, arm, folder)
-            srv = self.children.start(command, log, folder)
-            deadline = time.monotonic() + 30
-            while True:
+            if reused:
+                srv, conn = _calibration["srv"], _calibration["conn"]
                 if srv.poll() is not None:
-                    raise RuntimeError(f"server exited {srv.returncode}: {log.read_text()[-1000:]}")
-                try:
-                    conn = Conn("127.0.0.1", self.args.port, timeout=10)
-                    identity = info(conn, "server")
-                    if int(identity["process_id"]) != srv.pid:
-                        raise RuntimeError("listener PID is not our child")
-                    break
-                except (OSError, EOFError):
-                    if conn:
-                        conn.close()
-                        conn = None
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("server boot timed out")
-                    time.sleep(0.1)
-            result.update(pid=srv.pid, boot_info=identity)
-            # CONFIG GET echoes the requested knob even when the old reference
-            # cannot arm it (split, or fused overlap on). INFO SERVER read_local
-            # has always reported the effective lane. Check both arms before SET
-            # population or measured load, including write cells: arming also
-            # changes immutable replacement and retirement obligations.
-            effective_read_local = identity.get("read_local")
-            if effective_read_local not in ("0", "1"):
-                raise RuntimeError(f"{arm} boot lacks valid effective INFO SERVER read_local: "
-                                   f"{effective_read_local!r}")
-            if int(effective_read_local) != cell.read_local:
-                reason = (f"{arm} boot effective read_local={effective_read_local} does not match "
-                          f"cell read-local={cell.read_local}; CONFIG GET alone cannot prove arming")
-                if arm == "A":
-                    raise NotComparable(reason)
-                raise RuntimeError(reason)
-            for name, value in {"atomic": cell.atomic, **knobs}.items():
-                actual = conn.must("CONFIG", "GET", name)
-                if actual != [name.encode(), str(value).encode()]:
-                    raise RuntimeError(f"boot did not apply {name}={value}: {actual!r}")
-            result["population"] = self.populate(cell, arm, conn, folder)
-            result["populate_seconds"] = time.monotonic() - started
+                    raise RuntimeError("calibration server exited between load rungs")
+                result.update(pid=srv.pid, boot_info=_calibration["boot_info"],
+                    server_argv=_calibration["server_argv"], population=_calibration["population"],
+                    populate_seconds=0.)
+            else:
+                self.prepare_data(cell, arm, folder)
+                srv = self.children.start(command, log, folder)
+                deadline = time.monotonic() + 30
+                while True:
+                    if srv.poll() is not None:
+                        raise RuntimeError(f"server exited {srv.returncode}: {log.read_text()[-1000:]}")
+                    try:
+                        conn = Conn("127.0.0.1", self.args.port, timeout=10)
+                        identity = info(conn, "server")
+                        if int(identity["process_id"]) != srv.pid:
+                            raise RuntimeError("listener PID is not our child")
+                        break
+                    except (OSError, EOFError):
+                        if conn:
+                            conn.close()
+                            conn = None
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("server boot timed out")
+                        time.sleep(0.1)
+                result.update(pid=srv.pid, boot_info=identity)
+                # CONFIG GET echoes the requested knob even when the old reference
+                # cannot arm it (split, or fused overlap on). INFO SERVER read_local
+                # has always reported the effective lane. Check both arms before SET
+                # population or measured load, including write cells: arming also
+                # changes immutable replacement and retirement obligations.
+                effective_read_local = identity.get("read_local")
+                if effective_read_local not in ("0", "1"):
+                    raise RuntimeError(f"{arm} boot lacks valid effective INFO SERVER read_local: "
+                                       f"{effective_read_local!r}")
+                if int(effective_read_local) != cell.read_local:
+                    reason = (f"{arm} boot effective read_local={effective_read_local} does not match "
+                              f"cell read-local={cell.read_local}; CONFIG GET alone cannot prove arming")
+                    if arm == "A":
+                        raise NotComparable(reason)
+                    raise RuntimeError(reason)
+                for name, value in {"atomic": cell.atomic, **knobs}.items():
+                    actual = conn.must("CONFIG", "GET", name)
+                    if actual != [name.encode(), str(value).encode()]:
+                        raise RuntimeError(f"boot did not apply {name}={value}: {actual!r}")
+                result["population"] = self.populate(cell, arm, conn, folder)
+                result["populate_seconds"] = time.monotonic() - started
+                if _calibration is not None:
+                    _calibration.update(srv=srv, conn=conn, cell=asdict(cell), boot_info=identity,
+                        server_argv=result["server_argv"], population=result["population"])
             # Bracket ALL generators, after wire/snapshot population and any service-
             # cost probes. Only the named workload command counters enter accounting;
             # INFO/DEBUG and client protocol setup never become phantom workload ops.
             result["whole_run_commandstats_before"] = info(conn, "commandstats")
             result["whole_run_clients_before"] = info(conn, "clients")
-            load_lifetime = self.load_startup_seconds + WARMUP + WINDOW + TAIL
+            load_lifetime = self.load_startup_seconds + WARMUP + window + TAIL
             load_launch = time.monotonic() if self.load_startup_seconds else None
             if self.load_startup_seconds:
                 result["load_timing"] = dict(startup_allowance_seconds=self.load_startup_seconds,
                     first_launch_monotonic=load_launch, requested_lifetime_seconds=load_lifetime,
-                    fresh_warmup_seconds=WARMUP, central_window_seconds=WINDOW, tail_seconds=TAIL)
+                    fresh_warmup_seconds=WARMUP, central_window_seconds=window, tail_seconds=TAIL)
             for i, placement in enumerate(layout):
                 argv = self.memtier(placement, cell=cell) + workload_arguments(cell) + [f"--pipeline={cell.depth}",
                         f"--test-time={load_lifetime}",
@@ -1166,9 +1189,9 @@ class Runner:
                 remaining = load_launch + load_lifetime - t0
                 result["load_timing"].update(central_start_monotonic=t0,
                     minimum_remaining_lifetime_seconds=remaining)
-                if remaining < WINDOW + TAIL:
+                if remaining < window + TAIL:
                     raise RuntimeError("insufficient diagnostic load lifetime for full central window and tail")
-            time.sleep(WINDOW)
+            time.sleep(window)
             after = info(conn, "stats")
             t1, after_cpu = time.monotonic(), cpu_seconds(srv.pid)
             if profile is not None:
@@ -1190,7 +1213,7 @@ class Runner:
             after_commands = info(conn, "commandstats")
             after_mode = info(conn, "server") if cell.op == "REORDER" else {}
             if any(p.poll() is not None for p in generators):
-                raise RuntimeError(f"load generator ended inside the {WINDOW}-second window")
+                raise RuntimeError(f"load generator ended inside the {window}-second window")
             if int(info(conn, "clients")["connected_clients"]) != cell.conns + 1:
                 raise RuntimeError("load connections disappeared during measurement")
             commands = int(after["total_commands_processed"]) - int(before["total_commands_processed"]) - 1
@@ -1272,12 +1295,15 @@ class Runner:
                 raise
             finally:
                 # A failed counter/artifact close must never strand owned children.
-                if conn:
+                keep_server = _calibration is not None and result.get("complete") is True
+                if conn and not keep_server:
                     conn.close()
                 for p in generators:
                     self.children.stop(p)
-                if srv:
+                if srv and not keep_server:
                     self.children.stop(srv)
+                if _calibration is not None and not keep_server:
+                    _calibration.clear()
                 result["wall_seconds"] = time.monotonic() - started
                 (folder / "measurement.json").write_text(json.dumps(result, indent=2) + "\n")
         print(f"    {result['rate']/1e6:.5f}M/s legacy-busy={result['busy_pct']:.3f}% "
@@ -1352,6 +1378,8 @@ def parse_args():
     p.add_argument("--null-result", type=Path, default=Path(os.getenv("GATE_ABBA_NULL", os.getenv(
         "GATE_RECEIPT_NULL", ROOT / ".gate-history/receipts/baselines/full-null.json"))),
                    help="recent matched null required for comparison PASS; missing controls retain untrusted diagnostics")
+    p.add_argument("--calibrate", action="store_true",
+                   help="one-arm 10s load-floor search; boot/populate once per cell; PIN only, never a verdict")
     p.add_argument("--escalate", action="store_true",
                    help="ignore pinned load levels and search the ladder; use this to RE-PIN a cell "
                         "after the gate reports its pinned level no longer saturates")
@@ -1363,6 +1391,11 @@ def parse_args():
 
 def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
          diagnostic_pin_load_workers=0, diagnostic_load_startup_seconds=0):
+    if getattr(args, "calibrate", False):
+        if diagnostic_monitor is not None or diagnostic_profile or diagnostic_pin_load_workers or diagnostic_load_startup_seconds:
+            raise ValueError("calibration cannot use diagnostic measurement overrides")
+        from load_calibration import main as calibration_main
+        return calibration_main(args)
     if args.list_cells:
         cells = selected_cells(read_cells(args.cells), args.subset, args.only)
         print(json.dumps({"subset": args.subset, **coverage(cells)}, indent=2))
@@ -3324,4 +3357,7 @@ def self_test():
 
 if __name__ == "__main__":
     args = parse_args()
-    sys.exit(max(self_test(), saturation_self_test()) if args.self_test else main(args))
+    if args.self_test:
+        from load_calibration import self_test as calibration_self_test
+        sys.exit(max(self_test(), saturation_self_test(), calibration_self_test()))
+    sys.exit(main(args))

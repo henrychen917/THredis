@@ -86,11 +86,14 @@ def load(path=DEFAULT):
             for name, unit in (("observed_rate", "ops_per_second"), ("observed_busy", "percent")):
                 observation = floor[name]
                 require(isinstance(observation, dict) and set(observation) == {"unit", "order", "values"} and
-                        observation["unit"] == unit and observation["order"] == ["A", "B", "B", "A"] and
-                        isinstance(observation["values"], list) and len(observation["values"]) == 4 and
+                        observation["unit"] == unit and observation["order"] in (["A", "B", "B", "A"], ["B"]) and
+                        isinstance(observation["values"], list) and
+                        len(observation["values"]) == len(observation["order"]) and
                         all(type(v) in (int, float) and math.isfinite(v) and v >= 0
                             for v in observation["values"]),
-                        f"{ident}: calibrated floor lacks its four measured {name} samples")
+                        f"{ident}: calibrated floor lacks its measured {name} samples")
+            require(floor["observed_rate"]["order"] == floor["observed_busy"]["order"],
+                    f"{ident}: rate and occupancy observations use different calibration designs")
     return value
 
 
@@ -143,6 +146,107 @@ def configured_reference(commit, measurements=None):
     return path, {**record, "source": "gate_measurements.json", "ref": "origin/cpp"}
 
 
+def validate_fast_calibration(report, fingerprint):
+    """A short, single-arm ladder can authorize a PIN and nothing else.
+
+    Keep this separate from ABBA validation: fabricating four copies of one run
+    would invent repeatability and could accidentally certify a standing null.
+    Every retained rung is checked before any config entry is changed.
+    """
+    from abbagate import Cell
+    from abba_evidence import number, utc_seconds, validate_quiet
+    from abba_instrument import validate_fingerprint
+    from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
+    from load_calibration import select_calibration_floor
+    require(isinstance(report, dict) and report.get("schema") == 1 and
+            report.get("run_kind") == "load-calibration" and report.get("verdict") == "PIN" and
+            report.get("complete") is True, "fast calibration did not complete with a PIN")
+    require(report.get("measurement_valid") is False and report.get("normal_gate_eligible") is False and
+            report.get("comparison_trusted") is False and report.get("order") == ["B"] and
+            not report.get("null_control") and not report.get("standing_null") and not report.get("error") and
+            report.get("statistical_verdict") not in ("PASS", "FAIL"),
+            "fast calibration must remain ineligible for comparison and null verdicts")
+    require(validate_fingerprint(report.get("instrument_fingerprint")) == fingerprint["sha256"],
+            "fast calibration instrument differs")
+    require(report.get("window_seconds") == 10, "fast calibration changed its 10-second search window")
+    now = time.time()
+    started = utc_seconds(report.get("started_utc"))
+    elapsed = number(report.get("elapsed_seconds"), "calibration elapsed seconds", positive=True)
+    require(started <= now and started + elapsed <= now + 1,
+            "calibration timestamps are incomplete or in the future")
+    candidate = report.get("candidate")
+    require(isinstance(candidate, dict) and re.fullmatch(r"[0-9a-f]{64}", candidate.get("sha256", "")),
+            "calibration lacks its candidate binary identity")
+    source = report.get("cell_source")
+    require(isinstance(source, dict) and isinstance(source.get("text"), str) and
+            hashlib.sha256(source["text"].encode()).hexdigest() == source.get("sha256") and
+            type(source.get("total_cells")) is int and source["total_cells"] > 0,
+            "calibration lacks its measured cell source")
+    environment = report.get("environment")
+    require(isinstance(environment, dict) and environment.get("python_runtime") == fingerprint["python"],
+            "calibration Python environment differs")
+    for field in ("server_cpus", "load_cpus", "server_physical", "load_physical"):
+        cpus = environment.get(field)
+        require(isinstance(cpus, list) and cpus and all(type(cpu) is int and cpu >= 0 for cpu in cpus)
+                and len(cpus) == len(set(cpus)), "invalid calibration CPU allocation: " + field)
+    require(not set(environment["server_cpus"]) & set(environment["load_cpus"]) and
+            len(environment["server_physical"]) <= 32, "invalid calibration CPU allocation")
+    for field in ("uname", "memtier_sha256", "memtier_version", "keys", "data_bytes", "key_pattern", "split_ratio"):
+        require(environment.get(field), "missing calibration environment: " + field)
+    require(environment.get("population_by_arm") == {"B": "wire"},
+            "fast calibration must populate its single measured arm once over the wire")
+    qstart, qend = validate_quiet(report.get("quiet_box"), environment, now=now,
+                                  started=started, elapsed=elapsed)
+    rows = report.get("cells")
+    coverage = report.get("coverage")
+    require(isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows) and
+            isinstance(coverage, dict), "empty or malformed calibration campaign")
+    ids = [row.get("cell", {}).get("id") for row in rows]
+    require(all(isinstance(ident, str) and ident for ident in ids) and len(ids) == len(set(ids)) and
+            coverage.get("ids") == ids and coverage.get("count") == len(ids) and len(ids) <= source["total_cells"],
+            "calibration is incomplete: observed cell IDs differ from requested coverage")
+    windows = 0.
+    for row in rows:
+        cell = Cell(**row["cell"])
+        require(row.get("status") == ("EXEMPT" if cell.depth == 1 else "PIN") and
+                not row.get("error") and not row.get("reason"), f"{cell.id}: failed calibration cell")
+        rounds = row.get("rounds")
+        require(isinstance(rounds, list) and rounds, f"{cell.id}: unreached calibration ladder")
+        pids = set()
+        for index, block in enumerate(rounds):
+            runs = block.get("runs")
+            require(isinstance(runs, list) and len(runs) == 1 and isinstance(runs[0], dict),
+                    f"{cell.id}: calibration needs exactly one measurement per rung")
+            run = runs[0]
+            require(run.get("arm") == "B" and run.get("complete") is True and not run.get("error") and
+                    run.get("calibration_only") is True and run.get("population_reused") is (index > 0),
+                    f"{cell.id}: incomplete single-arm or repeated-population measurement")
+            require(type(run.get("pid")) is int and run["pid"] > 0 and
+                    run.get("artifacts") == f"{cell.id}/n{block['instances']}-{index + 1}-B",
+                    f"{cell.id}: calibration never booted or retained its measured server")
+            pids.add(run["pid"])
+            for field in ("rate", "latency_ms", "commands", "window_seconds"):
+                number(run.get(field), "calibration " + field, positive=True)
+            require(run["window_seconds"] >= report["window_seconds"], "shortened calibration measurement")
+            require(number(run.get("busy_pct"), "calibration busy percent") <= 100,
+                    "invalid calibration busy percent")
+            layout = run.get("load_layout")
+            require(isinstance(layout, list) and all(isinstance(item, dict) and
+                    isinstance(item.get("cpus"), list) for item in layout) and
+                    set(cpu for item in layout for cpu in item["cpus"]) == set(environment["load_cpus"]),
+                    "calibration generator layout differs from the granted load CPUs")
+            saturation = replay_saturation(run.get("saturation"), floor_pct=SATURATION_FLOOR,
+                mode=cell.mode, thread_count=len(environment["server_cpus"]))
+            require_saturation_window(saturation, run)
+            windows += run["window_seconds"]
+        require(len(pids) == 1, f"{cell.id}: calibration rebooted between load rungs")
+        selection = select_calibration_floor(replace(cell, instances=0), rounds)
+        require(selection["measurement_valid"] and
+                selection["status"] == ("EXEMPT" if cell.depth == 1 else "PIN"),
+                f"{cell.id}: no measured saturation plateau with higher-capacity confirmation")
+    require(qend - qstart >= windows, "quiet observer did not span every calibration window")
+
+
 def import_calibration(path, measurements, cells):
     # Recompute the mathematical selection; trusting a serialized PASS would let an
     # edited summary promote an unsaturated or incomplete measurement to a floor.
@@ -156,10 +260,14 @@ def import_calibration(path, measurements, cells):
     # Load selection alone cannot certify an instrument: an explicit failed null,
     # a failed depth-1 row, a shortened measurement, or incomplete quiet coverage
     # must reject the entire import too. Reuse the normal report validator.
-    validate_measurements(report, now=time.time(), expected_instrument=fingerprint)
-    if report["run_kind"] == "null-control":
-        validate_null(report, now=time.time())
-    require(report.get("escalate") is True, "floor import requires an explicit --escalate campaign")
+    fast = report.get("run_kind") == "load-calibration"
+    if fast:
+        validate_fast_calibration(report, fingerprint)
+    else:
+        validate_measurements(report, now=time.time(), expected_instrument=fingerprint)
+        if report["run_kind"] == "null-control":
+            validate_null(report, now=time.time())
+        require(report.get("escalate") is True, "floor import requires an explicit --escalate campaign")
     datetime.fromisoformat(report["started_utc"].replace("Z", "+00:00"))
     placement = geometry(report["environment"])
     instrument = fingerprint["sha256"]
@@ -177,24 +285,31 @@ def import_calibration(path, measurements, cells):
         if cell.depth == 1:
             continue
         require(row.get("instrument_valid", True) and not row.get("error"), f"{cell.id}: invalid measurement row")
-        selection = select_load_floor(replace(cell, instances=0), row["rounds"])
-        require(selection["measurement_valid"] and selection["status"] == "CONFIRMED",
+        if fast:
+            from load_calibration import select_calibration_floor
+            selection = select_calibration_floor(replace(cell, instances=0), row["rounds"])
+        else:
+            selection = select_load_floor(replace(cell, instances=0), row["rounds"])
+        require(selection["measurement_valid"] and selection["status"] == ("PIN" if fast else "CONFIRMED"),
                 f"{cell.id}: no measured saturation plateau with higher-capacity confirmation")
         count = selection["lowest_tested_qualifying_instances"]
         selected_runs = row["rounds"][selection["selected_index"]]["runs"]
-        # Keep the actual A1/B1/B2/A2 observations, including units, next to the
-        # floor they established. A mean or null entry loses which arm occupied
-        # the server. These are provenance only: every gate still rechecks live
-        # productive-role saturation and derives its threshold from that run.
+        # Keep actual observations, including arm order and units, next to the
+        # floor. A fast search stores one B sample; never manufacture ABBA repeats
+        # or imply that a calibration measured repeatability. Every verdict still
+        # rechecks productive-role saturation and derives its own threshold.
+        order = ["B"] if fast else list(ORDER)
+        method = "--calibrate (single-arm, persistent server, PIN only)" if fast else "--escalate"
+        binaries = (f"candidate={report['candidate']['sha256']}" if fast else
+                    f"reference={report['reference']['sha256']}; candidate={report['candidate']['sha256']}")
         updates[cell.id] = dict(instances=count, shape=shape(cell), geometry=placement,
             instrument_sha256=instrument, status="calibrated",
-            observed_rate=dict(unit="ops_per_second", order=list(ORDER),
+            observed_rate=dict(unit="ops_per_second", order=order,
                                values=[run["rate"] for run in selected_runs]),
-            observed_busy=dict(unit="percent", order=list(ORDER),
+            observed_busy=dict(unit="percent", order=order,
                                values=[run["busy_pct"] for run in selected_runs]),
             provenance={"when": report["started_utc"],
-            "how": f"abbagate --escalate; {path}; sha256={report_digest}; "
-                   f"reference={report['reference']['sha256']}; candidate={report['candidate']['sha256']}; "
+            "how": f"abbagate {method}; {path}; sha256={report_digest}; {binaries}; "
                    f"lowest tested qualifying instances={count}; confirmation={selection['confirmation_instances']}"})
     require(updates, "calibration contains no deep-pipeline load floors")
     # All-or-nothing import: a red/invalid later cell must not silently salvage an
@@ -273,6 +388,103 @@ def self_test():
                 path.write_bytes(b"different executable")
                 with self.assertRaisesRegex(ValueError, "digest mismatch"):
                     configured_reference(commit, self.config)
+
+        def test_fast_calibration_import_is_pin_only_and_replays_every_rung(self):
+            from abbagate import Cell, load_layout
+            from abba_evidence import validate_measurements
+            from abba_instrument import instrument_fingerprint
+            from _abba_test_fixtures import saturation_record, quiet_record
+            cell = Cell(**self.cell)
+            started = "2026-09-10T00:00:00Z"
+            epoch = datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+            fingerprint = instrument_fingerprint(DEFAULT.parent.parent)
+            load_cpus = self.placement["load_physical"] + self.placement["load_smt"]
+            rounds = []
+            for index, count in enumerate((1, 2)):
+                rounds.append(dict(instances=count, runs=[dict(arm="B", complete=True,
+                    calibration_only=True, population_reused=bool(index), instances=count, pid=123,
+                    rate=100., busy_pct=99.9, latency_ms=1., commands=1000,
+                    artifacts=f"{cell.id}/n{count}-{index + 1}-B", midpoint_monotonic=6, window_seconds=10.,
+                    load_layout=load_layout(load_cpus, count, cell.conns),
+                    saturation=saturation_record(cell.mode, window_seconds=10))]))
+            source = "synthetic fast calibration cell fixture\n"
+            report = dict(schema=1, run_kind="load-calibration", verdict="PIN", complete=True,
+                measurement_valid=False, normal_gate_eligible=False, comparison_trusted=False,
+                order=["B"], window_seconds=10, elapsed_seconds=100, started_utc=started,
+                instrument_fingerprint=fingerprint, candidate={"sha256": "a" * 64},
+                cell_source=dict(text=source, sha256=hashlib.sha256(source.encode()).hexdigest(), total_cells=1),
+                coverage=dict(ids=[cell.id], count=1), cells=[dict(cell=asdict(cell), status="PIN", rounds=rounds)],
+                environment={**self.placement, "port": 8700, "server_cpus": list(range(32)),
+                    "load_cpus": load_cpus, "python_runtime": fingerprint["python"], "uname": ["synthetic"],
+                    "memtier_sha256": "c" * 64, "memtier_version": "fixture", "keys": 2000000,
+                    "data_bytes": 64, "key_pattern": "P:P", "population_by_arm": {"B": "wire"}},
+                quiet_box=quiet_record(cpus=list(range(32)) + load_cpus, started_at=epoch,
+                    finished_at=epoch + 100, samples=101, window_seconds=10))
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "results.json"
+                path.write_text(json.dumps(report))
+                imported = copy.deepcopy(self.config)
+                self.assertEqual(import_calibration(path, imported, [cell]), [cell.id])
+                floor = imported["load_floors"][cell.id]
+                self.assertEqual(floor["instances"], 1)
+                self.assertEqual(floor["observed_rate"], dict(unit="ops_per_second", order=["B"], values=[100.]))
+                self.assertIn("PIN only", floor["provenance"]["how"])
+                config_path = Path(directory) / "config.json"
+                config_path.write_text(json.dumps(imported))
+                self.assertEqual(load(config_path), imported)
+                # The exact calibration report may be a measured pin, but must
+                # never become a normal gate PASS or a standing null.
+                with self.assertRaises(ValueError):
+                    validate_measurements(report, now=time.time())
+                for mutate in (
+                        lambda v: v.update(verdict="PASS"),
+                        lambda v: v.update(statistical_verdict="FAIL"),
+                        lambda v: v.update(complete=False),
+                        lambda v: v.update(measurement_valid=True),
+                        lambda v: v.update(normal_gate_eligible=True),
+                        lambda v: v.update(comparison_trusted=True),
+                        lambda v: v.update(order=["A", "B", "B", "A"]),
+                        lambda v: v.update(window_seconds=1),
+                        lambda v: v.update(standing_null={"verdict": "PASS"}),
+                        lambda v: v["instrument_fingerprint"].update(sha256="0" * 64),
+                        lambda v: v["quiet_box"].update(complete=False),
+                        lambda v: v["quiet_box"].update(finished_at=epoch + 1),
+                        lambda v: v["coverage"]["ids"].append("missing"),
+                        lambda v: v["cells"][0]["cell"].update(conns=2048),
+                        lambda v: v["cells"][0]["rounds"].pop(),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(complete=False),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(calibration_only=False),
+                        lambda v: v["cells"][0].update(status="FAIL"),
+                        lambda v: v["cells"][0].update(reason="explicit failure"),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(busy_pct=float("nan")),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(window_seconds=1),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(population_reused=False),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(pid=456),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"][0].update(rate=110),
+                        lambda v: v["cells"][0]["rounds"][0]["runs"][0].update(
+                            saturation=saturation_record(cell.mode, score=1, window_seconds=10)),
+                        lambda v: v["cells"][0]["rounds"][1]["runs"].append(
+                            copy.deepcopy(v["cells"][0]["rounds"][1]["runs"][0]))):
+                    with self.subTest(mutation=mutate):
+                        broken, unchanged = copy.deepcopy(report), copy.deepcopy(self.config)
+                        mutate(broken)
+                        path.write_text(json.dumps(broken))
+                        with self.assertRaises(ValueError):
+                            import_calibration(path, unchanged, [cell])
+                        self.assertEqual(unchanged, self.config)
+                # A failed later cell must not salvage the campaign prefix.
+                broken = copy.deepcopy(report)
+                later = copy.deepcopy(broken["cells"][0])
+                later["cell"]["id"] = "later"
+                later["rounds"][1]["runs"][0]["complete"] = False
+                broken["cells"].append(later)
+                broken["coverage"] = dict(ids=[cell.id, "later"], count=2)
+                broken["cell_source"]["total_cells"] = 2
+                path.write_text(json.dumps(broken))
+                unchanged = copy.deepcopy(self.config)
+                with self.assertRaises(ValueError):
+                    import_calibration(path, unchanged, [cell, replace(cell, id="later")])
+                self.assertEqual(unchanged, self.config)
 
         def test_calibration_import_replays_evidence_and_rejects_mutations(self):
             from abbagate import Cell, load_layout, ORDER, assess

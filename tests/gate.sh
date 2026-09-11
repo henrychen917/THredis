@@ -2583,7 +2583,7 @@ job_ready(){
   return 0
 }
 
-# ---- 0. preflight: tools, oracle tree, strays ------------------------------------------------
+# ---- 0. preflight: tools, oracle tree, intended ports ---------------------------------------
 MISSING=
 for tool in g++ make python3 redis-cli memtier_benchmark ss taskset timeout awk setarch flock; do
   command -v "$tool" >/dev/null 2>&1 || MISSING="$MISSING $tool"
@@ -2612,9 +2612,6 @@ if [ -n "$ORACLE_MISSING" ]; then
   fi
   echo "  The 'generated Redis 7.4 ACL categories' row FAILS with this reason; every other row runs."
 fi
-STRAYS=$(pgrep -x tomokv 2>/dev/null | paste -sd, -)
-[ -z "$STRAYS" ] || say "stray tomokv processes on this box (pids $STRAYS)" \
-    "WARN (other lanes? they share CPU with the timed rows; the port guard covers only $PORT)"
 for reserved_port in "${SLOT_PORTS[@]}"; do
   for reserved_offset in 0 1 2; do guard_port "$((reserved_port+reserved_offset))"; done
 done
