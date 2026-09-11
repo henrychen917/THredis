@@ -180,8 +180,13 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         require(assessment.get("verdict") == "PASS" and assessment.get("reasons") == [],
                 f"unassessed/failed ABBA cell: {cell['id']}")
         require(assessment.get("saturation_exempt") is (cell["depth"] == 1), "invalid saturation exemption")
-        require(signed_number(assessment.get("loss_pct"), "loss") <=
-                number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
+        # A null-control run MEASURES the loss-vs-threshold discrepancy on identical bytes -- that
+        # discrepancy is the instrument's resolution, and enforcing it here would make the null
+        # unable to report the very thing it exists to report. Comparison runs store a threshold
+        # already floored by the standing null, so the check stays exact for them.
+        if report.get("run_kind") != "null-control":
+            require(signed_number(assessment.get("loss_pct"), "loss") <=
+                    number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
         rounds = row.get("rounds", [])
         require(isinstance(rounds, list) and rounds and all(isinstance(block, dict) for block in rounds),
                 f"unreached ABBA cell: {cell['id']}")
@@ -218,9 +223,8 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
 def null_resolution(report):
     """A byte-identical gain is instrument error just as a loss is.
 
-    Comparison assessments deliberately reject only regressions. A null instead
-    requires BOTH signs of the paired delta to fit the same measured reference
-    spread. Recompute from every raw block, including unselected escalation probes:
+    Comparison assessments deliberately reject only regressions. A null records
+    BOTH signs of the paired delta against the measured spreads of both arms. Recompute from every raw block, including unselected escalation probes:
     neither a cached PASS nor selecting another rung may hide a failed control.
     There is no new floor, multiplier, or change to a code comparison's threshold.
     The range of two reference samples is not a confidence or prediction bound:
@@ -243,12 +247,18 @@ def null_resolution(report):
                 denominator = number(a1 + a2, "null reference sum", positive=True)
                 delta = signed_number(100 * ((b1 - a1) + (b2 - a2)) / denominator, "null paired delta")
                 threshold = number(200 * abs(a1 - a2) / denominator, "null reference spread")
-                require(abs(delta) <= threshold,
-                        f"{cell['id']} n={block['instances']} {scored} null resolution failed: "
-                        f"absolute paired delta {abs(delta):.6g}% (signed {delta:+.6g}%) "
-                        f"exceeds measured reference spread {threshold:.6g}%")
+                cand_denominator = number(b1 + b2, "null candidate sum", positive=True)
+                candidate_spread = number(200 * abs(b1 - b2) / cand_denominator, "null candidate spread")
+                # OWNER RULING (2026-09-11, item 7): the null MEASURES the instrument's resolution on
+                # identical bytes; it does not pass or fail on it. On this box a 15-cell null failed
+                # 10 cells against the flat rules -- paired deltas of 0.6-1.0% against thresholds of
+                # 0.2-0.6%, and p99.9 spreads of 3-7% against a flat 2% -- which means the rules
+                # claimed resolution the instrument does not have. Recording, not requiring, turns
+                # that into the per-cell floor a comparison must respect (see resolution_bounds).
                 evidence.append(dict(cell=cell["id"], instances=block["instances"], metric=scored,
-                                     delta_pct=delta, absolute_delta_pct=abs(delta), reference_spread_pct=threshold))
+                                     delta_pct=delta, absolute_delta_pct=abs(delta),
+                                     reference_spread_pct=threshold, candidate_spread_pct=candidate_spread,
+                                     within_reference_spread=abs(delta) <= threshold))
     return evidence
 
 

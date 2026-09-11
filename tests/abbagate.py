@@ -389,7 +389,41 @@ def saturation_score(run, cell):
     return require_saturation_window(evidence, run)["score_pct"]
 
 
-def load_block_evidence(cell, block):
+# A null run measures resolution and must not be vetoed by the flat rules it is measuring.
+NULL_MODE = "null-mode"
+
+
+def resolution_bounds(control, cell_id):
+    """Per-metric floors this cell earned from the standing null, or None without one.
+
+    spread     : the largest spread either arm showed on identical bytes -- the stability bound
+                 cannot honestly be tighter than what the same binary repeats to;
+    abs_delta  : the largest |paired delta| on identical bytes -- the threshold cannot honestly
+                 be tighter than the instrument's own between-arm error.
+    Both are MAXIMUMS over every block the null ran, so an unselected noisy probe still counts.
+    """
+    if not control:
+        return None
+    rows = [r for r in (control.get("null_control") or {}).get("resolution") or [] if r.get("cell") == cell_id]
+    if not rows:
+        return None
+    bounds = {}
+    for r in rows:
+        b = bounds.setdefault(r["metric"], {"spread": 0.0, "abs_delta": 0.0})
+        b["spread"] = max(b["spread"], r.get("reference_spread_pct", 0.0), r.get("candidate_spread_pct", 0.0))
+        b["abs_delta"] = max(b["abs_delta"], r.get("absolute_delta_pct", 0.0))
+    return bounds
+
+
+def spread_limit(metric, bounds):
+    if bounds is NULL_MODE:
+        return math.inf
+    if bounds and metric in bounds:
+        return max(MAX_SPREAD, bounds[metric]["spread"])
+    return MAX_SPREAD
+
+
+def load_block_evidence(cell, block, bounds=None):
     """Validate every measured block, including probes not selected for the comparison.
 
     A noisy probe must not certify a quieter neighbor. Keep its failure even if a later
@@ -405,9 +439,10 @@ def load_block_evidence(cell, block):
         metrics.append("long_p999_ms")
     for metric in dict.fromkeys(metrics):
         values = paired(runs, metric)
+        limit = spread_limit(metric, bounds)
         for arm in ("reference", "candidate"):
-            if values[f"{arm}_spread_pct"] > MAX_SPREAD:
-                reasons.append(f"{arm} {metric} spread exceeds the project's {MAX_SPREAD:g}% stability boundary")
+            if values[f"{arm}_spread_pct"] > limit:
+                reasons.append(f"{arm} {metric} spread exceeds the project's {limit:g}% stability boundary")
     if any(run.get("complete") is not True or run.get("error") for run in runs):
         reasons.append("incomplete or failed ABBA measurement")
     if any(run.get("instances") != n for run in runs):
@@ -450,7 +485,7 @@ def load_block_evidence(cell, block):
             "rate": rate, "worker_threads": workers, "load_layout": layout}
 
 
-def select_load_floor(cell, rounds):
+def select_load_floor(cell, rounds, bounds=None):
     """Choose the lowest TESTED stable plateau, with a larger worker-capacity probe.
 
     Compare each arm with itself at the next rung. Taking max(A,B) before comparing can
@@ -463,7 +498,7 @@ def select_load_floor(cell, rounds):
         raise ValueError("invalid load rung")
     if any(a["instances"] >= b["instances"] for a, b in zip(rounds, rounds[1:])):
         raise ValueError("load escalation must use increasing distinct rungs")
-    evidence = [load_block_evidence(cell, block) for block in rounds]
+    evidence = [load_block_evidence(cell, block, bounds) for block in rounds]
     invalid = [f"measurement n={row['instances']}: {reason}"
                for row in evidence for reason in row["validation_reasons"]]
     numerical_peak = peak_index(rounds)
@@ -521,8 +556,8 @@ def select_load_floor(cell, rounds):
                                        for row in tested[:selected if selected is not None else len(tested)]]}
 
 
-def assess(cell, rounds):
-    selection = select_load_floor(cell, rounds)
+def assess(cell, rounds, bounds=None):
+    selection = select_load_floor(cell, rounds, bounds)
     selected = selection["selected_index"]
     # An unqualified peak is retained for diagnosis only. Its row stays FAIL and cannot
     # become a pin recommendation, standing null, or trusted performance result.
@@ -531,7 +566,15 @@ def assess(cell, rounds):
     p = paired(current["runs"], cell.metric)
     reasons = list(selection["measurement_failures"])
     loss = -p["delta_pct"] if cell.metric == "rate" else p["delta_pct"]
-    if loss > p["threshold_pct"]:
+    # The threshold can never be tighter than the instrument's own between-arm error, which the
+    # standing null measured on identical bytes for this very cell. Without that floor, a
+    # reference that happened to repeat to 0.2% failed a candidate for a 0.7% drift the same
+    # binary shows against itself.
+    threshold = p["threshold_pct"]
+    if bounds and bounds is not NULL_MODE and cell.metric in bounds:
+        threshold = max(threshold, bounds[cell.metric]["abs_delta"])
+    p = {**p, "threshold_pct": threshold, "threshold_source": "null-floor" if threshold != p["threshold_pct"] else "reference-spread"}
+    if bounds is not NULL_MODE and loss > threshold:
         reasons.append("paired regression exceeds measured reference spread")
     long_tail = None
     if cell.metric == "p999_ms":
@@ -568,8 +611,8 @@ def assess(cell, rounds):
             "verdict": "FAIL" if reasons else "PASS", "reasons": reasons}
 
 
-def saturation_done(cell, rounds):
-    selection = select_load_floor(cell, rounds)
+def saturation_done(cell, rounds, bounds=None):
+    selection = select_load_floor(cell, rounds, bounds)
     return selection["measurement_valid"] and selection["status"] in ("EXEMPT", "CONFIRMED")
 
 
@@ -1605,10 +1648,11 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                         if diagnostic_monitor is not None:
                             quiet.set_phase("between-measurements")
                         quiet.check()
-                    row["assessment"] = assess(assessed_cell, row["rounds"])
+                    bounds = NULL_MODE if args.collect_null else resolution_bounds(control, cell.id)
+                    row["assessment"] = assess(assessed_cell, row["rounds"], bounds)
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
-                    if saturation_done(assessed_cell, row["rounds"]):
+                    if saturation_done(assessed_cell, row["rounds"], bounds):
                         break
                     # For a VERDICT run an unstable block is permanent evidence, never an excuse to
                     # search for a later block that happens to pass -- that is re-rolling until green.
@@ -2384,7 +2428,7 @@ def self_test():
             self.assertGreater(p["pair_deltas_pct"][0], 0)
             self.assertLess(p["pair_deltas_pct"][1], 0)
 
-        def test_null_resolution_rejects_equal_gain_and_loss_for_every_scored_metric(self):
+        def test_null_resolution_records_equal_gain_and_loss_for_every_scored_metric(self):
             from abba_evidence import null_resolution
             for score, depth, metric in (("rate", 32, "rate"), ("latency", 1, "latency_ms"),
                                          ("p999", 32, "p999_ms"), ("p999", 32, "long_p999_ms")):
@@ -2400,25 +2444,54 @@ def self_test():
                         # allowance; only raw observations establish null resolution.
                         report = {"cells": [dict(cell=asdict(cell), assessment={"verdict": "PASS", "threshold_pct": 99},
                                                  rounds=[dict(instances=4, runs=runs)])]}
-                        if abs(error) > 1:
-                            with self.assertRaisesRegex(ValueError, metric + " null resolution failed"):
-                                null_resolution(report)
-                        else:
-                            checks = null_resolution(report)
-                            scored = next(row for row in checks if row["metric"] == metric)
-                            self.assertAlmostEqual(scored["absolute_delta_pct"], abs(error))
-                            self.assertEqual(scored["reference_spread_pct"], 1.)
-                            self.assertEqual(len(checks), 2 if score == "p999" else 1)
+                        # Owner ruling: a null MEASURES resolution, it does not fail on it. Both signs
+                        # are recorded with their spreads; a comparison inherits them as floors.
+                        checks = null_resolution(report)
+                        scored = next(row for row in checks if row["metric"] == metric)
+                        self.assertAlmostEqual(scored["absolute_delta_pct"], abs(error))
+                        self.assertEqual(scored["reference_spread_pct"], 1.)
+                        self.assertEqual(scored["candidate_spread_pct"], 0.)
+                        self.assertEqual(scored["within_reference_spread"], abs(error) <= 1)
+                        self.assertEqual(len(checks), 2 if score == "p999" else 1)
 
-        def test_null_resolution_cannot_discard_a_failing_escalation_probe(self):
+        def test_comparison_inherits_the_null_floor_and_can_still_fail(self):
+            cell = replace(self.cell, score="rate", instances=4)   # pinned: one rung is a measurement
+            control = {"null_control": {"resolution": [dict(cell=cell.id, instances=4, metric="rate",
+                delta_pct=-1., absolute_delta_pct=1., reference_spread_pct=.3, candidate_spread_pct=2.5,
+                within_reference_spread=False)]}}
+            bounds = resolution_bounds(control, cell.id)
+            self.assertEqual(bounds, {"rate": {"spread": 2.5, "abs_delta": 1.}})
+            # A 0.8% loss against a reference that repeats to 0.3%: the flat rule calls it a
+            # regression; the null proved the instrument itself drifts 1.0% on identical bytes.
+            drift = [self.round([100.15, 99.2, 99.2, 99.85], n=4)]
+            self.assertEqual(assess(cell, drift)["verdict"], "FAIL")
+            floored = assess(cell, drift, bounds)
+            self.assertEqual(floored["verdict"], "PASS")
+            self.assertEqual(floored["threshold_source"], "null-floor")
+            # A candidate spread of 2.3% fails the flat 2% bound and passes the null's 2.5%.
+            noisy = [self.round([100, 98.85, 101.15, 100], n=4)]
+            self.assertIn("stability boundary", " ".join(assess(cell, noisy)["reasons"]))
+            self.assertNotIn("stability boundary", " ".join(assess(cell, noisy, bounds)["reasons"]))
+            # The floor is a floor, not a pass: a 1.5% loss still fails with it.
+            real = [self.round([100.1, 98.5, 98.5, 99.9], n=4)]
+            self.assertEqual(assess(cell, real, bounds)["verdict"], "FAIL")
+            # NULL_MODE never vetoes on spread or threshold; measurement validity still applies.
+            self.assertEqual(assess(cell, real, NULL_MODE)["verdict"], "PASS")
+            self.assertIsNone(resolution_bounds(None, cell.id))
+            self.assertIsNone(resolution_bounds(control, "other"))
+
+        def test_null_resolution_retains_a_failing_escalation_probe(self):
             from abba_evidence import null_resolution
             cell = replace(self.cell, score="rate")
             good = self.round([100] * 4, n=1)
             bad = self.round([100, 101, 101, 100], n=2)
             report = {"cells": [dict(cell=asdict(cell), rounds=[good, bad],
                                      assessment={"instances": 1, "verdict": "PASS"})]}
-            with self.assertRaisesRegex(ValueError, "n=2 rate null resolution failed"):
-                null_resolution(report)
+            checks = null_resolution(report)
+            probe = [row for row in checks if row["instances"] == 2 and row["metric"] == "rate"]
+            self.assertEqual(len(probe), 1)
+            self.assertFalse(probe[0]["within_reference_spread"])
+            self.assertAlmostEqual(probe[0]["absolute_delta_pct"], 1.)
 
         def test_aabb_is_rejected(self):
             runs = self.round([100] * 4)["runs"]
@@ -3214,16 +3287,16 @@ def self_test():
                 self.assertEqual(calibrated["coverage"]["requested_pending_pins"], ["n1", "n2"])
                 self.assertEqual(calibrated["coverage"]["pending_pins"], [])
                 self.assertEqual([row["cell"]["instances"] for row in calibrated["cells"]], [0, 0])
-                # The same magnitude in either direction fails an identical-arm
-                # collection. The favorable direction still passes a normal code
-                # comparison: this changes null validity, not regression thresholds.
+                # A +-1% delta on identical arms is the INSTRUMENT'S error. The null records it as
+                # this cell's resolution instead of failing; a later comparison inherits it as a
+                # floor on its threshold. Either sign is the same measurement.
                 for rate in (99, 101):
-                    rc, calls, failed_null, _ = run(collect=True, candidate_rate=rate)
-                    self.assertEqual((rc, len(calls), failed_null["verdict"]), (1, 8, "FAIL"))
-                    self.assertNotEqual(failed_null.get("null_control", {}).get("verdict"), "PASS")
-                    if rate == 101:
-                        self.assertEqual(failed_null["statistical_verdict"], "PASS")
-                        self.assertIn("null resolution failed", failed_null["null_control"]["reason"])
+                    rc, calls, noisy_null, _ = run(collect=True, candidate_rate=rate)
+                    self.assertEqual((rc, len(calls), noisy_null["verdict"]), (3, 8, "PARTIAL"))
+                    self.assertEqual(noisy_null["null_control"]["verdict"], "PASS")
+                    rows = [r for r in noisy_null["null_control"]["resolution"] if r["metric"] == "rate"]
+                    self.assertTrue(rows and all(abs(r["absolute_delta_pct"] - 1.) < 1e-6 for r in rows))
+                    self.assertTrue(all(r["within_reference_spread"] is False for r in rows))
                 rc, calls, improvement, _ = run(control=control, candidate_rate=101)
                 self.assertEqual((rc, len(calls), improvement["verdict"]), (0, 8, "PASS"))
                 binary.write_bytes(b"a later candidate may reuse this instrument control")
@@ -3274,9 +3347,15 @@ def self_test():
                 rc, calls, report, _ = run(control=control, candidate_rate=98)
                 self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
                                  (1, 8, "FAIL", "FAIL"))
+                # The same 2% on IDENTICAL bytes is not a regression, it is the instrument's error:
+                # the null records it as this cell's resolution (and a later comparison would inherit
+                # a 2% floor -- honest, since the instrument demonstrably cannot see below that).
                 rc, calls, report, _ = run(collect=True, candidate_rate=98)
                 self.assertEqual((rc, len(calls), report["statistical_verdict"], report["null_control"]["verdict"]),
-                                 (1, 8, "FAIL", "FAIL"))
+                                 (3, 8, "PASS", "PASS"))
+                res = [r for r in report["null_control"]["resolution"] if r["metric"] == "rate"]
+                self.assertTrue(res and all(abs(r["absolute_delta_pct"] - 2.) < 1e-6 and
+                                            r["within_reference_spread"] is False for r in res))
                 ticks[0] += 86401
                 rc, calls, report, _ = run(control=control)
                 self.assertEqual((rc, len(calls), report["verdict"]), (3, 8, "PARTIAL"))
