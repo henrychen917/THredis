@@ -76,10 +76,15 @@ class QuietMonitor:
             raise ValueError("quiet monitor ports must be integers in 1..65535")
         # Topology determines only the budget denominator, never expands the
         # observed CPU set beyond the explicit server/load axes.
-        topology = read_topology(sorted(server_cpus))
+        topology = read_topology(sorted(self.cpus))
         self.server_physical_cores = len({topology[cpu] for cpu in server_cpus})
+        # The budget must be denominated in the cores actually SAMPLED, not the server cores alone.
+        # sample() sums busy ticks across server+load CPUs, so scaling the budget by the server
+        # count only compared 112 cores' idle noise against a 32-core allowance and refused every
+        # run by ~1% (0.99s vs 0.96s per 20s on 2026-09-11). Same fraction, matching denominator.
+        self.sampled_physical_cores = len({topology[cpu] for cpu in self.cpus})
         self.window_seconds = window_seconds
-        self.cpu_budget_seconds = BACKGROUND_CPU_FRACTION * self.server_physical_cores * window_seconds
+        self.cpu_budget_seconds = BACKGROUND_CPU_FRACTION * self.sampled_physical_cores * window_seconds
         self.interval = interval
         self.tick_seconds = 1 / os.sysconf("SC_CLK_TCK")
         self.previous = cpu_snapshot(self.cpus)

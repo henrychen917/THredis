@@ -1608,9 +1608,16 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                     row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
-                    # An unstable measured block is permanent evidence, never an excuse to
-                    # search for a later block that happens to pass.
-                    if not row["assessment"]["measurement_valid"] or saturation_done(assessed_cell, row["rounds"]):
+                    if saturation_done(assessed_cell, row["rounds"]):
+                        break
+                    # For a VERDICT run an unstable block is permanent evidence, never an excuse to
+                    # search for a later block that happens to pass -- that is re-rolling until green.
+                    # CALIBRATION is the opposite problem. Its low rungs are DELIBERATELY unsaturated,
+                    # so they are unstable by construction, and the search exists precisely to walk
+                    # past them to the rung where the server saturates. Breaking on the first unstable
+                    # block meant the ladder never advanced beyond n=1: on 2026-09-11 a 33-minute
+                    # campaign measured 15 cells for one rung each and recorded zero floors.
+                    if not row["assessment"]["measurement_valid"] and not args.escalate:
                         break
             except (InterruptedError, QuietViolation):
                 raise
