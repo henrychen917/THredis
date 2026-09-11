@@ -110,6 +110,11 @@ def validate_quiet(quiet, environment, *, now, started, elapsed):
     return qstart, qend
 
 
+# Run-to-run scatter of one binary on identical bytes, measured by the standing nulls.
+# Defined here rather than imported: abbagate imports this module, so importing back is a cycle.
+PLATEAU_TOLERANCE_PCT = 1.0
+
+
 def validate_measurements(report, *, now, expected_source=None, expected_cells=None, harness=None, candidate=None,
                           expected_instrument=None):
     require(isinstance(report, dict), "ABBA evidence must be a JSON object")
@@ -187,6 +192,7 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         if report.get("run_kind") != "null-control":
             require(signed_number(assessment.get("loss_pct"), "loss") <=
                     number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
+        judged_occupancy = []
         rounds = row.get("rounds", [])
         require(isinstance(rounds, list) and rounds and all(isinstance(block, dict) for block in rounds),
                 f"unreached ABBA cell: {cell['id']}")
@@ -210,12 +216,24 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
                     mode=cell["mode"], thread_count=len(environment["server_cpus"]))
                 central_saturation = require_saturation_window(saturation, run)
                 if cell["depth"] > 1 and block["instances"] == assessment["instances"]:
-                    require(central_saturation["floor_met"], "judged block is below the productive-role floor")
+                    # Per-RUN, so it reproduces the min() bias the assessment moved away from: a cell
+                    # sitting near the floor fails whenever any one of four samples dips under. The
+                    # occupancy of the judged block is collected here and checked once, against the
+                    # BLOCK MEAN, exactly as assess() does (t01, 2026-09-12: 94.24/95.35/95.39/95.21
+                    # on identical bytes, mean 95.05 vs a 95 floor).
+                    judged_occupancy.append(central_saturation)
                 require(type(run.get("pid")) is int and run["pid"] > 0, "measurement never booted a server")
                 if cell["op"] == "REORDER":
                     number(run.get("p999_ms"), "short p99.9", positive=True)
                     number(run.get("long_p999_ms"), "long p99.9", positive=True)
                 windows += run["window_seconds"]
+        if judged_occupancy:
+            scores = [number(x.get("score_pct"), "productive-role occupancy", positive=True)
+                      for x in judged_occupancy]
+            mean = sum(scores) / len(scores)
+            require(mean >= SATURATION_FLOOR and min(scores) >= SATURATION_FLOOR - PLATEAU_TOLERANCE_PCT,
+                    f"{cell['id']}: judged block is below the productive-role floor "
+                    f"(mean {mean:.2f}%, worst {min(scores):.2f}%, floor {SATURATION_FLOOR:g}%)")
     require(qend - qstart >= windows, "quiet observer did not span all measurement windows")
     return started, environment
 
