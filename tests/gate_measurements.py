@@ -11,6 +11,7 @@ from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -81,6 +82,15 @@ def load(path=DEFAULT):
                 set(floor["geometry"]) == set(AXES) and isinstance(floor["instrument_sha256"], str) and
                 re.fullmatch("[0-9a-f]{64}", floor["instrument_sha256"]),
                 f"{ident}: calibrated floor lacks placement/instrument identity")
+        if floor["status"] == "calibrated":
+            for name, unit in (("observed_rate", "ops_per_second"), ("observed_busy", "percent")):
+                observation = floor[name]
+                require(isinstance(observation, dict) and set(observation) == {"unit", "order", "values"} and
+                        observation["unit"] == unit and observation["order"] == ["A", "B", "B", "A"] and
+                        isinstance(observation["values"], list) and len(observation["values"]) == 4 and
+                        all(type(v) in (int, float) and math.isfinite(v) and v >= 0
+                            for v in observation["values"]),
+                        f"{ident}: calibrated floor lacks its four measured {name} samples")
     return value
 
 
@@ -136,7 +146,7 @@ def configured_reference(commit, measurements=None):
 def import_calibration(path, measurements, cells):
     # Recompute the mathematical selection; trusting a serialized PASS would let an
     # edited summary promote an unsaturated or incomplete measurement to a floor.
-    from abbagate import Cell, select_load_floor
+    from abbagate import Cell, ORDER, select_load_floor
     from abba_evidence import validate_measurements, validate_null
     from abba_instrument import instrument_fingerprint
     path = Path(path).resolve()
@@ -171,9 +181,18 @@ def import_calibration(path, measurements, cells):
         require(selection["measurement_valid"] and selection["status"] == "CONFIRMED",
                 f"{cell.id}: no measured saturation plateau with higher-capacity confirmation")
         count = selection["lowest_tested_qualifying_instances"]
+        selected_runs = row["rounds"][selection["selected_index"]]["runs"]
+        # Keep the actual A1/B1/B2/A2 observations, including units, next to the
+        # floor they established. A mean or null entry loses which arm occupied
+        # the server. These are provenance only: every gate still rechecks live
+        # productive-role saturation and derives its threshold from that run.
         updates[cell.id] = dict(instances=count, shape=shape(cell), geometry=placement,
             instrument_sha256=instrument, status="calibrated",
-            observed_rate=None, observed_busy=None, provenance={"when": report["started_utc"],
+            observed_rate=dict(unit="ops_per_second", order=list(ORDER),
+                               values=[run["rate"] for run in selected_runs]),
+            observed_busy=dict(unit="percent", order=list(ORDER),
+                               values=[run["busy_pct"] for run in selected_runs]),
+            provenance={"when": report["started_utc"],
             "how": f"abbagate --escalate; {path}; sha256={report_digest}; "
                    f"reference={report['reference']['sha256']}; candidate={report['candidate']['sha256']}; "
                    f"lowest tested qualifying instances={count}; confirmation={selection['confirmation_instances']}"})
@@ -199,7 +218,9 @@ def self_test():
                 load_physical=list(range(32, 128)), load_smt=list(range(160, 256)), split_ratio="16:16")
             self.config["load_floors"]["unit"] = dict(instances=4, shape=shape(self.cell), geometry=self.placement,
                 instrument_sha256=instrument_digest(),
-                status="calibrated", observed_rate=None, observed_busy=None,
+                status="calibrated",
+                observed_rate=dict(unit="ops_per_second", order=["A", "B", "B", "A"], values=[100] * 4),
+                observed_busy=dict(unit="percent", order=["A", "B", "B", "A"], values=[99.9] * 4),
                 provenance={"when": "2026-09-11", "how": "synthetic negative control"})
 
         def test_shape_changes_invalidate_every_axis(self):
@@ -231,7 +252,11 @@ def self_test():
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.json"
                 for mutate in (lambda v: v.update(tolerance=100),
-                               lambda v: v["box"]["physical_cores"].pop("provenance")):
+                               lambda v: v["box"]["physical_cores"].pop("provenance"),
+                               lambda v: v["load_floors"]["unit"].update(observed_rate=None),
+                               lambda v: v["load_floors"]["unit"]["observed_busy"]["values"].pop(),
+                               lambda v: v["load_floors"]["unit"]["observed_rate"].update(unit="percent"),
+                               lambda v: v["load_floors"]["unit"]["observed_busy"].update(values=[float("nan")] * 4)):
                     value = copy.deepcopy(self.config)
                     mutate(value)
                     path.write_text(json.dumps(value))
@@ -293,6 +318,13 @@ def self_test():
                 config = copy.deepcopy(self.config)
                 self.assertEqual(import_calibration(path, config, [cell]), [cell.id])
                 self.assertEqual(config["load_floors"][cell.id]["instances"], 1)
+                self.assertEqual(config["load_floors"][cell.id]["observed_rate"],
+                                 dict(unit="ops_per_second", order=list(ORDER), values=[100] * 4))
+                self.assertEqual(config["load_floors"][cell.id]["observed_busy"],
+                                 dict(unit="percent", order=list(ORDER), values=[99.9] * 4))
+                stored = Path(directory) / "config.json"
+                stored.write_text(json.dumps(config))
+                self.assertEqual(load(stored), config)
                 self.assertIn(sha256(path), config["load_floors"][cell.id]["provenance"]["how"])
                 for mutate in (
                         lambda v: v.update(measurement_valid=False),

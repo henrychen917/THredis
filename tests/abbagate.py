@@ -546,7 +546,7 @@ def assess(cell, rounds):
                 reasons.append(
                     f"pinned load level {cell.instances} no longer saturates this cell "
                     f"(productive-role occupancy {min(occupancy):.1f}% < {BUSY_FLOOR:g}%); "
-                    f"re-pin it with --escalate and update the cells file")
+                    f"re-pin it with --escalate and import the calibration into gate_measurements.json")
         elif selected is None:
             reasons.append("no lowest tested load rung has valid saturation and higher-capacity plateau confirmation")
             reasons.extend(f"n={row['instances']}: {reason}"
