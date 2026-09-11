@@ -523,6 +523,68 @@ bad(){ printf 'FAIL\t0\t%s\n' "$1" >> "$LEDGER"; FAIL=$((FAIL+1)); }
                 self.assertEqual(self.collect('0\t1\t0\n', ledger)[0], (0, 1))
 
 
+# A 2026-09-11 full-inventory control retained a missing affinity observation before
+# core_tsan_build's first witness (scheduler-failure-_zqi3thv), although the live gate's
+# parallel control passed. Query the kernel through sched_getaffinity via taskset rather
+# than walking /proc/status a line at a time. The exact CPU assertion stays mandatory;
+# failed, missing and malformed observations still cannot publish a started witness.
+SCHEDULER_AFFINITY_PROBE = r'''
+  local affinity_pid=$BASHPID affinity_reply affinity_prefix
+  if ! affinity_reply=$(LC_ALL=C taskset -pc "$affinity_pid"); then
+    echo 'fixture affinity query failed' >&2
+    exit 22
+  fi
+  affinity_prefix="pid $affinity_pid's current affinity list: "
+  if [[ "$affinity_reply" != "$affinity_prefix"* ]]; then
+    printf 'fixture affinity query malformed: %s\n' "$affinity_reply" >&2
+    exit 22
+  fi
+  affinity=${affinity_reply#"$affinity_prefix"}
+  [ "$affinity" = "$LOAD_CORES" ] || {
+    echo "fixture slot affinity differs: $affinity/$LOAD_CORES" >&2
+    exit 22
+  }
+'''
+
+
+class SchedulerAffinity(unittest.TestCase):
+    def probe(self, response=None):
+        cpu = min(os.sched_getaffinity(0))
+        stub = '' if response is None else '''
+taskset(){
+  case "$AFFINITY_RESPONSE" in
+    missing) return 0;;
+    malformed) printf 'unrecognized output\\n';;
+    wrong) printf "pid %s's current affinity list: -1\\n" "$2";;
+    failed) printf "pid %s's current affinity list: %s\\n" "$2" "$LOAD_CORES"; return 1;;
+  esac
+}
+'''
+        script = stub + '\nprobe(){ local affinity=;\n' + SCHEDULER_AFFINITY_PROBE + '''
+printf '%s\\n' "$affinity"
+printf 'STARTED\\n'
+}
+probe
+'''
+        return subprocess.run(['taskset', '-c', str(cpu), 'bash', '-uc', script],
+                              env=dict(os.environ, LOAD_CORES=str(cpu),
+                                       AFFINITY_RESPONSE=response or ''),
+                              text=True, capture_output=True, timeout=5), cpu
+
+    def test_live_query_observes_the_exact_assigned_cpu(self):
+        result, cpu = self.probe()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f'{cpu}\nSTARTED\n')
+
+    def test_missing_malformed_wrong_or_failed_observation_cannot_start(self):
+        for response in ('missing', 'malformed', 'wrong', 'failed'):
+            with self.subTest(response=response):
+                result, _ = self.probe(response)
+                self.assertEqual(result.returncode, 22, result.stdout + result.stderr)
+                self.assertNotIn('STARTED', result.stdout)
+                self.assertIn('fixture ', result.stderr)
+
+
 class SchedulerWiring(unittest.TestCase):
     helper_jobs = frozenset(('production_units', 'core_tsan_build', 'waits_tsan_build'))
 
@@ -604,15 +666,12 @@ printf(){
         # or machine scheduling. No stub opens a socket or invokes a server/build/benchmark.
         stub = '''
 job_body(){
-  local current=$1 dependency status_key status_value affinity=
+  local current=$1 dependency affinity=
   if [ "$current" = "$FAILED_JOB" ] && [ "$FAILURE_BEHAVIOR" = before-affinity ]; then
     echo 'deliberate fixture failure before affinity witness' >&2
     return 17
   fi
-  while read -r status_key status_value; do
-    if [ "$status_key" = Cpus_allowed_list: ]; then affinity=$status_value; break; fi
-  done < "/proc/$BASHPID/status"
-  [ "$affinity" = "$LOAD_CORES" ] || { echo "fixture slot affinity differs: $affinity/$LOAD_CORES" >&2; exit 22; }
+__SCHEDULER_AFFINITY_PROBE__
   printf '%s\t%s\n' "$slot" "$affinity" > "$TMPDIR/fixture-affinity"
   : > "$RUN_DIR/started/$current"
   if ! job_ready "$current"; then echo "started $current before dependency completed" >&2; exit 18; fi
@@ -724,7 +783,7 @@ start_workers
 for requested in "${CANONICAL[@]}"; do collect_job "$requested"; done
 join_workers
 printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
-'''
+'''.replace('__SCHEDULER_AFFINITY_PROBE__', SCHEDULER_AFFINITY_PROBE)
         with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
             directory = Path(tmp)
             env = dict(os.environ, RUN_DIR=tmp, FAILED_JOB=failure, FAILURE_BEHAVIOR=behavior,
