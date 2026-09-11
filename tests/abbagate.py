@@ -1617,8 +1617,36 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                     # past them to the rung where the server saturates. Breaking on the first unstable
                     # block meant the ladder never advanced beyond n=1: on 2026-09-11 a 33-minute
                     # campaign measured 15 cells for one rung each and recorded zero floors.
-                    if not row["assessment"]["measurement_valid"] and not args.escalate:
-                        break
+                    if not row["assessment"]["measurement_valid"]:
+                        reasons = row["assessment"].get("reasons", [])
+                        incomplete = any("incomplete" in r or "failed ABBA" in r for r in reasons)
+                        # "Still climbing" means the fastest arm gained MORE THAN THE NOISE over the
+                        # previous rung -- a raw max is not enough, since a 0.5% rise inside a 3%
+                        # spread is noise, and treating it as a climb would let an unstable
+                        # confirmation probe be skipped. That is the p-hacking case, one rung up.
+                        still_climbing = False
+                        if len(row["rounds"]) >= 2:
+                            last = paired(row["rounds"][-1]["runs"])
+                            prev = paired(row["rounds"][-2]["runs"])
+                            fast = max(last["reference_mean"], last["candidate_mean"])
+                            before = max(prev["reference_mean"], prev["candidate_mean"])
+                            gain = 100 * (fast / before - 1) if before > 0 else 0.0
+                            noise = max(last["reference_spread_pct"], last["candidate_spread_pct"],
+                                        prev["reference_spread_pct"], prev["candidate_spread_pct"])
+                            still_climbing = gain > noise
+                        # Three cases, and only one may continue:
+                        #  * a VERDICT run: any invalid block is permanent (re-rolling is p-hacking);
+                        #  * an INCOMPLETE measurement (crash, closed connection): permanent in every
+                        #    mode -- a broken measurement says nothing about load, so searching past
+                        #    it would pin a floor on evidence that does not exist;
+                        #  * an unstable block that is NOT the current peak is the confirmation probe
+                        #    above a candidate floor, and cannot be discarded to look for a kinder
+                        #    one -- that is the same re-roll, one rung up.
+                        # What remains is calibration walking past an unstable rung while the rate is
+                        # still climbing: an unsaturated low rung, unstable by construction, and not a
+                        # floor candidate at all.
+                        if not args.escalate or incomplete or not still_climbing:
+                            break
             except (InterruptedError, QuietViolation):
                 raise
             except NotComparable as e:
