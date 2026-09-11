@@ -82,9 +82,19 @@ def validate_quiet(quiet, environment, *, now, started, elapsed):
     require(screening.get("capacity_fraction") == .0015 and
             screening.get("server_physical_cores") == len(environment["server_physical"]),
             "quiet CPU screening policy or server core count changed")
+    # The budget is denominated in the cores the guard actually SAMPLED. sample() sums busy ticks
+    # over server AND load CPUs, so a server-only denominator judged 112 cores of idle noise against
+    # a 32-core allowance and refused every run by ~1% (2026-09-11). A record that states its
+    # sampled count must match server+load exactly; a legacy record without it is server-only.
+    sampled = screening.get("sampled_physical_cores")
+    if sampled is None:
+        sampled = len(environment["server_physical"])
+    else:
+        require(sampled == len(environment["server_physical"]) + len(environment["load_physical"]),
+                "quiet CPU screening sampled-core count differs from server+load")
     window = number(screening.get("window_seconds"), "quiet screening window", positive=True)
     budget = number(screening.get("cpu_budget_seconds"), "quiet CPU budget", positive=True)
-    require(math.isclose(budget, .0015 * len(environment["server_physical"]) * window,
+    require(math.isclose(budget, .0015 * sampled * window,
                          rel_tol=1e-12, abs_tol=0), "quiet CPU budget differs from its fixed policy")
     peak = screening.get("peak_rolling")
     require(isinstance(peak, dict) and
