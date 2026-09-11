@@ -562,12 +562,12 @@
     }
   },
   "reference_binary": {
-    "path": "/home/user/Projects/bench-bins/tomokv-headline-c8e61f646",
-    "commit": "c8e61f64628655bf99acb91cd986684e5c608fde",
-    "sha256": "9846399c4c5ebb61d97015861b71e4408aad158eaf2f7dde979fde6b1044f154",
+    "path": "/home/user/Projects/bench-bins/tomokv-headline-7a2397c52",
+    "commit": "7a2397c52486cba0291a3a079aed47d556857346",
+    "sha256": "93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8",
     "provenance": {
-      "when": "2026-09-10T23:05:16.388009+00:00",
-      "how": "Commit identity from /home/user/Projects/bench-bins/MANIFEST.md headline pin and git rev-parse origin/cpp; SHA-256 computed from the existing executable. No rebuild or repin."
+      "when": "2026-09-11T15:14:59.446255+00:00",
+      "how": "Re-baseline after push: cx-final 7a2397c52 pushed to origin/cpp 2026-09-11 23:12 on a green correctness gate (419/419). Binary copied by rebaseline.sh from the pushed build; SHA-256 computed from it. Supersedes c8e61f646, which crashes (stack smash) on 2 smoke cells and refuses read-local with 2s/overlap on 6 more, so ABBA could not be evaluated against it."
     }
   },
   "load_floors": {
