@@ -24,6 +24,11 @@ import abbagate as abba
 WINDOW = 10
 
 
+# Rate jitter between saturated rungs of one binary, measured on identical bytes by the standing
+# null (see select_calibration_floor). Two nulls: 0.71% (2026-09-10), 0.6-1.0% (2026-09-11).
+PLATEAU_TOLERANCE_PCT = 1.0
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -70,8 +75,16 @@ def select_calibration_floor(cell, rounds):
         selected = 0
     else:
         for index, (current, above) in enumerate(zip(rows, rows[1:])):
+            # "Non-increasing" needs a tolerance, or a flat plateau is a coin flip. h27 on
+            # 2026-09-12: n=4 30.07M, n=8 30.27M -- a +0.7% jitter on a plateau the instrument
+            # itself scores as saturated from n=4 -- read as "still climbing", and the search walked
+            # to the 16-instance ceiling and pinned nothing; the previous run of the same cell dipped
+            # 2% at n=8 and pinned at 4. The tolerance is the instrument's demonstrated rate error on
+            # IDENTICAL bytes, measured by two standing nulls (0.71%, and 0.6-1.0% across 15 cells),
+            # not a chosen number. A genuine climb is 100%+ per rung here and cannot hide inside it.
             if (current["saturation_pct"] >= abba.BUSY_FLOOR and
-                    above["worker_threads"] > current["worker_threads"] and above["rate"] <= current["rate"]):
+                    above["worker_threads"] > current["worker_threads"] and
+                    above["rate"] < current["rate"] * (1 + PLATEAU_TOLERANCE_PCT / 100)):
                 selected, confirmation = index, index + 1
                 break
     return dict(method="one-arm-observed-peak-v1", measurement_valid=True,
@@ -259,9 +272,15 @@ def self_test():
             self.assertEqual(fast["confirmation_instances"], 4)
 
         def test_unconfirmed_unsaturated_or_no_capacity_increase_cannot_pin(self):
-            for rounds in ([self.block(1)], [self.block(1, 100), self.block(2, 101)],
+            # A rise at or beyond the measured plateau jitter (PLATEAU_TOLERANCE_PCT) is still a
+            # climb; a rise inside it is plateau noise and confirms the lower rung.
+            for rounds in ([self.block(1)], [self.block(1, 100), self.block(2, 102)],
+                           [self.block(1, 100), self.block(2, 100 * (1 + PLATEAU_TOLERANCE_PCT / 100))],
                            [self.block(1, 100, 20), self.block(2, 99)]):
                 self.assertEqual(select_calibration_floor(self.cell, rounds)["status"], "UNPROVEN")
+            within = select_calibration_floor(self.cell, [self.block(1, 100), self.block(2, 100.5)])
+            self.assertEqual((within["status"], within["lowest_tested_qualifying_instances"],
+                              within["confirmation_instances"]), ("PIN", 1, 2))
             rounds = [self.block(1), self.block(2)]
             # Two generators with eight workers each do not add capacity to one
             # sixteen-worker generator, even though instance count increased.
