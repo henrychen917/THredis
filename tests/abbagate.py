@@ -579,7 +579,14 @@ def assess(cell, rounds, bounds=None):
     long_tail = None
     if cell.metric == "p999_ms":
         long_tail = paired(current["runs"], "long_p999_ms")
-        if long_tail["delta_pct"] > long_tail["threshold_pct"]:
+        # Same contract as the primary metric: the blocker command's p99.9 threshold is floored by
+        # the null's measured error for THIS metric, and a null run never vetoes on it. Missed on the
+        # first pass; it failed t02 on identical bytes after the other fourteen cells passed.
+        long_threshold = long_tail["threshold_pct"]
+        if bounds and bounds is not NULL_MODE and "long_p999_ms" in bounds:
+            long_threshold = max(long_threshold, bounds["long_p999_ms"]["abs_delta"])
+        long_tail = {**long_tail, "threshold_pct": long_threshold}
+        if bounds is not NULL_MODE and long_tail["delta_pct"] > long_threshold:
             reasons.append("long-command p99.9 regression exceeds measured reference spread")
     gain, plateau_noise = None, None
     if cell.depth > 1:
@@ -2479,6 +2486,24 @@ def self_test():
             self.assertEqual(assess(cell, real, NULL_MODE)["verdict"], "PASS")
             self.assertIsNone(resolution_bounds(None, cell.id))
             self.assertIsNone(resolution_bounds(control, "other"))
+            # The blocker command's p99.9 has its own threshold and must follow the same contract.
+            tail = replace(self.cell, score="p999", op="REORDER", instances=4)
+            def tail_round(short, long_):
+                r = self.round([100] * 4, n=4)
+                for run, s_, l_ in zip(r["runs"], short, long_):
+                    run.update(p999_ms=s_, long_p999_ms=l_)
+                return r
+            # long p99.9 drifts +0.8% (B slower) against a reference that repeats to 0.3%.
+            drift_tail = [tail_round([1., 1., 1., 1.], [1.0015, 1.0095, 1.0095, .9985])]
+            self.assertIn("long-command p99.9", " ".join(assess(tail, drift_tail)["reasons"]))
+            tail_control = {"null_control": {"resolution": [
+                dict(cell=tail.id, instances=4, metric="p999_ms", delta_pct=0., absolute_delta_pct=0.,
+                     reference_spread_pct=.1, candidate_spread_pct=.1, within_reference_spread=True),
+                dict(cell=tail.id, instances=4, metric="long_p999_ms", delta_pct=1., absolute_delta_pct=1.,
+                     reference_spread_pct=.3, candidate_spread_pct=.3, within_reference_spread=False)]}}
+            tb = resolution_bounds(tail_control, tail.id)
+            self.assertNotIn("long-command p99.9", " ".join(assess(tail, drift_tail, tb)["reasons"]))
+            self.assertNotIn("long-command p99.9", " ".join(assess(tail, drift_tail, NULL_MODE)["reasons"]))
 
         def test_null_resolution_retains_a_failing_escalation_probe(self):
             from abba_evidence import null_resolution
