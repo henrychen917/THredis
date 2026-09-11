@@ -813,6 +813,8 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
             dependency_handshake = (directory / 'dependency-handshake').exists()
             dependency_failure = ((directory / 'dependency-failure').read_text()
                                   if (directory / 'dependency-failure').exists() else '')
+            # Return the saved path with the verdict diagnostics; callers include this in
+            # count assertions so a broken scheduler retains an actionable failure report.
             if counts != expected or (dependency_probe and (not dependency_reached or
                     (bool(dependency_failure) != add_asan_dependency) or
                     (dependency_handshake == add_asan_dependency))):
@@ -879,7 +881,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         self.assertEqual(forward['ledger'], reverse['ledger'], forward['output'] + reverse['output'])
         self.assertEqual(forward['observed_cpus'], forward['fixture_cpus'])
         self.assertEqual(reverse['observed_cpus'], reverse['fixture_cpus'])
-        self.assertEqual(forward['counts'], (len(self.canonical), 0))
+        self.assertEqual(forward['counts'], (len(self.canonical), 0), forward['output'])
         self.assertEqual({row[0] for row in reverse['families']}, set(self.canonical))
         self.assertEqual(reverse['cleaned'], set(self.canonical))
 
@@ -887,20 +889,20 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         for behavior in ('empty', 'red'):
             with self.subTest(behavior=behavior):
                 result = self.run_scheduler(failure='flipctl', behavior=behavior)
-                self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+                self.assertEqual(result['counts'], (len(self.canonical) - 1, 1), result['output'])
                 self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
 
     def test_worker_exit_before_done_is_a_failure(self):
         # Last in completion order, so its deliberate exit cannot block another stub's barrier.
         result = self.run_scheduler(failure=self.canonical[-1], behavior='crash')
-        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1), result['output'])
         self.assertIn(b'FAIL\tcorrectness family globcase\n', result['ledger'])
 
     def test_nonzero_worker_return_cannot_be_hidden_by_a_pass_fragment(self):
         result = self.run_scheduler(failure='flipctl', behavior='return')
         # The observed green row remains evidence; the abnormal return adds its own
         # infrastructure failure instead of silently deleting the partial fragment.
-        self.assertEqual(result['counts'], (len(self.canonical), 1))
+        self.assertEqual(result['counts'], (len(self.canonical), 1), result['output'])
         self.assertIn(b'ok\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
         self.assertIn(b'FAIL\tflip controller: ramp gate, hold, surge + mix re-maneuvers\n', result['ledger'])
 
@@ -909,18 +911,18 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
         # forward/reverse controls above. Three workers still open every family's publication
         # window while the collector runs; 97 synchronized shells on one CPU only add contention.
         result = self.run_scheduler(slots=3, ordered=False, delayed_completion=True)
-        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['counts'], (len(self.canonical), 0), result['output'])
 
     def test_limited_workers_reuse_slots_without_losing_or_repeating_jobs(self):
         result = self.run_scheduler(slots=3, ordered=False)
         self.assertCountEqual(result['completion'], self.canonical)
-        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['counts'], (len(self.canonical), 0), result['output'])
         self.assertEqual(len(result['families']), len(self.canonical))
         self.assertLessEqual({row[1] for row in result['families']}, {'0', '1', '2'})
 
     def test_atomic_boot_waits_for_all_other_families_and_their_cleanup(self):
         result = self.run_scheduler(slots=3, ordered=False)
-        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['counts'], (len(self.canonical), 0), result['output'])
         self.assertTrue(result['atomic_boot_reached'])
         self.assertEqual(result['exclusivity_failure'], '')
         self.assertEqual(result['completion'][-1], 'atomic_batteries')
@@ -931,7 +933,7 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
 
     def test_removing_atomic_exclusivity_fails_before_its_boot(self):
         result = self.run_scheduler(slots=2, ordered=False, remove_atomic_dependency=True)
-        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1), result['output'])
         self.assertFalse(result['atomic_boot_reached'])
         self.assertIn('atomic boot preceded completion of ', result['exclusivity_failure'])
         self.assertIn(b'FAIL\tcorrectness family atomic_batteries\n', result['ledger'])
@@ -939,20 +941,20 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
     def test_one_slot_uses_the_same_queue_without_losing_coverage(self):
         result = self.run_scheduler(slots=1)
         self.assertCountEqual(result['completion'], self.canonical)
-        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['counts'], (len(self.canonical), 0), result['output'])
         self.assertEqual({row[1] for row in result['families']}, {'0'})
         self.assertEqual(result['cleaned'], set(self.canonical))
 
     def test_failed_prerequisite_cannot_leave_the_queue_waiting_forever(self):
         result = self.run_scheduler(slots=2, ordered=False, failure='release', behavior='crash')
-        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1))
+        self.assertEqual(result['counts'], (len(self.canonical) - 1, 1), result['output'])
         self.assertIn(b'FAIL\tcorrectness family release\n', result['ledger'])
         self.assertEqual(result['helpers'], {'production_units', 'core_tsan_build', 'waits_tsan_build'})
         self.assertCountEqual(result['completion'], [name for name in self.canonical if name != 'release'])
 
     def test_release_boots_do_not_wait_for_independent_asan_build(self):
         result = self.run_scheduler(slots=2, ordered=False, dependency_probe=True)
-        self.assertEqual(result['counts'], (len(self.canonical), 0))
+        self.assertEqual(result['counts'], (len(self.canonical), 0), result['output'])
         self.assertEqual(result['helpers'], {'production_units', 'core_tsan_build', 'waits_tsan_build'})
         self.assertCountEqual(result['completion'], self.canonical)
         self.assertTrue(result['dependency_reached'], result['output'])
