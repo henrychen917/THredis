@@ -2309,11 +2309,14 @@ job_abba_selftest(){
 # unfinished connection cleanup is failed evidence, including in the parallel feature cells.
 # Calibrated inputs must also reject changed shapes and forged completion evidence before
 # ABBA consumes a floor; keep those controls inside this existing instrument row.
+# Quiet controls prove selected-core activity and occupied intended ports can refuse a
+# run, while activity outside the allocation cannot invalidate its measurement receipt.
 # The actual scheduler controls also run on every gate: a premature performance start,
 # partial completion publication or leaked child invalidates every later measurement.
 # This expanded row has its own timing context; pre-scheduler samples measured less work.
 row_begin "ABBA comparison + saturation negative controls" "with-scheduler-controls"
 py tests/abbagate.py --self-test > $TMPDIR/gate-abbagate-unit.txt 2>&1 \
+    && py tests/gate_quiet.py --self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_measurements.py --self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/background_environment_test.py >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
     && py tests/gate_history.py self-test >> $TMPDIR/gate-abbagate-unit.txt 2>&1 \
@@ -2805,17 +2808,7 @@ PY
 # our tracked background child is interruptible, so stopping the gate reaches ABBA's cleanup.
 ABBA_HISTORY_CONTEXT=$(python3 tests/gate_history.py abba-context -- "${ABBA_ARGS[@]}") || exit 2
 row_begin "headline ABBA vs last pushed binary" "$ABBA_HISTORY_CONTEXT"
-# The row watcher is this driver's sibling, not its child. Exempt only the declared exact
-# watcher identity; gate_quiet independently verifies its script, direct controller parent,
-# and --pid/--parent-start arguments on every sample. All other gate children stay foreign.
-ABBA_WATCH_START=missing
-if read -r ABBA_WATCH_STAT < "/proc/$ROW_WATCHDOG/stat"; then
-  ABBA_WATCH_STAT=${ABBA_WATCH_STAT##*) }; read -ra ABBA_WATCH_FIELDS <<< "$ABBA_WATCH_STAT"
-  ABBA_WATCH_START=${ABBA_WATCH_FIELDS[19]}
-fi
-GATE_QUIET_WATCHDOG="$ROW_WATCHDOG:$ABBA_WATCH_START" \
-  GATE_ABBA_BACKGROUND_ENVIRONMENT="${GATE_ABBA_BACKGROUND_ENVIRONMENT:-}" \
-  python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &
+python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &
 ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?

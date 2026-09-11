@@ -215,7 +215,6 @@ def arguments_for_block(args, fixture, output):
         server_cores=args.server_cores, server_smt=args.server_smt,
         load_cores=args.load_cores, load_smt=args.load_smt,
         ports=args.ports, port=args.port, memtier=args.memtier, output=output,
-        background_environment=args.background_environment,
         escalate=False, max_instances=16, collect_null=0,
         null_result=fixture / "no-standing-experiment-control.json")
 
@@ -472,8 +471,6 @@ def parse_args(argv=None):
     parser.add_argument("--cell", default="h12")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--memtier", default="memtier_benchmark")
-    parser.add_argument("--background-environment", type=Path,
-                        default=os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") or None)
     for name in ("server-cores", "server-smt", "load-cores", "load-smt"):
         parser.add_argument("--" + name, default=None)
     parser.add_argument("--ports", default="8700-8700")
@@ -488,8 +485,7 @@ def self_test():
     import io
     import unittest
     from unittest import mock
-    from background_environment import canonical_contract
-    from _abba_test_fixtures import saturation_record
+    from _abba_test_fixtures import quiet_record, saturation_record
 
     def write_snapshot(path, *, seed=7, epoch=1, cut=123, shards=256):
         # Synthetic header fixtures only; real priming always uses the server's SAVE.
@@ -511,14 +507,6 @@ def self_test():
         return SnapshotFixtures(empty, full, write_snapshot(empty), write_snapshot(full, epoch=2, cut=456))
 
     class Experiments(unittest.TestCase):
-        def test_background_environment_cli_env_and_block_arguments(self):
-            with mock.patch.dict(os.environ, {"GATE_ABBA_BACKGROUND_ENVIRONMENT": "/reviewed/env.json"}):
-                self.assertEqual(parse_args([]).background_environment, Path("/reviewed/env.json"))
-                args = parse_args(["--background-environment", "/reviewed/explicit.json"])
-                self.assertEqual(args.background_environment, Path("/reviewed/explicit.json"))
-                block = arguments_for_block(args, Path("/fixture"), Path("/output"))
-                self.assertEqual(block.background_environment, args.background_environment)
-
         def test_failed_first_null_is_retained_and_all_later_blocks_still_run(self):
             self.test_complete_driver_calls_real_abba_loop_twenty_four_times(first_null_fail=True)
 
@@ -566,14 +554,8 @@ def self_test():
                 def evidence():
                     cpus = list(range(128)) + list(range(160, 256))
                     samples = max(2, int(epoch + ticks[0] - quiet_started[0]))
-                    return dict(complete=True, interference=None, started_at=quiet_started[0],
-                        finished_at=epoch + ticks[0], samples=samples,
-                        sample_interval_seconds=1, cpus=cpus, requested_cpus=cpus,
-                        policy="operational-environment-v1", background_environment={
-                            "contract": canonical_contract(None),
-                            "source": {"path": None, "sha256": None}, "reviewed_inventory": None,
-                            "sample_artifact": str(directory / "fake-background-samples.jsonl"),
-                            "sample_count": samples, "listener_snapshots": 0})
+                    return quiet_record(cpus=cpus, samples=samples, started_at=quiet_started[0],
+                        finished_at=epoch + ticks[0], sample_artifact=directory / "fake-quiet-samples.jsonl")
                 monitor.evidence.side_effect = evidence
                 monitor.close.side_effect = evidence
                 original_window = abba.WINDOW
@@ -589,7 +571,7 @@ def self_test():
                      mock.patch.object(time, "monotonic", side_effect=lambda: ticks[0]), \
                      mock.patch.object(time, "gmtime", side_effect=lambda seconds=None:
                          original_gmtime(epoch + ticks[0] if seconds is None else seconds)), \
-                     mock.patch.dict(os.environ, {"GATE_QUIET_FILE": "", "GATE_ABBA_BACKGROUND_ENVIRONMENT": ""}), \
+                     mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(main(args), int(first_null_fail))
                 self.assertEqual(abba.WINDOW, original_window)
@@ -598,7 +580,7 @@ def self_test():
                             for sequence, arm in enumerate(abba.ORDER, 1)]
                 self.assertEqual(calls, expected)
                 self.assertEqual(quiet_factory.call_count, 7)  # Priming plus all six real blocks.
-                self.assertTrue(all(call.kwargs["background_environment"] == args.background_environment
+                self.assertTrue(all(call.kwargs["ports"] == (args.port,)
                                     for call in quiet_factory.call_args_list))
                 report = json.loads((directory / "experiment/experiment.json").read_text())
                 self.assertEqual(len(report["blocks"]), 6)
@@ -645,9 +627,8 @@ def self_test():
                     self.assertEqual(main(args), 1)
                 prime.assert_not_called()
                 quiet_factory.assert_called_once_with(list(range(32)), list(range(32, 128)) + list(range(160, 256)),
-                    own_root_pid=os.getpid(), window_seconds=abba.WINDOW,
-                    background_environment=args.background_environment,
-                    sample_artifact=directory / "out/priming-background-samples.jsonl")
+                    own_root_pid=os.getpid(), window_seconds=abba.WINDOW, ports=(args.port,),
+                    sample_artifact=directory / "out/priming-quiet-samples.jsonl")
                 quiet.close.assert_called_once()
                 report = json.loads((directory / "out/experiment.json").read_text())
                 self.assertIn("foreign CPU activity", report["error"])
@@ -664,7 +645,7 @@ def self_test():
                 args = parse_args(["--cells", str(source), "--output", str(directory / "out"),
                     "--candidate-binary", str(binary), "--memtier", sys.executable,
                     "--server-cores", "0-31", "--server-smt", "", "--load-cores", "32-127",
-                    "--load-smt", "160-255", "--background-environment", "/reviewed/exact.json"])
+                    "--load-smt", "160-255"])
                 quiet = mock.Mock()
                 quiet.evidence.return_value = {"complete": False, "interference": "late foreign work"}
                 quiet.check.side_effect = RuntimeError("late foreign work during owned priming cleanup")
@@ -683,7 +664,7 @@ def self_test():
                     self.assertEqual(main(args), 1)
                 block.assert_not_called()
                 self.assertEqual(events[:2], ["prime-cleaned-up", "quiet-closed"])
-                self.assertEqual(quiet_factory.call_args.kwargs["background_environment"], args.background_environment)
+                self.assertEqual(quiet_factory.call_args.kwargs["ports"], (args.port,))
                 report = json.loads((directory / "out/experiment.json").read_text())
                 self.assertIn("late foreign work", report["error"])
                 self.assertEqual(report["quiet_priming"]["interference"], "late foreign work")
@@ -992,13 +973,13 @@ def main(args):
         signal.signal(sig, interrupted)
     try:
         # Support probes and snapshot preparation precede abbagate.main(). Observe
-        # their entire lifetime, including owned cleanup, under the same reviewed
-        # contract as every scored block; a final latched failure forbids scoring.
+        # their entire lifetime, including owned cleanup, on the selected CPUs.
+        # A final latched failure forbids scoring.
         priming_quiet = abba.QuietMonitor(
             abba.cpus(args.server_cores) + abba.cpus(args.server_smt),
             abba.cpus(args.load_cores) + abba.cpus(args.load_smt), own_root_pid=os.getpid(),
-            window_seconds=abba.WINDOW, background_environment=args.background_environment,
-            sample_artifact=output / "priming-background-samples.jsonl")
+            window_seconds=abba.WINDOW, ports=(args.port,),
+            sample_artifact=output / "priming-quiet-samples.jsonl")
         priming_quiet.start()
         report["quiet_before_priming"] = priming_quiet.evidence()
         quiet_file = os.getenv("GATE_QUIET_FILE")
@@ -1034,9 +1015,6 @@ def main(args):
         priming_quiet = None
         for specification in BLOCKS:
             report["blocks"].append(run_block(args, fixture, output, cell, snapshot, specification))
-            if (report["blocks"][-1]["abba"].get("environment", {}).get("background_environment") !=
-                    report["quiet_priming"]["background_environment"]["contract"]):
-                raise RuntimeError("scored block and snapshot priming used different background contracts")
             report["elapsed_seconds"] = time.monotonic() - started
             (output / "experiment.json").write_text(json.dumps(report, indent=2) + "\n")
         report["evaluation"] = evaluate(report["blocks"])

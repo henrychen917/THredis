@@ -8,7 +8,6 @@ import re
 
 from abba_instrument import validate_fingerprint
 from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
-from background_environment import canonical_contract, validate_contract, STRICT
 
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
@@ -42,6 +41,63 @@ def digest(data):
 def utc_seconds(value):
     require(isinstance(value, str), "missing ABBA start timestamp")
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def validate_quiet(quiet, environment, *, now, started, elapsed):
+    """Replay scoped preflight evidence; never authenticate unrelated processes.
+
+    The live observer reads only the requested /proc/stat CPU rows. During a
+    benchmark those totals include our own load, so runtime samples are retained
+    as observations and the CPU budget applies to the quiet preflight only.
+    """
+    require(isinstance(quiet, dict), "invalid quiet-box evidence")
+    require(quiet.get("policy") == "selected-core-port-budget-v1",
+            "missing or unsupported selected-core quiet-box policy")
+    require(quiet.get("complete") is True and quiet.get("interference", "missing") is None,
+            "quiet-box evidence missing, incomplete, or contended")
+    qstart = number(quiet.get("started_at"), "quiet start", positive=True)
+    qend = number(quiet.get("finished_at"), "quiet end", positive=True)
+    number(quiet.get("sample_interval_seconds"), "quiet sample interval", positive=True)
+    samples = quiet.get("samples")
+    require(type(samples) is int and samples >= 2 and qstart < qend <= now + 1,
+            "quiet observer did not complete its sampling interval")
+    require(type(quiet.get("cpu_samples")) is int and quiet["cpu_samples"] == samples and
+            isinstance(quiet.get("sample_artifact"), str) and quiet["sample_artifact"],
+            "selected CPU observations did not cover every quiet sample")
+    selected = set(environment["server_cpus"] + environment["load_cpus"])
+    for field in ("cpus", "requested_cpus"):
+        value = quiet.get(field)
+        require(isinstance(value, list) and all(type(cpu) is int for cpu in value) and
+                len(value) == len(set(value)) and set(value) == selected,
+                "quiet observer did not watch exactly the measurement CPUs")
+    ports = quiet.get("ports")
+    require(isinstance(ports, list) and ports and
+            all(type(port) is int and 0 < port <= 65535 for port in ports) and
+            len(ports) == len(set(ports)) and ports == [environment.get("port")] and
+            type(quiet.get("listener_checks")) is int and quiet["listener_checks"] >= 1,
+            "quiet observer did not check its intended ports")
+    screening = quiet.get("generic_cpu_screening")
+    require(isinstance(screening, dict) and screening.get("scope") == "preflight",
+            "quiet CPU screening must identify its preflight scope")
+    require(screening.get("capacity_fraction") == .0015 and
+            screening.get("server_physical_cores") == len(environment["server_physical"]),
+            "quiet CPU screening policy or server core count changed")
+    window = number(screening.get("window_seconds"), "quiet screening window", positive=True)
+    budget = number(screening.get("cpu_budget_seconds"), "quiet CPU budget", positive=True)
+    require(math.isclose(budget, .0015 * len(environment["server_physical"]) * window,
+                         rel_tol=1e-12, abs_tol=0), "quiet CPU budget differs from its fixed policy")
+    peak = screening.get("peak_rolling")
+    require(isinstance(peak, dict) and
+            number(peak.get("cpu_seconds"), "quiet peak CPU seconds") <= budget,
+            "quiet preflight exceeded its CPU budget")
+    require(number(screening.get("preflight_seconds"), "quiet preflight duration", positive=True) >= window,
+            "quiet preflight did not cover its screening window")
+    # The final sample precedes complete. Count * interval is not an elapsed-time
+    # bound because sampling itself takes time; timestamps and measured windows
+    # independently prevent a preflight-only report from certifying a comparison.
+    require(started <= qstart and qend <= started + elapsed + 1,
+            "quiet timestamps are outside this ABBA run")
+    return qstart, qend
 
 
 def validate_measurements(report, *, now, expected_source=None, expected_cells=None, harness=None, candidate=None,
@@ -103,55 +159,8 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
             not set(environment["server_cpus"]) & set(environment["load_cpus"]), "invalid regression CPU allocation")
     for key in ("uname", "memtier_sha256", "memtier_version", "keys", "data_bytes", "key_pattern", "split_ratio", "population_by_arm"):
         require(environment.get(key), f"missing measurement environment: {key}")
-    quiet = report.get("quiet_box", {})
-    require(isinstance(quiet, dict), "invalid quiet-box evidence")
-    require(quiet.get("policy") == "operational-environment-v1",
-            "missing or unsupported operational quiet-box policy")
-    background = quiet.get("background_environment")
-    require(isinstance(background, dict), "missing quiet-box background environment evidence")
-    # Bind the exact reviewed identities (or the default affinity/budget policy), not the
-    # inventory capture time or its changing CPU counters. Both arms and any reused
-    # null must run under this same contract; observation provenance stays in quiet.
-    contract = validate_contract(environment.get("background_environment"))
-    require(validate_contract(background.get("contract")) == contract,
-            "quiet-box background environment differs from measurement environment")
-    require(quiet.get("complete") is True and quiet.get("interference", "missing") is None,
-            "quiet-box evidence missing, incomplete, or contended")
-    qstart = number(quiet.get("started_at"), "quiet start", positive=True)
-    qend = number(quiet.get("finished_at"), "quiet end", positive=True)
-    number(quiet.get("sample_interval_seconds"), "quiet sample interval", positive=True)
-    require(type(quiet.get("samples")) is int and quiet["samples"] >= 2 and qstart < qend <= now + 1,
-            "quiet observer did not complete its sampling interval")
-    require(type(background.get("sample_count")) is int and background["sample_count"] == quiet["samples"] and
-            isinstance(background.get("sample_artifact"), str) and background["sample_artifact"] and
-            type(background.get("listener_snapshots")) is int and
-            0 <= background["listener_snapshots"] <= quiet["samples"],
-            "background environment observations did not cover every quiet sample")
-    provenance = background.get("source")
-    require(isinstance(provenance, dict) and set(provenance) == {"path", "sha256"},
-            "missing background environment source provenance")
-    if contract["policy"] == STRICT:
-        require(provenance == {"path": None, "sha256": None} and
-                background.get("reviewed_inventory", "missing") is None,
-                "strict background policy unexpectedly carries reviewed identities")
-    else:
-        require(isinstance(provenance["path"], str) and provenance["path"] and
-                isinstance(provenance["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", provenance["sha256"]) and
-                isinstance(background.get("reviewed_inventory"), dict),
-                "missing reviewed background inventory provenance")
-        require(canonical_contract(background["reviewed_inventory"]) == contract,
-                "reviewed background inventory differs from its environment contract")
-    if any(row.get("listener_ports") for row in contract["reviewed_identities"]):
-        require(background["listener_snapshots"] == quiet["samples"],
-                "reviewed idle-server listeners were not observed at every quiet sample")
-    monitored = quiet.get("cpus", [])
-    requested = quiet.get("requested_cpus", [])
-    require(set(requested) == set(environment["server_cpus"] + environment["load_cpus"]) and
-            set(requested) <= set(monitored), "quiet observer did not watch the measurement CPUs")
-    # The monitor sets complete only after its final sample. Sample iteration itself takes time,
-    # so samples*interval is not an elapsed-time bound; requiring that would reject healthy runs.
-    # Timestamp bounds and the aggregate window duration independently rule out preflight-only data.
-    require(started <= qstart and qend <= started + elapsed + 1, "quiet timestamps are outside this ABBA run")
+    qstart, qend = validate_quiet(report.get("quiet_box"), environment, now=now,
+                                  started=started, elapsed=elapsed)
     windows = 0
     for cell, row in zip(cells, rows):
         require(row.get("verdict") == "PASS" and row.get("instrument_valid", True) is True,

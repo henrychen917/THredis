@@ -278,8 +278,7 @@ def self_test():
             from abbagate import Cell, load_layout, ORDER, assess
             from abba_instrument import instrument_fingerprint
             from abba_evidence import null_result
-            from background_environment import canonical_contract
-            from _abba_test_fixtures import saturation_record
+            from _abba_test_fixtures import saturation_record, quiet_record
             cell = Cell(**self.cell)
             rounds = []
             for count in (1, 2):
@@ -293,22 +292,17 @@ def self_test():
             instrument = instrument_fingerprint(DEFAULT.parent.parent)
             load_cpus = self.placement["load_physical"] + self.placement["load_smt"]
             monitored = list(range(32)) + load_cpus
-            background = canonical_contract(None)
             source = "synthetic cell fixture\n"
             report = dict(schema=1, order=list(ORDER), window_seconds=20, elapsed_seconds=200,
                 verdict="PARTIAL", statistical_verdict="PASS", run_kind="comparison", subset="full", only="",
                 receipt_harness_sha256="a" * 64, comparison_trusted=False,
                 measurement_valid=True, escalate=True, started_utc=started, instrument_fingerprint=instrument,
                 cell_source=dict(text=source, sha256=hashlib.sha256(source.encode()).hexdigest(), total_cells=1),
-                quiet_box=dict(complete=True, interference=None, policy="operational-environment-v1",
-                    started_at=epoch, finished_at=epoch + 200, sample_interval_seconds=1, samples=201,
-                    cpus=monitored, requested_cpus=monitored, background_environment=dict(contract=background,
-                        sample_count=201, sample_artifact="synthetic.jsonl", listener_snapshots=0,
-                        source={"path": None, "sha256": None}, reviewed_inventory=None)),
-                environment={**self.placement, "server_cpus": list(range(32)), "load_cpus": load_cpus,
+                quiet_box=quiet_record(cpus=monitored, started_at=epoch, finished_at=epoch + 200, samples=201),
+                environment={**self.placement, "port": 8700, "server_cpus": list(range(32)), "load_cpus": load_cpus,
                     "python_runtime": instrument["python"], "uname": ["synthetic"], "memtier_sha256": "c" * 64,
                     "memtier_version": "fixture", "keys": 2000000, "data_bytes": 64, "key_pattern": "P:P",
-                    "population_by_arm": {"A": "wire", "B": "wire"}, "background_environment": background},
+                    "population_by_arm": {"A": "wire", "B": "wire"}},
                 candidate={"sha256": "a" * 64}, reference={"sha256": "b" * 64},
                 coverage={"ids": [cell.id], "count": 1, "pending_pins": [], "requested_pending_pins": [cell.id]},
                 cells=[dict(cell=asdict(cell), rounds=rounds, verdict="PASS", assessment=assess(cell, rounds))])

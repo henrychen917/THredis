@@ -1346,10 +1346,6 @@ def parse_args():
                    default=int(os.environ["GATE_ABBA_PORT"]) if os.getenv("GATE_ABBA_PORT") else None,
                    help="optional single port inside --ports; standalone default 8700")
     p.add_argument("--memtier", default=os.getenv("GATE_ABBA_MEMTIER", "memtier_benchmark"))
-    p.add_argument("--background-environment", type=Path,
-                   default=Path(os.environ["GATE_ABBA_BACKGROUND_ENVIRONMENT"]) if os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") else None,
-                   help="reviewed background identities; free-roaming desktop work is recorded and budgeted, "
-                        "while competing experiments and unavoidable CPU overlap are refused")
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--collect-null", type=int, choices=(0, 1), default=0,
                    help="1 freezes one executable into identical arms and collects a null; always PARTIAL/exit 3")
@@ -1460,10 +1456,8 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
             except (OSError, ValueError) as error:
                 control_error = f"standing null unavailable: {args.null_result}: {error}"
                 print("ABBA UNTRUSTED: " + control_error + "; all measurements still run", flush=True)
-        quiet_options = {"own_root_pid": os.getpid(), "window_seconds": WINDOW}
-        if diagnostic_monitor is None:
-            quiet_options.update(background_environment=args.background_environment,
-                                 sample_artifact=out / "background-environment-samples.jsonl")
+        quiet_options = {"own_root_pid": os.getpid(), "window_seconds": WINDOW,
+                         "ports": (args.port,), "sample_artifact": out / "quiet-samples.jsonl"}
         quiet = (diagnostic_monitor or QuietMonitor)(server_cpus, load_cpus, **quiet_options)
         quiet.start()  # Fail before reference builds, capability probes, or server boots.
         report["quiet_box"] = quiet.evidence()
@@ -1523,8 +1517,6 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                                  "memtier_sha256": sha256(Path(args.memtier)),
                                  "memtier_version": capture([args.memtier, "--version"]).stdout.strip(),
                                  **runner.population_environment()}
-        if diagnostic_monitor is None:
-            report["environment"]["background_environment"] = quiet.evidence()["background_environment"]["contract"]
         print(f"GEOMETRY server={args.server_cores} ({len(server_physical)} physical cores) "
               f"server-smt={args.server_smt or '(reserved)'} ({len(server_cpus)} threads) "
               f"load={args.load_cores} load-smt={args.load_smt or '(reserved)'} "
@@ -1701,23 +1693,17 @@ def self_test():
     import io
     import unittest
     from unittest import mock
-    from background_environment import canonical_contract
-    from _abba_test_fixtures import saturation_record
+    from _abba_test_fixtures import quiet_record, saturation_record
     (ROOT / "build").mkdir(exist_ok=True)
 
     class ABBA(unittest.TestCase):
         def setUp(self):
             self.cell = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
-            # Serverless loop tests replace the process observer too. Dedicated
+            # Serverless loop tests replace the selected-CPU observer too. Dedicated
             # negative controls below inject failures through the same main path.
             self.quiet = mock.Mock()
-            environment = {"contract": canonical_contract(None), "source": {"path": None, "sha256": None},
-                           "reviewed_inventory": None, "sample_artifact": "/fake/background-samples.jsonl",
-                           "sample_count": 2, "listener_snapshots": 0}
-            self.quiet.evidence.return_value = {"interference": None, "samples": 2,
-                "policy": "operational-environment-v1", "background_environment": environment}
-            self.quiet.close.return_value = {"interference": None, "samples": 3, "complete": True,
-                "policy": "operational-environment-v1", "background_environment": {**environment, "sample_count": 3}}
+            self.quiet.evidence.return_value = quiet_record()
+            self.quiet.close.return_value = quiet_record(samples=3)
             patcher = mock.patch(__name__ + ".QuietMonitor", return_value=self.quiet)
             self.quiet_factory = patcher.start()
             self.addCleanup(patcher.stop)
@@ -2582,7 +2568,7 @@ def self_test():
         def fake_main(self, *, pin="-", depth=32, escalate=False, busy=99.9,
                       climbing=False, ceiling=16, contend_after=None, reference_error=None, rates=None,
                       run_overrides=None, load_cores="32-127", load_smt="160-255",
-                      diagnostic_profile=0, background_environment=None,
+                      diagnostic_profile=0,
                       diagnostic_pin_load_workers=0, diagnostic_load_startup_seconds=0):
             # Invoke main() and its real load layout, not assess() with fabricated
             # rounds. The regression was in the loop that PRODUCES rounds, and a
@@ -2599,8 +2585,6 @@ def self_test():
                         "--output", str(output), "--memtier", sys.executable,
                         "--server-cores", "0-31", "--server-smt", "", "--load-cores", load_cores,
                         "--load-smt", load_smt, "--max-instances", str(ceiling)] + (["--escalate"] if escalate else [])
-                if background_environment:
-                    argv += ["--background-environment", str(background_environment)]
                 with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {}, clear=True):
                     args = parse_args()
                 order, layouts = [], []
@@ -2712,20 +2696,12 @@ def self_test():
                 self.assertEqual(len(measurements), 4)
                 self.assertEqual(self.quiet_factory.call_args.kwargs["window_seconds"], window)
 
-        def test_background_environment_env_and_explicit_cli(self):
-            with mock.patch.dict(os.environ, {"GATE_ABBA_BACKGROUND_ENVIRONMENT": "/reviewed/from-gate.json"}, clear=True):
-                with mock.patch.object(sys, "argv", ["abbagate.py"]):
-                    self.assertEqual(parse_args().background_environment, Path("/reviewed/from-gate.json"))
-                with mock.patch.object(sys, "argv", ["abbagate.py", "--background-environment", "/reviewed/explicit.json"]):
-                    self.assertEqual(parse_args().background_environment, Path("/reviewed/explicit.json"))
-
-        def test_real_loop_forwards_reviewed_environment_and_binds_its_contract(self):
-            _, measurements, _, report, _ = self.fake_main(pin=4, background_environment="/reviewed/exact.json")
+        def test_real_loop_passes_selected_port_and_preserves_cpu_samples(self):
+            _, measurements, _, report, _ = self.fake_main(pin=4)
             self.assertEqual(len(measurements), 4)
-            self.assertEqual(self.quiet_factory.call_args.kwargs["background_environment"], Path("/reviewed/exact.json"))
-            self.assertEqual(self.quiet_factory.call_args.kwargs["sample_artifact"].name, "background-environment-samples.jsonl")
-            self.assertEqual(report["environment"]["background_environment"],
-                             self.quiet.evidence.return_value["background_environment"]["contract"])
+            self.assertEqual(self.quiet_factory.call_args.kwargs["ports"], (8700,))
+            self.assertEqual(self.quiet_factory.call_args.kwargs["sample_artifact"].name, "quiet-samples.jsonl")
+            self.assertEqual(report["quiet_box"]["policy"], "selected-core-port-budget-v1")
 
         def test_final_observation_can_fail_completed_real_loop(self):
             def close():
@@ -3125,13 +3101,8 @@ def self_test():
                     quiet = mock.Mock()
                     def evidence():
                         count = max(2, int(epoch + ticks[0] - quiet_started))
-                        return dict(complete=True, interference=None, started_at=quiet_started,
-                            finished_at=epoch + ticks[0], samples=count,
-                            policy="operational-environment-v1", background_environment={
-                                "contract": canonical_contract(None), "source": {"path": None, "sha256": None},
-                                "reviewed_inventory": None, "sample_artifact": str(out / "background-samples.jsonl"),
-                                "sample_count": count, "listener_snapshots": 0},
-                            sample_interval_seconds=1, cpus=cpus_, requested_cpus=cpus_)
+                        return quiet_record(cpus=cpus_, samples=count, started_at=quiet_started,
+                            finished_at=epoch + ticks[0], sample_artifact=out / "quiet-samples.jsonl")
                     quiet.evidence.side_effect = evidence
                     quiet.close.side_effect = evidence
                     def measure(_runner, cell, arm, index, instances, knobs):

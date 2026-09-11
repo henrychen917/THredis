@@ -267,8 +267,7 @@ def run_block(args, fixture, snapshot, output, postures):
         population_by_arm={"A": "snapshot", "B": "snapshot"}, attempts=attempts,
         postures=postures, setarch=args.setarch, **kw)
     def quiet(*a, **kw):
-        return DiagnosticQuiet(*a, background_environment=args.background_environment,
-            sample_artifact=output / "background-environment-samples.jsonl", **kw)
+        return DiagnosticQuiet(*a, **kw)
     try:
         rc = abba.main(options, diagnostic_monitor=quiet, diagnostic_profile=0)
     finally:
@@ -291,8 +290,6 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path)
     parser.add_argument("--memtier", default="memtier_benchmark")
     parser.add_argument("--setarch", default="setarch")
-    parser.add_argument("--background-environment", type=Path,
-                        default=os.getenv("GATE_ABBA_BACKGROUND_ENVIRONMENT") or None)
     for name in ("server-cores", "server-smt", "load-cores", "load-smt"):
         parser.add_argument("--" + name, default=None)
     parser.add_argument("--ports", default="8700-8700")
@@ -599,7 +596,8 @@ def self_test():
                     self.assertEqual(factory.call_count, 2)
                     self.assertTrue(all(block["complete"] for block in blocks))
                     self.assertEqual([len(block["attempts"]) for block in blocks], [4, 4])
-                    self.assertTrue(all(call.kwargs["background_environment"] == args.background_environment for call in factory.call_args_list))
+                    self.assertTrue(all(call.kwargs["ports"] == (abba.select_port(args.ports, args.port)[0],)
+                                        for call in factory.call_args_list))
                     self.assertTrue(all(block["abba"]["normal_gate_eligible"] is False for block in blocks))
                     if broken:
                         self.assertEqual(blocks[0]["abba"]["statistical_verdict"], "FAIL")

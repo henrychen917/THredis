@@ -206,7 +206,7 @@ class PerformanceFailures(unittest.TestCase):
 
 
 class LedgerWiring(unittest.TestCase):
-    instrument_helpers = ('tests/abbagate.py', 'tests/gate_measurements.py',
+    instrument_helpers = ('tests/abbagate.py', 'tests/gate_quiet.py', 'tests/gate_measurements.py',
                           'tests/background_environment_test.py', 'tests/gate_history.py',
                           'tests/gate_process_test.py', 'tests/gates_test.py')
 
@@ -218,7 +218,7 @@ class LedgerWiring(unittest.TestCase):
             end = gate.index('if [ "$TIER" = quick ]; then', start)
         else:
             marker = gate.index('# ---- B. mandatory headline performance')
-            start = gate.index('ABBA_WATCH_START=missing\n', marker)
+            start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &\n', marker)
             end = gate.index('\nesac', start) + len('\nesac')
         definitions = ''
         if kind == 'feature':
@@ -233,9 +233,6 @@ CANDIDATE_BINARY=/unused
 GATE_RATIO=6:2
 ABBA_ARGS=()
 ABBA_OUTPUT="$TMPDIR/abba"
-# Dispatch uses an owned controller identity as the fixture's watchdog stand-in. The actual
-# watcher command/parent validation is covered by gate_quiet's real-process controls.
-ROW_WATCHDOG=$BASHPID
 FEATURE_OUTPUT="$GATE_FEATURE_OUTPUT"
 collect_job(){
   case "$1" in
@@ -249,7 +246,7 @@ py(){
   # New control helpers must not accidentally inherit the feature-cell verdict.
   case "$1" in
     tests/feature_gate.py) return "$WIRE_RC";;
-    tests/abbagate.py|tests/gate_measurements.py|tests/background_environment_test.py|tests/gate_history.py|tests/gate_process_test.py|tests/gates_test.py)
+    tests/abbagate.py|tests/gate_quiet.py|tests/gate_measurements.py|tests/background_environment_test.py|tests/gate_history.py|tests/gate_process_test.py|tests/gates_test.py)
       printf '%s\\n' "$1" >> "$WIRE_CONTROLS"
       if [ -z "$WIRE_ABBA_HELPER" ] || [ "$1" = "$WIRE_ABBA_HELPER" ]; then
         return "$WIRE_ABBA_RC"
@@ -261,7 +258,6 @@ py(){
 python3(){
   if [ "$WIRE_KIND" = performance ]; then
     printf '%s\\0' "$@" > "$WIRE_ARGV"
-    printf '%s\\n' "$GATE_QUIET_WATCHDOG" > "$WIRE_WATCHDOG"
   fi
   return "$WIRE_ABBA_RC"
 }
@@ -276,9 +272,7 @@ say(){ :; }
             env = dict(os.environ, WIRE_RC=str(rc), WIRE_ABBA_RC=str(abba_rc),
                        WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory,
                        WIRE_KIND=kind, WIRE_ARGV=str(Path(directory) / 'argv'),
-                       WIRE_ABBA_HELPER=abba_helper, WIRE_CONTROLS=str(Path(directory) / 'controls'),
-                       WIRE_WATCHDOG=str(Path(directory) / 'watchdog'))
-            env.pop('GATE_QUIET_WATCHDOG', None)
+                       WIRE_ABBA_HELPER=abba_helper, WIRE_CONTROLS=str(Path(directory) / 'controls'))
             subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
                             prelude + definitions + gate[start:end]], cwd=root, env=env,
                            text=True, capture_output=True, check=True, timeout=10)
@@ -290,7 +284,6 @@ say(){ :; }
             if kind == 'performance':
                 argv = (Path(directory) / 'argv').read_bytes().decode().rstrip('\0').split('\0')
                 self.assertEqual(argv, ['tests/abbagate.py', '--output', str(Path(directory) / 'abba')])
-                self.assertRegex((Path(directory) / 'watchdog').read_text().strip(), r'^[1-9][0-9]*:[1-9][0-9]*$')
             return [line.split('\t') for line in ledger.read_text().splitlines()]
 
     def test_feature_rows_precede_quick_exit(self):
@@ -330,13 +323,61 @@ say(){ :; }
                     self.assertIn('partial diagnostic or skipped', rows[0][2])
 
 
+class QuietShellPreflight(unittest.TestCase):
+    def run_check(self, *, listener='', busy_selected=False, busy_elsewhere=False, missing_selected=False):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / 'tools/quietcheck.sh').read_text()
+        # Keep the production ss decision and /proc/stat selection. Substitute only
+        # the operating-system observations; tests must never wait for a quiet box.
+        script = script.replace('/proc/stat;', '"$WIRE_STAT";')
+        with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
+            directory = Path(temporary)
+            before = ''.join(f'cpu{cpu} 0 0 0 100 0 0 0 0\n' for cpu in range(4))
+            after = ''.join(
+                f'cpu{cpu} {100 if (busy_selected if cpu >= 2 else busy_elsewhere) else 0}'
+                f' 0 0 {100 if (busy_selected if cpu >= 2 else busy_elsewhere) else 200} 0 0 0 0\n'
+                for cpu in range(4))
+            if missing_selected:
+                after = '\n'.join(line for line in after.splitlines() if not line.startswith('cpu3 ')) + '\n'
+            (directory / 'stat').write_text(before)
+            (directory / 'after').write_text(after)
+            env = dict(os.environ, WIRE_STAT=str(directory / 'stat'),
+                       WIRE_AFTER=str(directory / 'after'), WIRE_LISTENER=listener)
+            stub = '''ss(){
+  [ "$*" = '-H -ltn sport = :19000' ] || return 87
+  printf '%s' "$WIRE_LISTENER"
+}
+sleep(){ cp "$WIRE_AFTER" "$WIRE_STAT"; }
+'''
+            return subprocess.run(['bash', '-uc', stub + script, 'quietcheck.sh', '2-3', '19000'],
+                                  cwd=root, env=env, text=True, capture_output=True, timeout=5)
+
+    def test_listener_without_visible_pid_refuses_intended_port(self):
+        result = self.run_check(listener='LISTEN 0 128 0.0.0.0:19000 0.0.0.0:*')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('port 19000 already listening', result.stderr)
+
+    def test_only_selected_cores_contribute_cpu_activity(self):
+        idle = self.run_check(busy_elsewhere=True)
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        busy = self.run_check(busy_selected=True)
+        self.assertEqual(busy.returncode, 2, busy.stderr)
+        self.assertIn('cpu2=100%', busy.stderr)
+        self.assertIn('cpu3=100%', busy.stderr)
+
+    def test_missing_selected_cpu_cannot_claim_quiet(self):
+        result = self.run_check(missing_selected=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('missing selected CPU counters', result.stderr)
+
+
 class ABBATermination(unittest.TestCase):
     def test_terminating_gate_reaps_driver_and_owned_child_but_not_foreign_process(self):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         cleanup = gate[gate.index('reap_children(){'):gate.index('\nport_listeners(){')]
         marker = gate.index('# ---- B. mandatory headline performance')
-        start = gate.index('ABBA_WATCH_START=missing\n', marker)
+        start = gate.index('python3 tests/abbagate.py "${ABBA_ARGS[@]}" --output "$ABBA_OUTPUT" &\n', marker)
         launch = gate[start:gate.index('\nesac', start) + len('\nesac')]
         with tempfile.TemporaryDirectory(dir=root / 'build') as tmp:
             directory = Path(tmp)
@@ -350,12 +391,7 @@ from abbagate import Children, parse_args
 sys.argv=['abbagate.py', *sys.argv[2:]]
 args=parse_args(); out=args.output
 assert out == Path(os.environ['WIRE_OUTPUT']), 'production output argument was lost'
-token=os.environ['GATE_QUIET_WATCHDOG']
-parent,start=map(int, token.split(':'))
-assert parent == os.getppid(), 'fixture controller identity was not transmitted'
-fields=Path(f'/proc/{parent}/stat').read_text().rsplit(')',1)[1].split()
-assert int(fields[19]) == start, 'fixture controller start identity changed'
-(out/'dispatch.json').write_text(json.dumps({'argv':sys.argv, 'watchdog':token}))
+(out/'dispatch.json').write_text(json.dumps({'argv':sys.argv}))
 children=Children()
 def interrupted(signum, frame):
     raise InterruptedError(signum)
@@ -372,7 +408,7 @@ finally:
 ''')
             prelude = '''set -u
 SRV=0; GLOBCASE_ORACLE=0; MMPID=0; PAUSABLE_PID=0; ABBA_PID=0; ABBA_ARGS=(); WORKER_PIDS=()
-ABBA_OUTPUT="$WIRE_OUTPUT"; ROW_WATCHDOG=$BASHPID
+ABBA_OUTPUT="$WIRE_OUTPUT"
 stop_workers(){ :; }
 row_unwatch(){ :; }
 python3(){
@@ -384,7 +420,6 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
 '''
             env = dict(os.environ, WIRE_PYTHON=sys.executable, WIRE_DRIVER=str(driver),
                        WIRE_TESTS=str(root / 'tests'), WIRE_OUTPUT=str(directory))
-            env.pop('GATE_QUIET_WATCHDOG', None)
             foreign = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
             process = subprocess.Popen(['bash', '-c', prelude + '\n' + cleanup + '\n' + launch],
                                        cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -404,7 +439,6 @@ bad(){ printf 'FAIL\\n' >> "$WIRE_OUTPUT/verdict"; }
                 self.assertTrue(pids, 'mock ABBA never reached its measurement boundary')
                 dispatch = json.loads((directory / 'dispatch.json').read_text())
                 self.assertEqual(dispatch['argv'], ['abbagate.py', '--output', str(directory)])
-                self.assertRegex(dispatch['watchdog'], r'^[1-9][0-9]*:[1-9][0-9]*$')
                 process.terminate()  # Only the gate PID receives TERM from the caller.
                 stdout, stderr = process.communicate(timeout=5)
                 self.assertEqual(process.returncode, 130, (stdout, stderr))
@@ -1164,7 +1198,7 @@ LEDGER="$RUN_DIR/ledger"; TIMINGS="$RUN_DIR/timings"; : > "$LEDGER"; : > "$TIMIN
 phase(){ printf 'PHASE %s\n' "$1" >> "$EVENTS"; }
 program_state(){ :; }
 quiet_wait(){ :; }
-row_begin(){ ROW_WATCHDOG=$BASHPID; }
+row_begin(){ :; }
 collect_job(){
   local required=("$1") child
   case "$1" in
@@ -1188,7 +1222,6 @@ python3(){
   case " ${JOB_NAMES[*]} " in *' abba '*|*' perf '*) return 73;; esac
   printf 'ABBA\n' >> "$EVENTS"
   printf '%s\0' "$@" > "$RUN_DIR/argv"
-  printf '%s\n' "$GATE_QUIET_WATCHDOG" > "$RUN_DIR/watchdog"
 }
 '''
         with tempfile.TemporaryDirectory(dir=root / 'build') as temporary:
@@ -1204,7 +1237,6 @@ python3(){
                     env = dict(os.environ, RUN_DIR=str(directory), EVENTS=str(directory / 'events'),
                                WIRE_PYTHON=sys.executable)
                     env.pop('GATE_LEDGER', None)
-                    env.pop('GATE_QUIET_WATCHDOG', None)
                     script = gateplan.shell_plan(plan) + ledger + '\nprintf "%s\\n" "$LEDGER"\n'
                     result = subprocess.run(['bash', '-uc', script + stub + start + coordinator],
                         cwd=root, env=env, text=True, capture_output=True, timeout=5)
@@ -1226,7 +1258,6 @@ python3(){
                         self.assertEqual(argv[argv.index('--subset') + 1],
                                          'smoke' if purpose == 'iteration' else 'full')
                         self.assertEqual(argv[-2:], ['--output', str(directory / 'abba')])
-                        self.assertRegex((directory / 'watchdog').read_text().strip(), r'^[1-9][0-9]*:[1-9][0-9]*$')
                         if purpose == 'iteration':
                             # Delete only the production measurement barrier. The same
                             # workload-boundary assertion must refuse ABBA before it emits

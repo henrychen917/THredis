@@ -247,7 +247,7 @@ def histogram_runtime(folder, count, requested):
 
 def validate_pair(floating, fixed):
     from abba_evidence import instrument
-    from background_environment import canonical_contract
+
     for report, pin in ((floating, 0), (fixed, 1)):
         require(report.get("run_kind") == "background-qualification" and
                 report.get("normal_gate_eligible") is False and report.get("comparison_trusted") is False,
@@ -283,8 +283,6 @@ def validate_pair(floating, fixed):
     require(bool(floating.get("cpu_profile_requested")) == bool(fixed.get("cpu_profile_requested")),
             "placement controls used different profiling settings")
     require(instrument(floating["environment"]) == instrument(fixed["environment"]), "placement geometry/workload environment differs")
-    require(canonical_contract(floating["quiet_box"]["reviewed_inventory"]) ==
-            canonical_contract(fixed["quiet_box"]["reviewed_inventory"]), "placement reviewed background differs")
     def layout(report):
         return [(row["cell"], [(block["instances"], [run["load_layout"] for run in block["runs"]])
                               for block in row["rounds"]]) for row in report["cells"]]
@@ -430,14 +428,10 @@ for command in sys.stdin:
                     histogram_runtime(tmp, 1, 33)
 
         def test_placement_pair_rejects_unmatched_lifetime_layout_or_profile(self):
-            from background_environment import canonical_contract
-            document = {"schema": 1, "processes": []}
-            # Contract parsing is independently tested by the environment helper;
-            # this control tests whether the pair validator actually compares it.
             floating = dict(run_kind="background-qualification", normal_gate_eligible=False,
                 comparison_trusted=False, pin_load_workers=0, load_startup_seconds=5,
                 candidate={"sha256": "a" * 64}, reference={"sha256": "a" * 64},
-                quiet_box=dict(diagnostic_complete=True, reviewed_inventory=document), environment={},
+                quiet_box=dict(diagnostic_complete=True), environment={},
                 window_seconds=20, order=["A", "B", "B", "A"], statistical_verdict="FAIL", cells=[dict(
                     cell={"id": "control"}, rounds=[dict(instances=1, runs=[dict(arm=arm, complete=True,
                         load_layout=[dict(cpus=[2, 3], threads=2, clients=256)],
@@ -449,26 +443,25 @@ for command in sys.stdin:
             fixed["pin_load_workers"] = 1
             for run in fixed["cells"][0]["rounds"][0]["runs"]:
                 run["load_worker_affinity"] = {"status": "COMPLETE"}
-            with mock.patch("background_environment.canonical_contract", return_value=canonical_contract(None)):
-                matched = validate_pair(floating, fixed)
-                self.assertEqual(matched["configuration"], "MATCHED")
-                self.assertEqual(matched["statistical_verdicts"], ["FAIL", "FAIL"])
-                self.assertTrue(matched["normal_unprofiled_operational_null_required"])
-                self.assertFalse(matched["latency_comparison_eligible"])
-                for field in ("lifetime", "workers", "profile", "actual-duration"):
-                    changed = copy.deepcopy(fixed)
-                    run = changed["cells"][0]["rounds"][0]["runs"][0]
-                    if field == "lifetime":
-                        run["load_timing"]["requested_lifetime_seconds"] = 28
-                    elif field == "workers":
-                        run["load_layout"][0]["threads"] = 1
-                    elif field == "actual-duration":
-                        run["full_histogram_runtime"]["processes"][0]["raw_runtime"].update(
-                            {"Finish time": 29000, "Total duration": 28000})
-                    else:
-                        changed["cpu_profile_requested"] = True
-                    with self.assertRaises(RuntimeError):
-                        validate_pair(floating, changed)
+            matched = validate_pair(floating, fixed)
+            self.assertEqual(matched["configuration"], "MATCHED")
+            self.assertEqual(matched["statistical_verdicts"], ["FAIL", "FAIL"])
+            self.assertTrue(matched["normal_unprofiled_operational_null_required"])
+            self.assertFalse(matched["latency_comparison_eligible"])
+            for field in ("lifetime", "workers", "profile", "actual-duration"):
+                changed = copy.deepcopy(fixed)
+                run = changed["cells"][0]["rounds"][0]["runs"][0]
+                if field == "lifetime":
+                    run["load_timing"]["requested_lifetime_seconds"] = 28
+                elif field == "workers":
+                    run["load_layout"][0]["threads"] = 1
+                elif field == "actual-duration":
+                    run["full_histogram_runtime"]["processes"][0]["raw_runtime"].update(
+                        {"Finish time": 29000, "Total duration": 28000})
+                else:
+                    changed["cpu_profile_requested"] = True
+                with self.assertRaises(RuntimeError):
+                    validate_pair(floating, changed)
 
     result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Controls))
     if not result.wasSuccessful():
