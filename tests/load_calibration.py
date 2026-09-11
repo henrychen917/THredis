@@ -24,9 +24,7 @@ import abbagate as abba
 WINDOW = 10
 
 
-# Rate jitter between saturated rungs of one binary, measured on identical bytes by the standing
-# null (see select_calibration_floor). Two nulls: 0.71% (2026-09-10), 0.6-1.0% (2026-09-11).
-PLATEAU_TOLERANCE_PCT = 1.0
+PLATEAU_TOLERANCE_PCT = abba.PLATEAU_TOLERANCE_PCT
 
 
 def require(condition, message):
