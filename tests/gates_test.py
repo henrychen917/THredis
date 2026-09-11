@@ -762,10 +762,16 @@ printf '%s %s\\n' "$PASS" "$FAIL" > "$RUN_DIR/counts"
                 output += preserve_failure(result.stdout, result.stderr)
             self.assertEqual(result.returncode, 0, output)
             observed_cpus = set()
-            for job in (directory / 'jobs').iterdir():
-                assigned_slot, observed_cpu = (job / 'fixture-affinity').read_text().split()
-                self.assertEqual(observed_cpu, slot_cpus[int(assigned_slot)], job.name)
-                observed_cpus.add(observed_cpu)
+            try:
+                for job in (directory / 'jobs').iterdir():
+                    assigned_slot, observed_cpu = (job / 'fixture-affinity').read_text().split()
+                    self.assertEqual(observed_cpu, slot_cpus[int(assigned_slot)], job.name)
+                    observed_cpus.add(observed_cpu)
+            except (AssertionError, IndexError, ValueError, OSError) as exc:
+                # A worker can fail before job_body records its affinity and still publish
+                # a recovered completion. Retain its output/ledger before TemporaryDirectory
+                # removes the only explanation; a missing witness remains a failed control.
+                self.fail(str(exc) + preserve_failure(result.stdout, result.stderr))
             if delayed_completion:
                 try:
                     fired = directory / 'delayed-publication'
