@@ -3521,13 +3521,18 @@ def self_test():
                     # A killed grandchild may remain a zombie until PID 1 reaps it; it cannot do
                     # CPU work. Check that state without ever discovering a process by its argv.
                     status = Path(f"/proc/{compiler_pid}/stat")
+                    # The child must STOP; whether it is caught as a zombie (Z) or already fully
+                    # reaped (X, or the status file gone) is a race this test does not control.
+                    # Under the gate's 12 parallel slots the reap wins often enough that asserting
+                    # Z alone is flaky -- it failed there on 2026-09-12 while passing standalone.
+                    stopped = {"Z", "X"}
                     deadline = time.monotonic() + 5
                     while status.exists() and time.monotonic() < deadline:
-                        if status.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                        if status.read_text().rsplit(")", 1)[1].split()[0] in stopped:
                             break
                         time.sleep(.01)
                     if status.exists():
-                        self.assertEqual(status.read_text().rsplit(")", 1)[1].split()[0], "Z")
+                        self.assertIn(status.read_text().rsplit(")", 1)[1].split()[0], stopped)
             finally:
                 if build and build.poll() is None:
                     stop_build(build)

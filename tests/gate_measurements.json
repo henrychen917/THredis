@@ -562,12 +562,12 @@
     }
   },
   "reference_binary": {
-    "path": "/home/user/Projects/bench-bins/tomokv-headline-7a2397c52",
-    "commit": "7a2397c52486cba0291a3a079aed47d556857346",
+    "path": "/home/user/Projects/bench-bins/tomokv-headline-df26865a0",
+    "commit": "df26865a0bd0a09f82aaa575de8558d794a931b1",
     "sha256": "93217be3502f808ab2c0882bc046b650dcd9d11db50ef36b0318ab92fe8737f8",
     "provenance": {
-      "when": "2026-09-11T15:14:59.446255+00:00",
-      "how": "Re-baseline after push: cx-final 7a2397c52 pushed to origin/cpp 2026-09-11 23:12 on a green correctness gate (419/419). Binary copied by rebaseline.sh from the pushed build; SHA-256 computed from it. Supersedes c8e61f646, which crashes (stack smash) on 2 smoke cells and refuses read-local with 2s/overlap on 6 more, so ABBA could not be evaluated against it."
+      "when": "2026-09-12T08:18:29.614437+00:00",
+      "how": "origin/cpp moved to df26865a0 when the 10:42 green gate pushed; the reviewed reference must track the last push or the tier SKIPs. src/ is unchanged since 7a2397c52, so the binary is byte-identical and was copied rather than rebuilt."
     }
   },
   "load_floors": {
