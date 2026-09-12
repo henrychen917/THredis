@@ -81,15 +81,8 @@ def sample_long_cost(conn):
     # handler cost of a command does not depend on which thread dispatched it, and the scored run
     # that follows is unaffected. (The observability gap itself is a server finding, not a test
     # problem; it is in PLAN-SERIAL.md for the read-local lane.)
-    local_original = None
+    armed = conn.must("CONFIG", "GET", "read-local")[1] not in (b"0", "0")
     try:
-        local_original = conn.must("CONFIG", "GET", "read-local")[1]
-    except Exception:
-        local_original = None
-    try:
-        if local_original not in (None, b"0", "0"):
-            conn.must("CONFIG", "SET", "read-local", "0")
-            time.sleep(0.2)
         conn.must("CONFIG", "SET", "slowlog-log-slower-than", "0")
         time.sleep(0.2)  # live config is observed at owner-loop boundaries
         conn.must("SLOWLOG", "RESET")
@@ -99,17 +92,26 @@ def sample_long_cost(conn):
         rows = conn.must("SLOWLOG", "GET", "128")
         samples = {name: [row[2] for row in rows if len(row) >= 4 and row[3]
                          and row[3][0].upper() == name.encode()] for name in ("GET", "BITCOUNT")}
-        if min(map(len, samples.values())) < 16:
+        # READS SERVED BY THE READ-LOCAL LANE NEVER REACH THE SLOW LOG. Measured 2026-09-12, same
+        # binary, three boots: 1s read-local=0 logged 16/16 GETs, 2s read-local=0 logged 16/16,
+        # 1s read-local=1 logged ZERO while still logging all 16 BITCOUNTs. read-local is immutable
+        # at runtime, so the lane cannot be quiesced for the sample either. What this function must
+        # establish is the BLOCKER's service cost; the GET comparison is a sanity check on it, and
+        # it is simply unobservable on an armed cell. Require the blocker either way, and compare
+        # only when GET was observable -- never silently drop the comparison on an unarmed cell.
+        if len(samples["BITCOUNT"]) < 16:
             raise RuntimeError("long-blocker service-cost sample was not recorded")
-        cost = {name: statistics.median(values) for name, values in samples.items()}
-        if cost["BITCOUNT"] <= cost["GET"]:
+        if not armed and len(samples["GET"]) < 16:
+            raise RuntimeError("short-command service-cost sample was not recorded")
+        cost = {name: statistics.median(values) for name, values in samples.items() if values}
+        if "GET" in cost and cost["BITCOUNT"] <= cost["GET"]:
             raise RuntimeError(f"BITCOUNT is not slower than GET: sampled handler microseconds {cost}")
+        if "GET" not in cost:
+            cost["GET"] = None
+            cost["short_command_unobservable"] = "read-local lane reads do not reach SLOWLOG"
     finally:
         conn.must("CONFIG", "SET", "slowlog-log-slower-than", original)
         conn.must("SLOWLOG", "RESET")
-        if local_original not in (None, b"0", "0"):
-            conn.must("CONFIG", "SET", "read-local",
-                      local_original.decode() if isinstance(local_original, bytes) else str(local_original))
         time.sleep(0.2)
     return cost
 

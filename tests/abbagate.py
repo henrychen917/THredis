@@ -3557,8 +3557,12 @@ def self_test():
                         if status.read_text().rsplit(")", 1)[1].split()[0] in stopped:
                             break
                         time.sleep(.01)
-                    if status.exists():
-                        self.assertIn(status.read_text().rsplit(")", 1)[1].split()[0], stopped)
+                    try:
+                        state = status.read_text().rsplit(")", 1)[1].split()[0]
+                    except (FileNotFoundError, ProcessLookupError):
+                        state = None      # fully reaped between the check and the read
+                    if state is not None:
+                        self.assertIn(state, stopped)
             finally:
                 if build and build.poll() is None:
                     stop_build(build)
