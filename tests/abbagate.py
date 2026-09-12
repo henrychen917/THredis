@@ -1565,8 +1565,17 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
         report["coverage"] = coverage(cells)
         pending = [cell.id for cell in cells if cell.pin_required and not cell.instances]
         if pending and not args.escalate:
-            raise ValueError("unmeasured load floors for " + ",".join(pending) +
-                             "; calibrate with --escalate and record the validated pins before gating")
+            # AN UNPINNED CELL SEARCHES; IT DOES NOT VETO THE OTHER SIXTEEN. Refusing the whole
+            # tier here made every cell hostage to the flakiest one: through 2026-09-12 a single
+            # cell that would not pin (t03's flat plateau, then t05/t06's unobservable GET cost)
+            # repeatedly produced ZERO measurements and cost a full ~60 minute cycle each time.
+            # The pinned cells still run one block against their measured floor -- the fast path is
+            # unchanged -- and an unpinned cell falls back to searching its ladder, which is slower
+            # and still yields a real comparison. The run says plainly which cells did that, so an
+            # unpinned cell is visible and gets re-pinned, rather than silently costing everything.
+            print("  UNPINNED, searching their ladders (slower; re-pin with --calibrate): "
+                  + ",".join(pending), flush=True)
+            report["unpinned_cells"] = pending
         # Standing nulls can use another server binary, but must use these exact harness bytes.
         # Capture before the quiet observer starts, and check again after its final sample so
         # fingerprinting itself never becomes foreign CPU work inside a measurement interval.
@@ -2453,7 +2462,7 @@ def self_test():
             self.assertEqual(tails["long_p999_ms"], 2)
             self.assertEqual(tails["short_count"], 101000)
 
-        def test_new_unmeasured_pins_fail_before_reference_or_measurement(self):
+        def test_new_unmeasured_pins_search_instead_of_vetoing_the_tier(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                 out = Path(tmp) / "out"
                 source = Path(tmp) / "unmeasured-cells"
@@ -2465,15 +2474,17 @@ def self_test():
                          "--cells", str(source), "--server-cores", "0-31", "--server-smt", "",
                          "--load-cores", "32-63", "--load-smt", ""]):
                     args = parse_args()
-                with mock.patch(__name__ + ".resolve_reference", side_effect=AssertionError("unmeasured pin reached reference")), \
+                # An unpinned cell no longer stops the run before the reference: it searches its
+                # ladder. The run must SAY so, so an unpinned cell is visible and gets re-pinned
+                # rather than silently costing every other cell its measurement.
+                with mock.patch(__name__ + ".resolve_reference", side_effect=RuntimeError("reference reached")), \
                      mock.patch(__name__ + ".check_placement"), mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(main(args), 1)
                 result = json.loads((out / "results.json").read_text())
-                self.assertIn("unmeasured load floors", result["reason"])
-                self.assertIn("--escalate", result["reason"])
-                self.assertEqual(result["cells"], [])
+                self.assertEqual(result["unpinned_cells"], ["u01"])
+                self.assertIn("reference reached", str(result.get("reason")))
 
         def round(self, rates, n=1, busy=99.5, latency=None, mode="1s"):
             layout = load_layout(list(range(32, 128)) + list(range(160, 256)), n, self.cell.conns)
