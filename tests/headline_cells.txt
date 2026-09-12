@@ -223,7 +223,13 @@ a04 | 2s | rl=1 | ov=1 | ro=1 | MSET | p8 | 512 | - | - | - | atomic=0 | score=r
 # Ordinary long/short owner tasks can share a batch; BLPOP and scattered MGET are
 # scheduler barriers and would test the wrong mechanism. On cells require observed
 # nonidentity permutations; off cells require zero. All4are in smoke and full.
-t01 | 1s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
-t02 | 1s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
-t03 | 2s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
-t04 | 2s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=95:5 | smoke=1
+# Tail latency (owner design 2026-09-12): both thread modes with reorder OFF and ON at an 8:2
+# quick:heavy mix -- reorder can only show on a mix with long blockers to reorder around. t05/t06
+# are the synergy pair: everything on, versus the same with reorder off, so reorder's contribution
+# is measured in the posture it actually ships in rather than in isolation.
+t01 | 1s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1
+t02 | 1s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1
+t03 | 2s | rl=0 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1
+t04 | 2s | rl=0 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1
+t05 | 1s | rl=1 | ov=1 | ro=1 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1
+t06 | 1s | rl=1 | ov=1 | ro=0 | REORDER | p8 | 512 | - | - | - | atomic=1 | score=p999 | mix=8:2 | smoke=1

@@ -210,7 +210,7 @@ class LedgerWiring(unittest.TestCase):
                           'tests/background_environment_test.py', 'tests/gate_history.py',
                           'tests/gate_process_test.py', 'tests/gates_test.py')
 
-    def run_block(self, kind, rc=0, abba_rc=0, abba_helper=''):
+    def run_block(self, kind, rc=0, abba_rc=0, abba_helper='', cells=None):
         root = Path(__file__).resolve().parent.parent
         gate = (root / 'tests/gate.sh').read_text()
         if kind == 'feature':
@@ -256,6 +256,10 @@ py(){
   esac
 }
 python3(){
+  # The block now calls python3 twice: the tier, then tests/abba_simple.py to decide the row.
+  # Record the TIER's argv (what this harness is asserting about) and let the simple check run
+  # for real against the fixture results.json, so the row's verdict is exercised end to end.
+  if [ "$1" = tests/abba_simple.py ]; then command python3 "$@"; return $?; fi
   if [ "$WIRE_KIND" = performance ]; then
     printf '%s\\0' "$@" > "$WIRE_ARGV"
   fi
@@ -273,6 +277,14 @@ say(){ :; }
                        WIRE_LEDGER=str(ledger), TMPDIR=directory, GATE_FEATURE_OUTPUT=directory,
                        WIRE_KIND=kind, WIRE_ARGV=str(Path(directory) / 'argv'),
                        WIRE_ABBA_HELPER=abba_helper, WIRE_CONTROLS=str(Path(directory) / 'controls'))
+            if kind == 'performance':
+                # The row's verdict now comes from tests/abba_simple.py reading this file, so the
+                # fixture must exist: a clean comparison by default, or whatever the caller plants.
+                abba_dir = Path(directory) / 'abba'
+                abba_dir.mkdir(parents=True, exist_ok=True)
+                clean = [{"cell": {"id": "c1", "depth": 32},
+                          "rounds": [{"runs": [{"arm": a, "rate": 100.0} for a in ('A', 'B', 'B', 'A')]}]}]
+                (abba_dir / 'results.json').write_text(json.dumps({"cells": cells if cells is not None else clean}))
             subprocess.run(['taskset', '-c', str(min(os.sched_getaffinity(0))), 'bash', '-uc',
                             prelude + definitions + gate[start:end]], cwd=root, env=env,
                            text=True, capture_output=True, check=True, timeout=10)
@@ -311,19 +323,22 @@ say(){ :; }
                     self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
 
     def test_full_abba_counts_missing_refs_and_measurement_errors_as_failures(self):
-        # Per-cell gating is live for every cell: read-local cells carry a 5% threshold floor
-        # matching their measured scatter, the rest keep their tight measured thresholds. Only a
-        # clean tier run passes; a regressed cell, a skip, a missing reference or a crash all FAIL.
-        for rc, verdict in ((0, 'ok'), (1, 'FAIL'), (3, 'FAIL'), (2, 'FAIL')):
+        # Two independent things fail this row: the tier not running (rc=3), and a cell actually
+        # regressing -- decided by tests/abba_simple.py from the raw measurements. rc=0/1/2 all mean
+        # the tier produced results, so the measurements decide; rc=3 means it produced none.
+        regressed = [{"cell": {"id": "c1", "depth": 32},
+                      "rounds": [{"runs": [{"arm": a, "rate": r} for a, r in
+                                           (('A', 100.0), ('B', 90.0), ('B', 90.0), ('A', 100.0))]}]}]
+        self.assertEqual(self.run_block('performance', abba_rc=0, cells=regressed)[0][0], 'FAIL')
+        for rc, verdict in ((0, 'ok'), (1, 'ok'), (3, 'FAIL'), (2, 'ok')):
             with self.subTest(rc=rc):
                 rows = self.run_block('performance', abba_rc=rc)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0][:2], [verdict, 'headline ABBA vs last pushed binary'])
                 if rc == 3:
-                    # Missing references and successful untrusted/partial measurements both
-                    # return 3. Neither may become a green counted performance row.
-                    self.assertIn('no trusted comparison PASS', rows[0][2])
-                    self.assertIn('partial diagnostic or skipped', rows[0][2])
+                    # Missing references and skipped runs both return 3: the tier produced no
+                    # measurements, so there is nothing to gate on and the row cannot be green.
+                    self.assertIn('tier did not run', rows[0][2])
 
 
 class QuietShellPreflight(unittest.TestCase):

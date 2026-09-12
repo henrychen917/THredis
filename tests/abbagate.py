@@ -103,6 +103,20 @@ PLATEAU_TOLERANCE_PCT = 1.0
 # stated plainly: a real read-local regression smaller than this is not detectable by this cell,
 # and needs the multi-instance variance explained rather than a tighter number.
 READ_LOCAL_THRESHOLD_FLOOR_PCT = 5.0
+
+
+def saturation_exempt(cell):
+    """Cells whose verdict is a LATENCY, so an occupancy floor does not protect it.
+
+    The floor exists so a throughput regression cannot hide in server headroom. A tail-latency
+    verdict is not protected by it: p99.9 does not improve because the server is busier. Depth 1
+    was already exempt for this reason; the blocker-mix reorder cells need the same treatment and
+    for a stronger reason -- their workload DELIBERATELY idles the server on long commands, so they
+    sit at or under the floor by construction. Measured 2026-09-12 on identical bytes: t03 ran
+    92.0-96.4% occupancy across six rungs and could never pin, t01 95.4/95.5, t02 96.7/97.4,
+    t04 93.7-97.9. Requiring 95% of them asks the workload not to be what it is.
+    """
+    return cell.depth == 1 or cell.metric == "p999_ms"
 #
 # SATURATION IS ESTABLISHED BY A RATE PLATEAU, NOT BY A BUSY PERCENTAGE ALONE (owner ruling
 # 2026-09-10). Demanding >=98% busy in every run fails a candidate FOR BEING FASTER: a quicker
@@ -522,7 +536,7 @@ def select_load_floor(cell, rounds, bounds=None):
     for index, current in enumerate(evidence):
         row = {**current, "rejection_reasons": list(current["validation_reasons"])}
         tested.append(row)
-        if cell.depth == 1 or pinned:
+        if saturation_exempt(cell) or pinned:
             if not invalid:
                 selected = index
             continue
@@ -558,7 +572,7 @@ def select_load_floor(cell, rounds, bounds=None):
     chosen = tested[selected] if selected is not None else None
     return {"method": "lowest-tested-confirmed-rung-v1", "measurement_valid": not invalid,
             "measurement_failures": invalid,
-            "status": "INVALID" if invalid else "EXEMPT" if cell.depth == 1 else
+            "status": "INVALID" if invalid else "EXEMPT" if saturation_exempt(cell) else
                       "PINNED" if pinned else "CONFIRMED" if chosen else "UNPROVEN",
             "selected_index": selected, "confirmation_index": confirmation,
             "lowest_tested_qualifying_instances": chosen["instances"] if chosen and not pinned and cell.depth > 1 else None,
@@ -606,7 +620,7 @@ def assess(cell, rounds, bounds=None):
         if bounds is not NULL_MODE and long_tail["delta_pct"] > long_threshold:
             reasons.append("long-command p99.9 regression exceeds measured reference spread")
     gain, plateau_noise = None, None
-    if cell.depth > 1:
+    if not saturation_exempt(cell):
         if selection["status"] == "PINNED":
             occupancy = [saturation_score(run, cell) for run in current["runs"]]
             # Judge the BLOCK's occupancy by its mean, not by its worst single run. min() of four
@@ -642,7 +656,7 @@ def assess(cell, rounds, bounds=None):
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
             "fastest_gain_pct": gain, "plateau_noise_pct": plateau_noise,
             "load_selection": selection, "measurement_valid": selection["measurement_valid"],
-            "saturation_exempt": cell.depth == 1,
+            "saturation_exempt": saturation_exempt(cell),
             "verdict": "FAIL" if reasons else "PASS", "reasons": reasons}
 
 
@@ -1860,7 +1874,7 @@ def self_test():
         def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
             from itertools import product
             cells = read_cells(ROOT / "tests/headline_cells.txt")
-            self.assertEqual(len(cells), 178)
+            self.assertEqual(len(cells), 180)   # +2: the t05/t06 reorder synergy pair
             original = [cell for cell in cells if cell.id.startswith("h")]
             self.assertEqual(len(original), 64)
             axes = lambda cell: (cell.mode, cell.read_local, cell.overlap, cell.reorder, cell.op, cell.depth)
@@ -1873,17 +1887,26 @@ def self_test():
             self.assertEqual({cell.atomic for cell in cells}, {0, 1})
             self.assertEqual({cell.conns for cell in cells}, {512, 2048})
 
-        def test_smoke_is_fifteen_justified_cells_not_a_cross_product(self):
+        def test_smoke_is_seventeen_justified_cells_not_a_cross_product(self):
             cells = selected_cells(read_cells(ROOT / "tests/headline_cells.txt"), "smoke")
-            self.assertEqual(len(cells), 15)
+            self.assertEqual(len(cells), 17)
             for mode in ("1s", "2s"):
                 sweep = [cell for cell in cells if cell.mode == mode and cell.op == "GET"]
                 self.assertEqual({(cell.read_local, cell.overlap, cell.reorder) for cell in sweep},
                                  {(1, 1, 1), (0, 1, 1), (1, 0, 1), (0, 0, 0)})
                 self.assertTrue(all(cell.depth == 32 for cell in sweep))
                 tail = [cell for cell in cells if cell.mode == mode and cell.op == "REORDER"]
+                # Both modes carry reorder off AND on -- reorder can only show against its own
+                # absence -- on an 8:2 quick:heavy mix, since a uniform-cost workload has no long
+                # blockers to reorder around.
                 self.assertEqual({cell.reorder for cell in tail}, {0, 1})
                 self.assertTrue(all(cell.depth > 1 and cell.metric == "p999_ms" for cell in tail))
+                self.assertTrue(all(cell.mix == "8:2" for cell in tail))
+            # The synergy pair: everything on, and the same with reorder off, so reorder's
+            # contribution is measured in the posture it ships in rather than in isolation.
+            synergy = {(c.read_local, c.overlap, c.reorder) for c in cells
+                       if c.op == "REORDER" and c.read_local}
+            self.assertEqual(synergy, {(1, 1, 1), (1, 1, 0)})
             self.assertEqual({cell.op for cell in cells}, {"GET", "SET", "MGET", "MSET", "REORDER"})
             self.assertIn(1, {cell.depth for cell in cells})
 
@@ -2390,7 +2413,10 @@ def self_test():
             result = assess(cell, [round_])
             self.assertEqual(result["verdict"], "FAIL")
             self.assertIn("long-command p99.9 regression exceeds measured reference spread", result["reasons"])
-            self.assertFalse(result["saturation_exempt"])
+            # p999 cells are saturation-EXEMPT (their blocker mix idles the server by design and
+            # their verdict is a latency), but the exemption touches only the occupancy floor --
+            # the long-tail regression above still fails, which is the point of this test.
+            self.assertTrue(result["saturation_exempt"])
 
         def test_hdr_decoder_matches_recorded_memtier_output_and_rejects_corruption(self):
             from abba_workloads import decode_histogram, percentile

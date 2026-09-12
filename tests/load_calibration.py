@@ -69,7 +69,7 @@ def select_calibration_floor(cell, rounds):
         rows.append(dict(instances=n, rate=run["rate"], worker_threads=workers,
                          assigned_cpus=assigned, saturation_pct=abba.saturation_score(run, cell)))
     selected = confirmation = None
-    if cell.depth == 1:
+    if abba.saturation_exempt(cell):
         selected = 0
     else:
         for index, (current, above) in enumerate(zip(rows, rows[1:])):
@@ -86,7 +86,7 @@ def select_calibration_floor(cell, rounds):
                 selected, confirmation = index, index + 1
                 break
     return dict(method="one-arm-observed-peak-v1", measurement_valid=True,
-        status="EXEMPT" if cell.depth == 1 else "PIN" if selected is not None else "UNPROVEN",
+        status="EXEMPT" if abba.saturation_exempt(cell) else "PIN" if selected is not None else "UNPROVEN",
         selected_index=selected, confirmation_index=confirmation,
         lowest_tested_qualifying_instances=rows[selected]["instances"] if selected is not None else None,
         confirmation_instances=rows[confirmation]["instances"] if confirmation is not None else None,

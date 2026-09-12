@@ -180,7 +180,8 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         require(isinstance(assessment, dict), "invalid ABBA assessment")
         require(assessment.get("verdict") == "PASS" and assessment.get("reasons") == [],
                 f"unassessed/failed ABBA cell: {cell['id']}")
-        require(assessment.get("saturation_exempt") is (cell["depth"] == 1), "invalid saturation exemption")
+        exempt = cell["depth"] == 1 or cell.get("score") == "p999"
+        require(assessment.get("saturation_exempt") is exempt, "invalid saturation exemption")
         # A null-control run MEASURES the loss-vs-threshold discrepancy on identical bytes -- that
         # discrepancy is the instrument's resolution, and enforcing it here would make the null
         # unable to report the very thing it exists to report. Comparison runs store a threshold
