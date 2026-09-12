@@ -2810,11 +2810,41 @@ ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?
 ABBA_PID=0
-case "$ABBA_RC" in
-  0) ok "headline ABBA vs last pushed binary";;
-  3) bad "headline ABBA vs last pushed binary" "no trusted comparison PASS (partial diagnostic or skipped); see ABBA output";;
-  *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
-esac
+  # WHAT THIS ROW GATES ON, and why not the per-cell verdicts (2026-09-12).
+  # Measured: with candidate and reference BYTE-IDENTICAL (sha256 93217be3...) this tier failed
+  # 9 of 15 cells, deltas to 28.6%. Not the box -- m47 repeated to 0.08% in the same run, and
+  # h11's server config re-measured by hand over four boots held 0.64%. The variance is specific
+  # to the tier's own multi-instance load configuration (512 connections over 4 generator
+  # instances); the identical server at 128 connections over 1 instance is stable. Until that is
+  # explained a per-cell verdict cannot separate a real regression from the harness, so gating on
+  # it is a coin flip that blocks every push.
+  # The row gates on what IS checkable: the tier RAN, against a resolved reference, and produced
+  # valid measurements -- a skip, a missing reference or a crash still FAIL. Per-cell regressions
+  # print as ADVISORY and are in results.json. Restore per-cell gating when the variance is
+  # explained; see PLAN-SERIAL.md.
+  case "$ABBA_RC" in
+    0) ok "headline ABBA vs last pushed binary";;
+    1) ok "headline ABBA vs last pushed binary"
+       say "ABBA ADVISORY" "cells regressed beyond threshold; NOT gating while the tier's own multi-instance variance is unexplained"
+       python3 - "$ABBA_OUTPUT/results.json" <<'ADV' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for c in d.get("cells", []):
+    if c.get("verdict") == "PASS":
+        continue
+    a = c.get("assessment") or {}
+    delta, thr = a.get("delta_pct"), a.get("threshold_pct")
+    detail = (f"{delta:+.2f}% vs T={thr:.2f}%" if isinstance(delta, float) and isinstance(thr, float)
+              else str(c.get("reason"))[:60])
+    print(f"    ABBA ADVISORY  {c['cell']['id']:5s} {detail}")
+ADV
+       ;;
+    3) bad "headline ABBA vs last pushed binary" "no trusted comparison PASS (partial diagnostic or skipped); see ABBA output";;
+    *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
+  esac
 
 phase abba-end
 publish_abba || exit 2
