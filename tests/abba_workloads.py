@@ -73,7 +73,23 @@ def sample_long_cost(conn):
     # time. Sample SLOWLOG before the benchmark, then restore its original setting
     # and clear the sample. No per-operation sampling is added to the scored run.
     original = conn.must("CONFIG", "GET", "slowlog-log-slower-than")[1]
+    # READ-LOCAL READS NEVER REACH THE SLOW LOG. Measured 2026-09-12: with --read-local 1, sixteen
+    # GETs produced 0 slowlog entries while sixteen BITCOUNTs produced 16; the same server with
+    # read-local off logged all sixteen. Reads served by the lane bypass the path that records
+    # them, so this sampler -- which needs GET's handler cost to show BITCOUNT is the slower
+    # command -- can never collect one. Quiesce the lane for the sample and restore it after: the
+    # handler cost of a command does not depend on which thread dispatched it, and the scored run
+    # that follows is unaffected. (The observability gap itself is a server finding, not a test
+    # problem; it is in PLAN-SERIAL.md for the read-local lane.)
+    local_original = None
     try:
+        local_original = conn.must("CONFIG", "GET", "read-local")[1]
+    except Exception:
+        local_original = None
+    try:
+        if local_original not in (None, b"0", "0"):
+            conn.must("CONFIG", "SET", "read-local", "0")
+            time.sleep(0.2)
         conn.must("CONFIG", "SET", "slowlog-log-slower-than", "0")
         time.sleep(0.2)  # live config is observed at owner-loop boundaries
         conn.must("SLOWLOG", "RESET")
@@ -91,6 +107,9 @@ def sample_long_cost(conn):
     finally:
         conn.must("CONFIG", "SET", "slowlog-log-slower-than", original)
         conn.must("SLOWLOG", "RESET")
+        if local_original not in (None, b"0", "0"):
+            conn.must("CONFIG", "SET", "read-local",
+                      local_original.decode() if isinstance(local_original, bytes) else str(local_original))
         time.sleep(0.2)
     return cost
 

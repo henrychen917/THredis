@@ -47,8 +47,20 @@ def threshold_for(cell):
     return DEFAULT_PCT
 
 
-def check(path):
+def check(path, expected_cells=None):
     report = json.loads(open(path).read())
+    cells = report.get("cells", [])
+    # A run that measured NOTHING is a failure, never a pass. On 2026-09-12 this check reported
+    # "PASS -- no cell regressed" against a results.json with zero cells, because four unpinned
+    # cells made the tier refuse before measuring. An empty result is the absence of evidence, and
+    # a gate that treats it as evidence of absence is worthless.
+    if not cells:
+        print(f"  ABBA SIMPLE: FAIL -- no cells measured; the tier produced nothing "
+              f"({str(report.get('reason'))[:110]})")
+        return 1
+    if expected_cells is not None and len(cells) != expected_cells:
+        print(f"  ABBA SIMPLE: FAIL -- measured {len(cells)} cells, expected {expected_cells}")
+        return 1
     worse = []
     print("  ABBA simple check (candidate vs reference, medians of the raw runs):")
     for row in report.get("cells", []):
@@ -131,6 +143,17 @@ def self_test():
         def test_missing_measurements_fail(self):
             self.assertEqual(self.run_report({"cells": [{"cell": dict(id="c1", depth=32), "rounds": []}]}), 1)
 
+        def test_zero_cells_is_a_failure_not_a_vacuous_pass(self):
+            self.assertEqual(self.run_report({"cells": []}), 1)
+            self.assertEqual(self.run_report({"cells": [], "reason": "unmeasured load floors"}), 1)
+
+        def test_fewer_cells_than_expected_fails(self):
+            doc = report("rate", {}, [100, 100], [100, 100])
+            self.assertEqual(self.run_report(doc), 0)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                json.dump(doc, handle)
+            self.assertEqual(check(handle.name, expected_cells=17), 1)
+
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(Simple)
     return 0 if unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful() else 1
 
@@ -138,4 +161,5 @@ def self_test():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
         raise SystemExit(self_test())
-    raise SystemExit(check(sys.argv[1]))
+    expected = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    raise SystemExit(check(sys.argv[1], expected))
