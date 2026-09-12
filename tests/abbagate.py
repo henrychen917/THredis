@@ -96,6 +96,13 @@ BUSY_FLOOR = SATURATION_FLOOR  # productive-role occupancy; plateau remains inde
 # same plateau, and how far a single occupancy sample may sit under the floor before the block is
 # judged unsaturated. Lives here because load_calibration imports this module.
 PLATEAU_TOLERANCE_PCT = 1.0
+# Read-local cells above depth 1 run at this box's highest throughput (54-56 Mops/s on GET p32) and
+# repeat far less tightly than the rest: measured on IDENTICAL bytes, h11 4.56%, h31 4.62%,
+# h27 5.44%, h15 6.51%, against 0.08-1.8% for every non-read-local cell in the same run. Their
+# threshold floors here so the tier stops reporting its own scatter as a regression. The cost is
+# stated plainly: a real read-local regression smaller than this is not detectable by this cell,
+# and needs the multi-instance variance explained rather than a tighter number.
+READ_LOCAL_THRESHOLD_FLOOR_PCT = 5.0
 #
 # SATURATION IS ESTABLISHED BY A RATE PLATEAU, NOT BY A BUSY PERCENTAGE ALONE (owner ruling
 # 2026-09-10). Demanding >=98% busy in every run fails a candidate FOR BEING FASTER: a quicker
@@ -579,7 +586,11 @@ def assess(cell, rounds, bounds=None):
     threshold = p["threshold_pct"]
     if bounds and bounds is not NULL_MODE and cell.metric in bounds:
         threshold = max(threshold, bounds[cell.metric]["abs_delta"])
-    p = {**p, "threshold_pct": threshold, "threshold_source": "null-floor" if threshold != p["threshold_pct"] else "reference-spread"}
+    if cell.read_local and cell.depth > 1:
+        threshold = max(threshold, READ_LOCAL_THRESHOLD_FLOOR_PCT)
+    source = ("reference-spread" if threshold == p["threshold_pct"]
+              else "read-local-floor" if threshold == READ_LOCAL_THRESHOLD_FLOOR_PCT else "null-floor")
+    p = {**p, "threshold_pct": threshold, "threshold_source": source}
     if bounds is not NULL_MODE and loss > threshold:
         reasons.append("paired regression exceeds measured reference spread")
     long_tail = None
@@ -1834,7 +1845,9 @@ def self_test():
 
     class ABBA(unittest.TestCase):
         def setUp(self):
-            self.cell = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
+            # read_local=0, matching the real h01 and keeping threshold tests independent of the
+            # read-local floor; the read-local cases construct their own cell with it enabled.
+            self.cell = Cell("h01", "1s", 0, 0, 0, "GET", 32, 512)
             # Serverless loop tests replace the selected-CPU observer too. Dedicated
             # negative controls below inject failures through the same main path.
             self.quiet = mock.Mock()
@@ -2503,6 +2516,20 @@ def self_test():
             self.assertEqual(assess(cell, real, NULL_MODE)["verdict"], "PASS")
             self.assertIsNone(resolution_bounds(None, cell.id))
             self.assertIsNone(resolution_bounds(control, "other"))
+            # Read-local above depth 1 floors at its measured scatter (4.6-6.5% on identical bytes).
+            rl = replace(self.cell, score="rate", read_local=1, instances=4)
+            drift4 = [self.round([100.5, 96.5, 96.5, 99.5], n=4)]          # ~4% loss
+            a = assess(rl, drift4)
+            self.assertEqual((a["verdict"], a["threshold_source"]), ("PASS", "read-local-floor"))
+            self.assertEqual(a["threshold_pct"], READ_LOCAL_THRESHOLD_FLOOR_PCT)
+            # It is a floor, not a licence: a 7% loss on the same cell still fails.
+            self.assertEqual(assess(rl, [self.round([100.5, 93., 93., 99.5], n=4)])["verdict"], "FAIL")
+            # Depth 1 and non-read-local cells keep the tighter thresholds.
+            off = replace(self.cell, score="rate", read_local=0, instances=4)
+            self.assertEqual(assess(off, drift4)["verdict"], "FAIL")
+            p1 = replace(self.cell, score="latency", read_local=1, depth=1, instances=0)
+            self.assertNotEqual(assess(p1, [self.round([100] * 4, n=1)]).get("threshold_source"),
+                                "read-local-floor")
             # The blocker command's p99.9 has its own threshold and must follow the same contract.
             tail = replace(self.cell, score="p999", op="REORDER", instances=4)
             def tail_round(short, long_):
@@ -2697,7 +2724,7 @@ def self_test():
         def test_historical_numbers_are_not_inputs(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                 f = Path(tmp) / "cells"
-                f.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | garbage | stale | ignored\n")
+                f.write_text("h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | garbage | stale | ignored\n")
                 self.assertEqual(read_cells(f), [self.cell])
                 f.write_text(f.read_text() * 2)
                 with self.assertRaises(ValueError):
@@ -3205,7 +3232,7 @@ def self_test():
                 binary.write_bytes(b"test executable identity; never executed")
                 binary.chmod(0o700)
                 source = directory / "cells"
-                source.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | stale\n")
+                source.write_text("h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | stale\n")
                 for candidate_rate, expected in ((100, 3), (98, 1)):
                     output = directory / str(candidate_rate)
                     argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),

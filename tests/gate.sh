@@ -2810,26 +2810,8 @@ ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?
 ABBA_PID=0
-# WHAT THIS ROW GATES ON, and why not the per-cell verdicts (2026-09-12).
-# Measured: with candidate and reference BYTE-IDENTICAL (sha256 93217be3...) this tier failed
-# 9 of 15 cells, deltas to 28.6%. Not the box -- m47 repeated to 0.08% in the same run, and
-# h11's server config re-measured by hand over four boots held 0.64%. The variance is specific
-# to the tier's own multi-instance load configuration (512 connections over 4 generator
-# instances); the identical server at 128 connections over 1 instance is stable. Until that is
-# explained a per-cell verdict cannot separate a real regression from the harness, so gating on
-# it is a coin flip that blocks every push.
-# The row gates on what IS checkable: the tier RAN, against a resolved reference, and produced
-# valid measurements -- a skip, a missing reference or a crash still FAIL. Per-cell regressions
-# print as ADVISORY and are in results.json. Restore per-cell gating when the variance is
-# explained; see PLAN-SERIAL.md.
 case "$ABBA_RC" in
   0) ok "headline ABBA vs last pushed binary";;
-  1) ok "headline ABBA vs last pushed binary"
-       # abbagate has already printed each cell's delta, threshold and verdict above, and
-       # results.json retains them. No second reader here: the ledger harness stubs python3
-       # to capture this block's argv, so an extra interpreter call changes what it observes.
-     say "ABBA ADVISORY" "cells regressed beyond threshold; NOT gating while the tier's own multi-instance variance is unexplained"
-     ;;
   3) bad "headline ABBA vs last pushed binary" "no trusted comparison PASS (partial diagnostic or skipped); see ABBA output";;
   *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
 esac

@@ -311,11 +311,10 @@ say(){ :; }
                     self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
 
     def test_full_abba_counts_missing_refs_and_measurement_errors_as_failures(self):
-        # rc=1 is "the tier ran and some cell regressed". Per-cell gating is suspended while the
-        # tier's own multi-instance variance is unexplained (byte-identical arms failed 9/15 cells
-        # on 2026-09-12), so that is an ADVISORY pass. rc=3 (skip / no resolved reference) and any
-        # other code still FAIL -- those are the failures this row exists to catch.
-        for rc, verdict in ((0, 'ok'), (1, 'ok'), (3, 'FAIL'), (2, 'FAIL')):
+        # Per-cell gating is live for every cell: read-local cells carry a 5% threshold floor
+        # matching their measured scatter, the rest keep their tight measured thresholds. Only a
+        # clean tier run passes; a regressed cell, a skip, a missing reference or a crash all FAIL.
+        for rc, verdict in ((0, 'ok'), (1, 'FAIL'), (3, 'FAIL'), (2, 'FAIL')):
             with self.subTest(rc=rc):
                 rows = self.run_block('performance', abba_rc=rc)
                 self.assertEqual(len(rows), 1)
