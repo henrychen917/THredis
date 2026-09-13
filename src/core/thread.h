@@ -615,18 +615,23 @@ public:
                 bits &= bits - 1;
                 const uint32_t p = w * 64 + b;
                 if (p >= nchan_) continue;
+                // A drain cannot replace/remask its inbox: that belongs to the quiesced role
+                // edge after callbacks and retirement finish. Hold the transport pointer over
+                // the callback so an opaque command handler cannot force its reload for retire
+                // and the next recv. Keep head/tail/retired accesses in their original order.
+                TaskInbox* const inbox = task_in_.get();
                 Task t;
                 auto recv = [&] {
                     if constexpr (IofusedPrivateQueue)
-                        return task_in_->recv_fused_private<kInboxSlots>(p, t);
+                        return inbox->recv_fused_private<kInboxSlots>(p, t);
                     else
-                        return task_in_->recv(p, t);
+                        return inbox->recv(p, t);
                 };
                 while (recv()) {
                     uint64_t age = 0;
                     if (t.enqueue_us_low && sig_.observe_queue_delay(t.enqueue_us_low, age))
                         sig_.observe_oldest_age(age);
-                    fn(t); task_in_->retire(p); n++;
+                    fn(t); inbox->retire(p); n++;
                 }
             }
         }
@@ -645,13 +650,14 @@ public:
         if (!per_producer_limit) std::abort();
         uint32_t n = 0;
         auto take_lane = [&](uint32_t producer) {
+            TaskInbox* const inbox = task_in_.get();
             uint32_t drained = 0;
             Task task;
             auto recv = [&] {
                 if constexpr (IofusedPrivateQueue)
-                    return task_in_->recv_fused_private<kInboxSlots>(producer, task);
+                    return inbox->recv_fused_private<kInboxSlots>(producer, task);
                 else
-                    return task_in_->recv(producer, task);
+                    return inbox->recv(producer, task);
             };
             while (drained < per_producer_limit && recv()) {
                 uint64_t age = 0;
@@ -659,7 +665,7 @@ public:
                     sig_.observe_queue_delay(task.enqueue_us_low, age))
                     sig_.observe_oldest_age(age);
                 const bool completed_batch = fn(task);
-                task_in_->retire(producer);
+                inbox->retire(producer);
                 drained++;
                 n++;
                 if (completed_batch) batch_boundary();
@@ -695,9 +701,10 @@ public:
         uint32_t count = 0;
         lane_count = 0;
         auto take_lane = [&](uint32_t producer) {
+            TaskInbox* const inbox = task_in_.get();
             const uint32_t begin = count;
             Task task;
-            while (count < capacity && task_in_->pop_unretired(producer, task)) {
+            while (count < capacity && inbox->pop_unretired(producer, task)) {
                 uint64_t age = 0;
                 if (task.enqueue_us_low &&
                     sig_.observe_queue_delay(task.enqueue_us_low, age))
@@ -772,8 +779,9 @@ public:
                 bits &= bits - 1;
                 const uint32_t p = w * 64 + b;
                 if (p >= nchan_) continue;
+                ClientChan& lane = client_in_[p];
                 Client* c = nullptr;
-                while (client_in_[p].recv(c)) { fn(c); client_in_[p].retire(); n++; }
+                while (lane.recv(c)) { fn(c); lane.retire(); n++; }
             }
         }
         return n;
@@ -789,8 +797,9 @@ public:
                 bits &= bits - 1;
                 const uint32_t p = w * 64 + b;
                 if (p >= nchan_) continue;
+                ReleaseChan& lane = release_in_[p];
                 BorrowRelease r;
-                while (release_in_[p].recv(r)) { fn(r); release_in_[p].retire(); n++; }
+                while (lane.recv(r)) { fn(r); lane.retire(); n++; }
             }
         }
         return n;
@@ -806,10 +815,11 @@ public:
                 bits &= bits - 1;
                 const uint32_t p = w * 64 + b;
                 if (p >= nchan_) continue;
+                TransferChan& lane = transfer_in_[p];
                 ClientTransfer transfer;
-                while (transfer_in_[p].recv(transfer)) {
+                while (lane.recv(transfer)) {
                     fn(transfer);
-                    transfer_in_[p].retire();
+                    lane.retire();
                     n++;
                 }
             }
@@ -1021,39 +1031,46 @@ public:
     uint32_t drain_tasks_unmasked(Fn&& fn) {
         uint32_t n = 0; Task t;
         for (uint32_t p = 0; p < nchan_; p++) {
+            TaskInbox* const inbox = task_in_.get();
             auto recv = [&] {
                 if constexpr (IofusedPrivateQueue)
-                    return task_in_->recv_fused_private<kInboxSlots>(p, t);
+                    return inbox->recv_fused_private<kInboxSlots>(p, t);
                 else
-                    return task_in_->recv(p, t);
+                    return inbox->recv(p, t);
             };
             while (recv()) {
                 uint64_t age = 0;
                 if (t.enqueue_us_low && sig_.observe_queue_delay(t.enqueue_us_low, age))
                     sig_.observe_oldest_age(age);
-                fn(t); task_in_->retire(p); n++;
+                fn(t); inbox->retire(p); n++;
             }
         }
         return n;
     }
     template <typename Fn> uint32_t drain_clients_unmasked(Fn&& fn) {
         uint32_t n = 0; Client* c = nullptr;
-        for (uint32_t p = 0; p < nchan_; p++)
-            while (client_in_[p].recv(c)) { fn(c); client_in_[p].retire(); n++; }
+        for (uint32_t p = 0; p < nchan_; p++) {
+            ClientChan& lane = client_in_[p];
+            while (lane.recv(c)) { fn(c); lane.retire(); n++; }
+        }
         return n;
     }
     template <typename Fn> uint32_t drain_releases_unmasked(Fn&& fn) {
         uint32_t n = 0; BorrowRelease r;
-        for (uint32_t p = 0; p < nchan_; p++)
-            while (release_in_[p].recv(r)) { fn(r); release_in_[p].retire(); n++; }
+        for (uint32_t p = 0; p < nchan_; p++) {
+            ReleaseChan& lane = release_in_[p];
+            while (lane.recv(r)) { fn(r); lane.retire(); n++; }
+        }
         return n;
     }
     template <typename Fn> uint32_t drain_client_transfers_unmasked(Fn&& fn) {
         uint32_t n = 0; ClientTransfer transfer;
-        for (uint32_t p = 0; p < nchan_; p++)
-            while (transfer_in_[p].recv(transfer)) {
-                fn(transfer); transfer_in_[p].retire(); n++;
+        for (uint32_t p = 0; p < nchan_; p++) {
+            TransferChan& lane = transfer_in_[p];
+            while (lane.recv(transfer)) {
+                fn(transfer); lane.retire(); n++;
             }
+        }
         return n;
     }
 
@@ -1163,11 +1180,15 @@ private:
     std::unique_ptr<TransferChan[]> transfer_in_;
     std::unique_ptr<uint64_t[]> command_counts_;
     uint32_t command_count_size_ = 0;
-    uint64_t total_commands_ = 0;
+    // task_in_ is read by peer producers. Keep the rare scan-hold store on that
+    // line and put the every-command store below, with the owner counters. Swapping
+    // equal-sized counters preserves the 1408-byte stride and every other offset;
+    // it may trade transport-line reacquisitions for an extra owner-counter line.
+    uint64_t atomic_scan_holds_ = 0;
     FlipFingerprintWriter flip_fingerprint_;
     uint64_t atomic_groups_ = 0;
     uint64_t atomic_localfast_ = 0;
-    uint64_t atomic_scan_holds_ = 0;
+    uint64_t total_commands_ = 0;
     AtomicAdmissionState atomic_admission_state_;
     ReadyMask  ready_;                     // as a sender: which of my clients completed work
     std::vector<Client*>  slots_;          // slot -> client, sender-owned

@@ -102,6 +102,11 @@ build/read-local-write-ring-unit: tests/read_local_write_ring_unit.cc $(wildcard
 build/reorder-unit: tests/reorder_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/reorder_unit.cc -o $@
+# Serverless transport/WB access-order witnesses, with poisoned unpublished reply metadata.
+build/cache-access-unit: tests/cache_access_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -ffunction-sections -fdata-sections -I. $< -Wl,--gc-sections -o $@ $(LDLIBS)
 STORE_REGRESSION_SRC := tests/store_regression.cc src/cmd/t_hash.cc src/cmd/t_hash_ttl.cc
 build/store-regression: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
 	@mkdir -p build

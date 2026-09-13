@@ -4844,31 +4844,9 @@ ordinary_shard_ready:
         for (uint32_t i = 0; i < batch.count; i++) {
             Client* client = batch.clients[i];
             if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(
-                    op.zc_len, kGenthreadWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kGenthreadCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
+            prefetch_wb_client<kGenthreadWbPrefetchOpsPerConn,
+                               kGenthreadWbBorrowPrefetchBytes,
+                               kGenthreadCacheLineBytes>(*client);
         }
 
         work += batch.count;
@@ -4999,31 +4977,9 @@ ordinary_shard_ready:
         for (uint32_t i = 0; i < batch.count; i++) {
             Client* client = batch.clients[i];
             if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(
-                    op.zc_len, kGenthreadWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kGenthreadCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
+            prefetch_wb_client<kGenthreadWbPrefetchOpsPerConn,
+                               kGenthreadWbBorrowPrefetchBytes,
+                               kGenthreadCacheLineBytes>(*client);
         }
 
         const uint32_t wb_occupancy = batch.count;
@@ -5236,37 +5192,38 @@ ordinary_shard_ready:
         return collect_retire_work<HasUnix, kEp>(unmasked) + wb_gather(batch);
     }
 
-    // WB.PF pass 1 issues hints for every potentially retireable state line. Pass 2 performs the
-    // required acquire and, only for a published plain BORROW, hints the store payload. The hint
-    // neither reads nor copies payload bytes and never changes the borrow lifetime.
-    void wb_prefetch(WbBatch& batch) {
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
+    // Keep one connection's WB metadata hot from its state hints to its payload hints. The old
+    // two whole-batch walks revisited Client/ROB after hinting as many as 64 * 64 unrelated Op
+    // lines. One ROB is already a bounded prefetch window; retaining both inner passes preserves
+    // lookahead within it without a staging array, a pointer chase or another runtime knob.
+    // Only this IO thread advances flush/dispatch, and neither pass calls a callback, so the
+    // frontier snapshot is valid throughout. EX can publish Done meanwhile: acquire still guards
+    // EVERY payload-metadata read, and the first unfinished op still ends the borrow walk.
+    // No payload is read, retired or kept alive by a hint; QSBR and borrow release are unchanged.
+    template <uint32_t Ops, uint32_t BorrowBytes, uint32_t CacheLineBytes>
+    static __attribute__((always_inline)) void prefetch_wb_client(Client& client) {
+        Rob<kRobWindow>& rob = client.rob();
+        const uint64_t first = rob.flush_id();
+        const uint64_t count = std::min<uint64_t>(rob.dispatch_id() - first, Ops);
+        for (uint64_t off = 0; off < count; off++)
+            __builtin_prefetch(&rob.at(first + off).state, 0, 3);
+        for (uint64_t off = 0; off < count; off++) {
+            Op& op = rob.at(first + off);
+            if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
+            if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
+            const uint32_t bytes = std::min(op.zc_len, BorrowBytes);
+            for (uint32_t pos = 0; pos < bytes; pos += CacheLineBytes)
+                __builtin_prefetch(op.zc_ptr + pos, 0, 1);
         }
+    }
+
+    static void wb_prefetch(WbBatch& batch) {
         for (uint32_t i = 0; i < batch.count; i++) {
             Client* client = batch.clients[i];
             if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(op.zc_len, kIoPipeWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kIoPipeCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
+            prefetch_wb_client<kIoPipeWbPrefetchOpsPerClient,
+                               kIoPipeWbBorrowPrefetchBytes,
+                               kIoPipeCacheLineBytes>(*client);
         }
     }
 
