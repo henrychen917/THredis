@@ -22,7 +22,7 @@ constexpr uint32_t kP = 14;
 constexpr uint32_t kQ = 64 - kP;
 constexpr uint32_t kRegisterMask = kRegisters - 1;
 constexpr uint8_t kRegisterMax = 63;
-constexpr uint32_t kSparseMaxBytes = 3000;  // Redis hll-sparse-max-bytes default.
+uint32_t g_sparse_max_bytes = 3000;  // Boot-latched before any worker can use the HLL helpers.
 constexpr double kAlphaInf = 0.721347520444481703680;
 
 inline const uint8_t* bytes(Slice image) {
@@ -283,7 +283,7 @@ int sparse_set(std::string& image, uint32_t index, uint8_t value) {
     }
 
     const size_t old_len = is_xzero ? 2 : 1;
-    if (sequence_len > old_len && image.size() + sequence_len - old_len > kSparseMaxBytes)
+    if (sequence_len > old_len && image.size() + sequence_len - old_len > g_sparse_max_bytes)
         return promote_and_set(image, index, value);
     image.replace(pos, old_len, reinterpret_cast<const char*>(sequence), sequence_len);
 
@@ -361,6 +361,8 @@ uint64_t estimate(const int (&histogram)[64]) {
 }
 
 }  // namespace
+
+void configure_sparse_max_bytes(uint32_t value) { g_sparse_max_bytes = value; }
 
 bool header_valid(Slice image) {
     if (image.n < kHeaderBytes) return false;

@@ -489,7 +489,7 @@ int main(int argc, char** argv) {
         ::close(probe);
     }
     std::string unix_error;
-    if (!unix_listener.open(cfg.tcp_backlog, unix_error)) {
+    if (!unix_listener.open(cfg.tcp_backlog, unix_error, cfg.unixsocketperm)) {
         std::fprintf(stderr, "%s\n", unix_error.c_str());
         for (uint32_t i = 0; i < nthreads; i++) srv.thread(i).stop_flag().store(true);
         for (auto& thread : pool) thread.join();

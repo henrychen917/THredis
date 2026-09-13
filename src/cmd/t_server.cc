@@ -10,6 +10,7 @@
 #include "debug.h"
 #include "debug_sleep.h"
 #include "info_stats.h"
+#include "hll.h"
 #include "scripting.h"
 #include "server_tail.h"
 #include "slowlog.h"
@@ -304,6 +305,16 @@ void add_config(const char* name, ConfigKind kind, uint64_t value) {
 void init_config(const Config& cfg) {
     std::lock_guard<std::mutex> lock(g_config_mu);
     g_config.clear();
+    hll::configure_sparse_max_bytes(cfg.hll_sparse_max_bytes);
+    g_config.push_back({"hll-sparse-max-bytes", ConfigKind::Bytes,
+                        std::to_string(cfg.hll_sparse_max_bytes), true});
+    g_config.push_back({"port", ConfigKind::Unsigned, std::to_string(cfg.port), true});
+    g_config.push_back({"bind", ConfigKind::String, cfg.bind_addr, true});
+    g_config.push_back({"unixsocket", ConfigKind::String,
+                        cfg.unixsocket ? cfg.unixsocket : "", true});
+    char unix_mode[8];
+    std::snprintf(unix_mode, sizeof(unix_mode), "%o", static_cast<unsigned>(cfg.unixsocketperm));
+    g_config.push_back({"unixsocketperm", ConfigKind::String, unix_mode, true});
     g_config.push_back({"save", ConfigKind::Save, cfg_save_schedule_string(cfg.save)});
     g_config.push_back({"dir", ConfigKind::String, (cfg.dir && *cfg.dir) ? cfg.dir : "."});
     g_config.push_back({"dbfilename", ConfigKind::String,
@@ -338,6 +349,8 @@ void init_config(const Config& cfg) {
     g_config.push_back({"aof-use-rdb-preamble", ConfigKind::String, "yes"});
     g_config.push_back({"aof-timestamp-enabled", ConfigKind::Bool,
                         cfg.aof_timestamp_enabled ? "yes" : "no"});
+    g_config.push_back({"aof-load-truncated", ConfigKind::Bool,
+                        cfg.aof_load_truncated ? "yes" : "no", true});
     add_config("maxmemory", ConfigKind::Bytes, cfg.maxmemory);
     g_config.push_back({"maxmemory-policy", ConfigKind::Policy,
                         maxmemory_policy_name(cfg.maxmemory_policy)});
@@ -381,14 +394,14 @@ void init_config(const Config& cfg) {
     add_config("proto-max-bulk-len", ConfigKind::Bytes, cfg.proto_max_bulk_len);
     add_config("zc-min", ConfigKind::Unsigned, cfg.zc_min);
     add_config("atomic", ConfigKind::Unsigned, cfg.atomic);
-    add_config("hash-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.hash.max_entries);
-    add_config("hash-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.hash.max_value);
+    add_config("hash-max-listpack-entries", ConfigKind::Unsigned, cfg.type_limits.hash.max_entries);
+    add_config("hash-max-listpack-value", ConfigKind::Bytes, cfg.type_limits.hash.max_value);
     add_config("list-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.list.max_entries);
     add_config("list-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.list.max_value);
     add_config("set-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.set.max_entries);
     add_config("set-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.set.max_value);
-    add_config("zset-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.zset.max_entries);
-    add_config("zset-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.zset.max_value);
+    add_config("zset-max-listpack-entries", ConfigKind::Unsigned, cfg.type_limits.zset.max_entries);
+    add_config("zset-max-listpack-value", ConfigKind::Bytes, cfg.type_limits.zset.max_value);
     add_config("stream-node-max-bytes", ConfigKind::Unsigned,
                cfg.stream_limits.node_max_bytes);
     add_config("stream-node-max-entries", ConfigKind::Unsigned,
@@ -416,6 +429,11 @@ void init_config(const Config& cfg) {
 }
 
 ConfigValue* find_config(Slice name) {
+    for (const ConfigAlias& alias : kConfigAliases) {
+        if (!eq_icase(name, alias.name)) continue;
+        name = Slice(alias.canonical, std::strlen(alias.canonical));
+        break;
+    }
     for (ConfigValue& item : g_config)
         if (eq_icase(name, item.name)) return &item;
     return nullptr;
@@ -460,7 +478,16 @@ bool parse_client_output_buffer_limit_slice(Slice input,
     return cfg_parse_client_output_buffer_limit(argv.data(), argv.size(), out, error);
 }
 
-bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
+bool normalize_config(const ConfigValue& entry, Slice input, std::string& out,
+                      bool legacy_compact = false) {
+    if (std::strstr(entry.name, "-max-listpack-")) {
+        uint32_t value = 0;
+        if (!cfg_parse_compact_limit(input.p, input.n,
+                                     entry.kind == ConfigKind::Bytes, legacy_compact, value))
+            return false;
+        out = std::to_string(value);
+        return true;
+    }
     switch (entry.kind) {
         case ConfigKind::String:
             if (!std::strcmp(entry.name, "acl-pubsub-default")) {
@@ -563,6 +590,23 @@ bool collect_config_updates(Op& op,
             msg.append(op.arg(i).p, op.arg(i).n); msg.push_back('\'');
             reply_err(op.sink(), msg.c_str()); return false;
         }
+        bool legacy_compact = false;
+        for (const ConfigAlias& alias : kConfigAliases)
+            if (std::strstr(alias.name, "-max-compact-") && eq_icase(op.arg(i), alias.name))
+                legacy_compact = true;
+        // Redis accepts canonical+historical aliases together (last value wins), but rejects
+        // repeating the same spelling in one SET. Keep that grammar for the new bindings.
+        if (!legacy_compact && std::strstr(item->name, "-max-listpack-")) {
+            const std::string requested(op.arg(i).p, op.arg(i).n);
+            for (uint32_t previous = 2; previous < i; previous += 2) {
+                if (!eq_icase(op.arg(previous), requested.c_str())) continue;
+                std::string msg = "ERR CONFIG SET failed (possibly related to argument '";
+                msg += requested;
+                msg += "') - duplicate parameter";
+                reply_err(op.sink(), msg.c_str());
+                return false;
+            }
+        }
         if (!std::strcmp(item->name, "aof-use-rdb-preamble")) {
             if (!eq_icase(op.arg(i + 1), "yes")) {
                 reply_err(op.sink(), "ERR aof-use-rdb-preamble no is unsupported: the AOF base file is a TomoKV snapshot");
@@ -585,7 +629,8 @@ bool collect_config_updates(Op& op,
                 value = cfg_client_output_buffer_limit_string(parsed);
             }
         } else {
-            normalized = normalize_config(*item, op.arg(i + 1), value);
+            // The old TomoKV spelling accepted leading zeroes and bare bytes only.
+            normalized = normalize_config(*item, op.arg(i + 1), value, legacy_compact);
         }
         if (!normalized) {
             std::string msg = "ERR Invalid argument '";
@@ -1304,11 +1349,16 @@ void cmd_config(Shard& sh, Op& op) {
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             for (const ConfigValue& item : g_config) {
-                Slice name(item.name, std::strlen(item.name));
-                bool matched = false;
-                for (uint32_t i = 2; i < op.argc() && !matched; i++)
-                    matched = command_glob_match(op.arg(i), name, true);
-                if (matched) matches.emplace_back(item.name, item.value);
+                auto match = [&](const char* spelling) {
+                    Slice name(spelling, std::strlen(spelling));
+                    bool matched = false;
+                    for (uint32_t i = 2; i < op.argc() && !matched; i++)
+                        matched = command_glob_match(op.arg(i), name, true);
+                    if (matched) matches.emplace_back(spelling, item.value);
+                };
+                match(item.name);
+                for (const ConfigAlias& alias : kConfigAliases)
+                    if (!std::strcmp(alias.canonical, item.name)) match(alias.name);
             }
         }
         auto sink = op.sink();
@@ -1492,14 +1542,14 @@ void cmd_config(Shard& sh, Op& op) {
             if (!parse_u64(Slice(update.second.data(), update.second.size()), value)) continue;
             const uint32_t v = static_cast<uint32_t>(value);
             if (!std::strcmp(update.first->name, "zc-min")) sh.set_zc_min(v);
-            else if (!std::strcmp(update.first->name, "hash-max-compact-entries")) limits.hash.max_entries = v;
-            else if (!std::strcmp(update.first->name, "hash-max-compact-value")) limits.hash.max_value = v;
+            else if (!std::strcmp(update.first->name, "hash-max-listpack-entries")) limits.hash.max_entries = v;
+            else if (!std::strcmp(update.first->name, "hash-max-listpack-value")) limits.hash.max_value = v;
             else if (!std::strcmp(update.first->name, "list-max-compact-entries")) limits.list.max_entries = v;
             else if (!std::strcmp(update.first->name, "list-max-compact-value")) limits.list.max_value = v;
             else if (!std::strcmp(update.first->name, "set-max-compact-entries")) limits.set.max_entries = v;
             else if (!std::strcmp(update.first->name, "set-max-compact-value")) limits.set.max_value = v;
-            else if (!std::strcmp(update.first->name, "zset-max-compact-entries")) limits.zset.max_entries = v;
-            else if (!std::strcmp(update.first->name, "zset-max-compact-value")) limits.zset.max_value = v;
+            else if (!std::strcmp(update.first->name, "zset-max-listpack-entries")) limits.zset.max_entries = v;
+            else if (!std::strcmp(update.first->name, "zset-max-listpack-value")) limits.zset.max_value = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-bytes")) stream_limits.node_max_bytes = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-entries")) stream_limits.node_max_entries = v;
         }

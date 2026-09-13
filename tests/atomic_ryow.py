@@ -171,7 +171,11 @@ note("MSETNX duplicate key uses pre-command state",
 # string cutover so this also exercises IO-prebuilt KvObj abandonment and owner-side admission.
 leakkeys = ["ary:abandon%d" % i for i in range(8)]
 admin.cmd("DEL", *leakkeys)
-admin.cmd("SET", leakkeys[0], "abandon:guard")
+# Establish the guard on the MSETNX connection: RYOW makes rejection mandatory even when
+# another commit holds the safe snapshot below this SET's ticket. A foreign admin's guard
+# can be excluded by that cut; reply=1 then means a committed MSETNX, not an abandoned leak.
+c = Resp()
+assert c.cmd("SET", leakkeys[0], "abandon:guard") == b"OK"
 leak_stop = threading.Event()
 leak_errors = []
 leak_reads = 0
@@ -195,7 +199,6 @@ def leak_reader():
 
 thread = threading.Thread(target=leak_reader, daemon=True)
 thread.start()
-c = Resp()
 try:
     for seq in range(256):
         args = ["MSETNX"]

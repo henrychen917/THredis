@@ -14,6 +14,9 @@ inline constexpr uint32_t kDenseBytes = kRegisters * 6 / 8;
 inline constexpr uint32_t kHeaderBytes = 16;
 inline constexpr uint32_t kDenseSize = kHeaderBytes + kDenseBytes;
 
+// Set once before worker creation; all HLL mutation/replay/merge callers share this boot policy.
+void configure_sparse_max_bytes(uint32_t value);
+
 // Header validation is deliberately separate from sparse-stream validation. Redis makes the same
 // distinction: a bad HLL string gets WRONGTYPE, while a valid HYLL header whose opcode stream is
 // corrupt gets INVALIDOBJ when an operation actually decodes it.

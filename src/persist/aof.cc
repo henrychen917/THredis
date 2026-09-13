@@ -2386,7 +2386,8 @@ bool aof_read_recovery(const Config& config, uint32_t expected_shards,
     if (!manifest_exists) {
         bool exists = false;
         std::string local_warning;
-        auto plan = aof_read_plan(aof_file_path(config).c_str(), expected_shards, true,
+        auto plan = aof_read_plan(aof_file_path(config).c_str(), expected_shards,
+                                  config.aof_load_truncated,
                                   exists, local_warning, error);
         if (!error.empty()) return false;
         if (!local_warning.empty()) warning = local_warning;
@@ -2424,7 +2425,8 @@ bool aof_read_recovery(const Config& config, uint32_t expected_shards,
         const bool last = index + 1 == manifest.increments.size();
         const std::vector<uint32_t>* initial = &manifest.increment_starts[index];
         auto plan = aof_read_plan((directory + "/" + entry.second).c_str(), expected_shards,
-                                  last, exists, local_warning, error, initial);
+                                  last && config.aof_load_truncated,
+                                  exists, local_warning, error, initial);
         if (!plan || !exists) {
             if (error.empty()) error = "AOF manifest increment file is missing";
             return false;

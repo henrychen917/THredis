@@ -272,7 +272,7 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
         return 1;
     }
     std::string unix_error;
-    if (!unix_listener.open(cfg.tcp_backlog, unix_error)) {
+    if (!unix_listener.open(cfg.tcp_backlog, unix_error, cfg.unixsocketperm)) {
         std::fprintf(stderr, "%s\n", unix_error.c_str());
         stop_workers();
         return 1;

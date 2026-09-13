@@ -33,7 +33,7 @@ public:
     int fd() const { return fd_; }
 
     // May be called exactly once, after persistence load and before any IoLoop activates.
-    bool open(uint32_t backlog, std::string& error) {
+    bool open(uint32_t backlog, std::string& error, uint16_t permissions) {
         if (!configured()) return true;
         if (fd_ >= 0 || owns_path_) {
             error = "unix listener was opened more than once";
@@ -98,6 +98,12 @@ public:
             return false;
         }
         owns_path_ = true;
+        // Redis mode 0 leaves the process umask in charge. Apply an explicit mode before
+        // listening; the existing pathname/fd owner also cleans up a chmod failure.
+        if (permissions && ::chmod(path_, static_cast<mode_t>(permissions)) != 0) {
+            error = std::string("chmod unixsocket: ") + std::strerror(errno);
+            return false;
+        }
         if (::listen(fd_, static_cast<int>(backlog)) != 0) {
             error = std::string("listen unixsocket: ") + std::strerror(errno);
             ::close(fd_);
