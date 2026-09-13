@@ -31,10 +31,10 @@ struct CoreConcurrencyTest {
         return {text.data(), static_cast<uint32_t>(text.size())};
     }
 
-    template <bool Fused = false>
+    template <bool Fused = false, bool ReadLocalExecutor = Fused>
     struct Fixture {
         Server server;
-        ExLoopT<Fused> loops[8];
+        ExLoopT<ReadLocalExecutor> loops[8];
         IoLoop io;
         uint32_t source = Fused ? 0 : 6;
         uint32_t destination = Fused ? 1 : 7;
@@ -209,6 +209,146 @@ struct CoreConcurrencyTest {
         ex_schedule_batch(batch, 64);
         std::copy(std::begin(batch), std::begin(batch) + 64, tasks.begin());
         for (uint32_t i = 0; i < 64; i++) require(tasks[i].op_id == i, "one-client FIFO shortcut");
+    }
+
+    static void arrival_window() {
+        ExecArrivalDepth depth;
+        require(!depth.armed() && depth.limit() == 0, "arrival policy starts disarmed");
+        depth.arm();
+        for (uint32_t observed : {3u, 4u, 5u, 6u}) depth.observe(observed);
+        require(depth.limit() == 5, "arrival mean is not rounded to a power of two");
+        require(depth.observe(100) == 29 && depth.observe(100) == 53,
+                "every nonempty arrival replaces the oldest observation in a sliding window");
+        for (uint32_t i = 0; i < kExSpinBudget; i++) depth.observe(0);
+        require(depth.limit() == 53, "idle spins cannot dilute the nonempty arrival window");
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) depth.observe(UINT32_MAX);
+        require(depth.limit() == 128, "large arrival hints clamp before summation");
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) depth.observe(1);
+        require(depth.limit() == 1, "a shallow window replaces the prior deep estimate");
+    }
+
+    inline static std::vector<uint32_t> executed_batch_sizes;
+    static void record_exec_batch(const Task*, uint32_t n) {
+        require(n > 0 && n <= ExecArrivalDepth::kCapacity, "actual batch is within scratch");
+        executed_batch_sizes.push_back(n);
+    }
+
+    // Exercise the actual drain, not a second implementation of the gather rule. INCR replies
+    // lock exact FIFO execution and task conservation across ROB wraps and partial batches.
+    // The extra split instantiation is the fused-capable owner used by the RL2S runtime.
+    template <bool Fused, bool ReadLocalExecutor = Fused>
+    static void adaptive_batches() {
+        Fixture<Fused, ReadLocalExecutor> f;
+        auto& owner = f.loops[f.source];
+        auto& inbox = f.server.thread(f.source);
+        auto& producer = f.server.thread(f.io_id);
+        Client clients[3] = {Client(-1), Client(-1), Client(-1)};
+        for (uint32_t i = 0; i < 3; i++) {
+            f.client(clients[i]);
+            clients[i].set_id(i + 1);
+        }
+        const std::string key = f.key(f.sid());
+        uint32_t total = 0;
+        constexpr uint32_t kPlainCapacity = Fused ? kGenthreadPipelineExBatchOps : kExecBatch;
+        ExLoopT<ReadLocalExecutor>::test_before_exec_batch_ = record_exec_batch;
+        auto wave = [&](uint32_t count, bool use_filler = false, bool lose_hint = false) {
+            std::vector<std::string> expected[3];
+            for (uint32_t i = 0; i < count; i++) {
+                Client& client = clients[i % 3];
+                prepare(client, {Slice("INCR"), slice(key)}, f.server);
+                const Task task{&client, client.rob().dispatch_id(), -1, nullptr};
+                client.rob().publish();
+                const bool posted = Fused
+                    ? inbox.post_iofused_task_quiet(f.io_id, task, producer.sig())
+                    : inbox.post_task_quiet(f.io_id, task, producer.sig());
+                require(posted, "entire arrival burst published (no skip)");
+                expected[i % 3].push_back(":" + std::to_string(total + i + 1) + "\r\n");
+            }
+            executed_batch_sizes.clear();
+            const uint64_t ops_before = inbox.sig().ops;
+            uint32_t consumed = 0, filled = 0;
+            if (lose_hint) {
+                const uint32_t limit = owner.arrival_depth_.limit();
+                require(owner.template drain_tasks<kPlainCapacity, Fused>() == 0 &&
+                            executed_batch_sizes.empty(), "quiet publication has no notify hint");
+                require(owner.arrival_depth_.limit() == limit, "missing hint cannot close window");
+                consumed = owner.template drain_tasks<kPlainCapacity, Fused>(true);
+            } else {
+                inbox.flush_task_notify(f.io_id, owner.ring_, producer.sig());
+                if (use_filler) {
+                    bool filler_used = false;
+                    auto filler = [&] {
+                        require(executed_batch_sizes.empty(), "filler precedes first execution");
+                        filled++;
+                    };
+                    consumed = owner.template drain_tasks_with_filler<kPlainCapacity, Fused>(
+                        false, filler, filler_used);
+                    require(filler_used && filled == 1, "filler fires exactly once, including tail");
+                } else {
+                    consumed = owner.template drain_tasks<kPlainCapacity, Fused>();
+                }
+            }
+            require(consumed == count && inbox.sig().ops - ops_before == count,
+                    "drain consumes and accounts for every task exactly once");
+            require(inbox.ex_inbound_quiesced(), "retired frontier covers every consumed task");
+            uint32_t executed = 0;
+            for (uint32_t n : executed_batch_sizes) executed += n;
+            require(executed == count, "every gathered task reached an execution batch");
+            for (uint32_t i = 0; i < 3; i++) {
+                size_t returned = 0;
+                clients[i].rob().drain([&](Op& done) {
+                    require(returned < expected[i].size() &&
+                                std::string(done.reply.data(), done.reply.size()) == expected[i][returned],
+                            "INCR reply proves FIFO execution across batch and ROB boundaries");
+                    returned++;
+                });
+                require(returned == expected[i].size(), "every task replied without another arrival");
+            }
+            total += count;
+        };
+
+        wave(67);
+        require(!owner.arrival_depth_.armed(), "disabled drain never samples or arms itself");
+        require(executed_batch_sizes == (Fused ? std::vector<uint32_t>{67}
+                                             : std::vector<uint32_t>{32, 32, 3}),
+                "disabled drain retains its existing batch geometry");
+        owner.reorder_enabled_ = true;
+        owner.arrival_depth_.arm();
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) wave(1);
+        require(owner.arrival_depth_.limit() == 1, "real shallow arrivals select one task");
+        wave(0);
+        require(owner.arrival_depth_.limit() == 1 && executed_batch_sizes.empty(),
+                "an empty ready-mask drain neither samples nor invents a batch");
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) wave(5);
+        require(owner.arrival_depth_.limit() == 5 && executed_batch_sizes == std::vector<uint32_t>{5},
+                "controller escapes its previous one-task limit using unclipped arrivals");
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) wave(131);
+        require(owner.arrival_depth_.limit() == 128 &&
+                    executed_batch_sizes == std::vector<uint32_t>{128, 3},
+                "deep arrivals select more than 32 with reorder armed and flush the partial tail");
+        if constexpr (Fused) {
+            for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) wave(131, true);
+            require(executed_batch_sizes == std::vector<uint32_t>{128, 3},
+                    "filler executes once across a full adaptive batch and its partial tail");
+        }
+        wave(1, Fused);
+        require(executed_batch_sizes == std::vector<uint32_t>{1},
+                "a stale deep limit never waits to fill a shallow batch");
+        wave(67, false, true);
+        require(executed_batch_sizes == (Fused ? std::vector<uint32_t>{67}
+                                             : std::vector<uint32_t>{32, 32, 3}),
+                "lost-hint unmasked recovery keeps its original geometry");
+        for (uint32_t i = 0; i < ExecArrivalDepth::kWindow; i++) wave(3, Fused);
+        require(owner.arrival_depth_.limit() == 3 && executed_batch_sizes == std::vector<uint32_t>{3},
+                "shallow traffic replaces the deep window through ordinary and filler drains");
+        ExLoopT<ReadLocalExecutor>::test_before_exec_batch_ = nullptr;
+    }
+
+    static void batch_depth() {
+        arrival_window();
+        adaptive_batches<false>();
+        adaptive_batches<false, true>();
+        adaptive_batches<true>();
     }
 
     inline static std::mutex pause_mutex;
@@ -419,7 +559,12 @@ int main(int argc, char** argv) {
     T::require(tomo::command_registry_init(false), "command registry initialization");
     const std::string row = argv[1];
     if (row == "watch") T::watch_disconnect();
-    else if (row == "scheduler") T::scheduler();
+    else if (row == "scheduler") {
+        T::scheduler();
+        // Extend the existing quick/full gate row; batchdepth is also selectable for a lane build.
+        T::batch_depth();
+    }
+    else if (row == "batchdepth") T::batch_depth();
     else if (row == "lifetime") T::lifetime();
     else if (row == "drain") T::drain_ack();
     else if (row == "route") T::route_order();

@@ -41,8 +41,8 @@ namespace tomo {
 // measure, not a result.
 inline constexpr uint32_t kExSpinBudget = 2048;
 
-// How many ops are gathered before executing, so their storage prefetches can overlap. Large enough
-// that the prefetches have time to land, small enough that the batch stays in L1.
+// Disarmed gather quantum and read-local capture capacity. Large enough that the storage
+// prefetches have time to land, small enough that the batch stays in L1.
 inline constexpr uint32_t kExecBatch = kGenthreadExBatchOps;
 inline constexpr uint32_t kReadLocalPrefetchKeys = 32;
 inline constexpr uint32_t kActiveExpireChecks = 20;
@@ -71,6 +71,44 @@ static_assert(kReadLocalDrainChunkOps == kExecBatch);
 static_assert(kReadLocalOwnerTaskChunkOps == kExecBatch);
 static_assert(kReadLocalMaxChunksBetweenOwnerBatches > 0);
 static_assert((kExecBatch & (kExecBatch - 1)) == 0);
+
+// Arrival depth is the work visible BEFORE gathering, not the clipped size of the last batch:
+// learning from our own limit would trap a shallow controller there when a deep pipe arrives.
+// Keep the existing 128-task scratch capacity (including reorder's byte indices), but let the
+// number executed together be any integer in [1, capacity]. kExecBatch remains the mask-sensitive
+// 32-task geometry used by read-local captures and the disarmed executor.
+struct ExecArrivalDepth {
+    static constexpr uint32_t kCapacity = kGenthreadPipelineExBatchOps;
+    // One window spans the number of ordinary batches in the existing largest executor burst.
+    // Count nonempty arrival observations, not polling iterations: an idle thread's spin budget
+    // must not outweigh the traffic. No timers, command stamps, or load-generator settings enter
+    // the policy. A changed steady depth replaces the old estimate within four ready drains.
+    static constexpr uint32_t kWindow = kCapacity / kExecBatch;
+    static_assert(kCapacity % kExecBatch == 0 && kWindow == sizeof(uint32_t));
+    static_assert(kCapacity <= UINT8_MAX && kCapacity * kWindow <= UINT16_MAX);
+
+    // Four byte-sized observations in one word; shifting replaces the oldest without a cursor
+    // or counter. Startup seeds each byte with the ordinary quantum; arrivals replace one at a time.
+    constexpr void arm() { samples_ = kExecBatch * 0x01010101u; }
+    constexpr bool armed() const { return samples_ != 0; }
+    constexpr uint32_t limit() const {
+        // Pair sums have 16 bits each, so two maximum-depth bytes cannot carry into the other pair.
+        const uint32_t pairs = (samples_ & 0x00ff00ffu) + ((samples_ >> 8) & 0x00ff00ffu);
+        return ((pairs & 0xffffu) + (pairs >> 16) + kWindow - 1) / kWindow;
+    }
+
+    // Called once per fresh-task drain, outside every task loop. Zero leaves the window alone:
+    // the caller still drains notifications, and the existing unmasked idle audit recovers a
+    // missing notification. An arrival hint never decides whether queued work may execute.
+    constexpr uint32_t observe(uint32_t depth) {
+        if (depth) samples_ = (samples_ << 8) | std::min(depth, kCapacity);
+        return limit();
+    }
+
+private:
+    uint32_t samples_ = 0; // --overlap 0: no sampling, scratch, or allocation
+};
+static_assert(sizeof(ExecArrivalDepth) == 4 && alignof(ExecArrivalDepth) == 4);
 
 // Constructed only for an armed declared-key-precise write whose owner has since enabled eviction.
 // Keeping the existing maxmemory admission active but forcing NoEviction makes the IO-side promise
@@ -179,6 +217,7 @@ public:
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
         reorder_enabled_ = srv->cfg().reorder != 0;
+        if (srv->cfg().overlap) arrival_depth_.arm();
         pipeline_batches_ = Fused && srv->thread_mode() == ThreadMode::Fused &&
                             srv->cfg().overlap != 0;
         // Fused overlap uses fixed producer lanes; synchronous local-read demotion resolves
@@ -843,6 +882,7 @@ private:
 #ifdef TOMO_CORE_CONCURRENCY_TEST
     inline static void (*test_after_done_)(Client*) = nullptr;
     inline static void (*test_after_drain_ack_)() = nullptr;
+    inline static void (*test_before_exec_batch_)(const Task*, uint32_t) = nullptr;
 #endif
 
     bool read_local_enabled() const {
@@ -1979,6 +2019,10 @@ private:
     template <uint32_t BatchOps = kGenthreadExBatchOps,
               bool IofusedPrivateQueue = false>
     uint32_t drain_tasks(bool unmasked = false) {
+        if (!unmasked && __builtin_expect(arrival_depth_.armed(), false)) {
+            const uint32_t depth = self_->notified_task_depth_capped(ExecArrivalDepth::kCapacity);
+            if (depth) return drain_tasks_adaptive<IofusedPrivateQueue>(depth);
+        }
         Task batch[BatchOps];
         uint32_t held = 0;
         auto take = [&](const Task& t) {
@@ -2002,6 +2046,10 @@ private:
     // same pop/retire sequence, so no streams lane list or delayed-retirement context is involved.
     template <uint32_t BatchOps, bool IofusedPrivateQueue, typename Filler>
     uint32_t drain_tasks_with_filler(bool unmasked, Filler& filler, bool& filler_used) {
+        if (!unmasked && arrival_depth_.armed()) {
+            const uint32_t depth = self_->notified_task_depth_capped(ExecArrivalDepth::kCapacity);
+            if (depth) return drain_tasks_adaptive<IofusedPrivateQueue>(depth, &filler, &filler_used);
+        }
         Task batch[BatchOps];
         uint32_t held = 0;
         auto execute_batch = [&] {
@@ -2026,6 +2074,53 @@ private:
         const uint32_t n = unmasked
             ? self_->drain_tasks_unmasked<IofusedPrivateQueue>(take)
             : self_->drain_tasks<IofusedPrivateQueue>(take);
+        execute_batch();
+        self_->sig().ops += n;
+        return n;
+    }
+
+    // The same actuator in 1s and 2s, including the fused-capable RL2S owner. Only fresh owner
+    // batches change: local-read chunks, snapshot/retry debt, and the unmasked drain used at
+    // quiescence retain their geometry and ordering. This state describes arrivals to a physical
+    // executor, owns no task/shard pointer, and needs no transfer on a shard or role move.
+    //
+    // Keep the larger scratch frame behind the armed, nonempty call, including without LTO.
+    // The existing held counter/comparison does all per-task gathering; the only policy work is
+    // the caller's capped hint scan and this window update per drain. An empty hint takes the
+    // original drain, which still sees a racing notification; it never reserves this frame or
+    // touches the window. The hint never limits HOW MUCH is drained: every partial batch executes
+    // immediately and no task is held waiting for another arrival.
+    template <bool IofusedPrivateQueue, typename Filler = void>
+    __attribute__((noinline))
+    uint32_t drain_tasks_adaptive(uint32_t depth, Filler* filler = nullptr,
+                                  bool* filler_used = nullptr) {
+        const uint32_t limit = arrival_depth_.observe(depth);
+        Task batch[ExecArrivalDepth::kCapacity];
+        uint32_t held = 0;
+        auto execute_batch = [&] {
+            if (!held) return;
+            if constexpr (!std::is_void_v<Filler>) {
+                if (!*filler_used && xshard_retries_.empty()) {
+                    if (__builtin_expect(reorder_enabled_, false))
+                        srv_->mode_schedule_stats(self_->id()).note_reorder(
+                            held, ex_schedule_batch(batch, held));
+                    prefetch_exec_batch(batch, held);
+                    (*filler)();
+                    *filler_used = true;
+                    exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
+                } else {
+                    exec_batch<IofusedPrivateQueue>(batch, held);
+                }
+            } else {
+                exec_batch<IofusedPrivateQueue>(batch, held);
+            }
+            held = 0;
+        };
+        auto take = [&](const Task& task) {
+            batch[held++] = task;
+            if (held == limit) execute_batch();
+        };
+        const uint32_t n = self_->drain_tasks<IofusedPrivateQueue>(take);
         execute_batch();
         self_->sig().ops += n;
         return n;
@@ -2401,6 +2496,9 @@ private:
     // stream filler.
     template <bool IofusedPrivateQueue = false>
     void exec_batch_prefetched(const Task* batch, uint32_t n) {
+#ifdef TOMO_CORE_CONCURRENCY_TEST
+        if (test_before_exec_batch_) test_before_exec_batch_(batch, n);
+#endif
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
@@ -2411,7 +2509,7 @@ private:
             // wait on either.
             NotifyBatchScope notify_batch(this);
             // THE ENTIRE DISABLED-FEATURE COST OF SLOWLOG/LATENCY: one predicted-false branch
-            // here, once per batch of up to kExecBatch ops. No clock is read and the recorder is
+            // here, once per execution batch. No clock is read and the recorder is
             // not linked into this loop at all. The armed body is out of line in
             // exec_batch_timed().
             if (__builtin_expect(slowlog_armed_, false)) {
@@ -3104,6 +3202,10 @@ private:
     // Slow-log state at the true cold tail: nothing above it moves. `slowlog_armed_` is the single
     // predicted-false branch exec_batch pays when the feature is off.
     bool         slowlog_armed_ = false;
+    // Four of the five padding bytes before SlowlogArm's 8-byte alignment. No field moves and
+    // neither executor stride grows. Only --overlap 1 arms this owner-private window; the off
+    // drain keeps its original constant batch and never reserves the adaptive scratch frame.
+    ExecArrivalDepth arrival_depth_;
     SlowlogArm   slowlog_arm_{};
     SlowlogExState slowlog_state_{};
     // Fused-only state stays at the true tail so every split ExLoop field keeps its offset.
@@ -3112,7 +3214,8 @@ private:
     void* fused_io_context_ = nullptr;
     FusedCompletionFn fused_completion_ = nullptr;
     Ring* fused_handoff_ring_ = nullptr;
-    // Both interwoven schedules share the measured 128-task geometry and coalesced N2 boundary.
+    // Both interwoven schedules retain the 128-task scratch capacity and coalesced N2 boundary;
+    // the armed arrival window selects how much of that capacity each fresh batch uses.
     bool pipeline_batches_ = false;
     bool iofused_ = false;
     // Consumes the bool padding this class already carried before notify_batch_n_. Ordinary
@@ -3122,9 +3225,11 @@ private:
     // Per-batch completion notification. While a batch is open, the slot
     // path of notify_sender records (io, slot) here instead of fencing and setting per op; the
     // batch end pays ONE seq_cst fence, one ReadyMask::set per recorded client run and one wake
-    // decision per io that saw an empty->flagged edge. Sized to this loop's largest batch; the
-    // record never holds more than one entry per executed task, and a full record flushes in
-    // place regardless. (io, slot), never Client*: the flush may run a whole batch after the Done
+    // decision per io that saw an empty->flagged edge. Retain the existing storage: a larger
+    // adaptive batch on a non-read-local split executor flushes this 32-entry record early,
+    // while the fused-capable RL2S owner already has 128 entries. The record never holds more
+    // than one entry per executed task, and a full record flushes in place regardless.
+    // (io, slot), never Client*: the flush may run a whole batch after the Done
     // store, and a connection is only guaranteed allocated until the io's second reap prologue
     // after close.
     struct NotifyEntry { uint32_t io; uint32_t slot; };
