@@ -144,6 +144,13 @@ build/atomic-survivors-unit: tests/atomic_survivors_unit.cc src/cmd/xshard.cc $(
 	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. tests/atomic_survivors_unit.cc \
 	  $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) -o $@ $(JELIBS) $(LDLIBS) -lm
 
+# Inspect real record/header allocation arenas on pinned owner threads, including aborts and
+# quiesced shard handoff. JE=1 is required; no server or io_uring instance is started.
+build/owner-arena-unit: tests/owner_arena_unit.cc src/cmd/xshard.cc $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) $(wildcard src/*/*.inc) $(wildcard src/*/*.h) Makefile
+	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. $< \
+	  $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) -o $@ \
+	  $(JELIBS) $(LDLIBS) -lm -Wl,--wrap=mallocx -Wl,--wrap=sdallocx
+
 # Load drivers: not part of `all`, kept compiling here so they cannot rot unnoticed.
 build/benchtxn: tools/benchtxn.cc Makefile
 	@mkdir -p build

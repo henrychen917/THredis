@@ -1951,28 +1951,16 @@ ScatterPrepare xshard_prepare(Server& server, Op& op, ScatterArenaPool& pool,
         state->keys[i] = KeyRef{routes[i].hash, routes[i].arg, routes[i].shard};
     if (routes != route_stack) delete[] routes;
 
-    // Blind string values belong to the op's IO thread until an owner links them. Allocation and
-    // memcpy therefore run on the underutilized stage without touching a shard or shard metadata.
-    // key_anchor is the ownership bit: an owner clears it only after atomic_install_group takes the
-    // object; abandonment and prepare failures leave it for IO-side destruction.
-    if (atomic_write && (kind == Kind::Mset || kind == Kind::Msetnx)) {
-        for (uint32_t i = 0; i < key_count; i++) {
-            KeyRef& key = state->keys[i];
-            // Small/int objects already come from the shard owner's hot value pool. Moving those to
-            // generic jemalloc regressed MSET-8 despite shifting cycles to IO. Large strings bypass
-            // that pool in V3, so prebuild precisely the allocation+memcpy work that was already a
-            // heap operation and preserve the allocation-free common cell.
-            if (op.arg(key.arg + 1).n <= kEmbedThreshold) continue;
-            KvObj* value = xshard_make_string(op.arg(key.arg), op.arg(key.arg + 1));
-            if (!value) {
-                set_oom(op);
-                xshard_abandon_unpublished(state, pool, owner_io);
-                return ScatterPrepare::Error;
-            }
-            key.stable_object = value;
-            key.key_anchor = value;
-        }
-    }
+    // MSET/MSETNX materialize on the executing shard owner, including external strings. Workers
+    // already bind a private jemalloc arena after pinning; prebuilding >kEmbedThreshold values
+    // here instead made both the record header and its payload on IO before handing them to EX.
+    // Leave stable_object/key_anchor empty so the existing owner materialization pass uses
+    // xshard_make_atomic_string: the small-value pool stays intact and large allocations/copies
+    // run on the current owner after a quiesced shard handoff. No arena pointer is
+    // captured at dispatch, so there is no additional per-owner state to rebind at migration.
+    // The Op retains its argv through completion. Owner materialization still precedes admission
+    // and exchange; partial OOM leaves unlinked key_anchors for the existing abort cleanup.
+    // This removes the IO-born record handoff, not the argv handoff or foreign read-local loads.
 
     if (state->snapshot != UINT64_MAX && !pool.register_snapshot(server, state, owner_io)) {
         set_oom(op);
