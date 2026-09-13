@@ -47,50 +47,12 @@ struct ExScheduleKey {
     uint8_t length = 0;
 };
 
+// Only a non-degenerate multi-client run reaches dependency widening and bucket scatter.
+// Keeping this frame out of line also keeps its hash table and Task copies off identity paths.
 template <size_t BatchOps>
-uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
-    if (n < 2) return 0;
-    Client* const only_client = tasks[0].client;
-    uint32_t distinct_at = 1;
-    while (distinct_at < n && tasks[distinct_at].client == only_client) distinct_at++;
-    // Absolute per-connection order leaves no legal permutation in a one-client run.
-    if (distinct_at == n) return 0;
-
-    ExScheduleKey keys[BatchOps];
-    uint8_t min_rank = UINT8_MAX;
-    uint8_t max_rank = 0;
-    uint8_t first_length = 0;
-    bool one_length = true;
-
-    // The gather contract presents each connection's Tasks in increasing op_id order. Sample
-    // newest-to-oldest: flush_id only advances, so an older task still receives a strictly
-    // lower rank even if IO retires a completed prefix between samples. Adjacent tasks from
-    // one connection reuse the head load without any per-connection table. The slow path
-    // verifies the contract before reordering; every earlier exit retains FIFO.
-    Client* sampled_client = nullptr;
-    uint64_t sampled_head = 0;
-    for (uint32_t i = n; i-- > 0;) {
-        const Task& task = tasks[i];
-        if (task.client != sampled_client) {
-            sampled_client = task.client;
-            sampled_head = sampled_client->rob().flush_id();
-        }
-        const uint64_t distance = task.op_id - sampled_head;
-        // A fresh unfinished task is always in the 64-slot live ROB window. If that invariant
-        // is ever broken, preserve today's FIFO instead of collapsing ranks and risking order.
-        if (__builtin_expect(distance >= kRobWindow, false)) return 1;
-        keys[i] = ExScheduleKey{static_cast<uint8_t>(distance), base_lengths[i]};
-        min_rank = std::min(min_rank, keys[i].rank);
-        max_rank = std::max(max_rank, keys[i].rank);
-        if (i == n - 1) first_length = keys[i].length;
-        else one_length &= keys[i].length == first_length;
-    }
-
-    // The measured-law escape is defined on the directly available gathered classes and runs
-    // before conservative widening for an invisible predecessor. This is what keeps homogeneous
-    // rank-adjacent traffic off the dependency and bucket paths.
-    if (one_length && max_rank - min_rank <= 1) return 1;
-
+__attribute__((noinline))
+uint32_t ex_schedule_ranked_run(Task* tasks, ExScheduleKey* keys, uint32_t n,
+                                uint8_t min_rank, uint8_t max_rank) {
     // Effective class is the prefix maximum for each connection in this gathered run. A rank
     // before the first represented task, or a gap in its ids, means an unrepresented blocker;
     // its slot cannot safely be read while IO may recycle it, so Long is the no-state upper
@@ -128,7 +90,7 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
         }
         chain_last[slot] = static_cast<uint8_t>(i);
     }
-    one_length = true;
+    bool one_length = true;
     for (uint32_t i = 1; i < n; i++) one_length &= keys[i].length == keys[0].length;
     if (one_length && max_rank - min_rank <= 1) return 1;
 
@@ -178,11 +140,17 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
     return 2;
 }
 
-// Keep scratch behind the caller's boot-latched enable branch, including stack reservation.
-// Deduce capacity from the gathered array: exec_batch must not decay it to a Task pointer.
-// No heap allocation, persistent state, truncated suffix, or change to the scheduling policy.
+// Visit each represented Op once to collect eligibility, static cost and ROB rank together.
+// The gather contract is increasing op_id per connection. Sampling NEWEST to OLDEST is required:
+// flush_id can advance on IO during this scan, but an older task must still get a lower rank.
+// Adjacent tasks from a connection share that snapshot. Never read an absent predecessor's slot;
+// the ranked slow path retains the existing conservative Long widening for missing heads/gaps.
+//
+// Runs are visited backwards solely to combine the metadata and rank passes. Permutations stay
+// inside their original barrier-delimited run, so visiting independent runs in reverse cannot
+// move a Task across a barrier or change the stable (rank, effective class) policy.
 template <size_t BatchOps>
-__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
+__attribute__((noinline)) ReorderResult ex_schedule_candidates(Task (&tasks)[BatchOps], uint32_t n) {
     static_assert(BatchOps == kGenthreadExBatchOps ||
                   BatchOps == kGenthreadPipelineExBatchOps,
                   "audit new executor geometry before enabling reorder");
@@ -191,24 +159,70 @@ __attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps
     // A future broken gather must fail loudly even in release builds, never schedule a prefix.
     if (__builtin_expect(n > BatchOps, false)) std::abort();
     ReorderResult result;
-    uint8_t base_lengths[BatchOps];
-    uint32_t begin = 0;
-    while (begin < n) {
-        if (!ex_sched_candidate(tasks[begin], base_lengths[begin])) {
-            begin++;
-            continue;
+    ExScheduleKey keys[BatchOps];
+    uint32_t end = n;
+    while (end) {
+        uint32_t begin = end;
+        Client* first_client = nullptr;
+        Client* sampled_client = nullptr;
+        uint64_t sampled_head = 0;
+        uint8_t min_rank = UINT8_MAX, max_rank = 0, first_length = 0;
+        bool multi_client = false, one_length = true, valid_rank = true;
+        while (begin) {
+            const Task& task = tasks[begin - 1];
+            uint8_t length;
+            if (!ex_sched_candidate(task, length)) break;
+            --begin;
+            if (begin == end - 1) {
+                first_client = task.client;
+                first_length = length;
+            } else {
+                multi_client |= task.client != first_client;
+                one_length &= length == first_length;
+            }
+            if (task.client != sampled_client) {
+                sampled_client = task.client;
+                sampled_head = sampled_client->rob().flush_id();
+            }
+            const uint64_t distance = task.op_id - sampled_head;
+            // An unfinished task belongs to the 64-slot live window. An invalid sample makes
+            // the WHOLE run FIFO; do not clamp it into a bucket and accidentally invent order.
+            valid_rank &= distance < kRobWindow;
+            keys[begin] = {static_cast<uint8_t>(distance), length};
+            min_rank = std::min(min_rank, keys[begin].rank);
+            max_rank = std::max(max_rank, keys[begin].rank);
         }
-        uint32_t end = begin + 1;
-        while (end < n && ex_sched_candidate(tasks[end], base_lengths[end])) end++;
-        const uint32_t witness = ex_schedule_run<BatchOps>(
-            tasks + begin, base_lengths + begin, end - begin);
-        result.multi_client_runs += witness != 0;
-        result.permuted_runs += witness == 2;
-        // The failed candidate at end is a known barrier; consume it without reading its Op a
-        // second time, then find the next eligible run.
-        begin = end + (end < n);
+        if (multi_client) {
+            result.multi_client_runs++;
+            // Preserve the existing escape BEFORE dependency widening. In particular, this
+            // is not R2's uniform-class trigger: a wider all-GET rank span still gets scheduled.
+            if (valid_rank && !(one_length && max_rank - min_rank <= 1))
+                result.permuted_runs += ex_schedule_ranked_run<BatchOps>(
+                    tasks + begin, keys + begin, end - begin, min_rank, max_rank) == 2;
+        }
+        // The failed candidate just before begin is a known barrier: consume it once.
+        end = begin - (begin != 0);
     }
     return result;
+}
+
+// A single connection has no legal promotion, regardless of command classes, hazards, gaps,
+// or barriers. Check the gathered Task pointers before touching Op chunks or IO's flush line.
+// Keep the metadata/sort frame in its own callee so a FIFO batch reserves none of that scratch.
+// This is a connection-order proof, not a cost-class trigger: a multi-client all-GET batch still
+// promotes live heads across deeper requests when the existing rank policy calls for it.
+template <size_t BatchOps>
+__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
+    static_assert(BatchOps == kGenthreadExBatchOps ||
+                  BatchOps == kGenthreadPipelineExBatchOps,
+                  "audit new executor geometry before enabling reorder");
+    if (__builtin_expect(n > BatchOps, false)) std::abort();
+    if (n < 2) return {};
+    Client* const first = tasks[0].client;
+    uint32_t i = 1;
+    while (i < n && tasks[i].client == first) i++;
+    if (i == n) return {};
+    return ex_schedule_candidates(tasks, n);
 }
 
 }  // namespace tomo

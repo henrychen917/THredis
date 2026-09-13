@@ -251,6 +251,66 @@ void hidden_predecessors() {
     }
     std::puts("  predecessor controls: missing head, in-run gap and atomic hazard widen to Long");
 }
+
+void head_promotion_controls() {
+    // R1 still promotes a live head in homogeneous GET traffic if the rank spread exceeds the
+    // existing one-rank escape. Removing all uniform-class scheduling would silently become R2.
+    {
+        Client a(-1), b(-1);
+        Task tasks[kGenthreadExBatchOps];
+        tasks[0] = publish(a, point);
+        tasks[1] = publish(a, point);
+        tasks[2] = publish(a, point);
+        tasks[3] = publish(b, point);
+        require(tasks[2].op_id - a.rob().flush_id() == 2 &&
+                    tasks[3].op_id == b.rob().flush_id(), "wide uniform rank span was not entered");
+        verify(tasks, {tasks[0], tasks[3], tasks[1], tasks[2]}, true);
+        retire_all(a);
+        retire_all(b);
+    }
+    // The single-client proof must precede every Op read. These are deliberately unmaterialized
+    // ROB slots: an implementation that inspects their metadata fails, rather than timing a
+    // claimed shortcut or passing because the allocator happened to keep the chunks hot.
+    {
+        Client one(-1);
+        Task tasks[kGenthreadPipelineExBatchOps];
+        require(one.rob().quiesced(), "metadata tripwire unexpectedly has live slots");
+        for (uint32_t i = 0; i < kRobWindow; i++) tasks[i] = Task(&one, i, 7, nullptr);
+        verify(tasks, std::vector<Task>(tasks, tasks + kRobWindow), false);
+    }
+    // A slot alias outside the live window must leave its complete run FIFO. Both metadata
+    // reads still name allocated slots, so this exercises invalid RANK, not invalid storage.
+    {
+        Client a(-1), b(-1);
+        Task tasks[kGenthreadExBatchOps];
+        tasks[0] = publish(a, long_op);
+        tasks[0].op_id += kRobWindow;
+        tasks[1] = publish(b, point);
+        verify(tasks, {tasks[0], tasks[1]}, false);
+        retire_all(a);
+        retire_all(b);
+    }
+    // A broken producer's reversed same-connection ids must not be "repaired" by the sorter.
+    // This control checks FIFO directly: verify() intentionally rejects malformed input order.
+    {
+        Client a(-1), b(-1);
+        Task tasks[kGenthreadExBatchOps];
+        const Task old = publish(a, point);
+        const Task young = publish(a, long_op);
+        tasks[0] = young;
+        tasks[1] = old;
+        tasks[2] = publish(b, point);
+        const Task other = tasks[2];
+        const ReorderResult result = ex_schedule_batch(tasks, 3);
+        require(same(tasks[0], young) && same(tasks[1], old) && same(tasks[2], other),
+                "invalid gather order was permuted");
+        require(result.multi_client_runs == 1 && result.permuted_runs == 0,
+                "invalid gather telemetry claimed a permutation");
+        retire_all(a);
+        retire_all(b);
+    }
+    std::puts("  R1 controls: uniform head promotion, untouched metadata, invalid ranks/order");
+}
 }  // namespace
 
 int main() {
@@ -265,5 +325,7 @@ int main() {
     fifo_controls();
     hidden_predecessors();
     require(permutations == 175, "a required positive case silently disappeared");
+    head_promotion_controls();
+    require(permutations == 176, "the R1 homogeneous head-promotion witness disappeared");
     std::printf("reorder battery: PASS, %u witnessed permutations, max batch 128\n", permutations);
 }
