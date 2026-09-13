@@ -166,6 +166,21 @@ int main() {
         !rejects({"--tls-prefer-server-ciphers", "1"}))
         fail("invalid TLS grammar was accepted");
 
+    for (const char* flag : {"--latency-monitor-threshold", "--stream-node-max-entries",
+                             "--stream-node-max-bytes"}) {
+        if (rejection_text({flag, "4294967296"}) != std::string(flag) +
+                ": argument must be between 0 and 4294967295 inclusive\n")
+            fail("uint32 config overflow has no precise range diagnostic");
+        for (const char* value : {"0", "4294967295"}) {
+            tomo::Config cfg;
+            tomo::ConfigParseState state;
+            if (tomo::parse_config_args({flag, value}, cfg, state, 2, "test") != tomo::kConfigParsed)
+                fail("uint32 config endpoint rejected at boot");
+        }
+    }
+    for (const char* flag : {"--script-crossshard-cut-slots", "--script-crossshard-conflict-retries"})
+        if (!rejects({flag, "4294967296"})) fail("retired script flag accepted an overflowing value");
+
     // Restored reference controls: default translation, every alias, signed list modes,
     // full reference ranges, and the surprising INTEGER vs MEMORY distinction for set values.
     tomo::Config encodings;

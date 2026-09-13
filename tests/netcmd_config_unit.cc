@@ -32,6 +32,39 @@ extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
     return file;
 }
 
+void test_config_bounds() {
+    tomo::Server server;
+    tomo::command_bind_server(&server);
+    // Keep the real CONFIG registry, without live worker publication or server startup.
+    tomo::command_bind_server(nullptr);
+    tomo::Shard shard;
+    shard.init_private(nullptr, 0, tomo::TypeLimits{}, tomo::StreamLimits{});
+    for (const char* name : {"latency-monitor-threshold", "stream-node-max-entries",
+                             "stream-node-max-bytes"}) {
+        check(execute(shard, {"CONFIG", "SET", name, "17"}) .empty(),
+              "valid uint32 config accepted");
+        const auto before = execute(shard, {"CONFIG", "GET", name});
+        for (const char* value : {"4294967296", "4294967297", "9223372036854775807", "-1"}) {
+            const std::string expected = std::string("-ERR CONFIG SET failed (possibly related to argument '") +
+                name + "') - argument must be between 0 and 4294967295 inclusive\r\n";
+            check(execute(shard, {"CONFIG", "SET", "zc-min", "23", name, value}) == expected,
+                  "out-of-range config rejected with exact bounds and Redis error grammar");
+            check(execute(shard, {"CONFIG", "GET", name}) == before,
+                  "rejected uint32 config leaves reported value intact");
+            check(shard.zc_min() == UINT32_MAX, "failed CONFIG SET publishes no preceding pair");
+            check(shard.stream_limits().node_max_entries != 0 &&
+                  shard.stream_limits().node_max_bytes != 0,
+                  "rejected stream limits did not silently disable a rollover axis");
+        }
+        for (const char* value : {"0", "4294967295"})
+            check(execute(shard, {"CONFIG", "SET", name, value}) .empty(),
+                  "both supported config endpoints accepted");
+        check(execute(shard, {"CONFIG", "SET", name, "17"}) .empty(), "restore config");
+    }
+    check(execute(shard, {"CONFIG", "SET", "stream-node-max-bytes", "4kb"}) .empty() &&
+          shard.stream_limits().node_max_bytes == 4096, "stream byte limit accepts Redis memory grammar");
+}
+
 void test_config_rewrite() {
     check(tomo::config_quote("77") == "77", "simple scalar keeps its original spelling");
     const std::string value = "pass with spaces\n\r\t\"'\\tail";

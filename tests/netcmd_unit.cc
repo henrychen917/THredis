@@ -239,6 +239,7 @@ struct NetcmdRegression {
     }
 
     static void config() {
+        test_config_bounds();
         Server server;
         const std::string password = "pass with spaces\n\r\t\"'\\tail";
         char directory[] = "build/netcmd-config-XXXXXX";
@@ -268,6 +269,7 @@ int main(int argc, char** argv) {
     else if (mode == "receive") R::receive_segments();
     else if (mode == "collection-oom") R::collection_oom();
     else if (mode == "config") R::config();
+    else if (mode == "config-bounds") test_config_bounds();
     else check(false, "unknown regression section");
     std::printf("ok: netcmd %s\n", argv[1]);
 }
