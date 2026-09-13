@@ -252,7 +252,7 @@ python3 tests/gate_history.py prepare --history "$ROW_HISTORY" "${HISTORY_ARGS[@
 # negative control BEFORE the quick exit (quick +1, full +1) and the mandatory headline result
 # AFTER it (full +1). 418+1 = 419 quick; 467-32+2 = 437 full.
 EXPECT_QUICK=419
-EXPECT_FULL=437                 # full without the optional NIC row.
+EXPECT_FULL=436                 # ABBA row reports and is not counted; self-test row remains.
 say(){ printf '  %-52s %s\n' "$1" "$2"; }
 canonical_label(){ sed -E \
       -e 's/(direct|hits|records|skipped|suppressed|zc_sends)=[0-9]+/\1=N/g' \
@@ -2810,20 +2810,22 @@ ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?
 ABBA_PID=0
-# ABBA ALWAYS RUNS -- you get the numbers every version, in the log and in results.json.
-# It gates on ONE simple rule, computed from the raw measurements by tests/abba_simple.py:
-# is any cell's candidate median more than SIMPLE_REGRESSION_PCT worse than its reference median?
-# That is the whole question a performance gate asks. The tier's other machinery (load-floor pins,
-# standing nulls, occupancy floors, resolution bounds) stays as REPORTING: each of those checks can
-# independently refuse to produce a verdict, and doing so is what consumed a week while the
-# measurement itself was repeating to 0.08-0.64%.
+# ABBA REPORTS. CORRECTNESS GATES. (Owner ruling 2026-09-13: gate work stops here.)
+# The tier runs on every version and its per-cell numbers print above and land in results.json;
+# read them. It does not decide the gate, for two measured reasons:
+#   * its own per-row timeout is derived from the row's history, and that history is dominated by
+#     runs that aborted before measuring (median 0.42s) -- so every genuine measurement was killed
+#     at 30s. Three overnight rounds, three identical timeouts.
+#   * its calibrate -> import -> gate loop has not closed once in two days; one cell's failed
+#     calibration ("t01: failed calibration cell") declines the whole import, and the tier then
+#     searches every ladder from scratch, which no timeout budget survives.
+# Correctness (437 rows, 12 slots, ~9 min) has been green since 2026-09-12 and is what protects a
+# merge. Numbers you can trust to gate on again come from the read-local observability lane first
+# (SLOWLOG never sees lane reads; no read_local_hits are recorded), not from more tier machinery.
 case "$ABBA_RC" in
-  3) bad "headline ABBA vs last pushed binary" "tier did not run (no reference, skipped, or crashed); see ABBA output";;
-  *) if python3 tests/abba_simple.py "$ABBA_OUTPUT/results.json"; then
-       ok "headline ABBA vs last pushed binary"
-     else
-       bad "headline ABBA vs last pushed binary" "a cell regressed beyond the simple threshold; see above"
-     fi;;
+  0) say "headline ABBA" "measured; no cell regressed (reporting only, not gating)";;
+  3) say "headline ABBA" "did not run (no reference / skipped); reporting only, not gating";;
+  *) say "headline ABBA" "measured; see per-cell numbers above and results.json (reporting only, not gating)";;
 esac
 
 phase abba-end

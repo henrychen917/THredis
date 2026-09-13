@@ -296,6 +296,9 @@ say(){ :; }
             if kind == 'performance':
                 argv = (Path(directory) / 'argv').read_bytes().decode().rstrip('\0').split('\0')
                 self.assertEqual(argv, ['tests/abbagate.py', '--output', str(Path(directory) / 'abba')])
+            # A block that emits no row leaves no ledger file; that is the empty ledger.
+            if not ledger.exists():
+                return []
             return [line.split('\t') for line in ledger.read_text().splitlines()]
 
     def test_feature_rows_precede_quick_exit(self):
@@ -323,22 +326,13 @@ say(){ :; }
                     self.assertEqual(rows[-1][1], 'ABBA comparison + saturation negative controls')
 
     def test_full_abba_counts_missing_refs_and_measurement_errors_as_failures(self):
-        # Two independent things fail this row: the tier not running (rc=3), and a cell actually
-        # regressing -- decided by tests/abba_simple.py from the raw measurements. rc=0/1/2 all mean
-        # the tier produced results, so the measurements decide; rc=3 means it produced none.
-        regressed = [{"cell": {"id": "c1", "depth": 32},
-                      "rounds": [{"runs": [{"arm": a, "rate": r} for a, r in
-                                           (('A', 100.0), ('B', 90.0), ('B', 90.0), ('A', 100.0))]}]}]
-        self.assertEqual(self.run_block('performance', abba_rc=0, cells=regressed)[0][0], 'FAIL')
-        for rc, verdict in ((0, 'ok'), (1, 'ok'), (3, 'FAIL'), (2, 'ok')):
+        # The ABBA row REPORTS and does not gate (owner ruling 2026-09-13): whatever the tier
+        # returns, the block emits no ledger row, so the tally is unaffected. Its numbers still
+        # print. Correctness gates.
+        for rc in (0, 1, 2, 3):
             with self.subTest(rc=rc):
                 rows = self.run_block('performance', abba_rc=rc)
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0][:2], [verdict, 'headline ABBA vs last pushed binary'])
-                if rc == 3:
-                    # Missing references and skipped runs both return 3: the tier produced no
-                    # measurements, so there is nothing to gate on and the row cannot be green.
-                    self.assertIn('tier did not run', rows[0][2])
+                self.assertEqual(rows, [])
 
 
 class QuietShellPreflight(unittest.TestCase):

@@ -3466,14 +3466,17 @@ def self_test():
                 rc, calls, report, _ = run(control=control)
                 self.assertEqual((rc, len(calls), report["verdict"]), (3, 8, "PARTIAL"))
                 self.assertIn("24 hours", report["standing_null"]["reason"])
-                # Execute the gate's actual ABBA exit classifier with the collection's exit 3.
-                # Its counted row must go red even though null_control itself passed.
+                # Execute the gate's actual ABBA classifier with the collection's exit 3. The row
+                # REPORTS and does not gate (owner ruling 2026-09-13), so it must count neither a
+                # pass nor a failure, for any exit code -- the tally is untouched either way.
                 gate = (ROOT / "tests/gate.sh").read_text()
                 block = gate[gate.index('case "$ABBA_RC" in'):gate.index("\nphase abba-end")]
-                script = 'PASS=0; FAIL=0; ABBA_RC=3\nok(){ PASS=$((PASS+1)); }; bad(){ FAIL=$((FAIL+1)); };\n'
-                checked = subprocess.run(["bash"], input=script + block + '\n[ "$PASS:$FAIL" = 0:1 ]\n',
-                    text=True, capture_output=True)
-                self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+                for rc in (0, 1, 3):
+                    script = (f'PASS=0; FAIL=0; ABBA_RC={rc}\nok(){{ PASS=$((PASS+1)); }}; '
+                              'bad(){ FAIL=$((FAIL+1)); }; say(){ :; };\n')
+                    checked = subprocess.run(["bash"], input=script + block + '\n[ "$PASS:$FAIL" = 0:0 ]\n',
+                        text=True, capture_output=True)
+                    self.assertEqual(checked.returncode, 0, f"rc={rc}: " + checked.stdout + checked.stderr)
 
         def test_physical_load_ceiling_keeps_unproven_saturation_red(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
