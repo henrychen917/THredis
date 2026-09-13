@@ -20,7 +20,11 @@ codex*.log
 BRIEF*.md
 LANE_RULES.md
 # The interactive agent transcript changes during validation and is not project source.
-/CODEX-OUT.md
+/CODEX-OUT*.md
+# Competition reports and measurement handoffs stay local to the lane.
+/MEASURE-REQUEST
+/MEASURE-RESULT
+/NEEDS-BOX
 
 # replycode lane: measurement drivers are tracked as sources, their binaries are not
 scratchpad/replycode/replay
