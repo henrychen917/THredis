@@ -10,6 +10,7 @@
 // the caller.  The block base/mask are then stable for the whole role tenure.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -80,6 +81,9 @@ class MaskedSpscArray {
         uint64_t lane_full_events = 0;
         uint64_t arena_occupancy_at_lane_full_sum = 0;
         uint64_t arena_capacity_at_lane_full_sum = 0;
+        // R6's private frontier replaces the normal tail store while IO is admitting a batch.
+        // It occupies existing padding; consumers still load only tail, never this frontier.
+        uint32_t admission_tail = 0;
     };
 
     struct Lane {
@@ -224,6 +228,54 @@ public:
             if (io_producer[p]) install(p, io_capacity);
             else                install(p, kInternalProducerSlots);
         return cursor <= total_slots_;
+    }
+
+    void begin_admission(uint32_t producer) {
+        ProducerLine& p = lanes_[producer].producer;
+        p.admission_tail = p.tail.load(std::memory_order_relaxed);
+    }
+
+    // Same capacity proof and slot store as push_prepared; only the publication destination
+    // changes. No per-op scheduler state, heap staging, or consumer-visible hole is introduced.
+    template <typename Prepare>
+    bool push_admitted(uint32_t producer, T value, Prepare&& prepare) {
+        ProducerLine& p = lanes_[producer].producer;
+        ConsumerLine& c = lanes_[producer].consumer;
+        const uint32_t tail = p.admission_tail;
+        const uint32_t next = tail + 1;
+        if (next - p.head_cached > p.available_capacity) {
+            p.head_cached = c.head.load(std::memory_order_acquire);
+            if (next - p.head_cached > p.available_capacity) {
+                note_lane_full(p);
+                return false;
+            }
+        }
+        prepare(value);
+        slots_[p.base + (tail & p.mask)] = value;
+        p.admission_tail = next;
+        return true;
+    }
+
+    // Transform only unpublished slots. Publishing each bounded chunk after the transform
+    // lets EX consume that chunk while IO orders the suffix. The callback must not reenter the
+    // producer. All chunks retain FIFO boundaries, including a ring wrap or a full bank.
+    template <uint32_t BatchOps, typename Order>
+    void finish_admission(uint32_t producer, Order&& order) {
+        ProducerLine& p = lanes_[producer].producer;
+        uint32_t tail = p.tail.load(std::memory_order_relaxed);
+        const uint32_t end = p.admission_tail;
+        if (end - tail > p.capacity) std::abort();
+        while (tail != end) {
+            const uint32_t count = std::min<uint32_t>(end - tail, BatchOps);
+            T batch[BatchOps];
+            for (uint32_t i = 0; i < count; i++)
+                batch[i] = slots_[p.base + ((tail + i) & p.mask)];
+            if (order(batch, count))
+                for (uint32_t i = 0; i < count; i++)
+                    slots_[p.base + ((tail + i) & p.mask)] = batch[i];
+            tail += count;
+            p.tail.store(tail, std::memory_order_release);
+        }
     }
 
     // Producer side.  This is ExQueue::push with only the slot address changed to base+(tail&mask).

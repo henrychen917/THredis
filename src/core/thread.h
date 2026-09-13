@@ -466,6 +466,20 @@ public:
     const AtomicAdmissionState& atomic_admission_state() const { return atomic_admission_state_; }
 
     // ---- posting (producer side) ---------------------------------------------------------------
+    void begin_task_admission(uint32_t from) {
+        if (task_in_) task_in_->begin_admission(from);
+    }
+    bool post_admitted_task_quiet(uint32_t from, const Task& task, LoopSignals& sig) {
+        if (!sig.age_sample_rate)
+            return task_in_->push_admitted(from, task, sig, [](Task&) {});
+        return task_in_->push_admitted(from, task, sig, [&](Task& queued) {
+            queued.enqueue_us_low = sig.next_age_stamp();
+        });
+    }
+    template <uint32_t BatchOps, typename Order>
+    void finish_task_admission(uint32_t from, Order&& order) {
+        task_in_->template finish_admission<BatchOps>(from, static_cast<Order&&>(order));
+    }
     // Push AND flag, in that order. Flagging before the push would let the consumer take the bit,
     // find an empty queue, and clear it while the item is still in flight.
     bool post_task(uint32_t from, const Task& t, Ring& my_ring, LoopSignals& sig) {

@@ -430,6 +430,19 @@ private:
 template <typename T, uint32_t MaxProducers>
 class MaskedChannelArray {
 public:
+    void begin_admission(uint32_t producer) { q_.begin_admission(producer); }
+    template <typename Prepare>
+    bool push_admitted(uint32_t producer, T value, LoopSignals& sig, Prepare&& prepare) {
+        if (!q_.push_admitted(producer, value, static_cast<Prepare&&>(prepare))) {
+            sig.full_events++;
+            return false;
+        }
+        return true;
+    }
+    template <uint32_t BatchOps, typename Order>
+    void finish_admission(uint32_t producer, Order&& order) {
+        q_.template finish_admission<BatchOps>(producer, static_cast<Order&&>(order));
+    }
     bool init_local(uint32_t producers, uint32_t slots_per_thread,
                     const std::vector<uint32_t>& io,
                     const std::vector<uint32_t>& ex) {

@@ -21,8 +21,8 @@
 #include "server.h"
 #include "signal.h"
 #include "genthread_pipeline.h"
-#include "read_local.h"
 #include "reorder.h"
+#include "read_local.h"
 #include "../net/conn.h"
 #include "../net/resp.h"
 #include "../net/uring.h"
@@ -178,7 +178,6 @@ public:
         lb_sample_countdown_ = lb_sample_rate_;
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
-        reorder_enabled_ = srv->cfg().reorder != 0;
         pipeline_batches_ = Fused && srv->thread_mode() == ThreadMode::Fused &&
                             srv->cfg().overlap != 0;
         // Fused overlap uses fixed producer lanes; synchronous local-read demotion resolves
@@ -2007,9 +2006,6 @@ private:
         auto execute_batch = [&] {
             if (!held) return;
             if (!filler_used && xshard_retries_.empty()) {
-                if (__builtin_expect(reorder_enabled_, false))
-                    srv_->mode_schedule_stats(self_->id()).note_reorder(
-                        held, ex_schedule_batch(batch, held));
                 prefetch_exec_batch(batch, held);
                 filler();
                 filler_used = true;
@@ -2473,14 +2469,12 @@ private:
     // micro-stage.
     template <bool IofusedPrivateQueue = false, size_t BatchOps>
     void exec_batch(Task (&batch)[BatchOps], uint32_t n) {
-        // Deferral first (skip wasted prefetch on the rare retry path), then the opt-in
-        // reorder BEFORE prefetch so prefetch order matches execution order.
+        // IO has already ordered admission. EX keeps its FIFO gather and prefetch order,
+        // including every deferred suffix behind a retry; it never runs a scheduler.
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
         }
-        if (__builtin_expect(reorder_enabled_, false))
-            srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
         prefetch_exec_batch(batch, n);
         exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
@@ -3059,7 +3053,6 @@ private:
     uint64_t   live_config_version_ = UINT64_MAX;
     AofManager* aof_manager_ = nullptr;
     bool       maxmemory_enabled_ = false;
-    bool       reorder_enabled_ = false;
     uint8_t    cached_lru_clock_ = 0;
     uint32_t   lb_sample_rate_ = 0;
     uint32_t   lb_sample_countdown_ = 0;

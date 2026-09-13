@@ -26,6 +26,7 @@
 #include "iopipe_pipeline.h"
 #include "signal.h"
 #include "ex_loop.h"
+#include "reorder.h"
 #include "genthread_pipeline.h"
 #include "../net/conn.h"
 #include "../net/resp.h"
@@ -57,6 +58,8 @@ inline constexpr uint32_t kRecvChunk = 16 * 1024;
 
 class IoLoop {
     friend struct CoreConcurrencyTest;
+    template <typename> friend class IoAdmissionBatch;
+    template <typename> friend class IoAdmissionFence;
 public:
     WbEngine& engine() { return wb_; }
     uint32_t reap_atomic_deferred() {
@@ -90,6 +93,7 @@ public:
         age_signals_armed_ = age_sample_rate_cached_ != 0;
         client_lb_signal_armed_ = srv_->client_lb_signals_enabled();
         lb_controller_armed_ = srv_->lb_controller_enabled();
+        reorder_enabled_ = srv_->cfg().reorder != 0;
         if (!ring_.init(4096)) return false;
         if (epoll_ && !init_epoll()) return false;
         wb_.bind(&ring_, this, [](void* ctx, int32_t shard, const char* ptr) {
@@ -2376,7 +2380,7 @@ private:
         if (res <= 0) { close_client(c); return; }
         c->commit_read(static_cast<size_t>(res));
         c->set_last_interaction_s(cached_now_s_);
-        if constexpr (Pipeline == 0) {
+        if constexpr (Pipeline == 0) if (!reorder_enabled_) {
             if constexpr (HasTls) {
                 if (c->is_tls())
                     parse_and_dispatch<true, Fused ? kGenthreadIfidBatchOps : 0>(c);
@@ -2501,7 +2505,7 @@ private:
             break;
         }
         if constexpr (Pipeline == 0) {
-            if (decrypted || c->rpos() < c->rlen())
+            if (!reorder_enabled_ && (decrypted || c->rpos() < c->rlen()))
                 parse_and_dispatch<true, Fused ? kGenthreadIfidBatchOps : 0>(c);
         }
         return !tls->failed();
@@ -2712,6 +2716,7 @@ private:
                 count = out;
             }
             if (!count && !reserve_current) return true;
+            IoAdmissionFence admission_fence(loop);
             storage_.reset(new (std::nothrow) Storage);
             if (!storage_) return false;
             count_ = count;
@@ -2803,6 +2808,7 @@ private:
 
         void commit_reads() {
             if (!loop_) return;
+            IoAdmissionFence admission_fence(*loop_);
             Rob<kRobWindow>& rob = client_->rob();
             bool completed_locally = false;
             for (uint32_t i = 0; i < count_; i++) {
@@ -2879,6 +2885,7 @@ private:
         void post_current(const Task& task, uint32_t worker) {
             if (!loop_ || reserved_current_worker_ != static_cast<int32_t>(worker))
                 std::abort();
+            IoAdmissionFence admission_fence(*loop_);
             loop_->srv_->thread(worker).post_task_reserved_quiet(
                 loop_->self_->id(), task, loop_->self_->sig());
             consume(worker);
@@ -2982,12 +2989,48 @@ private:
         touched_list_[ntouched_++] = worker;
     }
 
+    void begin_admission(bool resume = false) {
+        if (!reorder_enabled_ || (!resume && srv_->flip_dispatch_paused())) return;
+        if (admission_active_) std::abort();
+        // No ownership vectors survive this scope. FLIP/LB control and all quiescence
+        // acknowledgements run after it; cold reentrancy fences it before taking control.
+        for (uint32_t tid = 0; tid < srv_->nthreads(); tid++)
+            srv_->thread(tid).begin_task_admission(self_->id());
+        admission_active_ = true;
+    }
+
+    __attribute__((noinline)) void finish_admission() {
+        if (!admission_active_) return;
+        admission_active_ = false;
+        for (uint32_t i = 0; i < ntouched_; i++) {
+            const uint32_t worker = touched_list_[i];
+            srv_->thread(worker).finish_task_admission<kGenthreadPipelineExBatchOps>(
+                self_->id(), [&](auto& batch, uint32_t count) {
+                    const ReorderResult result = ex_schedule_batch(batch, count);
+                    srv_->mode_schedule_stats(self_->id()).note_reorder(count, result);
+                    return result.permuted_runs != 0;
+                });
+        }
+        flush_ifid_posts();
+    }
+
     // ---- parse -> route -> publish -----------------------------------------------------------------
     template <bool NoBorrow, uint32_t BatchOps = 0, bool IoPipe = false,
               bool TargetedIfid = false,
               bool SuppressOrdinaryActiveMark = false,
               bool IofusedPrivateQueue = false, bool SplitLocal = false>
     DispatchResult parse_and_dispatch(Client* c) {
+        if (__builtin_expect(admission_active_, false))
+            return parse_and_dispatch_impl<NoBorrow, BatchOps, IoPipe, TargetedIfid,
+                SuppressOrdinaryActiveMark, IofusedPrivateQueue, SplitLocal, true>(c);
+        return parse_and_dispatch_impl<NoBorrow, BatchOps, IoPipe, TargetedIfid,
+            SuppressOrdinaryActiveMark, IofusedPrivateQueue, SplitLocal, false>(c);
+    }
+
+    template <bool NoBorrow, uint32_t BatchOps, bool IoPipe, bool TargetedIfid,
+              bool SuppressOrdinaryActiveMark, bool IofusedPrivateQueue, bool SplitLocal,
+              bool Admission>
+    DispatchResult parse_and_dispatch_impl(Client* c) {
         // Split readers and fused overlap need the same ROB hazards, MGET fence,
         // admission, and demotion protocol as the baseline fused reader.
         static constexpr bool Fused = SplitLocal || IofusedPrivateQueue || (
@@ -3162,6 +3205,21 @@ private:
             const uint32_t consumed = pos - conn.rpos();
 
             const CommandSpec* spec = command_lookup(op->cmd_name());
+            if constexpr (Admission) {
+                // Cold subsystems may reserve or post through doors other than the ordinary
+                // parser. Keep the whole remainder of this connection on their unchanged path.
+                // No frame has advanced and no stateful command hook has run at this point.
+                constexpr uint32_t barriers = CmdFlags::Admin | CmdFlags::ConnLocal |
+                    CmdFlags::AllShards | CmdFlags::RandomShard | CmdFlags::CursorShard |
+                    CmdFlags::ConfigRoute | CmdFlags::ScriptRoute | CmdFlags::PubSub |
+                    CmdFlags::Blocking | CmdFlags::Transaction | CmdFlags::StreamRoute |
+                    CmdFlags::SubcmdRoute | CmdFlags::FlipAsync | CmdFlags::MultiShard;
+                if ((spec && (spec->flags & barriers)) || conn.multi_session() != nullptr) {
+                    IoAdmissionFence admission_fence(*this);
+                    return parse_and_dispatch_impl<NoBorrow, BatchOps, IoPipe, TargetedIfid,
+                        SuppressOrdinaryActiveMark, IofusedPrivateQueue, SplitLocal, false>(c);
+                }
+            }
             if (!spec) {
                 conn.advance_parse(consumed);
                 // Redis names the command and echoes the first arguments; client libraries and
@@ -4316,7 +4374,13 @@ ordinary_shard_ready:
                     posted = true;
                 }
             }
-            if (!posted && !post_task_quiet(worker, t)) {
+            auto post_ordinary = [&] {
+                if constexpr (Admission)
+                    return worker.post_admitted_task_quiet(self_id, t, sig);
+                else
+                    return post_task_quiet(worker, t);
+            };
+            if (!posted && !post_ordinary()) {
                 rob.unpublish();          // a refused push must leave NO trace -- including in the ROB
                 // A REFUSED PUSH MUST LEAVE NO TRACE. Advancing the parse cursor before this point
                 // consumed the command's bytes while publishing no op, so the client waited forever
@@ -4347,7 +4411,7 @@ ordinary_shard_ready:
             if constexpr (!SuppressOrdinaryActiveMark)
                 mark_active_known<TargetedIfid>(c);
         }
-        if constexpr (!IoPipe) {
+        if constexpr (!IoPipe && !Admission) {
             // Item 2: one notify per worker per parse pass, not per op. The pushes above are already
             // visible in the queues; this publishes the "look here" bit and pays the wake decision
             // once. The pipelined schedule deliberately folds the same set across its whole IFID
@@ -4655,6 +4719,7 @@ ordinary_shard_ready:
     // overlapping fused schedules. Reply retirement and sends remain separate WB stages.
     template <bool HasTls, bool kEp>
     uint32_t genthread_ifid_batch() {
+        IoAdmissionBatch admission_batch(*this);
         uint32_t work = 0;
         backstop_pass_ = (++flush_tick_ >= kFlushBackstopEvery);
         if (backstop_pass_) flush_tick_ = 0;
@@ -4689,6 +4754,7 @@ ordinary_shard_ready:
             }
 
             if (c->scatter_barrier()) {
+                IoAdmissionFence admission_fence(*this);
                 const bool resumed = c->blocked() && blocking_resume_move_iofused(
                     *srv_, *self_, ring_, *c, scatter_pool_);
                 if (resumed) {
@@ -4800,6 +4866,7 @@ ordinary_shard_ready:
             }
         }
 
+        admission_batch.finish();
         if constexpr (kEp) {
             while (!epoll_closes_.empty()) {
                 Client* victim = epoll_closes_.back();
@@ -5294,6 +5361,7 @@ ordinary_shard_ready:
     // ---- IFID.PARSE+HASH: read-buffer maintenance, decode/hash/route, quiet publication --------
     template <bool HasTls, bool kEp, bool SplitLocal = false>
     uint32_t ifid_parse_hash(IfidBatch& batch) {
+        IoAdmissionBatch admission_batch(*this);
         uint32_t work = 0;
         backstop_pass_ = (++flush_tick_ >= kIoPipeWbBackstopTurns);
         if (backstop_pass_) flush_tick_ = 0;
@@ -5327,6 +5395,7 @@ ordinary_shard_ready:
             }
 
             if (c->scatter_barrier()) {
+                IoAdmissionFence admission_fence(*this);
                 if (c->blocked() &&
                     blocking_resume_move(*srv_, *self_, ring_, *c, scatter_pool_)) {
                     enqueue_serve(c);
@@ -5422,6 +5491,7 @@ ordinary_shard_ready:
             }
         }
 
+        admission_batch.finish();
         if constexpr (kEp) {
             while (!epoll_closes_.empty()) {
                 Client* victim = epoll_closes_.back();
@@ -5603,6 +5673,7 @@ ordinary_shard_ready:
     template <bool HasTls, bool kEp, bool Fused = false, bool HasUnix = false,
               bool SweepPass = false>
     uint32_t flush_ready() {
+        IoAdmissionBatch admission_batch(*this);
         uint32_t work = 0;
         backstop_pass_ = (++flush_tick_ >= kFlushBackstopEvery);
         if (backstop_pass_) flush_tick_ = 0;
@@ -5642,6 +5713,7 @@ ordinary_shard_ready:
             // Reset only when the ROB is quiescent AND no recv is outstanding — see conn.h. Then
             // re-arm, in that order.
             if (c->scatter_barrier()) {
+                IoAdmissionFence admission_fence(*this);
                 if (c->blocked() &&
                     blocking_resume_move(*srv_, *self_, ring_, *c, scatter_pool_)) {
                     enqueue_serve(c);
@@ -5792,6 +5864,7 @@ ordinary_shard_ready:
         // the sites queue instead and the teardown happens here, between phases, where nothing is
         // iterating. Duplicates are harmless -- close_client is idempotent on an already-dead
         // client and simply retries one whose quiescence fence has not opened yet.
+        admission_batch.finish();
         if constexpr (kEp) {
             while (!epoll_closes_.empty()) {
                 Client* victim = epoll_closes_.back();
@@ -6112,6 +6185,7 @@ ordinary_shard_ready:
     }
 
     void close_client(Client* c, bool drain_tls_output = false) {
+        IoAdmissionFence admission_fence(*this);
         // IDEMPOTENT, and that is load-bearing: an abrupt disconnect can close a conn twice --
         // once when the recv fails and again when the in-flight reply's send CQE comes back
         // failed. The second call found the client already parked on the deferred-free list and
@@ -6415,6 +6489,9 @@ ordinary_shard_ready:
     // bounded residual rotation; teardown and migration defer while either context owns a Client.
     WbPipelineBatch* active_wb_context_ = nullptr;
     bool targeted_ifid_ = false;
+    // R6's pass selectors consume the padding before the existing aligned map.
+    bool reorder_enabled_ = false;
+    bool admission_active_ = false;
     // Cold teardown/migration state; leave all established hot member offsets intact.
     mutable std::unordered_map<Client*, ClientWorkFence> client_work_fences_;
 };

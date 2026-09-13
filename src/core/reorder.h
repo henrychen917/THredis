@@ -1,5 +1,14 @@
-// reorder.h -- latency scheduling across connections within one gathered executor batch.
+// reorder.h -- R6: order IO admission before releasing the producer tail to the owner.
 // Per-connection order and special-task barriers are absolute. One-client runs retain FIFO.
+// The transport keeps its original slots and consumer frontier. IO replaces the per-task
+// release store with a private frontier store, orders bounded chunks, then publishes them.
+// Thus EX never sorts, and no operation acquires a new counter, pointer or timestamp.
+//
+// The scope is one IO read pass, one producer/owner lane and one 128-task chunk. Other IO
+// producers, already-published work, atomic retries and the read-local lane are outside it.
+// There is no wait to fill a chunk. Every pass, special command, demotion, blocking resume and
+// close publishes its pending prefix before entering the existing mechanism. In 1s these
+// instructions compete with execution on the SAME core; moving them buys no spare IO core.
 #pragma once
 #include <algorithm>
 #include <cstddef>
@@ -12,6 +21,42 @@
 #include "../cmd/command.h"
 
 namespace tomo {
+
+// Scope guards live here so every entry and every exceptional publication uses the same fence.
+// Empty/off guards neither allocate nor enter the producer-bank or scheduler code.
+template <typename Loop>
+class IoAdmissionBatch {
+public:
+    explicit IoAdmissionBatch(Loop& loop) : loop_(loop) {
+        if (loop_.reorder_enabled_) loop_.begin_admission();
+    }
+    ~IoAdmissionBatch() { finish(); }
+    void finish() { if (loop_.admission_active_) loop_.finish_admission(); }
+    IoAdmissionBatch(const IoAdmissionBatch&) = delete;
+    IoAdmissionBatch& operator=(const IoAdmissionBatch&) = delete;
+private:
+    Loop& loop_;
+};
+
+template <typename Loop>
+class IoAdmissionFence {
+public:
+    explicit IoAdmissionFence(Loop& loop) : loop_(loop), resume_(loop.admission_active_) {
+        if (resume_) loop_.finish_admission();
+    }
+    ~IoAdmissionFence() {
+        if (!resume_) return;
+        // A cold subsystem may have posted ordinary/reserved tasks while admission was paused.
+        // Publish their notification and sample fresh tails before accepting a younger task.
+        loop_.flush_ifid_posts();
+        loop_.begin_admission(true);
+    }
+    IoAdmissionFence(const IoAdmissionFence&) = delete;
+    IoAdmissionFence& operator=(const IoAdmissionFence&) = delete;
+private:
+    Loop& loop_;
+    bool resume_;
+};
 
 inline constexpr uint32_t kExSchedClasses =
     static_cast<uint32_t>(CommandLengthClass::Count);
@@ -179,13 +224,13 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
 }
 
 // Keep scratch behind the caller's boot-latched enable branch, including stack reservation.
-// Deduce capacity from the gathered array: exec_batch must not decay it to a Task pointer.
+// Deduce capacity from the admission array: the producer must not decay it to a Task pointer.
 // No heap allocation, persistent state, truncated suffix, or change to the scheduling policy.
 template <size_t BatchOps>
 __attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
     static_assert(BatchOps == kGenthreadExBatchOps ||
                   BatchOps == kGenthreadPipelineExBatchOps,
-                  "audit new executor geometry before enabling reorder");
+                  "audit new admission geometry before enabling reorder");
     static_assert(BatchOps <= UINT8_MAX, "scheduler indices/counts must fit in a byte");
     static_assert((BatchOps & (BatchOps - 1)) == 0, "connection hash mask needs power of two");
     // A future broken gather must fail loudly even in release builds, never schedule a prefix.

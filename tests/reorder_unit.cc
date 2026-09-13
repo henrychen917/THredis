@@ -1,4 +1,4 @@
-// Server-less battery for the exact scheduler used by both executor call sites. Real Clients,
+// Server-less battery for the exact scheduler used before IO admission. Real Clients,
 // Tasks and published ROB slots; no alternate scheduling implementation or timing window.
 // The gate runs this under ASAN + UBSAN. A FIFO/no-op mutant must fail the permutation oracle.
 #include <algorithm>
@@ -251,6 +251,67 @@ void hidden_predecessors() {
     }
     std::puts("  predecessor controls: missing head, in-run gap and atomic hazard widen to Long");
 }
+
+// Exercise the actual private frontier and release publication, including wrap, credit
+// reservation and a partial final chunk. A publish-before-sort mutant fails before the oracle.
+void admission_transport() {
+    MaskedSpscArray<Task, 2> queue;
+    require(queue.init_local_fused<512>(2), "admission fixture queue initialization");
+    for (uint32_t round = 0; round < 3; round++) {
+        std::vector<std::unique_ptr<Client>> clients;
+        std::vector<Task> original;
+        require(queue.reserve(0, 2), "reserve capacity before admission");
+        queue.begin_admission(0);
+        for (uint32_t i = 0; i < 510; i++) {
+            clients.push_back(std::make_unique<Client>(-1));
+            original.push_back(publish(*clients.back(), i % 128 ? point : long_op));
+            require(queue.push_admitted(0, original.back(), [](Task&) {}),
+                    "admission refused before reserved capacity boundary");
+        }
+        require(!queue.push_admitted(0, original.back(), [](Task&) {}),
+                "admission ignored reserved credits");
+        Task task;
+        require(queue.depth(0) == 0 && !queue.pop(0, task),
+                "consumer observed an unpublished admission prefix");
+        uint32_t callbacks = 0;
+        queue.finish_admission<128>(0, [&](auto& tasks, uint32_t n) {
+            callbacks++;
+            return ex_schedule_batch(tasks, n).permuted_runs != 0;
+        });
+        require(callbacks == 4 && queue.depth(0) == 510,
+                "admission lost the partial chunk or published the wrong frontier");
+        std::vector<Task> expected;
+        for (uint32_t base = 0; base < 510; base += 128) {
+            for (uint32_t i = base + 1; i < std::min(base + 128, 510u); i++)
+                expected.push_back(original[i]);
+            expected.push_back(original[base]);
+        }
+        for (const Task& want : expected) {
+            require(queue.pop(0, task) && same(task, want), "published admission order differs");
+            queue.retire(0);
+        }
+        require(!queue.pop(0, task), "admission duplicated a task");
+        // The same lane can now publish a reserved special directly. A new admission scope
+        // must start AFTER it, including when the underlying ring is about to wrap.
+        queue.push_reserved(0, original[0]);
+        queue.cancel_reservation(0, 1);
+        queue.begin_admission(0);
+        require(queue.push_admitted(0, original[1], [](Task&) {}), "resume admission after direct post");
+        require(queue.pop(0, task) && same(task, original[0]), "admission passed a direct barrier");
+        queue.retire(0);
+        require(!queue.pop(0, task), "resumed admission published early");
+        queue.finish_admission<128>(0, [](auto&, uint32_t n) {
+            require(n == 1, "resumed private frontier is stale");
+            return false;
+        });
+        require(queue.pop(0, task) && same(task, original[1]), "resumed admission lost task");
+        queue.retire(0);
+        require(queue.quiesced(0), "admission did not fully retire");
+        for (auto& client : clients) retire_all(*client);
+    }
+    std::puts("  admission: private publication, exact order, credit refusal, wrap, direct-post fence");
+}
+
 }  // namespace
 
 int main() {
@@ -262,6 +323,7 @@ int main() {
     pipelines<kGenthreadPipelineExBatchOps>();
     barriers<kGenthreadExBatchOps>();
     barriers<kGenthreadPipelineExBatchOps>();
+    admission_transport();
     fifo_controls();
     hidden_predecessors();
     require(permutations == 175, "a required positive case silently disappeared");

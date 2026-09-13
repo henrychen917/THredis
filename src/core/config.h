@@ -362,7 +362,7 @@ struct Config {
 
     // Empty flag string = notifications off.
     uint32_t notify_events = 0;
-    // Boot-only latency reordering across connections in an executor batch; connection order is
+    // Boot-only latency reordering across connections before IO admission; connection order is
     // preserved. 0 keeps FIFO and allocates nothing. Same alignment hole as the former ex_sched.
     uint32_t reorder = 0;
 
@@ -959,7 +959,7 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                         "  threading: --thread-mode 2s|1s --overlap 0|1 --read-local 0|1 (defaults 2s, 0, 0)\n"
                         "             (split/fused are mode aliases)\n"
                         "    --overlap 1                 2s: IO-overlapped writeback; 1s: all overlap (uring)\n"
-                        "    --reorder 0|1 (default 0)   cross-connection reordering in an executor batch for latency; per-connection order always preserved\n"
+                        "    --reorder 0|1 (default 0)   cross-connection IO admission ordering for latency; per-connection order always preserved\n"
                         "  placement (default derived from allowed CPUs):\n"
                         "    --ratio io:ex               global counts, split mode only\n"
                         "    --place role@cpu,...        explicit CPUs; roles are ifid, ex\n"

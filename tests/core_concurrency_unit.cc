@@ -39,7 +39,7 @@ struct CoreConcurrencyTest {
         uint32_t source = Fused ? 0 : 6;
         uint32_t destination = Fused ? 1 : 7;
         uint32_t io_id = Fused ? 7 : 0;
-        Fixture() {
+        Fixture(bool reorder = false, uint32_t overlap = 0) {
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
             require(sched_getaffinity(0, sizeof(cpus), &cpus) == 0, "affinity unavailable");
@@ -61,6 +61,10 @@ struct CoreConcurrencyTest {
             config.shards = 16;
             config.thread_mode = Fused ? ThreadMode::Fused : ThreadMode::Split;
             config.flip_auto = 0;
+            config.reorder = reorder;
+            config.overlap = overlap;
+            config.read_local = reorder;
+            config.atomic = reorder;
             config.save.clear();
             require(server.init(config), "initialize in-memory fixture");
             require(server.nshards() == 16 && server.nthreads() == 8, "fixture geometry");
@@ -82,6 +86,7 @@ struct CoreConcurrencyTest {
             io.srv_ = &server;
             io.self_ = &server.thread(io_id);
             io.lb_controller_armed_ = true;
+            io.reorder_enabled_ = reorder;
         }
         int32_t sid() { return server.thread(source).shards().front()->id(); }
         std::string key(int32_t shard) {
@@ -133,6 +138,99 @@ struct CoreConcurrencyTest {
                     reply.assign(done.reply.data(), done.reply.size());
                 }) == 1, "command completed exactly once");
         return reply;
+    }
+
+
+    template <bool Fused, bool Overlap>
+    static void admission_parser() {
+        Fixture<Fused> f(true, Overlap);
+        // Only the reader's in-memory lane is needed: no ring, listener or execution thread.
+        FusedExLoop reader;
+        reader.srv_ = &f.server;
+        reader.self_ = &f.server.thread(f.io_id);
+        reader.read_local_.impl = std::make_unique<ReadLocalExImpl>();
+        auto& impl = *reader.read_local_.impl;
+        impl.lane.reset(new ReadLocalExImpl::LaneEntry[kInboxSlots]);
+        impl.lane_fallbacks.reset(new ReadLocalFallbackReason[kInboxSlots]);
+        impl.point_writes_precise = true;
+        f.io.fused_executor_ = &reader;
+        const std::string key = f.key(f.sid());
+        auto feed = [&](Client& c, const std::string& frames) {
+            size_t room = 0;
+            char* out = c.read_space(frames.size(), room, true);
+            require(out && room >= frames.size(), "fixture receive capacity");
+            std::memcpy(out, frames.data(), frames.size());
+            c.commit_read(frames.size());
+        };
+        auto wire = [&](std::initializer_list<std::string> args) {
+            std::string out = "*" + std::to_string(args.size()) + "\r\n";
+            for (const auto& arg : args)
+                out += "$" + std::to_string(arg.size()) + "\r\n" + arg + "\r\n";
+            return out;
+        };
+        auto parse = [&](Client& c) {
+            if constexpr (Fused && Overlap)
+                f.io.template parse_and_dispatch<false, 0, false, true, true, true>(&c);
+            else if constexpr (!Fused && Overlap)
+                f.io.template parse_and_dispatch<false, 0, true, false, false, false, true>(&c);
+            else
+                f.io.template parse_and_dispatch<false, kGenthreadIfidBatchOps>(&c);
+            require(c.rpos() == c.rlen(), "admission parse consumed its complete fixture");
+        };
+        auto take = [&] {
+            std::vector<Task> tasks;
+            f.server.thread(f.source).drain_tasks_unmasked([&](const Task& t) { tasks.push_back(t); });
+            return tasks;
+        };
+        Client long_client(-1), short_client(-1), barrier_client(-1), local_client(-1);
+        for (Client* c : {&long_client, &short_client, &barrier_client, &local_client}) f.client(*c);
+        feed(long_client, wire({"BITCOUNT", key}));
+        feed(short_client, wire({"SET", key, "x"}));
+        f.io.begin_admission();
+        parse(long_client);
+        parse(short_client);
+        require(take().empty(), "EX saw a task before IO admission ended");
+        f.io.finish_admission();
+        auto tasks = take();
+        require(tasks.size() == 2 && tasks[0].client == &short_client &&
+                    tasks[1].client == &long_client, "IO did not publish short before long");
+
+        // A connection-local command must flush all earlier connections before its own
+        // ordinary suffix, then allow a later cohort to use the refreshed private frontier.
+        feed(barrier_client, wire({"BITCOUNT", key}) + wire({"PING"}) + wire({"SET", key, "y"}));
+        f.io.begin_admission();
+        parse(barrier_client);
+        tasks = take();
+        require(tasks.size() == 2 && tasks[0].client == &barrier_client &&
+                    tasks[0].op_id == 0 && tasks[1].op_id == 2,
+                "special-command fence lost or inverted the connection suffix");
+        f.io.finish_admission();
+        require(take().empty(), "special-command fence left a stale private tail");
+
+        // Use the actual armed parser to open the local-read window, then demote it with
+        // a conflicting younger write. Both tasks must be published in program order.
+        feed(local_client, wire({"GET", key}));
+        f.io.begin_admission();
+        parse(local_client);
+        require(local_client.rob().has_pending_read_local(), "local-read window never opened");
+        require(take().empty(), "clean local read entered owner admission");
+        feed(local_client, wire({"SET", key, "z"}));
+        parse(local_client);
+        require(!local_client.rob().has_pending_read_local(), "conflicting write did not demote read");
+        f.io.finish_admission();
+        tasks = take();
+        require(tasks.size() == 2 && tasks[0].client == &local_client && tasks[0].op_id == 0 &&
+                    tasks[1].client == &local_client && tasks[1].op_id == 1,
+                "demotion reservation fence lost or inverted GET/SET");
+        for (Client* c : {&long_client, &short_client, &barrier_client, &local_client}) {
+            while (!c->rob().quiesced()) {
+                c->rob().at(c->rob().flush_id()).state.store(OpState::Done);
+                require(c->rob().drain([](Op&) {}) >= 1, "fixture ROB retirement");
+            }
+        }
+        f.io.clear_ifid_queue();
+        f.io.pending_serve_.clear();
+        f.io.active_.v.clear();
     }
 
     static void watch_disconnect() {
@@ -209,6 +307,11 @@ struct CoreConcurrencyTest {
         ex_schedule_batch(batch, 64);
         std::copy(std::begin(batch), std::begin(batch) + 64, tasks.begin());
         for (uint32_t i = 0; i < 64; i++) require(tasks[i].op_id == i, "one-client FIFO shortcut");
+
+        // The gate already selects this row in both tiers. Cover the actual IO publication
+        // and demotion fences here too; a manual-only selector would leave R6 ungated.
+        admission_parser<false, false>(); admission_parser<false, true>();
+        admission_parser<true, false>(); admission_parser<true, true>();
     }
 
     inline static std::mutex pause_mutex;
@@ -418,7 +521,10 @@ int main(int argc, char** argv) {
     T::require(argc == 2, "select one regression row");
     T::require(tomo::command_registry_init(false), "command registry initialization");
     const std::string row = argv[1];
-    if (row == "watch") T::watch_disconnect();
+    if (row == "admission") {
+        T::admission_parser<false, false>(); T::admission_parser<false, true>();
+        T::admission_parser<true, false>(); T::admission_parser<true, true>();
+    } else if (row == "watch") T::watch_disconnect();
     else if (row == "scheduler") T::scheduler();
     else if (row == "lifetime") T::lifetime();
     else if (row == "drain") T::drain_ack();
