@@ -39,7 +39,7 @@ struct CoreConcurrencyTest {
         uint32_t source = Fused ? 0 : 6;
         uint32_t destination = Fused ? 1 : 7;
         uint32_t io_id = Fused ? 7 : 0;
-        Fixture() {
+        explicit Fixture(uint32_t overlap = 0) {
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
             require(sched_getaffinity(0, sizeof(cpus), &cpus) == 0, "affinity unavailable");
@@ -60,6 +60,7 @@ struct CoreConcurrencyTest {
             Config config;
             config.shards = 16;
             config.thread_mode = Fused ? ThreadMode::Fused : ThreadMode::Split;
+            config.overlap = overlap;
             config.flip_auto = 0;
             config.save.clear();
             require(server.init(config), "initialize in-memory fixture");
@@ -209,6 +210,157 @@ struct CoreConcurrencyTest {
         ex_schedule_batch(batch, 64);
         std::copy(std::begin(batch), std::begin(batch) + 64, tasks.begin());
         for (uint32_t i = 0; i < 64; i++) require(tasks[i].op_id == i, "one-client FIFO shortcut");
+    }
+
+    inline static void* two_tier_owner = nullptr;
+    inline static const std::vector<Task>* two_tier_tasks = nullptr;
+    inline static uint32_t two_tier_done = 0;
+    inline static uint32_t two_tier_hinted = 0;
+    inline static bool two_tier_retry = false;
+    static void two_tier_prefetch_hook(const Task* batch, uint32_t n) {
+        require(n != 0 && two_tier_hinted + n <= two_tier_tasks->size(),
+                "two-tier must hint a nonempty bounded prefix");
+        for (uint32_t i = 0; i < n; i++) {
+            const Task& expected = (*two_tier_tasks)[two_tier_hinted++];
+            require(batch[i].client == expected.client && batch[i].op_id == expected.op_id,
+                    "two-tier hints must visit each handle exactly once in schedule order");
+            require(expected.client->rob().at(expected.op_id).state.load() == OpState::Issued,
+                    "lookahead must precede execution, not touch a completed ROB slot");
+        }
+    }
+    template <bool Fused>
+    static void two_tier_done_hook(Client*) {
+        auto& owner = *static_cast<ExLoopT<Fused>*>(two_tier_owner);
+        const uint32_t envelope_end = std::min<uint32_t>(two_tier_tasks->size(),
+            (two_tier_done / kGenthreadPipelineExBatchOps + 1) * kGenthreadPipelineExBatchOps);
+        const uint32_t hot_begin = two_tier_done / kExecBatch * kExecBatch;
+        require(two_tier_hinted == std::min(envelope_end, hot_begin + owner.prefetch_horizon_),
+                "two-tier must open the exact cache horizon before each hot batch");
+        // Done precedes notify_sender. A whole-128 execution mutant leaves 32 pending entries
+        // at op 33; the production two-tier arm has already flushed that handoff at op 32.
+        require(owner.notify_batch_n_ == two_tier_done % kExecBatch,
+                "two-tier handoff must flush at each hot-batch boundary");
+        if (++two_tier_done == kExecBatch && two_tier_retry) {
+            // Deterministic retry at the seam. This ownerless sentinel never executes; it makes
+            // the retry queue nonempty while the rest of the gathered prefix is still Issued.
+            owner.xshard_retries_.emplace_back(nullptr, UINT64_MAX,
+                                              owner.self_->shards().front()->id(), nullptr);
+        }
+    }
+
+    template <bool Fused>
+    static void two_tier(uint32_t n, bool unmasked, bool retry, bool reorder) {
+        Fixture<Fused> f(1);
+        auto& owner = f.loops[f.source];
+        owner.prefetch_horizon_ = overlap_prefetch_horizon(32768, 1048576, 64, Fused);
+        owner.reorder_enabled_ = reorder;
+        Client clients[4] = {Client(-1), Client(-1), Client(-1), Client(-1)};
+        for (Client& client : clients) f.client(client);
+        const std::string key = f.key(f.sid());
+        std::vector<Task> tasks;
+        for (uint32_t i = 0; i < n; i++) {
+            Client& client = clients[i % 4];
+            prepare(client, {Slice("INCR"), slice(key)}, f.server);
+            tasks.emplace_back(&client, client.rob().dispatch_id(), -1, nullptr);
+            client.rob().publish();
+            const bool posted = [&] {
+                if constexpr (Fused)
+                    return owner.self_->post_iofused_task_quiet(
+                        f.io_id, tasks.back(), owner.self_->sig());
+                else
+                    return owner.self_->post_task_quiet(
+                        f.io_id, tasks.back(), owner.self_->sig());
+            }();
+            require(posted, "two-tier fixture must publish every task");
+        }
+        if (!unmasked && n)
+            owner.self_->flush_task_notify(f.io_id, owner.ring_, owner.self_->sig());
+        uint32_t filler_calls = 0;
+        bool filler_used = false;
+        auto filler = [&] {
+            require(++filler_calls == 1, "two-tier filler must run exactly once");
+            require(two_tier_done == 0, "filler must precede the first Done publication");
+            for (const Task& task : tasks)
+                require(task.client->rob().at(task.op_id).state.load() == OpState::Issued,
+                        "prefetch horizon must not execute or complete future work");
+        };
+        two_tier_owner = &owner;
+        two_tier_tasks = &tasks;
+        two_tier_done = 0;
+        two_tier_hinted = 0;
+        two_tier_retry = retry;
+        ExLoopT<Fused>::test_after_done_ = two_tier_done_hook<Fused>;
+        ExLoopT<Fused>::test_before_prefetch_ = two_tier_prefetch_hook;
+        const uint32_t drained = [&] {
+            if constexpr (Fused)
+                return owner.template drain_tasks_with_filler<
+                    kGenthreadPipelineExBatchOps, true>(unmasked, filler, filler_used);
+            else
+                return owner.template drain_overlap_tasks<false>(unmasked);
+        }();
+        ExLoopT<Fused>::test_after_done_ = nullptr;
+        ExLoopT<Fused>::test_before_prefetch_ = nullptr;
+        two_tier_owner = nullptr;
+        two_tier_tasks = nullptr;
+        require(drained == n && owner.self_->sig().ops == n,
+                "two-tier drain must account for every published task exactly once");
+        require(owner.notify_batch_n_ == 0 && !owner.notify_batch_open_,
+                "two-tier partial tail must flush its notifications");
+        require(filler_calls == (Fused && n ? 1u : 0u) &&
+                    filler_used == (Fused && n != 0), "two-tier filler engagement");
+        const uint32_t done = retry ? kExecBatch : n;
+        require(two_tier_done == done, "retry must stop before the next hot batch");
+        require(two_tier_hinted == (retry ? std::min<uint32_t>(n, owner.prefetch_horizon_) : n),
+                "every reachable hint must fire; a retry must stop further warming");
+        require(owner.ordered_deferred_.size() == n - done,
+                "retry must durably retain the entire horizon suffix");
+        for (uint32_t i = 0; i < n; i++) {
+            const Task& task = tasks[i];
+            Op& op = task.client->rob().at(task.op_id);
+            require(op.state.load() == (i < done ? OpState::Done : OpState::Issued),
+                    "two-tier completion prefix must be exact");
+            if (i < done) {
+                op_materialise_code(op);
+                require(std::string(op.reply.data(), op.reply.size()) ==
+                            ":" + std::to_string(i + 1) + "\r\n",
+                        "INCR replies prove execution order and exactly-once mutation");
+            } else {
+                const Task& saved = owner.ordered_deferred_[i - done];
+                require(saved.client == task.client && saved.op_id == task.op_id &&
+                            saved.shard == task.shard && saved.scatter == task.scatter,
+                        "retry suffix must preserve Task identity and order");
+            }
+        }
+        // Retire only after inspecting the whole prefix, so no oracle reads recycled ROB slots.
+        owner.xshard_retries_.clear();
+        owner.ordered_deferred_.clear();
+        for (const Task& task : tasks) task.client->rob().at(task.op_id).state.store(OpState::Done);
+        for (Client& client : clients) client.rob().drain([](Op&) {});
+    }
+
+    static void overlap() {
+        require(overlap_prefetch_horizon(32768, 1048576, 64, true) == 64 &&
+                    overlap_prefetch_horizon(32768, 1048576, 64, false) == 128,
+                "two-tier mode budgets on Bergamo");
+        require(overlap_prefetch_horizon(-1, 1048576, 64, false) == 0 &&
+                    overlap_prefetch_horizon(32768, 0, 64, true) == 0 &&
+                    overlap_prefetch_horizon(32768, 1048576, 0, false) == 0 &&
+                    overlap_prefetch_horizon(4096, 4096, 64, false) == 0,
+                "unknown or insufficient cache capacity must decline two-tier execution");
+        require(overlap_prefetch_horizon(32768, 32768, 64, false) == 64,
+                "L2 must independently limit the horizon");
+        for (bool unmasked : {false, true}) {
+            for (bool reorder : {false, true}) {
+                for (uint32_t n : {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, 128u, 256u}) {
+                    two_tier<false>(n, unmasked, false, reorder);
+                    two_tier<true>(n, unmasked, false, reorder);
+                }
+                two_tier<false>(128, unmasked, true, reorder);
+                two_tier<true>(128, unmasked, true, reorder);
+                two_tier<false>(256, unmasked, true, reorder);
+                two_tier<true>(256, unmasked, true, reorder);
+            }
+        }
     }
 
     inline static std::mutex pause_mutex;
@@ -420,6 +572,7 @@ int main(int argc, char** argv) {
     const std::string row = argv[1];
     if (row == "watch") T::watch_disconnect();
     else if (row == "scheduler") T::scheduler();
+    else if (row == "overlap") T::overlap();
     else if (row == "lifetime") T::lifetime();
     else if (row == "drain") T::drain_ack();
     else if (row == "route") T::route_order();
