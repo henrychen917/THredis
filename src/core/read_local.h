@@ -336,6 +336,10 @@ public:
             server_->read_local_grace_floor(ring_.head_stamp(), grace_hint_);
         const uint32_t drained = ring_.drain_below(
             grace_floor, [this](uint32_t slot) { reclaim_entry(entries_[slot]); });
+        if (!drained) {
+            const Entry& entry = entries_[ring_.head];
+            read_local_table_grace_blocked(entry.reclaim, entry.owner, entry.payload);
+        }
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         stats.qsbr_reclaims += drained;
         if (!drained) stats.qsbr_zero_progress_scans++;

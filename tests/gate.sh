@@ -572,6 +572,59 @@ py tests/read_local_lane.py 127.0.0.1 "$PORT" >/tmp/gate-read-local-lane.txt 2>&
     || bad "read-local lane admission battery" "see /tmp/gate-read-local-lane.txt"
 stop
 
+# ---- Table publication: nine rows, physically BEFORE the quick-tier exit --------------------
+# Four directed publication/lifetime/churn/OOM rows, two retained atomic-safety batteries,
+# one atomic-0 run, and two inactive-lane allocation controls. No table/capture/filter selectors.
+# Mainline has quick 325 / full 342; these nine rows require quick 334 / full 351.
+# EXPECT_* are intentionally left for the maintainer. Boot failures emit every expected row.
+if boot_fused ./build/tomokv --atomic 1 --read-local 1 --lb 0 \
+    --enable-debug-command yes; then
+  for NW_CASE in prepublication retirement churn oom; do
+    NW_LOG=/tmp/gate-read-local-table-$NW_CASE.txt
+    py tests/read_local_table.py 127.0.0.1 "$PORT" fused "$NW_CASE" >"$NW_LOG" 2>&1 \
+        && ok "table publication $NW_CASE" \
+        || bad "table publication $NW_CASE" "see $NW_LOG"
+  done
+  py tests/bplus.py 127.0.0.1 "$PORT" >/tmp/gate-table-bplus.txt 2>&1 \
+      && ok "table publication retains B+ atomic safety" \
+      || bad "table publication retains B+ atomic safety" "see /tmp/gate-table-bplus.txt"
+  py tests/atomic_torn.py 127.0.0.1 "$PORT" >/tmp/gate-table-atomic-torn.txt 2>&1 \
+      && ok "table publication retains atomic torn-read protection" \
+      || bad "table publication retains atomic torn-read protection" \
+             "see /tmp/gate-table-atomic-torn.txt"
+else
+  for NW_CASE in prepublication retirement churn oom; do
+    bad "table publication $NW_CASE" "boot failed; see $SRVLOG"
+  done
+  bad "table publication retains B+ atomic safety" "boot failed; see $SRVLOG"
+  bad "table publication retains atomic torn-read protection" "boot failed; see $SRVLOG"
+fi
+stop
+for NW_POSTURE in atomic0 disabled; do
+  NW_ATOMIC=1; NW_READ_LOCAL=1; NW_TEST=fused
+  [ "$NW_POSTURE" = atomic0 ] && NW_ATOMIC=0
+  if [ "$NW_POSTURE" = disabled ]; then NW_READ_LOCAL=0; NW_TEST=disabled; fi
+  if boot_fused ./build/tomokv --atomic "$NW_ATOMIC" --read-local "$NW_READ_LOCAL" \
+      --lb 0 --enable-debug-command yes; then
+    py tests/read_local_table.py 127.0.0.1 "$PORT" "$NW_TEST" \
+        >"/tmp/gate-table-$NW_POSTURE.txt" 2>&1 \
+        && ok "table publication $NW_POSTURE" \
+        || bad "table publication $NW_POSTURE" "see /tmp/gate-table-$NW_POSTURE.txt"
+  else
+    bad "table publication $NW_POSTURE" "boot failed; see $SRVLOG"
+  fi
+  stop
+done
+if boot ./build/tomokv --atomic 1 --read-local 1 \
+    --lb 0 --enable-debug-command yes; then
+  py tests/read_local_table.py 127.0.0.1 "$PORT" split >/tmp/gate-table-split.txt 2>&1 \
+      && ok "table publication split allocation-free control" \
+      || bad "table publication split allocation-free control" "see /tmp/gate-table-split.txt"
+else
+  bad "table publication split allocation-free control" "boot failed; see $SRVLOG"
+fi
+stop
+
 # ---- ACL recheck over a CODED reply: exactly one reply per blocking command -------------------
 # A blocking command's reply is discarded and replaced when the live ACL denies it at retire. A
 # timeout answers "*-1" / "_", which are ReplyCode-carried, so a discard that clears only the byte

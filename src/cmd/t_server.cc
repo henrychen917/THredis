@@ -985,6 +985,26 @@ void cmd_debug_impl(Shard&, Op& op) {
     // cannot manufacture an unrelated same-shard key whose filter cell is provably negative from
     // its name alone. Expose only the deterministic cell mapping, never the live cell contents;
     // the actual GET/MGET result and read-local counters remain the mechanism oracle.
+    // Directed topology/QSBR battery. 1 holds a captured root across publication, 2 requires
+    // a read to finish during private construction, 3 releases that reader, 0 disarms. Uses a
+    // single shard and ordinary writes only; the test's legacy-word poison is deliberately fatal
+    // to an accidental validating read. No hook exists when the boot-only table arm is OFF.
+    if (eq_icase(subcommand, "read-local-table") && op.argc() == 4) {
+        uint64_t mode = 0;
+        if (!g_server || !parse_u64(op.arg(3), mode) || mode > 3) {
+            reply_err(op.sink(), "ERR syntax: DEBUG READ-LOCAL-TABLE key 0|1|2|3");
+            return;
+        }
+        const uint64_t hash = FlatStore::hash_key(op.arg(2));
+        const int32_t sid = g_server->router().shard_of(hash);
+        if (!g_server->shard(sid).store().debug_read_local_table(
+                hash, g_server->worker_of_shard(sid), static_cast<uint32_t>(mode))) {
+            reply_err(op.sink(), "ERR table publication is disabled or hook is not in that state");
+            return;
+        }
+        reply_ok(op.sink());
+        return;
+    }
     if (eq_icase(subcommand, "atomic-filter-cell") && op.argc() == 3) {
         const uint64_t hash = FlatStore::hash_key(op.arg(2));
         reply_int(op.sink(), FlatStore::foreign_read_filter_index(hash));
@@ -1951,6 +1971,16 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned>(g_server ? g_server->cfg().port : 0),
                 static_cast<unsigned long long>(uptime),
                 static_cast<unsigned long long>(uptime / 86400));
+        const bool lane_on = g_server && g_server->read_local_enabled();
+        appendf(body,
+                "read_local_table:%u\r\n"
+                "read_local_table_scope:%s\r\nread_local_table_read_path:%s\r\n"
+                "read_local_table_atomic_validation:%u\r\n"
+                "read_local_table_mget_validation:%u\r\n",
+                lane_on ? 1u : 0u,
+                lane_on ? "topology_only" : "off",
+                lane_on ? "published" : "owner",
+                lane_on ? 1u : 0u, lane_on ? 1u : 0u);
         if (g_server && g_server->thread_mode() == ThreadMode::Fused) {
             appendf(body,
                     "fused_threads:%u\r\nclient_threads:%u\r\nowner_threads:%u\r\n"
@@ -2418,6 +2448,31 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(foreign_read_wildcard_cells),
                 static_cast<unsigned long long>(foreign_read_saturated_cells),
                 static_cast<unsigned long long>(foreign_read_poisoned_shards));
+        ReadLocalTableMetrics tables;
+        if (g_server && g_server->read_local_enabled())
+            for (uint32_t sid = 0; sid < g_server->nshards(); ++sid)
+                g_server->shard(static_cast<int32_t>(sid)).store().read_local_table_metrics(tables);
+        // Lifetime counters are process-lifetime values, deliberately independent of RESETSTAT.
+#define TOMO_TABLE_INFO(name) appendf(body, "read_local_table_" #name ":%llu\r\n", \
+                static_cast<unsigned long long>(tables.name))
+        TOMO_TABLE_INFO(probes); TOMO_TABLE_INFO(served); TOMO_TABLE_INFO(atomic_validations);
+        TOMO_TABLE_INFO(published); TOMO_TABLE_INFO(retired); TOMO_TABLE_INFO(reclaimed);
+        TOMO_TABLE_INFO(current_bytes); TOMO_TABLE_INFO(retired_bytes);
+        TOMO_TABLE_INFO(detached_bytes);
+        TOMO_TABLE_INFO(peak_retired_bytes); TOMO_TABLE_INFO(build_bytes);
+        TOMO_TABLE_INFO(peak_build_bytes); TOMO_TABLE_INFO(prepared_bytes);
+        TOMO_TABLE_INFO(sidecar_bytes);
+        TOMO_TABLE_INFO(copied_slots); TOMO_TABLE_INFO(allocation_failures);
+        TOMO_TABLE_INFO(grows); TOMO_TABLE_INFO(shrinks); TOMO_TABLE_INFO(cleanups);
+        TOMO_TABLE_INFO(merges); TOMO_TABLE_INFO(snapshots); TOMO_TABLE_INFO(clears);
+        TOMO_TABLE_INFO(snapshot_clear_oom);
+        TOMO_TABLE_INFO(debug_phase); TOMO_TABLE_INFO(debug_held);
+        TOMO_TABLE_INFO(debug_grace_blocked); TOMO_TABLE_INFO(debug_retired_reads);
+        TOMO_TABLE_INFO(debug_prepublication_reads); TOMO_TABLE_INFO(debug_timeouts);
+#undef TOMO_TABLE_INFO
+        appendf(body, "read_local_table_transient_bytes:%llu\r\n",
+                static_cast<unsigned long long>(tables.retired_bytes + tables.detached_bytes +
+                                                tables.build_bytes + tables.prepared_bytes));
         appendf(body,
                 "read_local_hits:%llu\r\n"
                 "read_local_keyspace_hits:%llu\r\n"

@@ -780,34 +780,26 @@ private:
                 uint32_t steps = additional / kRehashSlotsPerOp + 1;
                 while (steps-- && rehashing()) rehash_step_read_local();
             }
-            if (rehashing())
-                return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
+            if (rehashing()) {
+                uint64_t occupied = static_cast<uint64_t>(live_[0]) + tombs_[0];
+                // Publication keeps snapshot keys in their old slots; reserve room for the eventual
+                // complete merge as well as this irrevocable batch's new physical inserts.
+                occupied += live_[1];
+                return occupied + additional < cap_[0];
+            }
         }
         if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + additional) * 100 <
             static_cast<uint64_t>(cap_[0]) * kLoadPct)
             return true;
         if (snapshot_prepared_)
             return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
-        uint64_t wanted = cap_[0];
+        uint64_t wanted = std::max(cap_[0], kMinCap);
         const uint64_t need = static_cast<uint64_t>(live_[0]) + additional;
         while (need * 100 >= wanted * kLoadPct) {
             wanted *= uint64_t{2};
             if (wanted > UINT32_MAX) return false;
         }
-        auto* fresh = static_cast<uint64_t*>(
-            flatstore_table_calloc(static_cast<size_t>(wanted), sizeof(uint64_t)));
-        if (!fresh) return false;
-        ReadLocalTableGuard table_change(*this);
-        read_local_topology_store(&tab_[1], tab_[0]);
-        read_local_topology_store(&cap_[1], cap_[0]);
-        read_local_topology_store(&mask_[1], mask_[0]);
-        live_[1] = live_[0]; tombs_[1] = tombs_[0];
-        read_local_topology_store(&tab_[0], fresh);
-        read_local_topology_store(&cap_[0], static_cast<uint32_t>(wanted));
-        read_local_topology_store(&mask_[0], static_cast<uint32_t>(wanted) - 1);
-        live_[0] = tombs_[0] = 0;
-        rehash_pos_ = 0;
-        return true;
+        return rebuild_read_local_table(static_cast<uint32_t>(wanted));
     }
 
     bool atomic_prepare_plain_read_local(Slice key, uint64_t hash, uint64_t origin_conn_id,
@@ -879,6 +871,9 @@ private:
     // a line the per-write path otherwise never touches.
     ReadLocalStoreState& read_local_store_state_armed() {
         return *reinterpret_cast<ReadLocalStoreState*>(atomic_pending_);
+    }
+    const ReadLocalStoreState& read_local_store_state_armed() const {
+        return *reinterpret_cast<const ReadLocalStoreState*>(atomic_pending_);
     }
 
     const ReadLocalStoreState& read_local_store_state_required() const {
@@ -966,9 +961,10 @@ private:
                 free_sized(entry, entry->allocation);
             }
         }
-        if (read_local_extended)
+        if (read_local_extended) {
+            destroy_read_local_table();
             delete reinterpret_cast<ReadLocalStoreState*>(atomic_pending_);
-        else
+        } else
             delete atomic_pending_;
         atomic_pending_ = nullptr;
     }
@@ -1241,10 +1237,10 @@ private:
     KvObj* atomic_exchange_physical_read_local(uint64_t hash, Slice key,
                                                KvObj* replacement) {
         // The key filter was release-published before this call. Enclose every possible physical
-        // exchange or direct insertion in the table sequence so a reader that observed the old
+        // exchange or direct insertion in the semantic sequence so a reader that observed the old
         // empty cell cannot consume an epoch-zero/aborted candidate. The same bracket is what a
         // local MGET compares on a group-free participant.
-        ReadLocalTableGuard atomic_change(*this);
+        ReadLocalAtomicGuard atomic_change(*this);
         uint32_t insertion_slot = 0;
         bool have_insertion_slot = false;
         bool insertion_reuses_tomb = false;
@@ -1272,9 +1268,12 @@ private:
                 }
                 if (object && tag_of_word(word) == tag && object->key().key_eq(key)) {
                     obj_bytes_ -= kvobj_size(object);
-                    if (replacement && table == 0) {
+                    if (replacement) {
                         (void)track_expire(hash, replacement);
-                        read_local_slot_store(&tab_[table][slot], make_word(tag, replacement));
+                        uint64_t next = make_word(tag, replacement);
+                        if (table == 1 && snapshot_active_)
+                            next |= word & kTombBit; // keep the serialized-preimage mark
+                        read_local_slot_store(&tab_[table][slot], next);
                         obj_bytes_ += kvobj_size(replacement);
                     } else {
                         untrack_expire(hash);
@@ -1312,7 +1311,6 @@ private:
         if (KvObj* object = exchange(0)) return object;
         if (rehashing()) {
             if (KvObj* object = exchange(1)) {
-                insert_replacement();
                 return object;
             }
         }

@@ -322,7 +322,7 @@ public:
                 }
             }
             for (const auto& shard : shards_) {
-                if (!shard->store().prepare_read_local()) {
+                if (!shard->store().prepare_read_local(nthreads)) {
                     std::fprintf(stderr, "fatal: could not allocate read-local store state\n");
                     return false;
                 }

@@ -264,6 +264,9 @@ int main() {
         fail("read-local boot grammar differs");
     tomo::Config read_local_default;
     if (read_local_default.read_local != 0) fail("read-local default differs");
+    for (const char* value : {"0", "1", "-1", "yes", ""})
+        if (!rejects({"--read-local-table", value}))
+            fail("removed read-local-table option was accepted");
     tomo::Config read_local_split;
     tomo::ConfigParseState read_local_split_state;
     const std::vector<const char*> read_local_split_args = {"--read-local", "1"};
