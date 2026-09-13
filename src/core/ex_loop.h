@@ -1979,6 +1979,8 @@ private:
     template <uint32_t BatchOps = kGenthreadExBatchOps,
               bool IofusedPrivateQueue = false>
     uint32_t drain_tasks(bool unmasked = false) {
+        if (__builtin_expect(reorder_enabled_, false))
+            return drain_tasks_reordered<BatchOps, IofusedPrivateQueue>(unmasked);
         Task batch[BatchOps];
         uint32_t held = 0;
         auto take = [&](const Task& t) {
@@ -2002,6 +2004,9 @@ private:
     // same pop/retire sequence, so no streams lane list or delayed-retirement context is involved.
     template <uint32_t BatchOps, bool IofusedPrivateQueue, typename Filler>
     uint32_t drain_tasks_with_filler(bool unmasked, Filler& filler, bool& filler_used) {
+        if (__builtin_expect(reorder_enabled_, false))
+            return drain_tasks_reordered<BatchOps, IofusedPrivateQueue>(
+                unmasked, &filler, &filler_used);
         Task batch[BatchOps];
         uint32_t held = 0;
         auto execute_batch = [&] {
@@ -2027,6 +2032,47 @@ private:
             ? self_->drain_tasks_unmasked<IofusedPrivateQueue>(take)
             : self_->drain_tasks<IofusedPrivateQueue>(take);
         execute_batch();
+        self_->sig().ops += n;
+        return n;
+    }
+
+    // R7 queues span gathered batches, but never the owner drain's control boundary. Off never
+    // enters this function or reserves its stack. The original inbox recv/callback/retire order
+    // stays intact; pending ROB tasks pin their Clients until executed or durably deferred.
+    template <uint32_t BatchOps, bool IofusedPrivateQueue, typename Filler = void>
+    __attribute__((noinline))
+    uint32_t drain_tasks_reordered(bool unmasked, Filler* filler = nullptr,
+                                   bool* filler_used = nullptr) {
+        ExReorderQueues<BatchOps> queues;
+        Task batch[BatchOps];
+        uint32_t held = 0;
+        auto emit = [&](const Task* selected, uint32_t count, ReorderResult witness) {
+            srv_->mode_schedule_stats(self_->id()).note_reorder(count, witness);
+            if (!xshard_retries_.empty()) {
+                for (uint32_t i = 0; i < count; i++) ordered_deferred_.push_back(selected[i]);
+                return;
+            }
+            prefetch_exec_batch(selected, count);
+            if constexpr (!std::is_void_v<Filler>) {
+                if (!*filler_used) {
+                    (*filler)();
+                    *filler_used = true;
+                }
+            }
+            exec_batch_prefetched<IofusedPrivateQueue>(selected, count);
+        };
+        auto take = [&](const Task& task) {
+            batch[held++] = task;
+            if (held == BatchOps) {
+                queues.submit(batch, held, emit);
+                held = 0;
+            }
+        };
+        const uint32_t n = unmasked
+            ? self_->drain_tasks_unmasked<IofusedPrivateQueue>(take)
+            : self_->drain_tasks<IofusedPrivateQueue>(take);
+        if (held) queues.submit(batch, held, emit);
+        queues.finish(emit);
         self_->sig().ops += n;
         return n;
     }
