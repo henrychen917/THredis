@@ -408,7 +408,11 @@ row_begin(){
   # The whole ABBA matrix is a single historical gate row. Until it has exact
   # history, its conservative budget must accommodate the full escalation matrix.
   # This bound is not a license to accept partial results; ABBA still scores all cells.
-  if [ "$ROW_MEDIAN" = - ] && [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ]; then
+  # The ABBA row's recorded history is dominated by runs that aborted before measuring (median
+  # 0.42s), so a history-derived budget kills every genuine measurement at 30s -- three overnight
+  # rounds on 2026-09-13 died exactly that way. The row only reports now; give it the full-matrix
+  # budget unconditionally rather than one derived from its own failures.
+  if [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ]; then
     ROW_TIMEOUT=43200; ROW_BASIS=no-history-full-matrix-conservative-default
   fi
   ROW_MARKER="$TMPDIR/row-timeout-$BASHPID.json"
