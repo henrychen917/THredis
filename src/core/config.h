@@ -465,6 +465,38 @@ inline bool cfg_parse_i64(const char* s, int64_t& out) {
     return true;
 }
 
+// These consumers have a locked uint32 ABI. Redis itself permits signed-64-bit ceilings;
+// keep its integer/memory grammar and diagnostic form, but report our supported bound honestly.
+inline bool cfg_parse_u32_limit(Slice input, bool memory, uint32_t& out, const char*& error) {
+    const std::string text(input.p, input.n);
+    int64_t integer = 0;
+    const bool canonical = cfg_parse_i64(text.c_str(), integer) && std::to_string(integer) == text;
+    uint64_t value = 0;
+    if (canonical) {
+        value = static_cast<uint64_t>(integer);
+    } else if (memory) {
+        // Redis also accepts an empty memory value or a bare suffix as zero.
+        if (!input.n || cfg_memory_suffix(input.p, input.n, "b") ||
+            cfg_memory_suffix(input.p, input.n, "k") || cfg_memory_suffix(input.p, input.n, "kb") ||
+            cfg_memory_suffix(input.p, input.n, "m") || cfg_memory_suffix(input.p, input.n, "mb") ||
+            cfg_memory_suffix(input.p, input.n, "g") || cfg_memory_suffix(input.p, input.n, "gb")) {
+            value = 0;
+        } else if (!cfg_parse_memory(input.p, input.n, value)) {
+            error = "argument must be a memory value";
+            return false;
+        }
+    } else {
+        error = "argument couldn't be parsed into an integer";
+        return false;
+    }
+    if (value > UINT32_MAX) {
+        error = "argument must be between 0 and 4294967295 inclusive";
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
 inline bool EncodingConfig::parse(uint32_t key, Slice input, int64_t& out) {
     if (key >= Count) return false;
     if (settings[key].memory) {
@@ -666,9 +698,11 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             }
         }
         else if (!std::strcmp(a, "--latency-monitor-threshold")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.latency_monitor_threshold)) {
-                std::fprintf(stderr,
-                             "--latency-monitor-threshold wants milliseconds, 0 to disable\n");
+            const char* value = next("");
+            const char* error = nullptr;
+            if (!cfg_parse_u32_limit(Slice(value, std::strlen(value)), false,
+                                     cfg.latency_monitor_threshold, error)) {
+                std::fprintf(stderr, "%s: %s\n", a, error);
                 return kConfigError;
             }
         }
@@ -914,11 +948,16 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                 return kConfigError;
             }
         }
-        else if (!std::strcmp(a, "--stream-node-max-bytes")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.stream_limits.node_max_bytes)) return kConfigError;
-        }
-        else if (!std::strcmp(a, "--stream-node-max-entries")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.stream_limits.node_max_entries)) return kConfigError;
+        else if (!std::strcmp(a, "--stream-node-max-bytes") ||
+                 !std::strcmp(a, "--stream-node-max-entries")) {
+            const bool memory = !std::strcmp(a, "--stream-node-max-bytes");
+            const char* value = next(nullptr);
+            const char* error = "missing argument";
+            uint32_t& limit = memory ? cfg.stream_limits.node_max_bytes : cfg.stream_limits.node_max_entries;
+            if (!value || !cfg_parse_u32_limit(Slice(value, std::strlen(value)), memory, limit, error)) {
+                std::fprintf(stderr, "%s: %s\n", a, error);
+                return kConfigError;
+            }
         }
         else if (!std::strcmp(a, "--zc-min")) {
             const char* v = next(nullptr);

@@ -285,7 +285,7 @@ enum class ConfigKind : uint8_t {
     String, Bool, Unsigned, Bytes, Enum, Policy, ClientOutputBufferLimit, NotifyFlags, Save,
     // slowlog-log-slower-than is the tree's first genuinely signed knob: redis's grammar accepts
     // and reports -1, so an unsigned representation would not round-trip.
-    Signed, Encoding
+    Signed, Encoding, Uint32, Uint32Bytes
 };
 struct ConfigValue {
     const char* name;
@@ -384,9 +384,9 @@ void init_config(const Config& cfg) {
     for (uint32_t i = 0; i < EncodingConfig::Count; i++)
         g_config.push_back({EncodingConfig::settings[i].name, ConfigKind::Encoding,
                             std::to_string(cfg.encodings.values[i])});
-    add_config("stream-node-max-bytes", ConfigKind::Unsigned,
+    add_config("stream-node-max-bytes", ConfigKind::Uint32Bytes,
                cfg.stream_limits.node_max_bytes);
-    add_config("stream-node-max-entries", ConfigKind::Unsigned,
+    add_config("stream-node-max-entries", ConfigKind::Uint32,
                cfg.stream_limits.node_max_entries);
     g_config.push_back({"requirepass", ConfigKind::String,
                         cfg.requirepass ? cfg.requirepass : ""});
@@ -399,7 +399,7 @@ void init_config(const Config& cfg) {
     g_config.push_back({"slowlog-log-slower-than", ConfigKind::Signed,
                         std::to_string(cfg.slowlog_log_slower_than)});
     add_config("slowlog-max-len", ConfigKind::Unsigned, cfg.slowlog_max_len);
-    add_config("latency-monitor-threshold", ConfigKind::Unsigned,
+    add_config("latency-monitor-threshold", ConfigKind::Uint32,
                cfg.latency_monitor_threshold);
     const char* debug_mode = cfg.enable_debug_command == DebugCommandMode::Yes ? "yes" :
                              cfg.enable_debug_command == DebugCommandMode::Local ? "local" : "no";
@@ -460,8 +460,16 @@ bool parse_client_output_buffer_limit_slice(Slice input,
     return cfg_parse_client_output_buffer_limit(argv.data(), argv.size(), out, error);
 }
 
-bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
+bool normalize_config(const ConfigValue& entry, Slice input, std::string& out, const char*& error) {
     switch (entry.kind) {
+        case ConfigKind::Uint32:
+        case ConfigKind::Uint32Bytes: {
+            uint32_t value = 0;
+            if (!cfg_parse_u32_limit(input, entry.kind == ConfigKind::Uint32Bytes, value, error))
+                return false;
+            out = std::to_string(value);
+            return true;
+        }
         case ConfigKind::Encoding: {
             int64_t value = 0;
             const int key = EncodingConfig::find(Slice(entry.name, std::strlen(entry.name)));
@@ -589,6 +597,7 @@ bool collect_config_updates(Op& op,
         }
         std::string value;
         bool normalized = false;
+        const char* config_error = nullptr;
         if (item->kind == ConfigKind::ClientOutputBufferLimit) {
             ClientOutputBufferLimits parsed;
             const char* error = nullptr;
@@ -599,9 +608,15 @@ bool collect_config_updates(Op& op,
                 value = cfg_client_output_buffer_limit_string(parsed);
             }
         } else {
-            normalized = normalize_config(*item, op.arg(i + 1), value);
+            normalized = normalize_config(*item, op.arg(i + 1), value, config_error);
         }
         if (!normalized) {
+            if (config_error) {
+                std::string msg = "ERR CONFIG SET failed (possibly related to argument '";
+                msg += item->name;
+                msg += "') - "; msg += config_error;
+                reply_err(op.sink(), msg.c_str()); return false;
+            }
             std::string msg = "ERR Invalid argument '";
             msg.append(op.arg(i + 1).p, op.arg(i + 1).n);
             msg += "' for CONFIG SET '"; msg += item->name; msg.push_back('\'');
