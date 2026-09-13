@@ -75,7 +75,9 @@ static_assert(sizeof(AtomicAdmissionState) == 64);
 struct Task {
     Client*  client = nullptr;
     uint64_t op_id  = 0;
-    int32_t  shard  = -1;       // -1 means use Op::shard (the ordinary single-shard path)
+    // Every negative value resolves through Op::shard. reorder.h encodes a batch arrival in
+    // that ordinary selector; -1 means no arrival. Explicit shard IDs remain non-negative.
+    int32_t  shard  = -1;
     // The original layout has a four-byte hole here before the aligned pointer. Sampled enqueue
     // time uses the low monotonic-microsecond word; modular subtraction is valid for queue delays
     // below 2^32 us. Zero means unsampled.

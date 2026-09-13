@@ -179,7 +179,10 @@ struct CoreConcurrencyTest {
             f.client(client);
             Op& op = prepare(client, {Slice(i % 3 ? "GET" : "STRLEN"), slice(key)}, f.server);
             (void)op;
-            tasks.emplace_back(&client, client.rob().dispatch_id(), -1, nullptr);
+            // Gather cycles A/B/C/D, but arrivals in each cycle were D/C/B/A. All four
+            // connections stay monotonic; cost, pointer order and ROB rank cannot be the oracle.
+            tasks.emplace_back(&client, client.rob().dispatch_id(),
+                               ex_schedule_arrival(100 + (i / 4) * 4 + 3 - i % 4), nullptr);
             client.rob().publish();
         }
         require(tasks.size() == 128 && tasks.size() > kExecBatch, "oversized fused batch armed");
@@ -189,12 +192,15 @@ struct CoreConcurrencyTest {
         }
         Task batch[kGenthreadPipelineExBatchOps];
         std::copy(tasks.begin(), tasks.end(), batch);
-        ex_schedule_batch(batch, static_cast<uint32_t>(tasks.size()));
+        const auto witness = ex_schedule_batch(batch, static_cast<uint32_t>(tasks.size()));
+        require(witness.permuted_runs == 1, "age order permuted the complete 128-task run");
         std::copy(std::begin(batch), std::end(batch), tasks.begin());
         uint64_t next[4] = {};
+        uint32_t position = 0;
         for (const Task& task : tasks) {
             const size_t client = task.client - clients;
             require(client < 4 && task.op_id == next[client]++, "scheduler preserves client order");
+            require(client == 3 - position++ % 4, "scheduler follows exact arrival oracle");
         }
         for (uint64_t count : next) require(count == 32, "scheduler conserves every task");
         // The original overrun occurs before the single-client shortcut too.
@@ -202,7 +208,7 @@ struct CoreConcurrencyTest {
         tasks.clear();
         for (uint32_t i = 0; i < 64; i++) {
             prepare(one, {Slice("GET"), slice(key)}, f.server);
-            tasks.emplace_back(&one, one.rob().dispatch_id(), -1, nullptr);
+            tasks.emplace_back(&one, one.rob().dispatch_id(), ex_schedule_arrival(100 + i), nullptr);
             one.rob().publish();
         }
         std::copy(tasks.begin(), tasks.end(), batch);
@@ -304,7 +310,9 @@ struct CoreConcurrencyTest {
                 "seed old value");
         Op& set = prepare(client, {Slice("SET"), slice(key), Slice("new")}, f.server);
         const uint32_t sampled_owner = f.server.worker_of_shard(set.shard);
-        Task unpublished{&client, client.rob().dispatch_id(), -1, nullptr};
+        Task unpublished{&client, client.rob().dispatch_id(), ex_schedule_arrival(100), nullptr};
+        require(unpublished.shard < -1 && f.loops[f.source].task_shard(unpublished) == sid,
+                "arrival selector resolves through the ordinary Op before migration");
         require(sampled_owner == f.source && f.server.thread(sampled_owner).ex_inbound_quiesced(),
                 "IO holds routed task while owner inbox is empty");
         f.server.lb_epoch_.store(1);
@@ -342,7 +350,7 @@ struct CoreConcurrencyTest {
         require(command(f, client, {Slice("SET"), slice(key), Slice("before-cut")}) == "+OK\r\n",
                 "seed snapshot preimage");
         prepare(client, {Slice("SET"), slice(key), Slice("after-cut")}, f.server);
-        Task stale{&client, client.rob().dispatch_id(), -1, nullptr};
+        Task stale{&client, client.rob().dispatch_id(), ex_schedule_arrival(200), nullptr};
         client.rob().publish();
         f.move(sid, false);
         FlatStore& store = f.server.shard(sid).store();
@@ -356,8 +364,9 @@ struct CoreConcurrencyTest {
         std::vector<Task> forwarded;
         f.server.thread(f.destination).drain_tasks_unmasked(
             [&](const Task& task) { forwarded.push_back(task); });
-        require(forwarded.size() == 1 && forwarded[0].op_id == stale.op_id,
-                "stale task forwarded exactly once");
+        require(forwarded.size() == 1 && forwarded[0].op_id == stale.op_id &&
+                    forwarded[0].shard == stale.shard,
+                "stale task forwarded exactly once with its original arrival selector");
         auto& owner = f.loops[f.destination];
         owner.snapshot_backlogs_.resize(16);
         owner.schedule_snapshot_task(forwarded[0]);

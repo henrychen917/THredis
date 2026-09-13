@@ -3023,6 +3023,11 @@ private:
                 return owner.post_tasks_quiet(self_id, tasks, count, sig);
             }
         };
+        // One arrival for this parse invocation, replacing the ordinary Task's -1 selector.
+        // Reuse the loop clock; keep sampling and its per-task flip EWMAs independent. The
+        // disabled arm does not load the clock, and local-lane admissions store no age at all.
+        const int32_t ordinary_selector = srv_->cfg().reorder
+            ? ex_schedule_arrival(sig.cached_now_us) : -1;
         DispatchResult result = DispatchResult::Progress;
         bool head_candidate = true;   // only the pass's FIRST dispatch can be the direct head
         const uint8_t security_flags = srv_->security_flags();
@@ -4307,7 +4312,7 @@ ordinary_shard_ready:
                     op->direct_cap = static_cast<uint32_t>(fb.cap());
                 }
             }
-            Task t{c, rob.dispatch_id(), -1, nullptr};
+            Task t{c, rob.dispatch_id(), ordinary_selector, nullptr};
             rob.publish();
             bool posted = false;
             if constexpr (Fused) {
