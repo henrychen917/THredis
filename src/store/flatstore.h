@@ -1952,6 +1952,9 @@ public:
         if (tab_[1]) __builtin_prefetch(&tab_[1][slot_start(1, h)], 0, 3);
     }
 
+    // Armed-store IO hint; defined with its only caller in core/io_loop.h.
+    inline void prefetch_from_io(uint64_t hash) const;
+
     // One hash for the whole server: the router takes its bucket from the low bits and FlatStore
     // mixes for its index, so both must agree and it lives here. Word-at-a-time, because FNV-1a
     // costs one DEPENDENT multiply per byte and a 20-character key is then a 20-long chain.

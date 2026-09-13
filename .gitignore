@@ -21,6 +21,9 @@ BRIEF*.md
 LANE_RULES.md
 # The interactive agent transcript changes during validation and is not project source.
 /CODEX-OUT.md
+# Competition handoffs and measured results are maintainer artifacts, not design documents.
+/MEASURE-REQUEST
+/MEASURE-RESULT
 
 # replycode lane: measurement drivers are tracked as sources, their binaries are not
 scratchpad/replycode/replay
