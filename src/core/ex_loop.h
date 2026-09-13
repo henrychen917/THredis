@@ -179,6 +179,8 @@ public:
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
         reorder_enabled_ = srv->cfg().reorder != 0;
+        if (reorder_enabled_ && !srv_->mode_schedule_stats(self_->id()).arm_reorder(self_->id()))
+            return false;
         pipeline_batches_ = Fused && srv->thread_mode() == ThreadMode::Fused &&
                             srv->cfg().overlap != 0;
         // Fused overlap uses fixed producer lanes; synchronous local-read demotion resolves
@@ -2007,13 +2009,14 @@ private:
         auto execute_batch = [&] {
             if (!held) return;
             if (!filler_used && xshard_retries_.empty()) {
-                if (__builtin_expect(reorder_enabled_, false))
-                    srv_->mode_schedule_stats(self_->id()).note_reorder(
-                        held, ex_schedule_batch(batch, held));
-                prefetch_exec_batch(batch, held);
-                filler();
+                if (__builtin_expect(reorder_enabled_, false)) {
+                    exec_batch_reordered<IofusedPrivateQueue>(batch, held, filler);
+                } else {
+                    prefetch_exec_batch(batch, held);
+                    filler();
+                    exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
+                }
                 filler_used = true;
-                exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
             } else {
                 exec_batch<IofusedPrivateQueue>(batch, held);
             }
@@ -2313,9 +2316,9 @@ private:
     // arms per-op timing for the next kSlowlogEscalateBatches batches instead, and the recurrence
     // is timed exactly. This is the documented divergence from redis, which times every command.
     //
-    template <bool IofusedPrivateQueue = false>
+    template <bool IofusedPrivateQueue = false, bool CostWindow = false>
     __attribute__((noinline, cold))
-    void exec_batch_timed(const Task* batch, uint32_t n) {
+    void exec_batch_timed(const Task* batch, uint32_t n, uint32_t sample = UINT32_MAX) {
         Server::ClientWorkScope client_work(*srv_, self_->id());
         const SlowlogArm arm = slowlog_arm_;
         const int64_t now_ms = cached_now_ms_;
@@ -2325,14 +2328,14 @@ private:
 
         if (slowlog_state_.escalate_batches || n == 1) {
             if (slowlog_state_.escalate_batches) slowlog_state_.escalate_batches--;
-            for (uint32_t i = 0; i < n; i++) {
+            auto one = [&]<bool MeasureCost>(uint32_t i) {
                 // Snapshot argv BEFORE execution. execute() publishes Done, after which the owning
                 // IO thread may retire the op and compact the read buffer the Slices point into.
                 Client* client = batch[i].client;
                 if (client)
                     slowlog_capture(client->rob().at(batch[i].op_id), slowlog_state_.capture);
                 const uint64_t started = now_ns();
-                const bool ok = execute<IofusedPrivateQueue>(batch[i]);
+                const bool ok = execute<IofusedPrivateQueue, false, MeasureCost>(batch[i]);
                 // Done is deliberately delayed with the commit. Armed per-op timing must include
                 // that commit and publish it before the Done-based one-command attribution test.
                 flush_xshard_commits();
@@ -2346,22 +2349,36 @@ private:
                         OpState::Done)
                     slowlog_record_captured(self_->id(), client->id(), slowlog_state_.capture,
                                             elapsed, now_ms, arm);
-                if (ok) continue;
-                xshard_retries_.push_back(batch[i]);
-                for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
-                return;
+                return ok;
+            };
+            uint32_t i = 0;
+            if constexpr (CostWindow) {
+                for (; i < sample; i++)
+                    if (!one.template operator()<false>(i)) goto retry;
+                if (!one.template operator()<true>(i)) goto retry;
+                i++;
             }
+            for (; i < n; i++)
+                if (!one.template operator()<false>(i)) goto retry;
+            return;
+        retry:
+            xshard_retries_.push_back(batch[i]);
+            for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
             return;
         }
 
         const uint64_t started = now_ns();
         uint32_t executed = n;
-        for (uint32_t i = 0; i < n; i++) {
-            if (execute<IofusedPrivateQueue>(batch[i])) continue;
-            xshard_retries_.push_back(batch[i]);
-            for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
-            executed = i;
-            break;
+        if constexpr (CostWindow) {
+            executed = exec_batch_cost_window<IofusedPrivateQueue>(batch, n, sample);
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                if (execute<IofusedPrivateQueue>(batch[i])) continue;
+                xshard_retries_.push_back(batch[i]);
+                for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                executed = i;
+                break;
+            }
         }
         flush_xshard_commits();
         const uint64_t elapsed = now_ns() - started;
@@ -2399,8 +2416,8 @@ private:
     // Consume a bucket-prefetched homogeneous batch. The interwoven schedule calls this
     // immediately after the prefetch loop; an interleaved schedule reaches it after independent-
     // stream filler.
-    template <bool IofusedPrivateQueue = false>
-    void exec_batch_prefetched(const Task* batch, uint32_t n) {
+    template <bool IofusedPrivateQueue = false, bool CostWindow = false>
+    void exec_batch_prefetched(const Task* batch, uint32_t n, uint32_t sample = UINT32_MAX) {
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
@@ -2415,7 +2432,9 @@ private:
             // not linked into this loop at all. The armed body is out of line in
             // exec_batch_timed().
             if (__builtin_expect(slowlog_armed_, false)) {
-                exec_batch_timed<IofusedPrivateQueue>(batch, n);
+                exec_batch_timed<IofusedPrivateQueue, CostWindow>(batch, n, sample);
+            } else if constexpr (CostWindow) {
+                exec_batch_cost_window<IofusedPrivateQueue>(batch, n, sample);
             } else {
                 for (uint32_t i = 0; i < n; i++) {
                     if (execute<IofusedPrivateQueue>(batch[i])) continue;
@@ -2433,6 +2452,38 @@ private:
         if (xshard_retries_.empty() && srv_->atomic_work_active()) {
             atomic_cleanup_cycle(256);
         }
+    }
+
+    // Only one selected execution has clocks, and its id is read before Done. Prefix/suffix
+    // use the original specialization. Keep retries at precisely the old boundary, and keep
+    // the enclosing notification, publication and reclamation scopes whole for the batch.
+    template <bool IofusedPrivateQueue>
+    __attribute__((noinline))
+    uint32_t exec_batch_cost_window(const Task* batch, uint32_t n, uint32_t sample) {
+        uint32_t i = 0;
+        for (; i < sample; i++)
+            if (!execute<IofusedPrivateQueue>(batch[i])) goto retry;
+        if (!execute<IofusedPrivateQueue, false, true>(batch[i])) goto retry;
+        for (++i; i < n; i++)
+            if (!execute<IofusedPrivateQueue>(batch[i])) goto retry;
+        return n;
+    retry:
+        xshard_retries_.push_back(batch[i]);
+        for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+        return i;
+    }
+
+    template <bool IofusedPrivateQueue, size_t BatchOps, typename Filler>
+    __attribute__((noinline))
+    void exec_batch_reordered(Task (&batch)[BatchOps], uint32_t n, Filler&& filler) {
+        auto& stats = srv_->mode_schedule_stats(self_->id());
+        ExReorderCosts& costs = *stats.reorder_costs;
+        stats.note_reorder(n, ex_schedule_batch(batch, n, costs));
+        const uint32_t sample = costs.sample_index(batch, n, static_cast<uint32_t>(cached_now_ms_));
+        prefetch_exec_batch(batch, n);
+        filler();
+        if (sample < n) exec_batch_prefetched<IofusedPrivateQueue, true>(batch, n, sample);
+        else            exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
 
     // Run mutation-capable reclamation only after every buffered E2 in the pass. In particular, an
@@ -2479,13 +2530,16 @@ private:
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
         }
-        if (__builtin_expect(reorder_enabled_, false))
-            srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
+        if (__builtin_expect(reorder_enabled_, false)) {
+            exec_batch_reordered<IofusedPrivateQueue>(batch, n, [] {});
+            return;
+        }
         prefetch_exec_batch(batch, n);
         exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
 
-    template <bool IofusedPrivateQueue = false, bool ReadLocalNoEvict = false>
+    template <bool IofusedPrivateQueue = false, bool ReadLocalNoEvict = false,
+              bool MeasureCost = false>
     bool execute(const Task& t) {
         Server::ClientWorkScope client_work(*srv_, self_->id());
         // Forwarding, rather than a request epoch, resolves the route-read/enqueue race.  This check
@@ -2578,7 +2632,7 @@ private:
                     sh.store().maxmemory_policy() != MaxmemoryPolicy::NoEviction,
                     false)) {
                 ReadLocalPreciseWriteGuard no_evict(sh.store());
-                return execute<IofusedPrivateQueue, true>(t);
+                return execute<IofusedPrivateQueue, true, MeasureCost>(t);
             }
         }
         sh.set_cached_now_ms(cached_now_ms_, cached_lru_clock_);
@@ -2617,6 +2671,17 @@ private:
         sh.note_execution(self_->domain());
 
         if (!t.scatter) self_->note_command(op.spec->id);
+
+        // Compile-time specialization: no clock, stamp or branch in ordinary execute(). A
+        // stale route, atomic park or watch deferral returned ABOVE this point and cannot train
+        // a cheap forwarding/defer attempt as the command's service cost. Snapshot/retry and
+        // local-read venues do not call this specialization. Same-owner MGET/MSET do.
+        uint64_t cost_started = 0;
+        uint16_t cost_id = 0;
+        if constexpr (MeasureCost) {
+            cost_id = op.spec->id;
+            cost_started = now_ns();
+        }
 
         if (t.scatter) {
             const ScatterTaskResult result = xshard_execute(t, sh, op, self_->id());
@@ -2691,6 +2756,13 @@ private:
             AofOwnerContext context{self_->id(), &ring_, &self_->sig()};
             if (op.local_xshard()) xshard_aof_emit_local(sh, op, context);
             else                   aof_record_local_op(sh, op, context);
+        }
+
+        if constexpr (MeasureCost) {
+            const uint64_t elapsed = now_ns() - cost_started;
+            auto& stats = srv_->mode_schedule_stats(self_->id());
+            stats.reorder_costs->observe(cost_id, elapsed);
+            if (elapsed) ModeScheduleStats::add(stats.reorder_cost_samples);
         }
 
         // Release pairs with the IO thread's acquire on Done: everything the handler wrote into

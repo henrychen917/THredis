@@ -191,8 +191,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (!command_registry_init(cfg.tls_port != 0, cfg.thread_mode == ThreadMode::Fused,
-                               Server::read_local_enabled(cfg))) {
+    if (!command_registry_init(cfg.tls_port != 0, cfg.thread_mode == ThreadMode::Fused)) {
         std::fprintf(stderr, "command registry init failed\n");
         return 1;
     }

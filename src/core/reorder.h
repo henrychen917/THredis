@@ -2,26 +2,107 @@
 // Per-connection order and special-task barriers are absolute. One-client runs retain FIFO.
 #pragma once
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include "genthread_pipeline.h"
 #include "thread.h"
-#include "orthog.h"
 #include "../net/conn.h"
 #include "../cmd/command.h"
 
 namespace tomo {
 
-inline constexpr uint32_t kExSchedClasses =
-    static_cast<uint32_t>(CommandLengthClass::Count);
+inline constexpr uint32_t kExSchedClasses = 3;
+inline constexpr uint8_t kExSchedUnknown = kExSchedClasses - 1;
 inline constexpr uint32_t kExSchedBuckets = kRobWindow * kExSchedClasses;
 inline constexpr uint32_t kExSchedBucketWords = (kExSchedBuckets + 63) / 64;
 static_assert(kExSchedBuckets == 192);
 
+struct ReorderResult {
+    uint32_t multi_client_runs = 0;
+    uint32_t permuted_runs = 0;
+};
+
+// R4 learns executor service, not queueing time. The table belongs to a physical worker, never
+// to a shard: moving shards does not transfer ownership of any entry or name another worker's
+// storage. Registry shadow rows share the same dense id. Local-lane reads, scatter fragments,
+// parked tasks and stale forwards are deliberately not training observations for this venue.
+//
+// Only the existing reorder=1 schedule sidecar owns this object. Ordinary scheduling reads one
+// cached class per candidate; EWMA updates, scans and clocks happen in one selected window.
+class ExReorderCosts {
+public:
+    static constexpr uint32_t kCommands = 256; // registry reserves at most 255 ACL command ids
+    static constexpr uint32_t kWindowMs = 10; // same observation cadence as LB's byte scan
+    static constexpr uint32_t kEwmaWeight = 8;
+
+    explicit ExReorderCosts(uint32_t worker = 0)
+        : next_id_(worker % kCommands), random_(worker + 1) {
+        classes_.fill(kExSchedUnknown);
+    }
+
+    uint8_t class_for(uint16_t id) const { return classes_[id]; }
+    uint64_t estimate_ns(uint16_t id) const { return service_ns_[id]; }
+
+    void observe(uint16_t id, uint64_t elapsed_ns) {
+        if (id >= kCommands || !elapsed_ns) return;
+        uint64_t& mean = service_ns_[id];
+        // Difference form cannot overflow even for UINT64_MAX samples; round towards the
+        // observation so a small, persistent change does not get stuck below one EWMA step.
+        if (!mean) mean = elapsed_ns;
+        else if (elapsed_ns > mean) {
+            const uint64_t difference = elapsed_ns - mean;
+            mean += difference / kEwmaWeight + (difference % kEwmaWeight != 0);
+        } else {
+            const uint64_t difference = mean - elapsed_ns;
+            mean -= difference / kEwmaWeight + (difference % kEwmaWeight != 0);
+        }
+
+        // Equal logarithmic bands over the observed range derive both boundaries from this
+        // worker's costs. No verb list, fixed nanosecond threshold or armed-write promotion.
+        // A factor-of-two bin absorbs sub-bin variation; one observed bin is homogeneous.
+        uint32_t low = 64, high = 0;
+        for (uint64_t ns : service_ns_) if (ns) {
+            const uint32_t bin = std::bit_width(ns) - 1;
+            low = std::min(low, bin);
+            high = std::max(high, bin);
+        }
+        const uint32_t span = high - low + 1;
+        for (uint32_t command = 0; command < kCommands; command++) {
+            const uint64_t ns = service_ns_[command];
+            classes_[command] = ns
+                ? (std::bit_width(ns) - 1 - low) * kExSchedClasses / span
+                : kExSchedUnknown;
+        }
+    }
+
+    // This gate uses the pass's already-read realtime milliseconds. Unsigned subtraction
+    // tolerates wrap/backward adjustments, and reserving the window even on an empty/barrier
+    // batch bounds failed sampling attempts too. There is no per-operation countdown.
+    bool open_window(uint32_t now_ms) {
+        if (window_seen_ && uint32_t(now_ms - last_window_ms_) < kWindowMs) return false;
+        window_seen_ = true;
+        last_window_ms_ = now_ms;
+        return true;
+    }
+
+    uint32_t sample_index(const Task* tasks, uint32_t n, uint32_t now_ms);
+
+private:
+    std::array<uint8_t, kCommands> classes_;
+    std::array<uint64_t, kCommands> service_ns_{};
+    uint32_t last_window_ms_ = 0;
+    uint32_t next_id_ = 0;
+    uint32_t random_;
+    bool window_seen_ = false;
+};
+
 // Only the ordinary one-owner path participates. Every existing special mechanism is a hard
 // barrier in the gathered sequence: eligible work on either side cannot move across it.
-inline bool ex_sched_candidate(const Task& task, uint8_t& length) {
+inline bool ex_sched_candidate(const Task& task, uint8_t& length,
+                               const ExReorderCosts& costs) {
     if (!task.client || task.scatter) return false;
     const Op& op = task.client->rob().at(task.op_id);
     if (!op.spec || op.has_blocking_state()) return false;
@@ -33,13 +114,37 @@ inline bool ex_sched_candidate(const Task& task, uint8_t& length) {
     // MultiShard is deliberately absent: a same-owner MGET/MSET local-fast task is ordinary
     // here. A real scatter has task.scatter set and returned above.
     if (op.spec->flags & kSpecial) return false;
-    length = static_cast<uint8_t>(command_length_class(*op.spec));
-    if (__builtin_expect(length >= kExSchedClasses, false)) return false;
+    if (__builtin_expect(op.spec->id >= ExReorderCosts::kCommands, false)) return false;
+    length = costs.class_for(op.spec->id);
     // There is no O(1) class pointer from an op to an exact parked atomic predecessor. The
     // immutable publish-time hazard bit says an older own atomic group existed; Long is the
     // safe upper bound without a deque scan or persistent scheduler state.
-    if (op.atomic_hazard()) length = static_cast<uint8_t>(CommandLengthClass::Long);
+    if (op.atomic_hazard()) length = kExSchedUnknown;
     return true;
+}
+
+inline uint32_t ExReorderCosts::sample_index(const Task* tasks, uint32_t n, uint32_t now_ms) {
+    if (!open_window(now_ms) || !n) return n;
+    // Round-robin over command ids represented in THIS batch, not over operations. Frequent
+    // GETs must not starve a rare expensive verb of samples. Randomise the starting position
+    // once per window so recurring pipelines do not always train on the same argument shape.
+    random_ ^= random_ << 13;
+    random_ ^= random_ >> 17;
+    random_ ^= random_ << 5;
+    const uint32_t start = random_ % n;
+    uint32_t chosen = n, best_distance = kCommands;
+    for (uint32_t offset = 0; offset < n; offset++) {
+        const uint32_t i = (start + offset) % n;
+        uint8_t length;
+        if (!ex_sched_candidate(tasks[i], length, *this)) continue;
+        const Op& op = tasks[i].client->rob().at(tasks[i].op_id);
+        if (op.atomic_hazard()) continue;
+        const uint32_t distance = (op.spec->id + kCommands - next_id_) % kCommands;
+        if (distance < best_distance) { best_distance = distance; chosen = i; }
+    }
+    if (chosen != n)
+        next_id_ = (tasks[chosen].client->rob().at(tasks[chosen].op_id).spec->id + 1) % kCommands;
+    return chosen;
 }
 
 struct ExScheduleKey {
@@ -116,7 +221,7 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
             chain_occupied[slot >> 6] |= bit;
             chain_client[slot] = client;
             if (keys[i].rank != 0)
-                keys[i].length = static_cast<uint8_t>(CommandLengthClass::Long);
+                keys[i].length = kExSchedUnknown;
         } else {
             const uint8_t previous = chain_last[slot];
             // Preserve the existing FIFO if a producer-lane bug ever violates the gather
@@ -124,7 +229,7 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
             if (tasks[i].op_id <= tasks[previous].op_id) return 1;
             keys[i].length = std::max(keys[i].length, keys[previous].length);
             if (tasks[i].op_id != tasks[previous].op_id + 1)
-                keys[i].length = static_cast<uint8_t>(CommandLengthClass::Long);
+                keys[i].length = kExSchedUnknown;
         }
         chain_last[slot] = static_cast<uint8_t>(i);
     }
@@ -180,9 +285,10 @@ uint32_t ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
 
 // Keep scratch behind the caller's boot-latched enable branch, including stack reservation.
 // Deduce capacity from the gathered array: exec_batch must not decay it to a Task pointer.
-// No heap allocation, persistent state, truncated suffix, or change to the scheduling policy.
+// Scratch never allocates. The worker's cost table changes only at observation windows.
 template <size_t BatchOps>
-__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n) {
+__attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps], uint32_t n,
+                                                       const ExReorderCosts& costs) {
     static_assert(BatchOps == kGenthreadExBatchOps ||
                   BatchOps == kGenthreadPipelineExBatchOps,
                   "audit new executor geometry before enabling reorder");
@@ -194,12 +300,12 @@ __attribute__((noinline)) ReorderResult ex_schedule_batch(Task (&tasks)[BatchOps
     uint8_t base_lengths[BatchOps];
     uint32_t begin = 0;
     while (begin < n) {
-        if (!ex_sched_candidate(tasks[begin], base_lengths[begin])) {
+        if (!ex_sched_candidate(tasks[begin], base_lengths[begin], costs)) {
             begin++;
             continue;
         }
         uint32_t end = begin + 1;
-        while (end < n && ex_sched_candidate(tasks[end], base_lengths[end])) end++;
+        while (end < n && ex_sched_candidate(tasks[end], base_lengths[end], costs)) end++;
         const uint32_t witness = ex_schedule_run<BatchOps>(
             tasks + begin, base_lengths + begin, end - begin);
         result.multi_client_runs += witness != 0;

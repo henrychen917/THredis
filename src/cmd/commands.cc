@@ -69,59 +69,11 @@ bool command_equal(Slice input, const char* canonical) {
     return true;
 }
 
-template <size_t N>
-bool command_name_in(const char* name, const char* const (&names)[N]) {
-    for (const char* candidate : names)
-        if (!std::strcmp(name, candidate)) return true;
-    return false;
-}
-
-// Owner scheduler class table. This runs once while copying the registry; execution reads only
-// the stamped metadata byte. Static means deliberately argv-independent: MGET is SmallMulti at
-// every arity, and a bounded LRANGE is still Long. That is the cost of constant policy lookup.
-CommandLengthClass command_length_class_for(const CommandSpec& spec, bool read_local_armed) {
-    static constexpr const char* kSmallMulti[] = {
-        "DEL", "UNLINK", "EXISTS", "TOUCH", "MGET", "MSET", "MSETNX",
-        "HMGET", "SMISMEMBER", "ZMSCORE",
-        "SMOVE", "LMOVE", "RPOPLPUSH",
-        "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX", "BLMOVE", "BRPOPLPUSH",
-    };
-    static constexpr const char* kLong[] = {
-        "GETRANGE", "SUBSTR", "SETRANGE", "BITFIELD", "BITFIELD_RO", "BITCOUNT",
-        "BITPOS", "DUMP", "RESTORE", "RESTORE-ASKING",
-        "HGETALL", "HKEYS", "HVALS", "HRANDFIELD", "HSCAN",
-        "LINDEX", "LINSERT", "LRANGE", "LREM", "LSET", "LPOS", "LTRIM",
-        "SMEMBERS", "SRANDMEMBER", "SSCAN",
-        "ZRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX",
-        "ZREVRANGEBYLEX", "ZREVRANGE", "ZRANDMEMBER", "ZSCAN",
-        "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
-        "GEOSEARCH", "XRANGE", "XREVRANGE", "XPENDING", "XCLAIM", "XAUTOCLAIM",
-        "XTRIM", "SCAN",
-    };
-    CommandLengthClass length = CommandLengthClass::Point;
-    if (command_name_in(spec.name, kSmallMulti))
-        length = CommandLengthClass::SmallMulti;
-    else if ((spec.flags & CmdFlags::MultiShard) || command_name_in(spec.name, kLong))
-        length = CommandLengthClass::Long;
-
-    // Armed read-local raises write-side cost, most visibly because raw-string updates lose the
-    // try_overwrite path used by plain SET. Stamp that coarse boot-only cost into the existing
-    // two-bit class: Point -> SmallMulti, SmallMulti -> Long, and Long saturates at Long. The
-    // unarmed branch returns the historical assignment byte-for-byte.
-    if (read_local_armed && (spec.flags & CmdFlags::Write)) {
-        if (length == CommandLengthClass::Point)
-            length = CommandLengthClass::SmallMulti;
-        else
-            length = CommandLengthClass::Long;
-    }
-    return length;
-}
-
 }  // namespace
 
 HotCommandSpecs g_hot_command_specs;
 
-bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_armed) {
+bool command_registry_init(bool tls_enabled, bool fused_mode) {
     if (g_registry.built) return true;
     const CommandTable families[] = {
         string_command_table(), hash_command_table(), hash_ttl_command_table(),
@@ -155,8 +107,6 @@ bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_ar
         for (const CommandTable& family : families)
             for (size_t i = 0; i < family.size; i++) {
                 CommandSpec copy = family.specs[i];
-                copy.length_class =
-                    static_cast<uint8_t>(command_length_class_for(copy, read_local_armed));
                 if (fused_mode && !std::strcmp(copy.name, "FLIP")) {
                     copy.flags &= ~CmdFlags::FlipAsync;
                     copy.handler = cmd_flip_unavailable;

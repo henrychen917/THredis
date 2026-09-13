@@ -31,7 +31,7 @@ struct CoreConcurrencyTest {
         return {text.data(), static_cast<uint32_t>(text.size())};
     }
 
-    template <bool Fused = false>
+    template <bool Fused = false, bool Reorder = false>
     struct Fixture {
         Server server;
         ExLoopT<Fused> loops[8];
@@ -61,6 +61,11 @@ struct CoreConcurrencyTest {
             config.shards = 16;
             config.thread_mode = Fused ? ThreadMode::Fused : ThreadMode::Split;
             config.flip_auto = 0;
+            config.reorder = Reorder;
+            if constexpr (Reorder) {
+                config.read_local = 1;
+                config.atomic = 1;
+            }
             config.save.clear();
             require(server.init(config), "initialize in-memory fixture");
             require(server.nshards() == 16 && server.nthreads() == 8, "fixture geometry");
@@ -75,6 +80,9 @@ struct CoreConcurrencyTest {
                 loop.self_ = &thread;
                 loop.fused_handoff_ring_ = &loop.ring_;
                 loop.cached_now_ms_ = 1000;
+                loop.reorder_enabled_ = Reorder;
+                if constexpr (Reorder)
+                    require(server.mode_schedule_stats(tid).arm_reorder(tid), "arm measured costs");
                 loop.lb_controller_armed_ = true;
                 server.bind_owner_notify_pending(tid, &loop.notify_keyless_pending_);
                 loop.refresh_live_config();
@@ -171,6 +179,8 @@ struct CoreConcurrencyTest {
 
     static void scheduler() {
         Fixture<true> f;
+        require(!f.server.mode_schedule_stats(), "reorder off allocates no cost or schedule table");
+        ExReorderCosts costs;
         Client clients[4] = {Client(-1), Client(-1), Client(-1), Client(-1)};
         std::vector<Task> tasks;
         const std::string key = f.key(f.sid());
@@ -185,11 +195,11 @@ struct CoreConcurrencyTest {
         require(tasks.size() == 128 && tasks.size() > kExecBatch, "oversized fused batch armed");
         for (const Task& task : tasks) {
             uint8_t length = 255;
-            require(ex_sched_candidate(task, length), "every gathered task eligible");
+            require(ex_sched_candidate(task, length, costs), "every gathered task eligible");
         }
         Task batch[kGenthreadPipelineExBatchOps];
         std::copy(tasks.begin(), tasks.end(), batch);
-        ex_schedule_batch(batch, static_cast<uint32_t>(tasks.size()));
+        ex_schedule_batch(batch, static_cast<uint32_t>(tasks.size()), costs);
         std::copy(std::begin(batch), std::end(batch), tasks.begin());
         uint64_t next[4] = {};
         for (const Task& task : tasks) {
@@ -206,9 +216,60 @@ struct CoreConcurrencyTest {
             one.rob().publish();
         }
         std::copy(tasks.begin(), tasks.end(), batch);
-        ex_schedule_batch(batch, 64);
+        ex_schedule_batch(batch, 64, costs);
         std::copy(std::begin(batch), std::begin(batch) + 64, tasks.begin());
         for (uint32_t i = 0; i < 64; i++) require(tasks[i].op_id == i, "one-client FIFO shortcut");
+        sampling_executor<false>();
+        sampling_executor<true>();
+    }
+
+    template <bool Fused>
+    static void sampling_executor() {
+        Fixture<Fused, true> f;
+        auto& owner = f.loops[f.source];
+        auto& sidecar = f.server.mode_schedule_stats(f.source);
+        const std::string key = f.key(f.sid());
+        const uint16_t get_id = command_lookup(Slice("GET"))->id;
+        const uint16_t strlen_id = command_lookup(Slice("STRLEN"))->id;
+        Client clients[2] = {Client(-1), Client(-1)};
+        for (auto& client : clients) f.client(client);
+        // Test the three shipped execution loops: no slowlog, batch-timed slowlog (the boot
+        // default), and escalated slowlog. A sample path bypassed by slowlog must fail here.
+        for (uint32_t timing = 0; timing < 3; timing++) {
+            sidecar.reorder_costs = std::make_unique<ExReorderCosts>(f.source);
+            const uint64_t samples_before = sidecar.reorder_cost_samples.load();
+            auto& model = *sidecar.reorder_costs;
+            owner.slowlog_armed_ = timing != 0;
+            auto batch = [&] {
+                Task tasks[kGenthreadExBatchOps];
+                for (uint32_t i = 0; i < 2; i++) {
+                    Op& op = prepare(clients[i], {Slice(i ? "STRLEN" : "GET"), slice(key)}, f.server);
+                    tasks[i] = Task(&clients[i], clients[i].rob().dispatch_id(), op.shard, nullptr);
+                    clients[i].rob().publish();
+                }
+                owner.slowlog_state_.escalate_batches = timing == 2 ? 1 : 0;
+                owner.exec_batch(tasks, 2);
+                for (auto& client : clients)
+                    require(client.rob().drain([](Op&) {}) == 1, "sample batch completes exactly once");
+            };
+            batch();
+            const uint64_t first_get = model.estimate_ns(get_id);
+            const uint64_t first_strlen = model.estimate_ns(strlen_id);
+            require(bool(first_get) != bool(first_strlen), "one command trained in the first window");
+            require(sidecar.reorder_cost_samples.load() == samples_before + 1,
+                    "one successful-window INFO witness");
+            batch();
+            require(model.estimate_ns(get_id) == first_get &&
+                    model.estimate_ns(strlen_id) == first_strlen, "same-window batch cannot train");
+            require(sidecar.reorder_cost_samples.load() == samples_before + 1,
+                    "unsampled batch cannot publish a cost witness");
+            owner.cached_now_ms_ += ExReorderCosts::kWindowMs;
+            batch();
+            require(model.estimate_ns(get_id) && model.estimate_ns(strlen_id),
+                    "next window trains the other represented command id");
+            require(sidecar.reorder_cost_samples.load() == samples_before + 2,
+                    "second successful-window INFO witness");
+        }
     }
 
     inline static std::mutex pause_mutex;

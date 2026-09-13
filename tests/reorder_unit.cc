@@ -24,16 +24,27 @@ using namespace tomo;
 void require(bool condition, const char* what) { if (!condition) fail(what); }
 void unused_handler(Shard&, Op&) { fail("fixture executed a command"); }
 
-constexpr CommandSpec spec(const char* name, CommandLengthClass length, uint32_t flags) {
+constexpr CommandSpec spec(const char* name, uint16_t id, uint32_t flags) {
     CommandSpec out(name, 2, 2, flags, unused_handler, 1, 1, 1, unused_handler);
-    out.length_class = static_cast<uint8_t>(length);
+    out.id = id;
     return out;
 }
-constexpr auto point = spec("GET", CommandLengthClass::Point, CmdFlags::Readonly);
-constexpr auto small = spec("MGET", CommandLengthClass::SmallMulti,
+constexpr auto point = spec("GET", 0, CmdFlags::Readonly);
+constexpr auto small = spec("MGET", 1,
                             CmdFlags::Readonly | CmdFlags::MultiShard);
-constexpr auto long_op = spec("BITCOUNT", CommandLengthClass::Long, CmdFlags::Readonly);
-constexpr auto admin = spec("DEBUG", CommandLengthClass::Point, CmdFlags::Admin);
+constexpr auto long_op = spec("BITCOUNT", 2, CmdFlags::Readonly);
+constexpr auto admin = spec("DEBUG", 3, CmdFlags::Admin);
+
+ExReorderCosts trained_costs() {
+    ExReorderCosts costs;
+    costs.observe(point.id, 128);
+    costs.observe(small.id, 512);
+    costs.observe(long_op.id, 4096);
+    require(costs.class_for(point.id) == 0 && costs.class_for(small.id) == 1 &&
+            costs.class_for(long_op.id) == 2, "three measured cost bands armed");
+    return costs;
+}
+const ExReorderCosts costs = trained_costs();
 
 Task publish(Client& client, const CommandSpec& command, bool hazard = false) {
     auto& rob = client.rob();
@@ -69,10 +80,11 @@ bool same(const Task& a, const Task& b) {
 
 uint32_t permutations = 0;
 template <size_t Capacity>
-void verify(Task (&tasks)[Capacity], const std::vector<Task>& expected, bool must_move) {
+void verify(Task (&tasks)[Capacity], const std::vector<Task>& expected, bool must_move,
+            const ExReorderCosts& model = costs) {
     require(expected.size() <= Capacity, "oracle exceeds its input capacity");
     const std::vector<Task> before(tasks, tasks + Capacity);
-    const ReorderResult witness = ex_schedule_batch(tasks, static_cast<uint32_t>(expected.size()));
+    const ReorderResult witness = ex_schedule_batch(tasks, static_cast<uint32_t>(expected.size()), model);
     bool moved = false;
     for (size_t i = 0; i < expected.size(); i++) {
         require(same(tasks[i], expected[i]), "actual permutation differs from exact oracle");
@@ -111,9 +123,7 @@ void heads() {
                     tasks[i].op_id == clients.back()->rob().flush_id(),
                     "mixed-client head-rank state was not entered");
             uint8_t length = 255;
-            require(ex_sched_candidate(tasks[i], length) &&
-                    length == static_cast<uint8_t>(i ? CommandLengthClass::Point :
-                                                      CommandLengthClass::Long),
+            require(ex_sched_candidate(tasks[i], length, costs) && length == (i ? 0 : 2),
                     "mixed-length eligible run was not entered");
         }
         for (uint32_t i = 1; i < n; i++) expected.push_back(tasks[i]);
@@ -174,7 +184,7 @@ void barriers() {
             clients[barrier_at]->rob().at(tasks[barrier_at].op_id).spec = &point;
         }
         uint8_t length = 255;
-        require(!ex_sched_candidate(tasks[barrier_at], length), "barrier state was not entered");
+        require(!ex_sched_candidate(tasks[barrier_at], length, costs), "barrier state was not entered");
         std::vector<Task> expected;
         auto append_run = [&](uint32_t begin, uint32_t end) {
             for (uint32_t i = begin; i < end; i++) if (i % 2) expected.push_back(tasks[i]);
@@ -251,6 +261,91 @@ void hidden_predecessors() {
     }
     std::puts("  predecessor controls: missing head, in-run gap and atomic hazard widen to Long");
 }
+
+void learning() {
+    ExReorderCosts model;
+    Client a(-1), b(-1);
+    Task tasks[kGenthreadExBatchOps];
+    tasks[0] = publish(a, point);
+    tasks[1] = publish(b, long_op);
+    verify(tasks, {tasks[0], tasks[1]}, false, model); // unseen ids are equally unknown
+
+    // Deliberately reverse the old verb heuristic: expensive GET, cheap BITCOUNT. Both commands
+    // are live heads. A static-class or never-observe mutant must miss this exact permutation.
+    model.observe(point.id, 4096);
+    model.observe(long_op.id, 128);
+    verify(tasks, {tasks[1], tasks[0]}, true, model);
+    for (uint32_t i = 0; i < 64; i++) {
+        model.observe(point.id, 128);
+        model.observe(long_op.id, 4096);
+    }
+    require(model.estimate_ns(point.id) < model.estimate_ns(long_op.id),
+            "EWMA followed the new service regime");
+    verify(tasks, {tasks[1], tasks[0]}, true, model);
+    retire_all(a);
+    retire_all(b);
+
+    ExReorderCosts other_worker;
+    require(other_worker.class_for(point.id) == kExSchedUnknown &&
+            other_worker.estimate_ns(point.id) == 0, "workers do not share learned state");
+    other_worker.observe(255, UINT64_MAX);
+    other_worker.observe(255, UINT64_MAX);
+    require(other_worker.estimate_ns(255) == UINT64_MAX, "EWMA maximum does not overflow");
+    other_worker.observe(255, 1);
+    require(other_worker.estimate_ns(255) < UINT64_MAX, "EWMA maximum can decay");
+    other_worker.observe(255, 0);
+    other_worker.observe(256, 100);
+    ExReorderCosts exact;
+    exact.observe(0, 128);
+    exact.observe(0, 256);
+    require(exact.estimate_ns(0) == 144, "one-eighth EWMA update");
+    exact.observe(0, 128);
+    require(exact.estimate_ns(0) == 142, "EWMA decays without unsigned underflow");
+    exact.observe(0, 141);
+    require(exact.estimate_ns(0) == 141, "small persistent changes cannot get stuck");
+    std::puts("  learning: measured order reversal, regime change, isolation and EWMA boundaries");
+}
+
+void sampling_windows() {
+    ExReorderCosts model;
+    Client a(-1), b(-1), c(-1);
+    Task tasks[kGenthreadExBatchOps];
+    for (uint32_t i = 0; i < kGenthreadExBatchOps - 1; i++) tasks[i] = publish(a, point);
+    tasks[kGenthreadExBatchOps - 1] = publish(b, long_op);
+    const uint32_t first = model.sample_index(tasks, kGenthreadExBatchOps, 1000);
+    require(first < kGenthreadExBatchOps - 1, "first window selects initial command id");
+    for (uint32_t ms = 1000; ms < 1000 + ExReorderCosts::kWindowMs; ms++)
+        require(model.sample_index(tasks, kGenthreadExBatchOps, ms) == kGenthreadExBatchOps,
+                "same window cannot arm another task");
+    require(model.sample_index(tasks, kGenthreadExBatchOps,
+                               1000 + ExReorderCosts::kWindowMs) == kGenthreadExBatchOps - 1,
+            "rare command receives the next window despite 31 frequent commands");
+    retire_all(a);
+    retire_all(b);
+
+    tasks[0] = publish(c, admin);
+    tasks[1] = publish(a, point, true);
+    tasks[2] = publish(b, point);
+    tasks[2].scatter = reinterpret_cast<ScatterState*>(&c);
+    require(model.sample_index(tasks, 3, 2000) == 3,
+            "barriers, scatter and atomic hazards cannot train the table");
+    tasks[2].scatter = nullptr;
+    require(model.sample_index(tasks, 3, 2000) == 3,
+            "an unsuccessful window does not rescan every subsequent batch");
+    require(model.sample_index(tasks, 3, 2000 + ExReorderCosts::kWindowMs) == 2,
+            "fresh window rearms a newly eligible task");
+    require(model.estimate_ns(point.id) == 0, "selection alone cannot invent a timing observation");
+    retire_all(a);
+    retire_all(b);
+    retire_all(c);
+
+    ExReorderCosts wrap;
+    require(wrap.open_window(UINT32_MAX - 4) && !wrap.open_window(4) && wrap.open_window(5),
+            "window clock wraps with the exact cadence");
+    require(wrap.open_window(1) && !wrap.open_window(1),
+            "backward wall-clock adjustment cannot stall or repeatedly reopen sampling");
+    std::puts("  windows: one task per window, rare-id fairness, barriers and clock wrap");
+}
 }  // namespace
 
 int main() {
@@ -264,6 +359,8 @@ int main() {
     barriers<kGenthreadPipelineExBatchOps>();
     fifo_controls();
     hidden_predecessors();
-    require(permutations == 175, "a required positive case silently disappeared");
+    learning();
+    sampling_windows();
+    require(permutations == 177, "a required positive case silently disappeared");
     std::printf("reorder battery: PASS, %u witnessed permutations, max batch 128\n", permutations);
 }

@@ -22,17 +22,6 @@ namespace tomo {
 class Shard;
 class Op;
 
-// Static executor scheduling cost. This is deliberately coarse: the policy needs a cheap verb
-// class, not a runtime estimate from argv or clocks. Point includes GET and unarmed SET; the armed
-// registry promotes writes by one saturated class. SmallMulti is the simple fanout/vector family;
-// Long covers combining, range, scan, and other whole-value work.
-enum class CommandLengthClass : uint8_t {
-    Point = 0,
-    SmallMulti = 1,
-    Long = 2,
-    Count = 3,
-};
-
 struct CmdFlags {
     static constexpr uint32_t Write     = 1u << 0;   // mutates the keyspace
     static constexpr uint32_t Readonly  = 1u << 1;
@@ -126,8 +115,6 @@ struct CommandSpec {
     int32_t     min_arity;
     int32_t     max_arity;
     uint32_t    flags;
-    // Boot-stamped scheduler metadata in the existing alignment hole before handler.
-    uint8_t     length_class = 0;
     CmdHandler  handler;
 
     // Key range within argv: [first_key, last_key] stepping by key_step.
@@ -149,7 +136,7 @@ struct CommandSpec {
                           int16_t last_key_, int16_t key_step_,
                           CmdHandler handler_notify_ = nullptr)
         : name(name_), min_arity(min_arity_), max_arity(max_arity_), flags(flags_),
-          length_class(0), handler(handler_), first_key(first_key_), last_key(last_key_),
+          handler(handler_), first_key(first_key_), last_key(last_key_),
           key_step(key_step_),
           handler_notify(handler_notify_ ? handler_notify_ :
                          (handler_ == cmd_xshard_only ? cmd_xshard_only_notify : handler_)) {}
@@ -158,10 +145,6 @@ struct CommandSpec {
 // 48 = the ACL audit's measured 40 plus the notify v2 handler_notify tail pointer. Registry rows
 // are cold read-only data; the lock exists to catch accidental growth, not to forbid deliberate.
 static_assert(sizeof(CommandSpec) == 48);
-
-inline CommandLengthClass command_length_class(const CommandSpec& spec) {
-    return static_cast<CommandLengthClass>(spec.length_class);
-}
 
 inline bool command_is_read_local_mget(const CommandSpec& spec) {
     constexpr uint32_t kMgetClass = CmdFlags::ReadLocalEligible | CmdFlags::MultiShard;
@@ -228,8 +211,7 @@ CommandTable pfdebug_command_table();
 
 // Built once before threads start. Lookup hashes the uppercase-normalized bytes into an open-
 // addressed table; the load factor is capped at 1/2 so ordinary command names land in one probe.
-bool command_registry_init(bool tls_enabled, bool fused_mode = false,
-                           bool read_local_armed = false);
+bool command_registry_init(bool tls_enabled, bool fused_mode = false);
 
 // Clean registry rows for the verbs command_lookup resolves inline. command_registry_init stamps
 // them from the same rows the hash table indexes and re-checks the two against each other; they
