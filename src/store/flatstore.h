@@ -14,9 +14,9 @@
 //                               allocated once and freed once. Every operation below moves at most
 //                               an 8-byte slot word that POINTS at it.
 //
-//   Shard migration (LB)        moves NOTHING AT ALL. Reassigning a shard rewrites only the EX bits
-//                               in Router's bucket entries behind one descriptor commit. No table
-//                               is touched, no pointer is rehashed. Pure ownership handoff.
+//   Shard migration (LB)        moves NOTHING AT ALL. Reassigning a shard to another worker is one
+//                               atomic store of a thread id into worker_of_shard[]. No table is
+//                               touched, no pointer is rehashed. Pure handoff.
 //
 //   Table resize                rehashes 8-byte SLOT WORDS into a larger or smaller array, because
 //                               an open-addressed slot index is a function of the capacity. This is
@@ -29,9 +29,8 @@
 // Rehashing a large table in one pass is a multi-second stall on the write tail — the fork measured
 // exactly that and had to move to serve-while-copy to turn a 2.4 s p99.99 into 39 ms. So this works
 // the way Redis's dict does: allocate the new table, keep the old one, and migrate a BOUNDED number
-// of slots on subsequent mutations and owner maintenance passes. Lookups search both tables and
-// do not advance the move. Armed resizes reserve a QSBR record before starting, so their final
-// step cannot wait for object-retirement capacity. Grace may delay freeing an unlinked old table.
+// of slots on every subsequent operation. No operation pays more than that bound, so the tail stays
+// flat while the table grows underneath the workload.
 //
 //   t_[0]  the CURRENT table. Every insert goes here. Always present.
 //   t_[1]  the OLD table, present only while rehashing. Drains, then is freed.
@@ -47,8 +46,7 @@
 //
 //   [63:49] 15-bit tag   high bits of the hash; rejects a non-matching probe without touching the key
 //   [48]    TOMB
-//   [47:0]  KvObj*       boot verifies the allocator stays in the low 48-bit VA range; debug packs
-//                       assert the same invariant before using the top bits
+//   [47:0]  KvObj*       x86-64 user pointers are canonical 48-bit, so the top bits are free
 //
 //   word == 0             EMPTY  the calloc state, and the ONLY thing that stops a probe
 //   ptr != 0              LIVE
@@ -62,7 +60,6 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
-#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -70,60 +67,16 @@
 #include <memory>
 #include <new>
 #include <string>
-#include <type_traits>
-#include <utility>
 #include <vector>
 #include "../base/alloc.h"
-#include "../core/atomic_tripwire.h"
 #include "eviction.h"
 #include "../cmd/notify.h"
-#include "kv_block_cache.h"
 #include "kvobj.h"
 #include "atomic_mvcc.h"
-#include "foreign_read_safety.h"
-#include "read_local_reclaim.h"
 #include "../snapshot/format.h"
 #include "../persist/aof.h"
 
-#ifndef TOMO_READ_LOCAL_RECLAIM_PREFETCHW
-#define TOMO_READ_LOCAL_RECLAIM_PREFETCHW 0
-#endif
-
 namespace tomo {
-
-static_assert(TOMO_READ_LOCAL_RECLAIM_PREFETCHW == 0 ||
-              TOMO_READ_LOCAL_RECLAIM_PREFETCHW == 1,
-              "TOMO_READ_LOCAL_RECLAIM_PREFETCHW must be 0 (off) or 1 (on)");
-inline constexpr bool kReadLocalReclaimPrefetchw =
-    TOMO_READ_LOCAL_RECLAIM_PREFETCHW != 0;
-
-// Fault injection for the cold table-allocation paths. It is compiled in whenever NDEBUG is not
-// defined -- which is every build the Makefile produces, release included -- and costs one relaxed
-// load per table allocation, never anything on the request path. Defining NDEBUG removes this
-// surface (and every assert() in the tree) as a build-system decision.
-#ifndef NDEBUG
-inline std::atomic<uint32_t> g_flatstore_table_alloc_failures{0};
-
-inline void flatstore_debug_fail_table_allocations(uint32_t count) {
-    g_flatstore_table_alloc_failures.store(count, std::memory_order_relaxed);
-}
-
-inline bool flatstore_debug_consume_table_alloc_failure() {
-    uint32_t remaining = g_flatstore_table_alloc_failures.load(std::memory_order_relaxed);
-    while (remaining) {
-        if (g_flatstore_table_alloc_failures.compare_exchange_weak(
-                remaining, remaining - 1, std::memory_order_relaxed)) return true;
-    }
-    return false;
-}
-#endif
-
-inline void* flatstore_table_calloc(size_t count, size_t width) {
-#ifndef NDEBUG
-    if (flatstore_debug_consume_table_alloc_failure()) return nullptr;
-#endif
-    return std::calloc(count, width);
-}
 
 struct ScatterState;
 uint64_t xshard_atomic_key_hash(const ScatterState* state, uint32_t ordered_index);
@@ -150,8 +103,8 @@ inline uint64_t mix64(uint64_t h);
 class ExpireIndex {
 public:
     ExpireIndex() = default;
-    ~ExpireIndex() { std::free(hashes_[0]); std::free(sidecars_[0]);
-                     std::free(hashes_[1]); std::free(sidecars_[1]); }
+    ~ExpireIndex() { std::free(hashes_[0]); std::free(states_[0]);
+                     std::free(hashes_[1]); std::free(states_[1]); }
     ExpireIndex(const ExpireIndex&) = delete;
     ExpireIndex& operator=(const ExpireIndex&) = delete;
 
@@ -161,9 +114,7 @@ public:
     // expiring until the next command wakes it.
     bool migrating() const { return cap_[1] != 0; }
     size_t memory_bytes() const {
-        return static_cast<size_t>((static_cast<uint64_t>(cap_[0]) + cap_[1]) *
-                                   (sizeof(uint64_t) + sizeof(uint8_t) +
-                                    (kTtlDeadlineSidecar ? sizeof(int64_t) : 0)));
+        return (cap_[0] + cap_[1]) * (sizeof(uint64_t) + sizeof(uint8_t));
     }
     void clear() {
         release(0);
@@ -172,55 +123,32 @@ public:
         migrate_ = 0;
     }
 
-    bool insert(uint64_t hash, int64_t deadline = kNoTtlDeadline) {
+    bool insert(uint64_t hash) {
         if (rehashing()) {
             migrate(kMigrateSlotsPerOp);
             // Backstop only. At the shipped step rate the new table is at most ~41% loaded when the
             // move ends, so this cannot fire; finishing the move is still cheaper than letting an
             // insert run out of slots.
-            if (rehashing() &&
-                (static_cast<uint64_t>(live_[1]) + tombs_[1] + 1) * 100 >=
-                    static_cast<uint64_t>(cap_[1]) * 70)
+            if (rehashing() && (live_[1] + tombs_[1] + 1) * 100 >= cap_[1] * 70)
                 finish_migration();
         }
         if (!cap_[0] && !allocate(0, kMinCap)) return false;
-        if (!rehashing() &&
-            (static_cast<uint64_t>(live_[0]) + tombs_[0] + 1) * 100 >=
-                static_cast<uint64_t>(cap_[0]) * 70) {
-            uint64_t wanted = cap_[0];
-            if (static_cast<uint64_t>(live_[0]) * 2 >= cap_[0]) {
-                if (wanted > std::numeric_limits<size_t>::max() / uint64_t{2}) return false;
-                wanted *= uint64_t{2};
-            }
-            if (!begin_rehash(static_cast<size_t>(wanted))) return false;
+        if (!rehashing() && (live_[0] + tombs_[0] + 1) * 100 >= cap_[0] * 70) {
+            const size_t cap = live_[0] * 2 >= cap_[0] ? cap_[0] * 2 : cap_[0];
+            if (!begin_rehash(cap)) return false;
             migrate(kMigrateSlotsPerOp);
         }
         // A deadline re-registered while the move is in flight must leave the old table, or live_
         // double-counts it until the migration catches up.
         if (rehashing()) (void)erase_in(0, hash);
-        return insert_raw(rehashing() ? 1 : 0, hash, deadline);
+        return insert_raw(rehashing() ? 1 : 0, hash);
     }
 
-    // Erasing from an index with nothing LIVE in it is a PROVEN no-op, not an approximation:
-    // erase_in() only ever clears a kLive slot, and it changes nothing else. So this guard is
-    // exact, and it is the only skip that is. Do NOT make the erase conditional on "the key has a
-    // deadline" instead -- see track_expire() for the two things that would break.
     bool erase(uint64_t hash) {
-        if (size() == 0) return false;
         bool removed = erase_in(1, hash);
         if (!removed) removed = erase_in(0, hash);
         if (removed && size() == 0) collapse_empty();
         return removed;
-    }
-
-    // Selector-on prototype: owner-side TTL reads can pay one probe here while ordinary keys pay
-    // none.  The inline slot remains the authoritative fallback because this hash-only index
-    // cannot yet distinguish an exact 64-bit collision or preserve every MVCC version.
-    int64_t deadline(uint64_t hash, int64_t fallback) const {
-        if constexpr (!kTtlDeadlineSidecar) return fallback;
-        int64_t value = fallback;
-        if (deadline_in(1, hash, value) || deadline_in(0, hash, value)) return value;
-        return fallback;
     }
 
     template <typename Fn>
@@ -243,8 +171,8 @@ public:
             checked++;
             if (pos < old_left) {
                 const size_t slot = migrate_ + pos;
-                if (states(0)[slot] == kLive) fn(hashes_[0][slot]);
-            } else if (states(1)[pos - old_left] == kLive) {
+                if (states_[0][slot] == kLive) fn(hashes_[0][slot]);
+            } else if (states_[1][pos - old_left] == kLive) {
                 fn(hashes_[1][pos - old_left]);
             }
         }
@@ -259,7 +187,7 @@ public:
             for (int t = 0; t < 2; t++) {
                 if (!cap_[t] || !live_[t]) continue;
                 const size_t pos = static_cast<size_t>(mix64(random + i * 2 + t)) & (cap_[t] - 1);
-                if (states(t)[pos] == kLive) { out = hashes_[t][pos]; return true; }
+                if (states_[t][pos] == kLive) { out = hashes_[t][pos]; return true; }
             }
         for (uint32_t i = 0; i < attempts; i++) {
             const size_t old_left = cap_[0] - migrate_;
@@ -269,8 +197,8 @@ public:
             const size_t pos = cursor_++;
             if (pos < old_left) {
                 const size_t slot = migrate_ + pos;
-                if (states(0)[slot] == kLive) { out = hashes_[0][slot]; return true; }
-            } else if (states(1)[pos - old_left] == kLive) {
+                if (states_[0][slot] == kLive) { out = hashes_[0][slot]; return true; }
+            } else if (states_[1][pos - old_left] == kLive) {
                 out = hashes_[1][pos - old_left];
                 return true;
             }
@@ -290,23 +218,11 @@ private:
 
     bool rehashing() const { return cap_[1] != 0; }
 
-    uint8_t* states(int t) const {
-        if (!sidecars_[t]) return nullptr;
-        auto* bytes = sidecars_[t];
-        if constexpr (kTtlDeadlineSidecar) bytes += cap_[t] * sizeof(int64_t);
-        return bytes;
-    }
-
-    int64_t* deadlines(int t) const {
-        if constexpr (!kTtlDeadlineSidecar) return nullptr;
-        return reinterpret_cast<int64_t*>(sidecars_[t]);
-    }
-
     void release(int t) {
         std::free(hashes_[t]);
-        std::free(sidecars_[t]);
+        std::free(states_[t]);
         hashes_[t] = nullptr;
-        sidecars_[t] = nullptr;
+        states_[t] = nullptr;
         cap_[t] = 0;
         live_[t] = tombs_[t] = 0;
     }
@@ -315,15 +231,13 @@ private:
     // arrive as demand-zero pages. Writing the zeroes here would put the whole new sidecar back on
     // one operation's critical path -- which is the stall this change exists to remove.
     bool allocate(int t, size_t cap) {
-        auto* hashes = static_cast<uint64_t*>(flatstore_table_calloc(cap, sizeof(uint64_t)));
-        const size_t sidecar_width = sizeof(uint8_t) +
-                                     (kTtlDeadlineSidecar ? sizeof(int64_t) : 0);
-        auto* sidecar = static_cast<uint8_t*>(flatstore_table_calloc(cap, sidecar_width));
-        if (!hashes || !sidecar) { std::free(hashes); std::free(sidecar); return false; }
+        auto* hashes = static_cast<uint64_t*>(std::calloc(cap, sizeof(uint64_t)));
+        auto* states = static_cast<uint8_t*>(std::calloc(cap, sizeof(uint8_t)));  // kEmpty == 0
+        if (!hashes || !states) { std::free(hashes); std::free(states); return false; }
         std::free(hashes_[t]);
-        std::free(sidecars_[t]);
+        std::free(states_[t]);
         hashes_[t] = hashes;
-        sidecars_[t] = sidecar;
+        states_[t] = states;
         cap_[t] = cap;
         live_[t] = tombs_[t] = 0;
         return true;
@@ -332,7 +246,7 @@ private:
     __attribute__((noinline, cold))
     void collapse_empty() {
         if (!rehashing() && cap_[0] <= kMinCap) {
-            std::memset(states(0), kEmpty, cap_[0]);
+            std::memset(states_[0], kEmpty, cap_[0]);
             tombs_[0] = 0;
             cursor_ = 0;
             return;
@@ -357,13 +271,12 @@ private:
         while (slots && migrate_ < cap_[0]) {
             const size_t pos = migrate_++;
             slots--;
-            if (states(0)[pos] != kLive) continue;
-            const int64_t deadline = kTtlDeadlineSidecar ? deadlines(0)[pos] : kNoTtlDeadline;
-            states(0)[pos] = kTomb;
+            if (states_[0][pos] != kLive) continue;
+            states_[0][pos] = kTomb;
             live_[0]--;
             tombs_[0]++;
             // Cannot fail: the destination was sized for every live entry plus headroom.
-            (void)insert_raw(1, hashes_[0][pos], deadline);
+            (void)insert_raw(1, hashes_[0][pos]);
         }
         if (migrate_ >= cap_[0]) finish_migration();
     }
@@ -371,22 +284,21 @@ private:
     void finish_migration() {
         while (migrate_ < cap_[0]) {
             const size_t pos = migrate_++;
-            if (states(0)[pos] != kLive) continue;
-            const int64_t deadline = kTtlDeadlineSidecar ? deadlines(0)[pos] : kNoTtlDeadline;
-            states(0)[pos] = kTomb;
+            if (states_[0][pos] != kLive) continue;
+            states_[0][pos] = kTomb;
             live_[0]--;
             tombs_[0]++;
-            (void)insert_raw(1, hashes_[0][pos], deadline);
+            (void)insert_raw(1, hashes_[0][pos]);
         }
         std::free(hashes_[0]);
-        std::free(sidecars_[0]);
+        std::free(states_[0]);
         hashes_[0] = hashes_[1];
-        sidecars_[0] = sidecars_[1];
+        states_[0] = states_[1];
         cap_[0] = cap_[1];
         live_[0] = live_[1];
         tombs_[0] = tombs_[1];
         hashes_[1] = nullptr;
-        sidecars_[1] = nullptr;
+        states_[1] = nullptr;
         cap_[1] = 0;
         live_[1] = tombs_[1] = 0;
         migrate_ = 0;
@@ -397,24 +309,22 @@ private:
         return static_cast<size_t>(mix64(hash)) & (cap_[t] - 1);
     }
 
-    bool insert_raw(int t, uint64_t hash, int64_t deadline) {
+    bool insert_raw(int t, uint64_t hash) {
         const size_t cap = cap_[t];
         if (!cap) return false;
         size_t pos = start(t, hash);
         size_t first_tomb = cap;
         for (size_t probes = 0; probes < cap; probes++) {
-            if (states(t)[pos] == kEmpty) {
+            if (states_[t][pos] == kEmpty) {
                 if (first_tomb != cap) { pos = first_tomb; tombs_[t]--; }
                 hashes_[t][pos] = hash;
-                if constexpr (kTtlDeadlineSidecar) deadlines(t)[pos] = deadline;
-                states(t)[pos] = kLive;
+                states_[t][pos] = kLive;
                 live_[t]++;
                 return true;
             }
-            if (states(t)[pos] == kTomb) {
+            if (states_[t][pos] == kTomb) {
                 if (first_tomb == cap) first_tomb = pos;
             } else if (hashes_[t][pos] == hash) {
-                if constexpr (kTtlDeadlineSidecar) deadlines(t)[pos] = deadline;
                 return true;
             }
             pos = (pos + 1) & (cap - 1);
@@ -427,9 +337,9 @@ private:
         if (!cap) return false;
         size_t pos = start(t, hash);
         for (size_t probes = 0; probes < cap; probes++) {
-            if (states(t)[pos] == kEmpty) return false;
-            if (states(t)[pos] == kLive && hashes_[t][pos] == hash) {
-                states(t)[pos] = kTomb;
+            if (states_[t][pos] == kEmpty) return false;
+            if (states_[t][pos] == kLive && hashes_[t][pos] == hash) {
+                states_[t][pos] = kTomb;
                 live_[t]--;
                 tombs_[t]++;
                 return true;
@@ -439,31 +349,15 @@ private:
         return false;
     }
 
-    bool deadline_in(int t, uint64_t hash, int64_t& out) const {
-        if constexpr (!kTtlDeadlineSidecar) return false;
-        const size_t cap = cap_[t];
-        if (!cap) return false;
-        size_t pos = start(t, hash);
-        for (size_t probes = 0; probes < cap; probes++) {
-            if (states(t)[pos] == kEmpty) return false;
-            if (states(t)[pos] == kLive && hashes_[t][pos] == hash) {
-                out = deadlines(t)[pos];
-                return true;
-            }
-            pos = (pos + 1) & (cap - 1);
-        }
-        return false;
-    }
-
     uint64_t* hashes_[2] = {nullptr, nullptr};
-    uint8_t*  sidecars_[2] = {nullptr, nullptr};
+    uint8_t*  states_[2] = {nullptr, nullptr};
     size_t    cap_[2]    = {0, 0};
     uint32_t  live_[2]   = {0, 0};
     uint32_t  tombs_[2]  = {0, 0};
     size_t    cursor_ = 0;    // sampling cursor over the concatenation of both tables
     size_t    migrate_ = 0;   // next old-table slot to move while a migration is in flight
 };
-static_assert(sizeof(ExpireIndex) == 80, "ExpireIndex layout drift");
+
 // 64-bit finalizer (murmur3 fmix64). Cheap, and it decorrelates the index bits from the router's.
 // ---- hash hardening ---------------------------------------------------------------------------
 // Collisions are a CORRECTNESS non-event (find_in compares full key bytes after the tag filter)
@@ -548,27 +442,6 @@ inline uint64_t scan_cursor_next(uint64_t cursor, uint64_t mask) {
 }
 
 class FlatStore;
-struct FlatStoreLayoutLock;
-
-// Armed stores extend the already-cold atomic pending allocation. Keeping AtomicPendingState first
-// preserves atomic_pending_ and every FlatStore member/offset; disabled stores allocate precisely
-// the historical AtomicPendingState body and nothing else.
-struct ReadLocalStoreState {
-    AtomicPendingState atomic;
-    // `probe_sequence` is the one table word: it changes for topology moves and atomic physical
-    // exchanges, never for an ordinary immutable one-slot SET, so plain writes publish nothing
-    // beyond their slot store. Point probes validate against it; local MGET validates a group-free
-    // participant against it and a pending participant against the per-key cell epochs in
-    // `foreign_reads`.
-    std::atomic<uint64_t> probe_sequence{0};
-    ReadLocalRetireSink retire_sink{};
-    std::unique_ptr<ResizeRetirement> resize_retirement;
-    uint32_t table_mutation_depth = 0;
-    uint32_t pending_count = 0;
-    ForeignReadSafety foreign_reads{};
-};
-static_assert(std::is_standard_layout_v<ReadLocalStoreState>);
-static_assert(offsetof(ReadLocalStoreState, atomic) == 0);
 
 // Hash-field TTLs, defined in src/cmd/t_hash_ttl.cc. The store owns the ATTENTION (which keys carry
 // field deadlines, and the bounded cycle that revisits them); the hash lane owns the reap itself,
@@ -591,137 +464,19 @@ public:
 
     // Eight slot bytes at the 70% target load cost 11.43 bytes per live key. Accounting rounds
     // that stable-state estimate to 12; transient dual tables, tombstones and allocator metadata
-    // are deliberately outside the maxmemory model: charging those costs would make enforcement
-    // depend on resize history rather than maintained object/key counters. This is a stable
-    // logical cache budget, not an RSS ceiling.
+    // are deliberately outside the maxmemory model and documented in NOTES-EVICT.md.
     static constexpr size_t   kSlotOverheadPerKey = 12;
     static constexpr uint32_t kEvictionsPerOp = 16;
     static constexpr uint32_t kSampleProbeAttempts = 16;
 
     enum class InsertResult : uint8_t { Inserted, MaxmemoryOom, Failed };
     enum class OverwriteResult : uint8_t { Updated, NotPossible, MaxmemoryOom };
-    enum class ReadLocalProbeResult : uint8_t { Hit, Missing, AtomicPending, Churn };
 
-    struct ReadLocalProbe {
-        ReadLocalProbeResult result = ReadLocalProbeResult::Churn;
-        const KvObj* object = nullptr;
-        uint64_t state = 0;
-    };
-
-    // Stack-local result of the batch prefetch walk. `slot` identifies the exact word whose
-    // acquire load produced `object`; execute must never dereference it, because doing so would
-    // reload a concurrent replacement and defeat capture-at-prefetch. Rotation QSBR keeps both
-    // pointers allocated until the fused pass returns. Keep this a trivial, uninitialized aggregate:
-    // hot-path capture arrays assign every consumed entry, so default member stores would be waste.
-    struct ReadLocalPrefetchCapture {
-        ReadLocalProbeResult result;
-        const uint64_t* slot;
-        const KvObj* object;
-        uint64_t state;
-    };
-
-    struct ReadLocalTable {
-        uint64_t* slots = nullptr;
-        uint32_t cap = 0;
-        uint32_t mask = 0;
-    };
-    struct ReadLocalTopology { ReadLocalTable tables[2]; };
-
-    // Layout of the read-local table word. Bit 0 is open while a table mutation is being
-    // published; bit 1 is the whole-shard pending marker (any prepared atomic entry, also the
-    // fail-closed witness); bits 2..63 are an ABA-resistant generation advanced when the outer
-    // table bracket closes.
-    static constexpr uint64_t kReadLocalTableMutationBit = uint64_t{1} << 0;
-    static constexpr uint64_t kReadLocalPendingBit = uint64_t{1} << 1;
-    static constexpr uint32_t kReadLocalGenerationShift = 2;
-    static constexpr uint64_t kReadLocalGenerationMask =
-        std::numeric_limits<uint64_t>::max() >> kReadLocalGenerationShift;
-
-    class ReadLocalTableGuard {
-    public:
-        explicit ReadLocalTableGuard(FlatStore& store, bool active = true)
-            : store_(active ? &store : nullptr) {
-            if (store_) store_->read_local_table_mutation_begin();
-        }
-        ~ReadLocalTableGuard() {
-            if (store_) store_->read_local_table_mutation_end();
-        }
-        ReadLocalTableGuard(const ReadLocalTableGuard&) = delete;
-        ReadLocalTableGuard& operator=(const ReadLocalTableGuard&) = delete;
-        ReadLocalTableGuard(ReadLocalTableGuard&& other) noexcept : store_(other.store_) {
-            other.store_ = nullptr;
-        }
-        ReadLocalTableGuard& operator=(ReadLocalTableGuard&&) = delete;
-
-    private:
-        FlatStore* store_;
-    };
-
-    class ForeignReadKeyGuard {
-    public:
-        ForeignReadKeyGuard(FlatStore& store, uint64_t hash)
-            : store_(store.read_local_enabled_ ? &store : nullptr), hash_(hash) {
-            if (store_) store_->foreign_read_scope_open(hash_);
-        }
-        ~ForeignReadKeyGuard() {
-            if (store_) store_->foreign_read_scope_close(hash_);
-        }
-        ForeignReadKeyGuard(const ForeignReadKeyGuard&) = delete;
-        ForeignReadKeyGuard& operator=(const ForeignReadKeyGuard&) = delete;
-        ForeignReadKeyGuard(ForeignReadKeyGuard&& other) noexcept
-            : store_(other.store_), hash_(other.hash_) {
-            other.store_ = nullptr;
-        }
-        ForeignReadKeyGuard& operator=(ForeignReadKeyGuard&&) = delete;
-
-    private:
-        FlatStore* store_ = nullptr;
-        uint64_t hash_ = 0;
-    };
-
-    class ForeignReadPoisonGuard {
-    public:
-        explicit ForeignReadPoisonGuard(FlatStore& store, bool active = true)
-            : store_(active && store.read_local_enabled_ ? &store : nullptr) {
-            if (store_) store_->foreign_read_poison_open();
-        }
-        ~ForeignReadPoisonGuard() {
-            if (store_) store_->foreign_read_poison_close();
-        }
-        ForeignReadPoisonGuard(const ForeignReadPoisonGuard&) = delete;
-        ForeignReadPoisonGuard& operator=(const ForeignReadPoisonGuard&) = delete;
-        ForeignReadPoisonGuard(ForeignReadPoisonGuard&& other) noexcept
-            : store_(other.store_) {
-            other.store_ = nullptr;
-        }
-        ForeignReadPoisonGuard& operator=(ForeignReadPoisonGuard&&) = delete;
-
-    private:
-        FlatStore* store_ = nullptr;
-    };
-
-    // KvObj allocations use alloc_raw(), so probe that exact backend before any shard is built.
-    // A platform/allocator that can only supply wider virtual addresses cannot safely use the
-    // packed slot format and must be rejected at boot rather than losing pointer bits later.
-    static bool pointer_encoding_supported() {
-        constexpr size_t kProbeBytes = 64;
-        void* probe = alloc_raw(kProbeBytes);
-        if (!probe) return false;
-        const bool fits = (reinterpret_cast<uint64_t>(probe) & ~kPtrMask) == 0;
-        free_sized(probe, kProbeBytes);
-        return fits;
-    }
-
-    explicit FlatStore(uint32_t initial_cap = 1024) {
-        const uint32_t cap = round_pow2(initial_cap);
-        if (!cap || !alloc_table(0, cap)) throw std::bad_alloc();
-    }
+    explicit FlatStore(uint32_t initial_cap = 1024) { alloc_table(0, round_pow2(initial_cap)); }
     ~FlatStore() {
         // At process teardown no reader survives. Collapse pending entries first so the ordinary
         // table destructor below remains the unique owner of each promoted winner.
-        read_local_enabled_ = false;  // shutdown promotion/free is direct; no callback may outlive us
         atomic_promote_all_for_shutdown();
-        expires_.clear();
         if (snapshot_new_tab_) std::free(snapshot_new_tab_);
         for (int t = 0; t < 2; t++)
             if (tab_[t]) {
@@ -737,277 +492,9 @@ public:
     FlatStore(const FlatStore&) = delete;
     FlatStore& operator=(const FlatStore&) = delete;
 
-    // Boot-only allocation, before persistence replay or any foreign probe can exist.
-    bool prepare_read_local() {
-        if (!ensure_read_local_store_state()) return false;
-        // Persistence replay may leave a resize in flight before the lane is armed. Reserve
-        // its completion record at boot as well as at every later resize admission.
-        return prepare_resize_retirement();
-    }
-
-    // Enabled is boot-latched. The sink may be rebound only at a quiesced fused ownership handoff;
-    // false keeps the old store path and every installed writer hook predicted cold.
-    void configure_read_local(bool enabled, ReadLocalRetireSink sink) {
-        if (enabled && (!sink.defer || !sink.block_cache)) std::abort();
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        if (enabled && !sink.diagnostics()) std::abort();
-#endif
-        // Persistence loading finishes before the fused executor arms this store. Prepared atomic
-        // records cannot be retroactively marked in their entry headers, so fail closed if that
-        // boot invariant ever changes instead of publishing a false zero-pending state.
-        if (enabled && atomic_pending_entries() != 0) std::abort();
-        ReadLocalStoreState* state = read_local_store_state();
-        if (enabled && !state) std::abort();
-        if constexpr (kReadLocalSetTaxAtomicRaw) {
-            // Persistence/bootstrap may have used the ordinary overwrite path before the boot latch
-            // is exposed. Establish fixed atomic payload cells for that final image while no foreign
-            // probe can exist; every later Raw constructor performs the same preparation directly.
-            if (enabled && !read_local_enabled_)
-                for (int table = 0; table < 2; table++)
-                    if (tab_[table])
-                        for (uint32_t slot = 0; slot < cap_[table]; slot++)
-                            if (KvObj* object = ptr_of(tab_[table][slot]))
-                                kvobj_prepare_read_local_raw_cells(object);
-        }
-        if (state) state->retire_sink = sink;
-        read_local_enabled_ = enabled;
-    }
-    void rebind_read_local_retire_sink(ReadLocalRetireSink sink) {
-        if (!read_local_enabled_ || !sink.defer || !sink.block_cache) std::abort();
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        if (!sink.diagnostics()) std::abort();
-#endif
-        // Called only after the old owner has acknowledged an empty task/read/retire frontier and
-        // before the new owner executes store work. Advance the table generation at that ownership
-        // edge so a foreign copy cannot validate across two retire domains. Foreign probes never
-        // read the sink; keeping the boot-latched enabled byte untouched avoids a true-to-true data
-        // race at LB resume.
-        ReadLocalTableGuard ownership_change(*this);
-        read_local_store_state_required().retire_sink = sink;
-    }
-    bool read_local_enabled() const { return read_local_enabled_; }
-    bool read_retirement_available() const {
-        if (!read_local_enabled_) return true;
-        const auto& sink = read_local_store_state_required().retire_sink;
-        return !sink.available || sink.available(sink.context);
-    }
-#ifdef TOMO_RL_CACHE_DEBUG
-    // Debug builds only: lets Server assert that this store's sink still names its CURRENT owner.
-    const ReadLocalRetireSink& read_local_retire_sink_debug() const {
-        return read_local_store_state_required().retire_sink;
-    }
-#endif
-
-    uint64_t read_local_state_acquire() const {
-        return read_local_store_state_required().probe_sequence.load(std::memory_order_acquire);
-    }
-    static bool read_local_table_mutating(uint64_t state) {
-        return (state & kReadLocalTableMutationBit) != 0;
-    }
-    static uint32_t read_local_pending(uint64_t state) {
-        return (state & kReadLocalPendingBit) ? 1u : 0u;
-    }
-    static uint64_t read_local_generation(uint64_t state) {
-        return state >> kReadLocalGenerationShift;
-    }
-    // Wrap publishes this permanent fail-closed value rather than an equal "stable" generation.
-    static bool read_local_generation_poisoned(uint64_t state) {
-        return read_local_generation(state) == kReadLocalGenerationMask;
-    }
-    static bool read_local_state_eligible(uint64_t state) {
-        return !read_local_table_mutating(state) && !read_local_generation_poisoned(state);
-    }
-    // Equal table generation regardless of the independent pending hint; callers compare two words
-    // they have already proven even.
-    static bool read_local_generation_equal(uint64_t first, uint64_t second) {
-        return read_local_generation(first) == read_local_generation(second);
-    }
-    [[nodiscard]] ReadLocalTableGuard read_local_table_guard() {
-        return ReadLocalTableGuard(*this);
-    }
-
-    bool foreign_read_key_unsafe(uint64_t state, uint64_t hash) const {
-        // Pending is also the cheap empty-filter hint. It stays latched if filter bookkeeping ever
-        // permanently poisons, so short-circuiting here cannot turn that fail-closed state into a
-        // false negative after the last enumerable entry drains.
-        if (!read_local_pending(state)) return false;
-        return read_local_store_state_required().foreign_reads.might_contain(hash);
-    }
-    bool foreign_read_key_unsafe(uint64_t hash) const {
-        const uint64_t state = read_local_state_acquire();
-        return foreign_read_key_unsafe(state, hash);
-    }
-    // Multi-key window validator. Load it only for a key whose shard word carries the pending bit,
-    // and only to compare against a later load of the same cell. Called only on the armed lane.
-    uint32_t foreign_read_cell_epoch(uint64_t hash) const {
-        return read_local_store_state_required().foreign_reads.cell_epoch(hash);
-    }
-    static uint32_t foreign_read_filter_index(uint64_t hash) {
-        return ForeignReadSafety::cell_index(hash);
-    }
-    static uint32_t foreign_read_filter_fingerprint(uint64_t hash) {
-        return ForeignReadSafety::fingerprint(hash);
-    }
-    uint64_t foreign_read_unsafe_refs() const {
-        const ReadLocalStoreState* state = read_local_store_state();
-        return state ? state->foreign_reads.unsafe_total_refs() : 0;
-    }
-    uint64_t foreign_read_occupied_cells() const {
-        const ReadLocalStoreState* state = read_local_store_state();
-        return state ? state->foreign_reads.occupied_cells() : 0;
-    }
-    uint64_t foreign_read_wildcard_cells() const {
-        const ReadLocalStoreState* state = read_local_store_state();
-        return state ? state->foreign_reads.wildcard_cells() : 0;
-    }
-    uint64_t foreign_read_saturated_cells() const {
-        const ReadLocalStoreState* state = read_local_store_state();
-        return state ? state->foreign_reads.saturated_cells() : 0;
-    }
-    bool foreign_read_poisoned() const {
-        const ReadLocalStoreState* state = read_local_store_state();
-        return state && state->foreign_reads.poison_refs() != 0;
-    }
-    [[nodiscard]] ForeignReadKeyGuard foreign_read_key_guard(uint64_t hash) {
-        return ForeignReadKeyGuard(*this, hash);
-    }
-    [[nodiscard]] ForeignReadPoisonGuard foreign_read_poison_guard(bool active = true) {
-        return ForeignReadPoisonGuard(*this, active);
-    }
-
-    // Same-owner group/script paths retain their enumerated hashes through finish. Duplicate
-    // occurrences are intentional and must be closed symmetrically.
-    template <typename HashAt>
-    void foreign_read_scope_open_span(uint32_t count, HashAt&& hash_at) {
-        if (!read_local_enabled_) return;
-        // Unlike an AtomicEntry, this scoped path may mutate through an ordinary immutable slot
-        // replacement. Complete a brief sequence handshake around filter publication so a point
-        // reader that already observed a negative cell cannot validate across the later handler.
-        ReadLocalTableGuard publication(*this);
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.add_span(count, std::forward<HashAt>(hash_at));
-        foreign_read_pending_witness_open(state);
-    }
-
-    template <typename HashAt>
-    void foreign_read_scope_close_span(uint32_t count, HashAt&& hash_at) {
-        if (!read_local_enabled_) return;
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.close_span(count, std::forward<HashAt>(hash_at));
-        foreign_read_pending_witness_close(state);
-    }
-
-    void foreign_read_scope_open(uint64_t hash) {
-        foreign_read_scope_open_span(1, [&](uint32_t) { return hash; });
-    }
-
-    void foreign_read_scope_close(uint64_t hash) {
-        foreign_read_scope_close_span(1, [&](uint32_t) { return hash; });
-    }
-
-    // An enumerator that cannot name every key publishes a whole-shard wildcard. The caller must
-    // retain and close this scope after declining or completing the write.
-    void foreign_read_unenumerable_open() {
-        if (read_local_enabled_) foreign_read_poison_open();
-    }
-    void foreign_read_unenumerable_close() {
-        if (read_local_enabled_) foreign_read_poison_close();
-    }
-
-    ReadLocalProbe read_local_probe(uint64_t hash, Slice key) const {
-        if (__builtin_expect(!read_local_enabled_, false)) return {};
-        const uint64_t state = read_local_state_acquire();
-        if (foreign_read_key_unsafe(state, hash))
-            return {ReadLocalProbeResult::AtomicPending, nullptr, state};
-        if (!read_local_state_eligible(state))
-            return {ReadLocalProbeResult::Churn, nullptr, state};
-
-        ReadLocalTopology topology;
-        if (!read_local_snapshot_topology(state, topology)) {
-            const uint64_t changed = read_local_state_acquire();
-            return {foreign_read_key_unsafe(changed, hash)
-                        ? ReadLocalProbeResult::AtomicPending : ReadLocalProbeResult::Churn,
-                    nullptr, changed};
-        }
-
-        const KvObj* object = read_local_find_in(topology.tables[0], hash, key);
-        if (!object) object = read_local_find_in(topology.tables[1], hash, key);
-        const uint64_t final_state = read_local_state_acquire();
-        if (!read_local_probe_sequence_equal(final_state, state)) {
-            return {foreign_read_key_unsafe(final_state, hash)
-                        ? ReadLocalProbeResult::AtomicPending : ReadLocalProbeResult::Churn,
-                    nullptr, final_state};
-        }
-        return {object ? ReadLocalProbeResult::Hit : ReadLocalProbeResult::Missing,
-                object, state};
-    }
-
-    bool read_local_validate(uint64_t state) const {
-        return read_local_enabled_ && read_local_state_eligible(state) &&
-               read_local_probe_sequence_equal(read_local_state_acquire(), state);
-    }
-
-    void read_local_prefetch(uint64_t hash) const {
-        if (__builtin_expect(!read_local_enabled_, false)) return;
-        const uint64_t state = read_local_state_acquire();
-        if (!read_local_state_eligible(state)) return;
-        ReadLocalTopology topology;
-        if (!read_local_snapshot_topology(state, topology)) return;
-        for (const ReadLocalTable& table : topology.tables) {
-            if (!table.slots || !table.cap) continue;
-            const uint32_t slot = static_cast<uint32_t>(mix64(hash)) & table.mask;
-            __builtin_prefetch(table.slots + slot, 0, 1);
-        }
-    }
-
-    ReadLocalPrefetchCapture read_local_prefetch_capture(uint64_t hash, Slice key) const {
-        if (__builtin_expect(!read_local_enabled_, false))
-            return {ReadLocalProbeResult::Churn, nullptr, nullptr, 0};
-        const uint64_t state = read_local_state_acquire();
-        if (foreign_read_key_unsafe(state, hash))
-            return {ReadLocalProbeResult::AtomicPending, nullptr, nullptr, state};
-        if (!read_local_state_eligible(state))
-            return {ReadLocalProbeResult::Churn, nullptr, nullptr, state};
-
-        ReadLocalTopology topology;
-        if (!read_local_snapshot_topology(state, topology)) {
-            const uint64_t changed = read_local_state_acquire();
-            return {foreign_read_key_unsafe(changed, hash)
-                        ? ReadLocalProbeResult::AtomicPending : ReadLocalProbeResult::Churn,
-                    nullptr, nullptr, changed};
-        }
-
-        const uint64_t* slot = nullptr;
-        const KvObj* object = read_local_capture_in(topology.tables[0], hash, key, slot);
-        if (!object) {
-            const uint64_t* old_slot = nullptr;
-            object = read_local_capture_in(topology.tables[1], hash, key, old_slot);
-            // Keep the current table's empty stopper when there is no old table. During a rehash,
-            // the old-table match/stopper is the last word that decided the complete lookup.
-            if (old_slot) slot = old_slot;
-        }
-        const uint64_t final_state = read_local_state_acquire();
-        if (!read_local_probe_sequence_equal(final_state, state)) {
-            return {foreign_read_key_unsafe(final_state, hash)
-                        ? ReadLocalProbeResult::AtomicPending : ReadLocalProbeResult::Churn,
-                    nullptr, nullptr, final_state};
-        }
-        if (object) read_local_prefetch_object(object);
-        return {object ? ReadLocalProbeResult::Hit : ReadLocalProbeResult::Missing,
-                slot, object, state};
-    }
-
     bool     rehashing() const { return tab_[1] != nullptr; }
-    // Owner-only observation: DEBUG REHASH-STATE runs on shard 0's owner, so these real
-    // migration counters need neither cross-thread sampling nor new per-step instrumentation.
-    struct RehashProgress {
-        uint32_t current_capacity, old_capacity, cursor, old_live;
-    };
-    RehashProgress rehash_progress() const {
-        return {cap_[0], cap_[1], rehash_pos_, live_[1]};
-    }
     uint32_t size() const { return live_[0] + live_[1]; }
-    uint64_t capacity() const { return static_cast<uint64_t>(cap_[0]) + cap_[1]; }
+    uint32_t capacity() const { return cap_[0] + cap_[1]; }
     size_t   object_bytes() const { return obj_bytes_ + atomic_version_bytes_; }
     uint32_t expire_count() const { return expires_.size(); }
     // Hashes in this shard carrying at least one field deadline. THE gate for the whole hash-field
@@ -1017,16 +504,14 @@ public:
     // Registration is idempotent and keyed by key hash only, exactly like expires_. A stale entry
     // (key replaced, deleted, or persisted) is harmless: the cycle drops it on its next visit.
     void note_field_ttl(uint64_t h) {
-        // A missed registration must not disarm logical expiry. Keep the lazy-access gate
-        // sticky until FLUSH if the attention index could not allocate its entry.
-        if (!field_expires_.insert(h)) field_ttl_index_incomplete_ = true;
-        refresh_field_ttl_gate();
+        (void)field_expires_.insert(h);
+        field_ttl_gate_ = field_expires_.size();
     }
     // FIRED-proof for the lazy reap: >0 means a hash field really was collected on an access path,
     // not merely filtered out of a reply. INFO reports it as expired_hash_fields.
     void note_field_expired(uint32_t n) { field_expired_ += n; }
-    // Re-arms type-specific attention for an imported image, including atomic COPY/RENAME APPLY.
-    // The type guard keeps hash-field machinery behind the hash-only branch.
+    // Re-arms type-specific attention for an object that arrived from a snapshot, an AOF replay or
+    // RESTORE rather than from a command. Load-only, so it costs the hot path nothing.
     void note_loaded_object(uint64_t h, const KvObj* o) {
         if (static_cast<Type>(o->type) != Type::Hash) return;
         if (static_cast<Enc>(o->enc) == Enc::Compact) return;
@@ -1049,7 +534,7 @@ public:
         const size_t objects = obj_bytes_ + atomic_version_bytes_;
         if (keys > (std::numeric_limits<size_t>::max() - objects) / kSlotOverheadPerKey)
             return std::numeric_limits<size_t>::max();
-        return objects + static_cast<uint64_t>(keys) * kSlotOverheadPerKey;
+        return objects + keys * kSlotOverheadPerKey;
     }
 
     // ==== epoch-MVCC atomics (see src/store/flatstore_atomic.inc) ====
@@ -1069,15 +554,11 @@ public:
             return SnapshotWriteResult::Pending;
         }
         if (snapshot_prepared_) return SnapshotWriteResult::Ready;
-        if (read_local_enabled_ && !prepare_resize_retirement())
-            return SnapshotWriteResult::Error;
         uint64_t wanted = static_cast<uint64_t>(cap_[0]) * 2;
         if (wanted > UINT32_MAX) return SnapshotWriteResult::Error;
         const uint32_t cap = round_pow2(static_cast<uint32_t>(wanted));
-        if (!cap) return SnapshotWriteResult::Error;
-        auto* fresh = static_cast<uint64_t*>(flatstore_table_calloc(cap, sizeof(uint64_t)));
-        if (!fresh) return SnapshotWriteResult::Error;
-        snapshot_new_tab_ = fresh;
+        snapshot_new_tab_ = static_cast<uint64_t*>(std::calloc(cap, sizeof(uint64_t)));
+        if (!snapshot_new_tab_) return SnapshotWriteResult::Error;
         snapshot_new_cap_ = cap;
         snapshot_epoch_ = epoch;
         snapshot_cut_ms_ = cut_ms;
@@ -1089,8 +570,6 @@ public:
     // old table becomes the immutable-layout snapshot table (values may change only after their
     // pre-image has been serialized), and all new keys land in the fresh current table.
     bool snapshot_mark(int32_t shard_id, int64_t cut_ms) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return snapshot_mark_read_local(shard_id, cut_ms);
         if (!snapshot_prepared_ || snapshot_active_ || rehashing()) return false;
         tab_[1] = tab_[0]; cap_[1] = cap_[0]; mask_[1] = mask_[0];
         live_[1] = live_[0]; tombs_[1] = tombs_[0];
@@ -1120,8 +599,6 @@ public:
     uint64_t snapshot_preimages() const { return snapshot_preimages_; }
 
     SnapshotWriteResult snapshot_prepare_write(uint64_t h, Slice key) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return snapshot_prepare_write_read_local(h, key);
         if (!snapshot_active_) return SnapshotWriteResult::Ready;
         if (snapshot_failed_) return SnapshotWriteResult::Error;
         if (find_in(0, h, key)) return SnapshotWriteResult::Ready;  // born/moved after the cut
@@ -1129,7 +606,7 @@ public:
         KvObj* object = find_slot_in(1, h, key, slot);
         if (!object || slot < snapshot_pos_ || (tab_[1][slot] & kTombBit))
             return SnapshotWriteResult::Ready;
-        if (deadline_elapsed(h, object, snapshot_cut_ms_)) {
+        if ((object->flags & KvObjFlags::HasTtl) && object->expire_at_ms() <= snapshot_cut_ms_) {
             tab_[1][slot] |= kTombBit;             // absent at the cut; traversal must skip it
             return SnapshotWriteResult::Ready;
         }
@@ -1141,8 +618,6 @@ public:
 
     // CPU work on the owner, bounded by both bytes and examined slots.  It never writes a file.
     uint32_t snapshot_progress(uint32_t byte_budget, uint32_t slot_budget) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return snapshot_progress_read_local(byte_budget, slot_budget);
         if (!snapshot_active_ || snapshot_failed_ || snapshot_ready_) return 0;
         uint32_t work = 0;
         while (byte_budget && !snapshot_ready_ && !snapshot_failed_) {
@@ -1168,7 +643,8 @@ public:
                 snapshot_pos_++;
                 continue;
             }
-            if (deadline_elapsed(hash_key(object->key()), object, snapshot_cut_ms_)) {
+            if ((object->flags & KvObjFlags::HasTtl) &&
+                object->expire_at_ms() <= snapshot_cut_ms_) {
                 snapshot_pos_++;
                 continue;
             }
@@ -1207,8 +683,7 @@ public:
     // copy cost — nothing is copied — but an L3 domain is filled by access, so a shard that moves
     // has to be read back in on the other side.
     size_t resident_estimate() const {
-        return static_cast<size_t>((static_cast<uint64_t>(cap_[0]) + cap_[1]) *
-                                   sizeof(uint64_t)) + obj_bytes_ +
+        return static_cast<size_t>(cap_[0] + cap_[1]) * 8 + obj_bytes_ +
                atomic_version_bytes_ + pending_bytes_ +
                expires_.memory_bytes() + field_expires_.memory_bytes();
     }
@@ -1222,8 +697,7 @@ public:
     }
 
     KvObj* find(uint64_t h, Slice key) {
-        // Lookup must not inherit a resize's QSBR retirement wait. Both tables remain searchable;
-        // mutations and owner maintenance advance rehashing, including its final table retirement.
+        if (rehashing() && !snapshot_active_) rehash_step();
         KvObj* found = nullptr;
         if (__builtin_expect(atomic_pending_ != nullptr, false) &&
             __builtin_expect(atomic_pending_->live != 0, false)) {
@@ -1245,10 +719,10 @@ public:
     KvObj* find_notify(uint64_t h, Slice key, FlatNotifySink* sink) {
         KvObj* candidate = find_in(0, h, key);
         if (!candidate && rehashing()) candidate = find_in(1, h, key);
-        const bool expired = candidate && deadline_elapsed(h, candidate, cached_now_ms_) &&
+        const bool expired = candidate && (candidate->flags & KvObjFlags::HasTtl) &&
+                             candidate->expire_at_ms() <= cached_now_ms_ &&
                              !(snapshot_active_ && candidate == find_in(1, h, key));
-        if (expired && read_retirement_available())
-            notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
+        if (expired) notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
         KvObj* found = find(h, key);
         if (!found) notify_emit(sink, NOTIFY_KEY_MISS, NotifyEventId::Keymiss, key);
         return found;
@@ -1259,11 +733,9 @@ public:
     // than "new <= old" because good_size() is recomputed from the header — letting the real
     // allocation and the implied one diverge would silently break the resident estimate.
     OverwriteResult try_overwrite(uint64_t h, Slice key, Slice val) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return try_overwrite_read_local(h, key, val);
         KvObj* o = find_without_touch(h, key);
         if (!o) return OverwriteResult::NotPossible;
-        if (o->encoding() != Enc::Raw) return OverwriteResult::NotPossible;
+        if (static_cast<Enc>(o->enc) != Enc::Raw) return OverwriteResult::NotPossible;
         if (o->flags & KvObjFlags::HasTtl) return OverwriteResult::NotPossible;  // SET clears TTL
         if (val.n > kEmbedThreshold) return OverwriteResult::NotPossible;       // becomes Extern
         const size_t want = kvobj_alloc_size(o->klen(), val.n, false, Enc::Raw);
@@ -1271,7 +743,7 @@ public:
 
         // In-place overwrite is the one mutation that would change bytes without retiring their
         // allocation. With no outstanding borrows this is one predicted branch and no lookup.
-        if (outstanding_borrows_ && is_borrowed(o->str_data()))
+        if (outstanding_borrows_ && is_borrowed(o->str_value().p))
             return OverwriteResult::NotPossible;
 
         // The entire disabled-feature write tax is this branch. When enabled, the target key is
@@ -1283,12 +755,12 @@ public:
 
         // Same length means the same class and the same footprint: the accounting delta is exactly
         // zero, so do not compute it (kvobj_size was 7.7% of SET-cell cycles before this).
-        if (val.n == kvobj_read_local_raw_length(o)) {
+        if (val.n == o->vlen) {
             std::memcpy(o->val_ptr(), val.p, val.n);
             return OverwriteResult::Updated;
         }
         obj_bytes_ -= kvobj_size(o);
-        o->store_raw_length_relaxed(val.n);
+        o->vlen = val.n;
         std::memcpy(o->val_ptr(), val.p, val.n);
         obj_bytes_ += kvobj_size(o);
         return OverwriteResult::Updated;
@@ -1297,104 +769,6 @@ public:
     OverwriteResult try_overwrite_notify(uint64_t h, Slice key, Slice val,
                                          FlatNotifySink*) {
         return try_overwrite(h, key, val);
-    }
-
-    // ARMED WRITES ALLOCATE. A published object is immutable while read-local is armed (readers
-    // hold no lock and must never observe a half-written object), so a SET may not overwrite in
-    // place: it builds a fresh block, publishes it, and retires the old one through QSBR. Rather
-    // than round-trip that block through the allocator, the armed path takes it from the fused
-    // owner's post-grace block cache and falls back to mallocx only on a miss. Extern values keep an
-    // independent value allocation and stay on the baseline path. Unarmed builds see one
-    // boot-latched, predicted-false branch and the identical allocator call they have today.
-    KvObj* make_set_string(Slice key, Slice value, int64_t expire_at_ms = -1,
-                           bool reserve_ttl_slot = false) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats* stats = read_local_enabled_ ? &settax_stats() : nullptr;
-        if (stats) {
-            if (value.n <= kEmbedThreshold) stats->init_raw_calls++;
-            else stats->init_extern_calls++;
-            stats->init_key_bytes += key.n;
-            stats->init_value_bytes += value.n;
-        }
-#endif
-        if (__builtin_expect(read_local_enabled_, false) && value.n <= kEmbedThreshold) {
-            const bool has_ttl_slot = reserve_ttl_slot || expire_at_ms >= 0;
-            const size_t allocation = good_size(
-                kvobj_alloc_size(key.n, value.n, has_ttl_slot, Enc::Raw));
-            void* memory = read_local_cache_take(allocation);
-            if (!memory) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                if (stats) stats->fresh_allocation_attempts++;
-#endif
-                memory = alloc_raw(allocation);
-            }
-            if (!memory) {
-                // The allocator refused. The cache is holding physical memory nothing needs;
-                // hand it back and ask exactly once more before reporting OOM.
-                read_local_cache_release_all();
-                memory = alloc_raw(allocation);
-            }
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            if (stats && memory) stats->init_cell_prepare_calls++;
-#endif
-            return memory ? kvobj_init_raw_string(memory, key, value, expire_at_ms,
-                                                  reserve_ttl_slot) : nullptr;
-        }
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        KvObj* object = kvobj_new_string(
-            key, value, expire_at_ms, reserve_ttl_slot,
-            stats ? &stats->fresh_allocation_attempts : nullptr);
-        if (stats && object && value.n <= kEmbedThreshold) stats->init_cell_prepare_calls++;
-        return object;
-#else
-        return kvobj_new_string(key, value, expire_at_ms, reserve_ttl_slot);
-#endif
-    }
-
-    KvObj* make_set_int(Slice key, int64_t value, int64_t expire_at_ms = -1,
-                        bool reserve_ttl_slot = false) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats* stats = read_local_enabled_ ? &settax_stats() : nullptr;
-        if (stats) {
-            stats->init_int_calls++;
-            stats->init_key_bytes += key.n;
-            stats->init_value_bytes += sizeof(value);
-        }
-#endif
-        if (__builtin_expect(read_local_enabled_, false)) {
-            const bool has_ttl_slot = reserve_ttl_slot || expire_at_ms >= 0;
-            const size_t allocation = good_size(
-                kvobj_alloc_size(key.n, 0, has_ttl_slot, Enc::Int));
-            void* memory = read_local_cache_take(allocation);
-            if (!memory) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                if (stats) stats->fresh_allocation_attempts++;
-#endif
-                memory = alloc_raw(allocation);
-            }
-            if (!memory) {
-                read_local_cache_release_all();
-                memory = alloc_raw(allocation);
-            }
-            return memory ? kvobj_init_int(memory, key, value, expire_at_ms,
-                                           reserve_ttl_slot) : nullptr;
-        }
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        return kvobj_new_int(
-            key, value, expire_at_ms, reserve_ttl_slot,
-            stats ? &stats->fresh_allocation_attempts : nullptr);
-#else
-        return kvobj_new_int(key, value, expire_at_ms, reserve_ttl_slot);
-#endif
-    }
-
-    // A failed insertion never published the replacement, so no grace period is owed. It is NOT
-    // offered to the block cache: every caller reaches here because the store refused the write
-    // (OOM or a maxmemory refusal), and holding memory back from the allocator is exactly the
-    // wrong move under that pressure. Return it immediately.
-    void discard_set_value(KvObj* object) {
-        if (!object) return;
-        kvobj_free(object);
     }
 
     // Called by GET on the shard owner before publishing the Op. Pointer identity is sufficient:
@@ -1420,9 +794,8 @@ public:
         outstanding_borrows_--;
         if (b.refs) return;
         if (b.retired) {
-            const size_t capacity = kvobj_capacity(b.retired);
-            pending_bytes_ -= capacity + kvobj_external_bytes(b.retired);
-            free_retired_obj_now(b.retired, capacity);
+            pending_bytes_ -= kvobj_size(b.retired);
+            kvobj_free(b.retired);
         }
         borrow_index_dropped(ptr);
         const uint32_t last = static_cast<uint32_t>(borrows_.size() - 1);
@@ -1440,21 +813,6 @@ public:
 
     void set_cached_now_ms(int64_t now_ms) { cached_now_ms_ = now_ms; }
     void set_cached_lru_clock(uint8_t clock) { cached_lru_clock_ = clock; }
-    // Lifetime high-water mark for successful active reaps.  The deadline is known logical here;
-    // still reject a negative value defensively so a retained-but-persisted slot cannot report a
-    // multi-billion-millisecond lag.  Four bytes are enough for almost 50 days and larger stalls
-    // saturate instead of wrapping.
-    void note_active_expire_reap(int64_t deadline_ms) {
-        if (deadline_ms < 0 || cached_now_ms_ <= deadline_ms) return;
-        const uint64_t lag = static_cast<uint64_t>(cached_now_ms_ - deadline_ms);
-        const uint32_t bounded = lag > std::numeric_limits<uint32_t>::max()
-            ? std::numeric_limits<uint32_t>::max() : static_cast<uint32_t>(lag);
-        if (bounded > active_expire_reap_lag_ms_max_)
-            active_expire_reap_lag_ms_max_ = bounded;
-    }
-    uint32_t active_expire_reap_lag_ms_max() const {
-        return active_expire_reap_lag_ms_max_;
-    }
     // Owner-thread scratch: the current task's CLIENT NO-TOUCH answer. Written only when
     // maxmemory is enabled, so it costs nothing in the default configuration.
     void set_no_touch(bool value) { no_touch_ = value; }
@@ -1475,24 +833,6 @@ public:
         if (KvObj* object = find_in(0, h, key)) return object;
         return rehashing() ? find_in(1, h, key) : nullptr;
     }
-    // Owner-only deadline accessor. With the prototype selector enabled, a physically TTL-capable
-    // object pays one ExpireIndex probe; objects without the slot return before touching sidecar
-    // memory. Atomic/snapshot versions retain their inline transport value and bypass the hash-only
-    // prototype because one index entry cannot describe multiple versions of the same key.
-    int64_t deadline(uint64_t h, const KvObj* object) const {
-        if (!object || !object->has_ttl_slot()) return kNoTtlDeadline;
-        const int64_t inline_deadline = object->expire_at_ms();
-        if constexpr (kTtlDeadlineSidecar) {
-            if (snapshot_active_ || (atomic_pending_ && atomic_pending_->live != 0))
-                return inline_deadline;
-            return expires_.deadline(h, inline_deadline);
-        }
-        return inline_deadline;
-    }
-    bool deadline_elapsed(uint64_t h, const KvObj* object, int64_t now_ms) const {
-        const int64_t at = deadline(h, object);
-        return at >= 0 && at <= now_ms;
-    }
     // The deadline WATCH pins on an armed key. Redis probes the key with LOOKUP_NOTOUCH and does
     // not reap it, so an elapsed-but-unreaped key must stay physically counted here too. A key that
     // is ALREADY past its deadline when WATCH runs is redis's `wk->expired`: its later removal is
@@ -1500,7 +840,7 @@ public:
     int64_t watch_deadline(uint64_t h, Slice key) const {
         const KvObj* object = find_resident(h, key);
         if (!object) return -1;
-        const int64_t at = deadline(h, object);
+        const int64_t at = object->expire_at_ms();
         return at > cached_now_ms_ ? at : -1;
     }
     void bind_expired_counter(uint64_t* counter) { expired_counter_ = counter; }
@@ -1532,13 +872,11 @@ public:
     enum class TtlResult : uint8_t { Missing, NoChange, Updated, Oom, MaxmemoryOom };
 
     TtlResult set_expire(uint64_t h, Slice key, int64_t expire_at_ms) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return set_expire_read_local(h, key, expire_at_ms);
         KvObj* old = find(h, key);
         if (!old) return TtlResult::Missing;
-        if (old->has_ttl_slot()) {
+        if (old->flags & KvObjFlags::HasTtl) {
             old->set_expire_at_ms(expire_at_ms);
-            (void)track_expire(h, old);
+            expires_.insert(h);
             return TtlResult::Updated;
         }
         return rewrite_expire(h, old, expire_at_ms);
@@ -1546,13 +884,11 @@ public:
 
     TtlResult set_expire_notify(uint64_t h, Slice key, int64_t expire_at_ms,
                                 FlatNotifySink* sink) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return set_expire_notify_read_local(h, key, expire_at_ms, sink);
         KvObj* old = find_notify(h, key, sink);
         if (!old) return TtlResult::Missing;
-        if (old->has_ttl_slot()) {
+        if (old->flags & KvObjFlags::HasTtl) {
             old->set_expire_at_ms(expire_at_ms);
-            (void)track_expire(h, old);
+            expires_.insert(h);
             return TtlResult::Updated;
         }
         return rewrite_expire(h, old, expire_at_ms);
@@ -1561,27 +897,19 @@ public:
     TtlResult persist(uint64_t h, Slice key) {
         KvObj* old = find(h, key);
         if (!old) return TtlResult::Missing;
-        if (deadline(h, old) < 0) return TtlResult::NoChange;
-        if (__builtin_expect(read_local_enabled_, false))
-            return rewrite_expire_read_local(h, old, kNoTtlDeadline);
-        old->set_expire_at_ms(kNoTtlDeadline);
-        untrack_expire(h);
-        return TtlResult::Updated;
+        if (!(old->flags & KvObjFlags::HasTtl)) return TtlResult::NoChange;
+        return rewrite_expire(h, old, -1);
     }
 
     TtlResult persist_notify(uint64_t h, Slice key, FlatNotifySink* sink) {
         KvObj* old = find_notify(h, key, sink);
         if (!old) return TtlResult::Missing;
-        if (deadline(h, old) < 0) return TtlResult::NoChange;
-        if (__builtin_expect(read_local_enabled_, false))
-            return rewrite_expire_read_local(h, old, kNoTtlDeadline);
-        old->set_expire_at_ms(kNoTtlDeadline);
-        untrack_expire(h);
-        return TtlResult::Updated;
+        if (!(old->flags & KvObjFlags::HasTtl)) return TtlResult::NoChange;
+        return rewrite_expire(h, old, -1);
     }
 
     // Returns a WORK count, while `budget` bounds examined expire-index slots. The count is the
-    // number of expired keys removed, plus resize/retirement-capacity debt and sidecar work: half the
+    // number of expired keys removed, plus one while a sidecar move is still in flight: half the
     // index is then parked in the old table, and an owner that treats a barren sampling pass as
     // "nothing to do" parks with those deadlines unsampled until the next command wakes it.
     // Finding an object from its full hash follows only that hash's FlatStore probe run; it never
@@ -1590,29 +918,22 @@ public:
         // Expiry after the cut is a post-cut deletion.  Leaving the object physically present lets
         // traversal serialize its absolute deadline; find() still reports it logically absent.
         if (snapshot_active_) return 0;
-        const bool resizing = rehashing();
-        if (resizing) rehash_step();
-        // Count structural work even without TTL keys, including the final step. Idle owners
-        // must revisit an unfinished resize instead of parking until another command arrives.
-        uint32_t removed = resizing ? 1 : 0;
+        if (rehashing()) rehash_step();
+        uint32_t removed = 0;
         expires_.sample(budget, [&](uint64_t h) {
             KvObj* o = find_hash_in(0, h);
             if (!o && rehashing()) o = find_hash_in(1, h);
-            if (!o || !o->has_ttl_slot()) {
-                untrack_expire(h);       // stale tracker after a replacement or collision
+            if (!o || !(o->flags & KvObjFlags::HasTtl)) {
+                expires_.erase(h);       // stale tracker after a replacement or collision
                 return;
             }
             if (atomic_has_record(h, o->key())) return;  // promotion resolves the winning TTL
-            const int64_t at = deadline(h, o);
-            if (at < 0) { untrack_expire(h); return; }
-            if (at > cached_now_ms_) return;
-            if (!read_retirement_available()) { removed++; return; }
+            if (o->expire_at_ms() > cached_now_ms_) return;
             const Slice key = o->key();
             notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, key);
             (void)aof_.record_delete(key);
             if (erase_in(0, h, key) || (rehashing() && erase_in(1, h, key))) {
                 removed++;
-                note_active_expire_reap(at);
                 if (expired_counter_) (*expired_counter_)++;
             }
         });
@@ -1638,11 +959,10 @@ public:
                 // Key gone, replaced, re-typed, or every field TTL removed. Self-healing here is
                 // what lets registration stay a cheap unconditional insert on the write path.
                 field_expires_.erase(h);
-                refresh_field_ttl_gate();
+                field_ttl_gate_ = field_expires_.size();
                 return;
             }
             if (atomic_has_record(h, o->key())) return;
-            if (!read_retirement_available()) { removed++; return; }
             uint32_t reaped = 0;
             const size_t before = kvobj_size(o);
             const bool empty = hash_ttl_active_reap(*this, o, cached_now_ms_, reaped);
@@ -1650,10 +970,8 @@ public:
             const Slice key = o->key();
             notify_flat_store_emit(this, NOTIFY_HASH, NotifyEventId::Hexpired, key);
             field_expired_ += reaped;
-            // Reaping already shrank the object, including when the last field disappeared.
-            // erase_in() will subtract only the remaining footprint.
-            note_object_size_change(before, kvobj_size(o));
             if (!empty) {
+                note_object_size_change(before, kvobj_size(o));
                 (void)aof_.record_post_image_buffered(*this, h, key);
                 removed += reaped;
                 return;
@@ -1662,7 +980,7 @@ public:
             notify_flat_store_emit(this, NOTIFY_GENERIC, NotifyEventId::Del, key);
             if (erase_in(0, h, key) || (rehashing() && erase_in(1, h, key))) removed += reaped;
             field_expires_.erase(h);
-            refresh_field_ttl_gate();
+            field_ttl_gate_ = field_expires_.size();
         });
         return removed;
     }
@@ -1679,37 +997,33 @@ public:
         // semantics), so the very key being grown always "fits". The gate asks the raw question:
         // is the shard over budget NOW; evict others, never the op's key; else refuse.
         if (accounted_bytes() <= maxmemory_limit_) return true;
-        if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return refuse_over_budget();
+        if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return false;
         uint32_t budget = kEvictionsPerOp;
         while (budget-- && accounted_bytes() > maxmemory_limit_) {
             KvObj* victim = choose_victim(protected_key);
-            if (!victim) return refuse_over_budget();
+            if (!victim) return false;
             const uint64_t hash = hash_key(victim->key());
             const Slice key = victim->key();
             (void)aof_.record_delete(key);
             const uint32_t before = size();
             const bool live = erase(hash, key);
-            if (size() == before) return refuse_over_budget();
+            if (size() == before) return false;
             if (live && evicted_counter_) (*evicted_counter_)++;
         }
-        if (accounted_bytes() <= maxmemory_limit_) return true;
-        return refuse_over_budget();
+        return accounted_bytes() <= maxmemory_limit_;
     }
-
 
     // Takes ownership of `o` only on success; frees anything it displaces.
     InsertResult insert(uint64_t h, KvObj* o) {
-        if (__builtin_expect(read_local_enabled_, false)) return insert_read_local(h, o);
         const bool capturing = rehashing() && snapshot_active_;
         if (rehashing()) {
             if (!capturing) rehash_step();
         } else {
-            if (!maybe_start_grow()) return InsertResult::Failed;
+            maybe_start_grow();
         }
         // Preparation normally has the same cost as the original insert path.  Only an actually
         // full prepared table consults this state and refuses a new key rather than resizing it.
-        if (static_cast<uint64_t>(live_[0]) + tombs_[0] + 1 >= cap_[0] &&
-            snapshot_prepared_ &&
+        if (live_[0] + tombs_[0] + 1 >= cap_[0] && snapshot_prepared_ &&
             !find_in(0, h, o->key())) return InsertResult::Failed;
         if (capturing) {
             const bool exists = find_in(0, h, o->key()) || find_in(1, h, o->key());
@@ -1719,8 +1033,7 @@ public:
             // Count current-table tombstones as promised destination slots too.  Otherwise a
             // churn-heavy capture could leave enough logical capacity but no EMPTY terminating
             // slot, and the post-capture merge would be unable to place a frozen pointer.
-            if (!exists && static_cast<uint64_t>(live_[0]) + tombs_[0] + live_[1] + 1 >=
-                               cap_[0])
+            if (!exists && live_[0] + tombs_[0] + live_[1] + 1 >= cap_[0])
                 return InsertResult::Failed;
         }
         // Disabled maxmemory pays one predicted branch and does no metadata write or accounting
@@ -1745,7 +1058,8 @@ public:
     InsertResult insert_notify(uint64_t h, KvObj* o, FlatNotifySink* sink) {
         KvObj* candidate = find_in(0, h, o->key());
         if (!candidate && rehashing()) candidate = find_in(1, h, o->key());
-        const bool expired = candidate && deadline_elapsed(h, candidate, cached_now_ms_);
+        const bool expired = candidate && (candidate->flags & KvObjFlags::HasTtl) &&
+                             candidate->expire_at_ms() <= cached_now_ms_;
         const bool report_new = !candidate || expired;
         if (expired)
             notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
@@ -1756,7 +1070,6 @@ public:
     }
 
     bool erase(uint64_t h, Slice key) {
-        if (__builtin_expect(read_local_enabled_, false)) return erase_read_local(h, key);
         if (rehashing() && !snapshot_active_) rehash_step();
         bool expired = false;
         if (erase_in(0, h, key, &expired)) {
@@ -1777,7 +1090,8 @@ public:
         KvObj* candidate = find_in(0, h, key);
         if (!candidate && rehashing()) candidate = find_in(1, h, key);
         if (candidate) {
-            const bool expired = deadline_elapsed(h, candidate, cached_now_ms_);
+            const bool expired = (candidate->flags & KvObjFlags::HasTtl) &&
+                                 candidate->expire_at_ms() <= cached_now_ms_;
             if (expired)
                 notify_emit(sink, NOTIFY_EXPIRED, NotifyEventId::Expired, candidate->key());
             else if (event == EraseEvent::Del)
@@ -1799,45 +1113,25 @@ public:
     // FLUSH is intentionally proportional to the table capacity it discards. Borrowed string
     // values move to the existing retirement list, so a send already in flight remains valid.
     void clear() {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            clear_read_local();
-            return;
-        }
-        // Allocate the small replacement before touching either live table. If that cold allocation
-        // fails, retain and zero table 0 after retiring its objects; FLUSH still has a valid empty
-        // table and never exposes a half-demoted state.
-        uint64_t* fresh = allocate_table(1024);
-        expires_.clear();
         for (int t = 0; t < 2; t++) {
             if (!tab_[t]) continue;
             for (uint32_t i = 0; i < cap_[t]; i++)
                 if (KvObj* o = ptr_of(tab_[t][i])) retire_obj(o);
-            if (t == 0 && !fresh) {
-                std::memset(tab_[0], 0, static_cast<size_t>(
-                    static_cast<uint64_t>(cap_[0]) * sizeof(uint64_t)));
-                live_[0] = tombs_[0] = 0;
-                continue;
-            }
             std::free(tab_[t]);
             tab_[t] = nullptr;
             cap_[t] = mask_[t] = live_[t] = tombs_[t] = 0;
         }
+        expires_.clear();
         field_expires_.clear();
         field_ttl_gate_ = 0;
-        field_ttl_index_incomplete_ = false;
         rehash_pos_ = 0;
-        if (fresh) install_empty_table(0, fresh, 1024);
+        alloc_table(0, 1024);
     }
 
     // FLUSH after its scatter gate has prepared every frozen pre-image.  Preserve both table
     // allocations and their slot numbering until the capture walker releases its cursor; turn all
     // live entries into ordinary tombstones instead of freeing the tables as clear() does.
     void clear_during_snapshot() {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            clear_during_snapshot_read_local();
-            return;
-        }
-        expires_.clear();
         for (int t = 0; t < 2; t++) {
             if (!tab_[t]) continue;
             for (uint32_t i = 0; i < cap_[t]; i++) {
@@ -1849,20 +1143,19 @@ public:
                 }
             }
         }
+        expires_.clear();
         field_expires_.clear();
         field_ttl_gate_ = 0;
-        field_ttl_index_incomplete_ = false;
     }
 
     // RANDOMKEY starts from an owner-private draw, independent of the IO-side draw that selected
     // this shard. Reusing that routing draw correlates its low bits with the shard id and leaves
     // physical-slot residue classes unreachable when table capacities are powers of two. Reservoir
     // selection across the one wrapped walk keeps adjacent live slots from inheriting a tiny share
-    // of a sparse table's probability. Resolve the owner's read cut before sampling, including
-    // predecessors whose candidate is a physical deletion. Frozen snapshot objects stay resident.
+    // of a sparse table's probability. Lazy expiry is performed before a key becomes a candidate.
     KvObj* random_live() {
         const uint64_t total = static_cast<uint64_t>(cap_[0]) + cap_[1];
-        if (!total) return nullptr;
+        if (!total || size() == 0) return nullptr;
         const uint64_t start_pos = next_random() % total;
         KvObj* chosen = nullptr;
         uint64_t live_seen = 0;
@@ -1873,20 +1166,16 @@ public:
             const uint32_t slot = static_cast<uint32_t>(pos - (t ? cap_[0] : 0));
             KvObj* o = ptr_of(tab_[t][slot]);
             if (!o) continue;
-            const uint64_t h = hash_key(o->key());
-            if (atomic_pending_ && atomic_pending_->live) {
-                o = atomic_resolve(h, o->key(), atomic_read_epoch_);
-            } else {
-                if (deadline_elapsed(h, o, cached_now_ms_) && !(snapshot_active_ && t == 1))
-                    notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, o->key());
-                o = live_or_expire(t, h, o->key(), o);
+            if (!(o->flags & KvObjFlags::HasTtl) || o->expire_at_ms() > cached_now_ms_) {
+                if (next_random() % ++live_seen == 0) chosen = o;
+                continue;
             }
-            if (o && next_random() % ++live_seen == 0) chosen = o;
+            const uint64_t h = hash_key(o->key());
+            notify_flat_store_emit(this, NOTIFY_EXPIRED, NotifyEventId::Expired, o->key());
+            (void)aof_.record_delete(o->key());
+            erase_in(t, h, o->key());
+            if (expired_counter_) (*expired_counter_)++;
         }
-        atomic_for_each_side_key(atomic_read_epoch_, [&](Slice key) {
-            KvObj* o = atomic_resolve(hash_key(key), key, atomic_read_epoch_);
-            if (o && next_random() % ++live_seen == 0) chosen = o;
-        });
         return chosen;
     }
 
@@ -1900,30 +1189,22 @@ public:
     // entries at our load factor and a full walk costs the same number of round trips it always
     // did. A second, looser budget of 10*COUNT examined SLOTS is what keeps one call bounded when
     // tombstones stretch the probe runs; it is the same pair of budgets SSCAN documents.
-    // `expire_on_visit` distinguishes the two legitimate walkers. SCAN/KEYS keep redis semantics:
-    // a visited dead key is logically expired on the spot (event, AOF delete, erase). ACCOUNTING
-    // walks (the LB bucket-byte census) must pass false: they run from the executor loop at census
-    // cadence, not inside any logical operation, and a census that expires keys performs the
-    // expiry OUTSIDE every in-flight operation's pinned cut -- it physically deleted keys between
-    // the fragments of an MGET fan-out and tore the one-cut-per-logical-operation law (caught by
-    // the expwide battery the first time the census shipped default-on).
     template <typename Fn>
-    uint64_t scan(uint64_t cursor, uint32_t count, Fn&& fn, bool expire_on_visit = true) {
+    uint64_t scan(uint64_t cursor, uint32_t count, Fn&& fn) {
         if (!tab_[0]) return 0;
         const uint64_t slot_budget = static_cast<uint64_t>(count) * 10;
         uint32_t homes = 0;
         uint64_t slots = 0;
         do {
             if (!rehashing()) {
-                slots += scan_home(0, static_cast<uint32_t>(cursor) & mask_[0], fn,
-                                   expire_on_visit);
+                slots += scan_home(0, static_cast<uint32_t>(cursor) & mask_[0], fn);
                 homes++;
                 cursor = scan_cursor_next(cursor, mask_[0]);
             } else if (mask_[0] == mask_[1]) {
                 // Same-size rebuild (tombstone reclaim): identical homes, so one visit each.
                 const uint32_t home = static_cast<uint32_t>(cursor) & mask_[0];
-                slots += scan_home(0, home, fn, expire_on_visit);  // separate statements: both
-                slots += scan_home(1, home, fn, expire_on_visit);  // emit, order must be defined
+                slots += scan_home(0, home, fn);        // separate statements: both visits emit,
+                slots += scan_home(1, home, fn);        // so their order must not be unspecified
                 homes += 2;
                 cursor = scan_cursor_next(cursor, mask_[0]);
             } else {
@@ -1931,12 +1212,10 @@ public:
                 const int large = small ^ 1;                   // shrink puts it in 0
                 const uint64_t small_mask = mask_[small];
                 const uint64_t large_mask = mask_[large];
-                slots += scan_home(small, static_cast<uint32_t>(cursor & small_mask), fn,
-                                   expire_on_visit);
+                slots += scan_home(small, static_cast<uint32_t>(cursor & small_mask), fn);
                 homes++;
                 do {
-                    slots += scan_home(large, static_cast<uint32_t>(cursor & large_mask), fn,
-                                       expire_on_visit);
+                    slots += scan_home(large, static_cast<uint32_t>(cursor & large_mask), fn);
                     homes++;
                     cursor = scan_cursor_next(cursor, large_mask);
                 } while (cursor & (small_mask ^ large_mask));
@@ -1975,47 +1254,8 @@ public:
     }
 
 private:
-    void refresh_field_ttl_gate() {
-        // Once registration was lost, the count is no longer exact until FLUSH. Preserve a
-        // positive gate without reporting an artificial UINT32_MAX population through INFO.
-        field_ttl_gate_ = std::max(field_expires_.size(), uint32_t{field_ttl_index_incomplete_});
-    }
     static constexpr uint32_t kSnapshotRecordTag = 0x44434552;  // "RECD", little endian
     static constexpr uint32_t kSnapshotRecordHeader = 32;
-
-    // Key-expiry tracker registration. The index is hash-only: an entry states that this hash may
-    // carry a deadline, so registration is driven by LOGICAL volatility and a retained-but-
-    // persisted slot must not leave one behind.
-    bool track_expire(uint64_t hash, KvObj* object) {
-        if (!object) return true;
-        const int64_t at = object->expire_at_ms();
-        if (at >= 0) {
-            if (expires_.insert(hash, at)) return true;
-            // An extension may have failed while growing an existing index. A missing sidecar
-            // falls back to the object's deadline; a stale sidecar would expire it too soon.
-            if constexpr (kTtlDeadlineSidecar) expires_.erase(hash);
-            return false;
-        }
-        // The un-TTL'd store never reaches the index at all. Repeated here rather than left to
-        // ExpireIndex::erase() so the CALL goes too, which is most of what it cost.
-        //
-        // The erase itself STAYS, and it is load-bearing. `SET k v EX 10` then `SET k v` clears
-        // the deadline (redis semantics) and this is what takes the hash back out. Two things
-        // break if a stale entry is allowed to survive instead:
-        //   - INFO keyspace `expires` is expires_.size(); tests/expireindex.py asserts that count
-        //     EXACTLY (== n, == 0), so it would over-report until active expiry happened to
-        //     resample the hash;
-        //   - with TOMO_TTL_DEADLINE_SIDECAR=1 (src/store/store_ttl.h) deadline() reads the
-        //     deadline back OUT of this index, so a stale entry resurrects the TTL the SET just
-        //     cleared -- a wrong answer, not a slow one.
-        // Reaping alone would tolerate a false positive (active_expire() cleans stale trackers,
-        // and the index is documented hash-only, "may carry a deadline"); those two do not.
-        if (expires_.size() == 0) return true;
-        expires_.erase(hash);
-        return true;
-    }
-
-    void untrack_expire(uint64_t hash) { expires_.erase(hash); }
 
     struct SnapshotRecordState {
         bool active = false;
@@ -2093,10 +1333,6 @@ private:
     }
 
     void snapshot_progress_record(uint32_t& budget) {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            snapshot_progress_record_read_local(budget);
-            return;
-        }
         SnapshotRecordState& state = snapshot_record_;
         const KvObj* object = state.value.object;
         if (!state.active || !object) { snapshot_failed_ = true; return; }
@@ -2244,74 +1480,45 @@ private:
         }
     }
 
-    bool borrow_index_rebuild() {
-        uint64_t cap = 64;
-        const uint64_t occupancy = static_cast<uint64_t>(borrows_.size());
-        if (occupancy > UINT64_MAX / uint64_t{200}) return false;
-        const uint64_t wanted = occupancy * uint64_t{200};
-        for (;;) {                                             // land near 35% loaded
-            if (cap > UINT64_MAX / uint64_t{70}) return false;
-            if (cap * uint64_t{70} >= wanted) break;
-            if (cap > static_cast<uint64_t>(borrow_idx_.max_size()) / 2) {
-                return false;
-            }
-            cap *= uint64_t{2};
-        }
-        std::vector<uint32_t> fresh;
+    void borrow_index_rebuild() {
+        size_t cap = 64;
+        while (cap * 70 < borrows_.size() * 200) cap <<= 1;   // land near 35% loaded
         try {
-            fresh.assign(static_cast<size_t>(cap), kNoBorrow);
+            borrow_idx_.assign(cap, kNoBorrow);
         } catch (const std::bad_alloc&) {
-            return false;
+            borrow_index_release();       // scan mode; correctness never depended on the index
+            return;
         }
-        const size_t mask = fresh.size() - 1;
-        for (uint32_t i = 0; i < borrows_.size(); i++) {
-            size_t pos = borrow_hash(borrows_[i].ptr) & mask;
-            while (fresh[pos] != kNoBorrow) pos = (pos + 1) & mask;
-            fresh[pos] = i;
-        }
-        borrow_idx_.swap(fresh);
         borrow_tombs_ = 0;
-        return true;
+        for (uint32_t i = 0; i < borrows_.size(); i++) borrow_index_put(borrows_[i].ptr, i);
     }
 
     void borrow_index_added(const char* ptr, uint32_t at) {
         if (borrow_idx_.empty()) {
             if (borrows_.size() < kBorrowIndexMin) return;    // short scan beats a hash
-            (void)borrow_index_rebuild();                     // allocation failure stays scan mode
+            borrow_index_rebuild();
             return;
         }
-        if ((static_cast<uint64_t>(borrows_.size()) + borrow_tombs_) * 100 >=
-            static_cast<uint64_t>(borrow_idx_.size()) * 70) {
-            if (borrow_index_rebuild()) return;
-            // The old index remains valid on allocation failure and still has the trigger's 30%
-            // headroom. Add this borrow there; borrow_index_put() falls back to scan mode if a
-            // pathological tombstone layout nevertheless leaves no usable slot.
+        if ((borrows_.size() + borrow_tombs_) * 100 >= borrow_idx_.size() * 70) {
+            borrow_index_rebuild();
+            return;
         }
         borrow_index_put(ptr, at);
     }
 
-    static uint32_t round_pow2(uint32_t v) {
-        uint32_t p = kMinCap;
-        while (p < v) {
-            const uint64_t next = static_cast<uint64_t>(p) * 2;
-            if (next > UINT32_MAX) return 0;
-            p = static_cast<uint32_t>(next);
-        }
-        return p;
-    }
+    static uint32_t round_pow2(uint32_t v) { uint32_t p = kMinCap; while (p < v) p <<= 1; return p; }
     static uint16_t tag_of(uint64_t h)      { return static_cast<uint16_t>((h >> 49) & 0x7fff); }
     static uint16_t tag_of_word(uint64_t w) { return static_cast<uint16_t>((w >> 49) & 0x7fff); }
     static KvObj*   ptr_of(uint64_t w)      { return reinterpret_cast<KvObj*>(w & kPtrMask); }
     static uint64_t make_word(uint16_t tag, KvObj* o) {
-        const uint64_t pointer = reinterpret_cast<uint64_t>(o);
-        assert((pointer & ~kPtrMask) == 0 && "KvObj pointer exceeds FlatStore's 48-bit encoding");
-        return (static_cast<uint64_t>(tag) << 49) | pointer;
+        return (static_cast<uint64_t>(tag) << 49) | reinterpret_cast<uint64_t>(o);
     }
     uint32_t slot_start(int t, uint64_t h) const { return static_cast<uint32_t>(mix64(h)) & mask_[t]; }
 
     KvObj* find_without_touch(uint64_t h, Slice key) {
-        // Like find(), this lookup never moves slots or retires a rehash table. This also preserves
-        // the positional frozen image in tab_[1] during snapshot capture.
+        // During capture tab_[1] is the positional frozen image. Moving even an unrelated entry
+        // here can carry it past the snapshot cursor and omit it from the BASE.
+        if (rehashing() && !snapshot_active_) rehash_step();
         if (KvObj* o = find_in(0, h, key)) return live_or_expire(0, h, key, o);
         if (rehashing())
             if (KvObj* o = find_in(1, h, key)) return live_or_expire(1, h, key, o);
@@ -2329,10 +1536,6 @@ private:
     uint8_t lru_clock() const { return cached_lru_clock_; }
 
     void initialize_meta(KvObj* o) {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            initialize_meta_read_local(o);
-            return;
-        }
         if (maxmemory_policy_is_lru(maxmemory_policy_)) {
             o->set_eviction_meta(lru_clock());
         } else if (maxmemory_policy_is_lfu(maxmemory_policy_)) {
@@ -2341,10 +1544,6 @@ private:
     }
 
     void touch(KvObj* o) {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            touch_read_local(o);
-            return;
-        }
         if (maxmemory_policy_is_lru(maxmemory_policy_)) {
             o->set_eviction_meta(lru_clock());
             return;
@@ -2386,13 +1585,10 @@ private:
         if (!expires_.random_hash(next_random(), kSampleProbeAttempts, hash)) return nullptr;
         KvObj* o = find_hash_in(0, hash);
         if (!o && rehashing()) o = find_hash_in(1, hash);
-        if (o && deadline(hash, o) < 0) { untrack_expire(hash); return nullptr; }
         return o;
     }
 
     KvObj* choose_victim(Slice protected_key) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return choose_victim_read_local(protected_key);
         KvObj* best = nullptr;
         KvObj* seen[64];
         uint32_t seen_count = 0;
@@ -2400,8 +1596,8 @@ private:
         for (uint32_t i = 0; i < maxmemory_samples_; i++) {
             KvObj* candidate = maxmemory_policy_is_volatile(maxmemory_policy_)
                 ? random_volatile_candidate() : random_allkeys_candidate();
-            if (!candidate || candidate->key().key_eq(protected_key)) continue;
-            if (atomic_needs_version(hash_key(candidate->key()), candidate->key())) continue;
+            if (!candidate || candidate->key() == protected_key) continue;
+            if (atomic_has_record(hash_key(candidate->key()), candidate->key())) continue;
             bool duplicate = false;
             for (uint32_t j = 0; j < seen_count; j++)
                 if (seen[j] == candidate) { duplicate = true; break; }
@@ -2433,7 +1629,7 @@ private:
                 }
                 case MaxmemoryPolicy::VolatileTtl:
                     score = std::numeric_limits<uint64_t>::max() -
-                            static_cast<uint64_t>(deadline(hash_key(candidate->key()), candidate));
+                            static_cast<uint64_t>(candidate->expire_at_ms());
                     break;
                 case MaxmemoryPolicy::NoEviction:
                     return nullptr;
@@ -2441,7 +1637,8 @@ private:
             if (!best || score > best_score) { best = candidate; best_score = score; }
         }
         if (best) {
-            const bool expired = deadline_elapsed(hash_key(best->key()), best, cached_now_ms_);
+            const bool expired = (best->flags & KvObjFlags::HasTtl) &&
+                                 best->expire_at_ms() <= cached_now_ms_;
             notify_flat_store_emit(this,
                 expired ? NOTIFY_EXPIRED : NOTIFY_EVICTED,
                 expired ? NotifyEventId::Expired : NotifyEventId::Evicted, best->key());
@@ -2468,63 +1665,31 @@ private:
         return used + incoming_bytes;
     }
 
-    // The write is about to be REFUSED. Eviction either could not run or did not get this shard
-    // under budget, so the armed-write block cache is the last physical memory we can hand back
-    // before telling the client no. It is deliberately NOT released while eviction is succeeding:
-    // the cache is already bounded by the shard's own live footprint, so releasing it on every
-    // over-budget write would only make the next write allocate again -- the same allocator call
-    // count as before the cache existed, plus the walk. Always returns false, so the refusing
-    // call sites read as one statement.
-    bool refuse_over_budget() {
-        read_local_cache_trim_on_pressure();
-        return false;
-    }
-
     bool make_room_for(Slice protected_key, size_t incoming_bytes) {
-        // Every caller, including same-class overwrite, must preserve unvisited pre-images.
-        if (snapshot_active_) return true;
         if (projected_bytes(protected_key, incoming_bytes) <= maxmemory_limit_) return true;
-        if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return refuse_over_budget();
+        if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return false;
 
         uint32_t budget = kEvictionsPerOp;
         while (budget-- && projected_bytes(protected_key, incoming_bytes) > maxmemory_limit_) {
             KvObj* victim = choose_victim(protected_key);
-            if (!victim) return refuse_over_budget();
+            if (!victim) return false;
             const uint64_t hash = hash_key(victim->key());
             const Slice key = victim->key();
             (void)aof_.record_delete(key);
             const uint32_t before = size();
             const bool live = erase(hash, key);
-            if (size() == before) return refuse_over_budget();
+            if (size() == before) return false;
             if (live && evicted_counter_) (*evicted_counter_)++;
         }
-        if (projected_bytes(protected_key, incoming_bytes) <= maxmemory_limit_) return true;
-        return refuse_over_budget();
+        return projected_bytes(protected_key, incoming_bytes) <= maxmemory_limit_;
     }
 
-    static uint64_t* allocate_table(uint32_t cap) {
-        return static_cast<uint64_t*>(
-            flatstore_table_calloc(cap, sizeof(uint64_t)));  // EMPTY == 0
-    }
-
-    void install_empty_table(int t, uint64_t* table, uint32_t cap) {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            install_empty_table_read_local(t, table, cap);
-            return;
-        }
-        tab_[t]   = table;
+    void alloc_table(int t, uint32_t cap) {
+        tab_[t]   = static_cast<uint64_t*>(std::calloc(cap, sizeof(uint64_t)));  // EMPTY == 0
         cap_[t]   = cap;
         mask_[t]  = cap - 1;
         live_[t]  = 0;
         tombs_[t] = 0;
-    }
-
-    bool alloc_table(int t, uint32_t cap) {
-        uint64_t* fresh = allocate_table(cap);
-        if (!fresh) return false;
-        std::free(tab_[t]);
-        install_empty_table(t, fresh, cap);
-        return true;
     }
 
     // Emit every key whose HOME slot is `home`, wherever linear probing actually put it. Those keys
@@ -2534,7 +1699,7 @@ private:
     // home. Returns slots examined, charged against COUNT, and never zero -- an empty home must
     // still cost the caller one unit or a sparse table would walk itself out in a single call.
     template <typename Fn>
-    uint32_t scan_home(int t, uint32_t home, Fn& fn, bool expire_on_visit) {
+    uint32_t scan_home(int t, uint32_t home, Fn& fn) {
         uint32_t examined = 0;
         uint32_t i = home;
         for (uint32_t probes = 0; probes <= cap_[t]; probes++) {
@@ -2544,20 +1709,17 @@ private:
             KvObj* o = ptr_of(w);
             if (o) {
                 const uint64_t h = hash_key(o->key());
-                if (slot_start(t, h) == home) scan_visit(t, h, o, fn, expire_on_visit);
+                if (slot_start(t, h) == home) scan_visit(t, h, o, fn);
             }
             i = (i + 1) & mask_[t];
         }
         return examined ? examined : 1;
     }
 
-    // The per-key half of a scan step, unchanged from the physical walk it replaces. A walker
-    // with expire_on_visit=false sees the dead entry as-is: accounting walks must have no
-    // logical side effects (see the scan() comment).
+    // The per-key half of a scan step, unchanged from the physical walk it replaces.
     template <typename Fn>
-    void scan_visit(int t, uint64_t h, KvObj* o, Fn& fn, bool expire_on_visit) {
-        if (!expire_on_visit) { fn(o); return; }
-        if (deadline_elapsed(h, o, cached_now_ms_)) {
+    void scan_visit(int t, uint64_t h, KvObj* o, Fn& fn) {
+        if ((o->flags & KvObjFlags::HasTtl) && o->expire_at_ms() <= cached_now_ms_) {
             // An epoch record, not this physical candidate, owns logical expiry and pointer
             // lifetime. The walker callback resolves it at its registered cut.
             if (atomic_has_record(h, o->key())) { fn(o); return; }
@@ -2582,7 +1744,7 @@ private:
             const uint64_t w = tab_[t][i];
             if (w == 0) return nullptr;                     // EMPTY — the only stop
             KvObj* o = ptr_of(w);
-            if (o && tag_of_word(w) == tag && o->key().key_eq(key)) return o;
+            if (o && tag_of_word(w) == tag && o->key() == key) return o;
             i = (i + 1) & mask_[t];
         }
         return nullptr;
@@ -2596,7 +1758,7 @@ private:
             const uint64_t w = tab_[t][i];
             if (w == 0) return nullptr;
             KvObj* o = ptr_of(w);
-            if (o && tag_of_word(w) == tag && o->key().key_eq(key)) { slot = i; return o; }
+            if (o && tag_of_word(w) == tag && o->key() == key) { slot = i; return o; }
             i = (i + 1) & mask_[t];
         }
         return nullptr;
@@ -2610,13 +1772,8 @@ private:
             const uint64_t w = tab_[t][i];
             if (w == 0) return nullptr;
             KvObj* o = ptr_of(w);
-            // The slot flag is a byte on the object line the hash would read anyway; testing it
-            // first spares a full key hash on every slotless key that merely shares the 15-bit
-            // tag. The flag is PHYSICAL now -- a retained slot may hold -1 -- so logical
-            // volatility is decided by the deadline, after the hash has confirmed identity (the
-            // sidecar prototype's probe is keyed by that hash and must not run on a mismatch).
-            if (o && tag_of_word(w) == tag && o->has_ttl_slot() &&
-                hash_key(o->key()) == h && deadline(h, o) >= 0) return o;
+            if (o && tag_of_word(w) == tag && hash_key(o->key()) == h &&
+                (o->flags & KvObjFlags::HasTtl)) return o;
             i = (i + 1) & mask_[t];
         }
         return nullptr;
@@ -2642,26 +1799,16 @@ private:
     KvObj* live_or_expire(int t, uint64_t h, Slice key, KvObj* o) {
         // This is the non-expiring-key tax: one flags branch after the ordinary lookup. No clock
         // read occurs here; the executor refreshed cached_now_ms_ once for its loop pass.
-        if (!o->has_ttl_slot()) return o;
-        const int64_t at = deadline(h, o);
-        if (at < 0 || at > cached_now_ms_) return o;
+        if (!(o->flags & KvObjFlags::HasTtl)) return o;
+        if (o->expire_at_ms() > cached_now_ms_) return o;
         if (snapshot_active_ && t == 1) return nullptr;
-        // Logical expiry never needs reclamation. With a full armed ring, leave the object and
-        // its deadline index resident for owner maintenance. Only the eventual physical delete
-        // emits expiry/AOF/accounting effects; repeated reads cannot enqueue or wait for grace.
-        if (!read_retirement_available()) return nullptr;
         (void)aof_.record_delete(key);
         erase_in(t, h, key);
         if (expired_counter_) (*expired_counter_)++;
         return nullptr;
     }
 
-    // `fresh` means a newly published object: charge its bytes and (re)register its deadline.
-    // The one false caller is rehash_step(), moving an object that is already charged and already
-    // indexed -- the slot word moves, nothing else does.
-    bool insert_into(int t, uint64_t h, KvObj* o, bool fresh) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return insert_into_read_local(t, h, o, fresh);
+    bool insert_into(int t, uint64_t h, KvObj* o, bool track_expire) {
         const uint16_t tag = tag_of(h);
         const Slice    key = o->key();
         uint32_t i = slot_start(t, h);
@@ -2672,27 +1819,26 @@ private:
                 if (first_tomb >= 0) { tab_[t][first_tomb] = make_word(tag, o); tombs_[t]--; }
                 else                 { tab_[t][i] = make_word(tag, o); }
                 live_[t]++;
-                if (fresh) {
-                    obj_bytes_ += kvobj_size(o);
-                    (void)this->track_expire(h, o);
+                obj_bytes_ += kvobj_size(o);
+                if (track_expire) {
+                    if (o->flags & KvObjFlags::HasTtl) expires_.insert(h);
+                    else                                  expires_.erase(h);
                 }
                 return true;
             }
             KvObj* cur = ptr_of(w);
             if (!cur) { if (first_tomb < 0) first_tomb = static_cast<int32_t>(i); }
-            // The ONE key-equality site left on memcmp, and it is measured, not an oversight.
-            // This loop holds enough live state that inlining the byte compare cost 13
-            // instructions of extra spill on EVERY first insert -- more than the compare saves,
-            // and the compare itself almost never runs (it needs a 15-bit tag match: a real
-            // replacement or a collision). Both spellings are exact byte equality over the same
-            // bytes, so no path can answer differently; only the inlining policy differs.
             else if (tag_of_word(w) == tag && cur->key() == key) {
-                if (fresh && deadline_elapsed(h, cur, cached_now_ms_) && expired_counter_)
+                if (track_expire && (cur->flags & KvObjFlags::HasTtl) &&
+                    cur->expire_at_ms() <= cached_now_ms_ && expired_counter_)
                     (*expired_counter_)++;
-                if (fresh) (void)this->track_expire(h, o);
                 retire_obj(cur);                            // replace in place; live_ unchanged
+                obj_bytes_ += kvobj_size(o);
                 tab_[t][i] = make_word(tag, o);
-                if (fresh) obj_bytes_ += kvobj_size(o);
+                if (track_expire) {
+                    if (o->flags & KvObjFlags::HasTtl) expires_.insert(h);
+                    else                                  expires_.erase(h);
+                }
                 return true;
             }
             i = (i + 1) & mask_[t];
@@ -2707,8 +1853,6 @@ private:
     }
 
     bool erase_in(int t, uint64_t h, Slice key, bool* was_expired = nullptr) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return erase_in_read_local(t, h, key, was_expired);
         if (!tab_[t]) return false;
         const uint16_t tag = tag_of(h);
         uint32_t i = slot_start(t, h);
@@ -2716,14 +1860,15 @@ private:
             const uint64_t w = tab_[t][i];
             if (w == 0) return false;
             KvObj* o = ptr_of(w);
-            if (o && tag_of_word(w) == tag && o->key().key_eq(key)) {
+            if (o && tag_of_word(w) == tag && o->key() == key) {
                 if (was_expired) {
-                    *was_expired = deadline_elapsed(h, o, cached_now_ms_);
+                    *was_expired = (o->flags & KvObjFlags::HasTtl) &&
+                                   o->expire_at_ms() <= cached_now_ms_;
                 }
-                untrack_expire(h);
                 retire_obj(o);
                 tab_[t][i] = kTombBit;                      // DEAD: non-zero, ptr == 0
                 live_[t]--; tombs_[t]++;
+                expires_.erase(h);
                 return true;
             }
             i = (i + 1) & mask_[t];
@@ -2732,8 +1877,6 @@ private:
     }
 
     TtlResult rewrite_expire(uint64_t h, KvObj* old, int64_t expire_at_ms) {
-        if (__builtin_expect(read_local_enabled_, false))
-            return rewrite_expire_read_local(h, old, expire_at_ms);
         KvObj* replacement = kvobj_reheader(old, expire_at_ms);
         if (!replacement) return TtlResult::Oom;
         if (maxmemory_enabled_) replacement->set_eviction_meta(old->eviction_meta());
@@ -2757,966 +1900,35 @@ private:
         return TtlResult::Updated;
     }
 
-    OverwriteResult try_overwrite_read_local(uint64_t h, Slice key, Slice val) {
-        if constexpr (!kReadLocalSetTaxAtomicRaw) {
-            // OFF and variant B keep published values immutable for the whole grace period.
-            return OverwriteResult::NotPossible;
-        }
-
-        KvObj* object = find_without_touch(h, key);
-        if (!object) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_missing++;
-#endif
-            return OverwriteResult::NotPossible;
-        }
-        if (object->encoding() != Enc::Raw) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_encoding++;
-#endif
-            return OverwriteResult::NotPossible;
-        }
-        if (object->flags & KvObjFlags::HasTtl) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_ttl++;
-#endif
-            return OverwriteResult::NotPossible;  // SET clears TTL
-        }
-        if (val.n > kEmbedThreshold) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_oversize++;
-#endif
-            return OverwriteResult::NotPossible;  // becomes Extern
-        }
-        const size_t wanted = kvobj_alloc_size(object->klen(), val.n, false, Enc::Raw);
-        if (good_size(wanted) != kvobj_capacity(object)) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_size_class++;
-#endif
-            return OverwriteResult::NotPossible;
-        }
-        if (outstanding_borrows_ && is_borrowed(object->str_data())) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_borrowed++;
-#endif
-            return OverwriteResult::NotPossible;
-        }
-
-        if (__builtin_expect(maxmemory_enabled_, false)) {
-            if (!make_room_for(key, good_size(wanted))) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                settax_stats().overwrite_maxmemory_oom++;
-#endif
-                return OverwriteResult::MaxmemoryOom;
-            }
-            touch(object);
-        }
-
-        const uint32_t previous_length = kvobj_read_local_raw_length(object);
-        if constexpr (kReadLocalSetTaxVariant == ReadLocalSetTaxVariant::SequenceOverwrite) {
-            // Legacy selector 1 intentionally reuses the table publication word. Its unrelated-key
-            // retry tax is the round-1 control; selector 3 below never touches table generation.
-            ReadLocalTableGuard legacy_shard_sequence(*this);
-            if (previous_length == val.n) {
-                kvobj_write_read_local_raw(object, val);
-                return OverwriteResult::Updated;
-            }
-            obj_bytes_ -= kvobj_size(object);
-            kvobj_write_read_local_raw(object, val);
-            std::atomic_ref<uint32_t>(object->vlen).store(val.n, std::memory_order_relaxed);
-            obj_bytes_ += kvobj_size(object);
-            return OverwriteResult::Updated;
-        }
-
-        // Selector 3 overlays Raw's otherwise-unneeded vlen word with a full u32 object sequence;
-        // the bounded length occupies the byte freed by packing Type+Enc. Saturate into immutable
-        // replacement rather than wrap: even a preempted reader can therefore never accept ABA.
-        const uint32_t sequence = object->raw_sequence_relaxed();
-        if (sequence & 1u) std::abort();       // one shard owner means no concurrent writer
-        if (sequence >= UINT32_MAX - 1u) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().reject_sequence_saturated++;
-#endif
-            return OverwriteResult::NotPossible;
-        }
-        object->open_raw_sequence(sequence);
-        // The release fence after publishing odd keeps every following relaxed cell store on the
-        // far side of the open marker. One shard owner makes locked RMWs unnecessary here.
-        std::atomic_thread_fence(std::memory_order_release);
-        kvobj_write_read_local_raw(object, val);
-        if (previous_length != val.n) object->store_raw_length_relaxed(val.n);
-        object->close_raw_sequence(sequence);
-        // The old/new request sizes are in the same allocator class by the eligibility check above;
-        // Raw has no external allocation, so resident accounting is exactly unchanged.
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        settax_stats().overwrite_hits++;
-#endif
-        return OverwriteResult::Updated;
-    }
-
-    bool snapshot_mark_read_local(int32_t shard_id, int64_t cut_ms) {
-        if (!snapshot_prepared_ || snapshot_active_ || rehashing()) return false;
-        ReadLocalTableGuard table_change(*this);
-        read_local_topology_store(&tab_[1], tab_[0]);
-        read_local_topology_store(&cap_[1], cap_[0]);
-        read_local_topology_store(&mask_[1], mask_[0]);
-        live_[1] = live_[0]; tombs_[1] = tombs_[0];
-        read_local_topology_store(&tab_[0], snapshot_new_tab_);
-        read_local_topology_store(&cap_[0], snapshot_new_cap_);
-        read_local_topology_store(&mask_[0], snapshot_new_cap_ - 1);
-        live_[0] = tombs_[0] = 0;
-        snapshot_new_tab_ = nullptr; snapshot_new_cap_ = 0; snapshot_prepared_ = false;
-        rehash_pos_ = 0;
-        snapshot_active_ = true;
-        snapshot_shard_id_ = shard_id;
-        snapshot_cut_ms_ = cut_ms;
-        snapshot_pos_ = 0;
-        snapshot_sequence_ = 0;
-        snapshot_failed_ = false;
-        snapshot_finished_ = false;
-        snapshot_build_ = make_snapshot_chunk(SnapshotFrameBegin);
-        snapshot_ready_.reset();
-        snapshot_record_ = {};
-        return snapshot_build_ != nullptr;
-    }
-
-    SnapshotWriteResult snapshot_prepare_write_read_local(uint64_t h, Slice key) {
-        if (!snapshot_active_) return SnapshotWriteResult::Ready;
-        if (snapshot_failed_) return SnapshotWriteResult::Error;
-        if (find_in(0, h, key)) return SnapshotWriteResult::Ready;
-        uint32_t slot = 0;
-        KvObj* object = find_slot_in(1, h, key, slot);
-        if (!object || slot < snapshot_pos_ || (tab_[1][slot] & kTombBit))
-            return SnapshotWriteResult::Ready;
-        if (deadline_elapsed(h, object, snapshot_cut_ms_)) {
-            read_local_slot_store(&tab_[1][slot], tab_[1][slot] | kTombBit);
-            return SnapshotWriteResult::Ready;
-        }
-        if (snapshot_record_.active) return SnapshotWriteResult::Pending;
-        if (!snapshot_start_record(object, slot, true)) return SnapshotWriteResult::Error;
-        snapshot_preimages_++;
-        return SnapshotWriteResult::Pending;
-    }
-
-    uint32_t snapshot_progress_read_local(uint32_t byte_budget, uint32_t slot_budget) {
-        if (!snapshot_active_ || snapshot_failed_ || snapshot_ready_) return 0;
-        uint32_t work = 0;
-        while (byte_budget && !snapshot_ready_ && !snapshot_failed_) {
-            if (snapshot_record_.active) {
-                const uint32_t before = byte_budget;
-                snapshot_progress_record_read_local(byte_budget);
-                work += before - byte_budget;
-                if (snapshot_record_.active || snapshot_ready_) break;
-                continue;
-            }
-            if (snapshot_pos_ >= cap_[1]) {
-                snapshot_finish_stream();
-                break;
-            }
-            if (!slot_budget) break;
-            const uint32_t slot = snapshot_pos_;
-            const uint64_t word = tab_[1][slot];
-            KvObj* object = ptr_of(word);
-            slot_budget--; work++;
-            if (!object) { snapshot_pos_++; continue; }
-            if (word & kTombBit) {
-                read_local_slot_store(&tab_[1][slot], word & ~kTombBit);
-                snapshot_pos_++;
-                continue;
-            }
-            if (deadline_elapsed(hash_key(object->key()), object, snapshot_cut_ms_)) {
-                snapshot_pos_++;
-                continue;
-            }
-            if (!snapshot_start_record(object, slot, false)) break;
-        }
-        return work;
-    }
-
-    void snapshot_progress_record_read_local(uint32_t& budget) {
-        SnapshotRecordState& state = snapshot_record_;
-        const KvObj* object = state.value.object;
-        if (!state.active || !object) { snapshot_failed_ = true; return; }
-
-        if (state.header_offset < kSnapshotRecordHeader) {
-            const uint32_t n = snapshot_emit(state.header + state.header_offset,
-                                             kSnapshotRecordHeader - state.header_offset, budget);
-            state.header_offset += n;
-            if (state.header_offset != kSnapshotRecordHeader || snapshot_ready_) return;
-        }
-        if (state.key_offset < object->klen()) {
-            const uint32_t n = snapshot_emit(
-                reinterpret_cast<const uint8_t*>(object->key_ptr()) + state.key_offset,
-                object->klen() - state.key_offset, budget);
-            state.key_offset += n;
-            if (state.key_offset != object->klen() || snapshot_ready_) return;
-        }
-        while (state.value.offset < state.value.total && budget && !snapshot_ready_) {
-            if (!snapshot_build_) snapshot_build_ = make_snapshot_chunk(0);
-            if (!snapshot_build_) return;
-            const size_t room = kSnapshotChunkBytes - snapshot_build_->bytes.size();
-            const size_t capacity = std::min<size_t>(room, budget);
-            const size_t old_size = snapshot_build_->bytes.size();
-            try {
-                snapshot_build_->bytes.resize(old_size + capacity);
-            } catch (const std::bad_alloc&) {
-                snapshot_failed_ = true;
-                return;
-            }
-            size_t written = 0;
-            const SnapshotHookStatus status = state.hooks.read_save(
-                state.value, snapshot_build_->bytes.data() + old_size, capacity, written);
-            if (status != SnapshotHookStatus::Ok || written > capacity ||
-                (written == 0 && state.value.offset < state.value.total)) {
-                snapshot_build_->bytes.resize(old_size);
-                snapshot_failed_ = true;
-                return;
-            }
-            snapshot_build_->bytes.resize(old_size + written);
-            budget -= static_cast<uint32_t>(written);
-            if (snapshot_build_->bytes.size() == kSnapshotChunkBytes) snapshot_seal(0);
-        }
-        if (state.value.offset != state.value.total || snapshot_ready_) return;
-
-        const bool preimage = state.preimage;
-        const uint32_t slot = state.slot;
-        snapshot_record_ = {};
-        if (preimage) {
-            read_local_slot_store(&tab_[1][slot], tab_[1][slot] | kTombBit);
-        } else {
-            snapshot_pos_++;
-        }
-    }
-
-    TtlResult set_expire_read_local(uint64_t h, Slice key, int64_t expire_at_ms) {
-        KvObj* old = find(h, key);
-        if (!old) return TtlResult::Missing;
-        return rewrite_expire_read_local(h, old, expire_at_ms);
-    }
-
-    TtlResult set_expire_notify_read_local(uint64_t h, Slice key, int64_t expire_at_ms,
-                                           FlatNotifySink* sink) {
-        KvObj* old = find_notify(h, key, sink);
-        if (!old) return TtlResult::Missing;
-        return rewrite_expire_read_local(h, old, expire_at_ms);
-    }
-
-    InsertResult insert_read_local(uint64_t h, KvObj* o) {
-        const bool capturing = rehashing() && snapshot_active_;
-        if (rehashing()) {
-            if (!capturing) rehash_step_read_local();
-        } else {
-            if (!maybe_start_grow()) return InsertResult::Failed;
-        }
-        if (static_cast<uint64_t>(live_[0]) + tombs_[0] + 1 >= cap_[0] &&
-            snapshot_prepared_ &&
-            !find_in(0, h, o->key())) return InsertResult::Failed;
-        if (capturing) {
-            const bool exists = find_in(0, h, o->key()) || find_in(1, h, o->key());
-            if (!exists && static_cast<uint64_t>(live_[0]) + tombs_[0] + live_[1] + 1 >=
-                               cap_[0])
-                return InsertResult::Failed;
-        }
-        if (__builtin_expect(maxmemory_enabled_, false) && !snapshot_active_) {
-            if (!make_room_for(o->key(), kvobj_size(o))) return InsertResult::MaxmemoryOom;
-            if (o->eviction_meta() == 0) initialize_meta_read_local(o);
-        }
-        const bool moves_from_old = rehashing() && find_in(1, h, o->key()) != nullptr;
-        ReadLocalTableGuard table_move(*this, moves_from_old);
-        if (rehashing()) {
-            bool expired = false;
-            if (erase_in_read_local(1, h, o->key(), &expired) && expired && expired_counter_)
-                (*expired_counter_)++;
-        }
-        return insert_into_read_local(0, h, o, true)
-            ? InsertResult::Inserted : InsertResult::Failed;
-    }
-
-    bool erase_read_local(uint64_t h, Slice key) {
-        if (rehashing() && !snapshot_active_) rehash_step_read_local();
-        bool expired = false;
-        if (erase_in_read_local(0, h, key, &expired)) {
-            maybe_start_shrink();
-            if (expired && expired_counter_) (*expired_counter_)++;
-            return !expired;
-        }
-        if (rehashing() && erase_in_read_local(1, h, key, &expired)) {
-            maybe_start_shrink();
-            if (expired && expired_counter_) (*expired_counter_)++;
-            return !expired;
-        }
-        return false;
-    }
-
-    void clear_read_local() {
-        uint64_t* fresh = allocate_table(1024);
-        // A clear rewrites every answer without naming a key. Poison the per-key filter for its
-        // duration so a multi-key local read straddling it sees every cell epoch move; the poison
-        // opens before the first slot store and closes after the table bracket below.
-        ForeignReadPoisonGuard broad_change(*this);
-        ReadLocalTableGuard table_change(*this);
-        expires_.clear();
-        for (int t = 0; t < 2; t++) {
-            if (!tab_[t]) continue;
-            for (uint32_t i = 0; i < cap_[t]; i++) {
-                if (KvObj* object = ptr_of(tab_[t][i])) {
-                    read_local_slot_store(&tab_[t][i], kTombBit);
-                    retire_obj_read_local(object);
-                }
-            }
-            if (t == 0 && !fresh) {
-                for (uint32_t i = 0; i < cap_[0]; i++)
-                    read_local_slot_store(&tab_[0][i], 0);
-                live_[0] = tombs_[0] = 0;
-                continue;
-            }
-            uint64_t* retired = tab_[t];
-            read_local_topology_store(&tab_[t], static_cast<uint64_t*>(nullptr));
-            read_local_topology_store(&cap_[t], uint32_t{0});
-            read_local_topology_store(&mask_[t], uint32_t{0});
-            live_[t] = tombs_[t] = 0;
-            retire_table_read_local(retired);
-        }
-        field_expires_.clear();
-        field_ttl_gate_ = 0;
-        field_ttl_index_incomplete_ = false;
-        rehash_pos_ = 0;
-        // The keyspace this cache was serving has gone. Nothing is about to ask for those blocks,
-        // and the per-put ceiling would refuse new ones anyway (obj_bytes_ is now 0), so hand them
-        // straight back rather than holding them until the next write pressure.
-        read_local_cache_release_all();
-        read_local_store_state_armed().resize_retirement.reset();
-        if (fresh) install_empty_table_read_local(0, fresh, 1024);
-    }
-
-    void clear_during_snapshot_read_local() {
-        ForeignReadPoisonGuard broad_change(*this);
-        ReadLocalTableGuard table_change(*this);
-        expires_.clear();
-        for (int t = 0; t < 2; t++) {
-            if (!tab_[t]) continue;
-            for (uint32_t i = 0; i < cap_[t]; i++) {
-                if (KvObj* object = ptr_of(tab_[t][i])) {
-                    read_local_slot_store(&tab_[t][i], kTombBit);
-                    retire_obj_read_local(object);
-                    live_[t]--;
-                    tombs_[t]++;
-                }
-            }
-        }
-        field_expires_.clear();
-        field_ttl_gate_ = 0;
-        field_ttl_index_incomplete_ = false;
-    }
-
-    void initialize_meta_read_local(KvObj* o) {
-        if (maxmemory_policy_is_lru(maxmemory_policy_)) {
-            write_eviction_meta_read_local(o, lru_clock());
-        } else if (maxmemory_policy_is_lfu(maxmemory_policy_)) {
-            write_eviction_meta_read_local(o, 5);
-        }
-    }
-
-    void touch_read_local(KvObj* o) {
-        if (maxmemory_policy_is_lru(maxmemory_policy_)) {
-            write_eviction_meta_read_local(o, lru_clock());
-            return;
-        }
-        if (!maxmemory_policy_is_lfu(maxmemory_policy_)) return;
-
-        uint8_t count = o->eviction_meta();
-        if (count == 0) count = 5;
-        const uint32_t base = count > 5 ? static_cast<uint32_t>(count - 5) : 0;
-        const uint32_t denominator = base * 10 + 1;
-        if (count < 31 && next_random() % denominator == 0) count++;
-        write_eviction_meta_read_local(o, count);
-    }
-
-    KvObj* choose_victim_read_local(Slice protected_key) {
-        KvObj* best = nullptr;
-        KvObj* seen[64];
-        uint32_t seen_count = 0;
-        uint64_t best_score = 0;
-        for (uint32_t i = 0; i < maxmemory_samples_; i++) {
-            KvObj* candidate = maxmemory_policy_is_volatile(maxmemory_policy_)
-                ? random_volatile_candidate() : random_allkeys_candidate();
-            if (!candidate || candidate->key().key_eq(protected_key)) continue;
-            if (atomic_needs_version(hash_key(candidate->key()), candidate->key())) continue;
-            bool duplicate = false;
-            for (uint32_t j = 0; j < seen_count; j++)
-                if (seen[j] == candidate) { duplicate = true; break; }
-            if (duplicate) continue;
-            seen[seen_count++] = candidate;
-
-            uint64_t score = 0;
-            switch (maxmemory_policy_) {
-                case MaxmemoryPolicy::AllKeysRandom:
-                case MaxmemoryPolicy::VolatileRandom:
-                    score = next_random();
-                    break;
-                case MaxmemoryPolicy::AllKeysLru:
-                case MaxmemoryPolicy::VolatileLru: {
-                    const uint8_t age = static_cast<uint8_t>(
-                        (lru_clock() - candidate->eviction_meta()) & 0x1f);
-                    score = (static_cast<uint64_t>(age) << 56) |
-                            (next_random() & ((1ULL << 56) - 1));
-                    break;
-                }
-                case MaxmemoryPolicy::AllKeysLfu:
-                case MaxmemoryPolicy::VolatileLfu: {
-                    uint8_t count = candidate->eviction_meta();
-                    if (count) write_eviction_meta_read_local(candidate, --count);
-                    score = (static_cast<uint64_t>(31 - count) << 56) |
-                            (next_random() & ((1ULL << 56) - 1));
-                    break;
-                }
-                case MaxmemoryPolicy::VolatileTtl:
-                    score = std::numeric_limits<uint64_t>::max() -
-                            static_cast<uint64_t>(deadline(hash_key(candidate->key()), candidate));
-                    break;
-                case MaxmemoryPolicy::NoEviction:
-                    return nullptr;
-            }
-            if (!best || score > best_score) { best = candidate; best_score = score; }
-        }
-        if (best) {
-            const bool expired = deadline_elapsed(hash_key(best->key()), best, cached_now_ms_);
-            notify_flat_store_emit(this,
-                expired ? NOTIFY_EXPIRED : NOTIFY_EVICTED,
-                expired ? NotifyEventId::Expired : NotifyEventId::Evicted, best->key());
-        }
-        return best;
-    }
-
-    void install_empty_table_read_local(int t, uint64_t* table, uint32_t cap) {
-        ReadLocalTableGuard table_change(*this);
-        read_local_topology_store(&tab_[t], table);
-        read_local_topology_store(&cap_[t], cap);
-        read_local_topology_store(&mask_[t], cap - 1);
-        live_[t]  = 0;
-        tombs_[t] = 0;
-    }
-
-    bool insert_into_read_local(int t, uint64_t h, KvObj* o, bool track_expire) {
-        const uint16_t tag = tag_of(h);
-        const Slice    key = o->key();
-        uint32_t i = slot_start(t, h);
-        int32_t  first_tomb = -1;
-        for (uint32_t probes = 0; probes <= cap_[t]; probes++) {
-            const uint64_t w = tab_[t][i];
-            if (w == 0) {
-                if (first_tomb >= 0) {
-                    read_local_slot_store(&tab_[t][first_tomb], make_word(tag, o));
-                    tombs_[t]--;
-                } else {
-                    read_local_slot_store(&tab_[t][i], make_word(tag, o));
-                }
-                live_[t]++;
-                const size_t added_bytes = kvobj_capacity(o) + read_local_external_bytes(o);
-                obj_bytes_ += added_bytes;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                settax_stats().accounting_add_calls++;
-                settax_stats().accounting_bytes += added_bytes;
-#endif
-                if (track_expire) {
-                    (void)this->track_expire(h, o);
-                    if (o->expire_at_ms() < 0) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                        settax_stats().expire_erases++;
-#endif
-                    }
-                }
-                return true;
-            }
-            KvObj* cur = ptr_of(w);
-            if (!cur) { if (first_tomb < 0) first_tomb = static_cast<int32_t>(i); }
-            // Same measured exception as insert_into: memcmp here, not the inline compare.
-            else if (tag_of_word(w) == tag && cur->key() == key) {
-                if (track_expire && deadline_elapsed(h, cur, cached_now_ms_) && expired_counter_)
-                    (*expired_counter_)++;
-                // An acquiring reader that starts after the retirement stamp must no longer be
-                // able to acquire the displaced pointer.
-                if (track_expire) (void)this->track_expire(h, o);
-                read_local_slot_store(&tab_[t][i], make_word(tag, o));
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                settax_stats().slot_replacements++;
-#endif
-                retire_obj_read_local(cur);
-                const size_t added_bytes = kvobj_capacity(o) + read_local_external_bytes(o);
-                obj_bytes_ += added_bytes;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                settax_stats().accounting_add_calls++;
-                settax_stats().accounting_bytes += added_bytes;
-#endif
-                if (track_expire && o->expire_at_ms() < 0) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                    settax_stats().expire_erases++;
-#endif
-                }
-                return true;
-            }
-            i = (i + 1) & mask_[t];
-        }
-        return false;
-    }
-
-    bool erase_in_read_local(int t, uint64_t h, Slice key, bool* was_expired = nullptr) {
-        if (!tab_[t]) return false;
-        const uint16_t tag = tag_of(h);
-        uint32_t i = slot_start(t, h);
-        for (uint32_t probes = 0; probes <= cap_[t]; probes++) {
-            const uint64_t w = tab_[t][i];
-            if (w == 0) return false;
-            KvObj* o = ptr_of(w);
-            if (o && tag_of_word(w) == tag && o->key().key_eq(key)) {
-                if (was_expired) {
-                    *was_expired = deadline_elapsed(h, o, cached_now_ms_);
-                }
-                untrack_expire(h);
-                read_local_slot_store(&tab_[t][i], kTombBit);
-                retire_obj_read_local(o);
-                live_[t]--; tombs_[t]++;
-                return true;
-            }
-            i = (i + 1) & mask_[t];
-        }
-        return false;
-    }
-
-    TtlResult rewrite_expire_read_local(uint64_t h, KvObj* old, int64_t expire_at_ms) {
-        KvObj* replacement = kvobj_reheader(old, expire_at_ms);
-        if (!replacement) return TtlResult::Oom;
-        if (maxmemory_enabled_) replacement->set_eviction_meta(old->eviction_meta());
-
-        const bool moves_collection = static_cast<Type>(old->type) != Type::String &&
-                                      static_cast<Enc>(old->enc) == Enc::Extern;
-        if (moves_collection) {
-            write_object_flags_read_local(old, static_cast<uint8_t>(
-                old->flags & static_cast<uint8_t>(~KvObjFlags::OwnsExtern)));
-            write_object_flags_read_local(
-                replacement, static_cast<uint8_t>(replacement->flags | KvObjFlags::OwnsExtern));
-        }
-        const InsertResult inserted = insert_read_local(h, replacement);
-        if (inserted != InsertResult::Inserted) {
-            if (moves_collection) {
-                write_object_flags_read_local(
-                    old, static_cast<uint8_t>(old->flags | KvObjFlags::OwnsExtern));
-                write_object_flags_read_local(replacement, static_cast<uint8_t>(
-                    replacement->flags & static_cast<uint8_t>(~KvObjFlags::OwnsExtern)));
-            }
-            kvobj_free(replacement);
-            return inserted == InsertResult::MaxmemoryOom
-                ? TtlResult::MaxmemoryOom : TtlResult::Oom;
-        }
-        return TtlResult::Updated;
-    }
-
-    // kvobj_external_bytes() is out of line and switches on type. One byte of the header (already
-    // hot: the key compare loaded it) decides whether anything lives outside the block, so test it
-    // here and pay the call only for Enc::Extern. Same value as kvobj_size(o) - kvobj_capacity(o).
-    static size_t read_local_external_bytes(const KvObj* object) {
-        return static_cast<Enc>(object->enc) == Enc::Extern ? kvobj_external_bytes(object) : 0;
-    }
-
-    // Decode the header ONCE, exactly as unarmed retire_obj() does: the size class computed for
-    // accounting is also the sized-free length. It travels to the reclaim callback as the ring's
-    // auxiliary word, so the free after the grace period does not re-derive it from a header that
-    // has gone cold. A published object is immutable (variant 0), and eviction-meta updates keep
-    // the layout bits, so the class cannot change between retire and reclaim.
-    void retire_obj_read_local(KvObj* object) {
-        const size_t capacity = kvobj_capacity(object);
-        const size_t bytes = capacity + read_local_external_bytes(object);
-        obj_bytes_ -= bytes;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        settax_stats().accounting_sub_calls++;
-        settax_stats().accounting_bytes += bytes;
-#endif
-        read_local_store_state_armed().retire_sink.retire(
-            this, object, capacity, &FlatStore::read_local_reclaim_object);
-    }
-
-    bool start_rehash_read_local(uint32_t newcap) {
-        if (rehashing()) return true;
-        if (newcap < kMinCap) newcap = kMinCap;
-        uint64_t* fresh = allocate_table(newcap);
-        if (!fresh) return false;
-        if (!prepare_resize_retirement()) { std::free(fresh); return false; }
-        ReadLocalTableGuard table_change(*this);
-        if (rehash_counter_) (*rehash_counter_)++;
-        read_local_topology_store(&tab_[1], tab_[0]);
-        read_local_topology_store(&cap_[1], cap_[0]);
-        read_local_topology_store(&mask_[1], mask_[0]);
-        live_[1] = live_[0]; tombs_[1] = tombs_[0];
-        install_empty_table_read_local(0, fresh, newcap);
-        rehash_pos_ = 0;
-        return true;
-    }
-
-    void rehash_step_read_local() {
-        ReadLocalTableGuard table_change(*this);
-        uint32_t budget = kRehashSlotsPerOp;
-        while (budget && rehash_pos_ < cap_[1]) {
-            const uint64_t w = tab_[1][rehash_pos_];
-            if (KvObj* o = ptr_of(w)) {
-                // Publish the destination before withdrawing the old slot. A refused insertion
-                // must leave its source and accounting intact.
-                if (!insert_into_read_local(0, hash_key(o->key()), o, false)) return;
-                read_local_slot_store(&tab_[1][rehash_pos_], kTombBit);
-                live_[1]--; tombs_[1]++;
-                obj_bytes_ -= kvobj_size(o);
-            }
-            rehash_pos_++;
-            budget--;
-        }
-        if (rehash_pos_ >= cap_[1]) {
-            uint64_t* retired = tab_[1];
-            read_local_topology_store(&tab_[1], static_cast<uint64_t*>(nullptr));
-            read_local_topology_store(&cap_[1], uint32_t{0});
-            read_local_topology_store(&mask_[1], uint32_t{0});
-            live_[1] = 0; tombs_[1] = 0;
-            rehash_pos_ = 0;
-            auto& state = read_local_store_state_armed();
-            if (state.retire_sink.defer_resize) {
-                if (!state.resize_retirement) std::abort();
-                state.retire_sink.defer_resize(state.retire_sink.context,
-                                              state.resize_retirement.release(), retired);
-            } else {
-                retire_table_read_local(retired); // synchronous serverless sink
-            }
-        }
-    }
-
-    bool prepare_resize_retirement() {
-        auto& record = read_local_store_state_required().resize_retirement;
-        if (!record) record.reset(new (std::nothrow) ResizeRetirement);
-        return record != nullptr;
-    }
-
-    template <typename T>
-    void read_local_topology_store(T* location, T value) {
-        if (!read_local_enabled_ ||
-            !read_local_store_state_required().table_mutation_depth) std::abort();
-        __atomic_store_n(location, value, __ATOMIC_RELEASE);
-    }
-
-    // Slot words publish immutable objects. A release store plus QSBR lifetime is sufficient; only a
-    // multi-slot/table move needs the topology bracket above. Every caller is an *_read_local body
-    // reached through a read_local_enabled_ dispatch, so the latch is not re-tested here (it was one
-    // load + branch per publication, and a release store on an unarmed table would be harmless).
-    static void read_local_slot_store(uint64_t* location, uint64_t value) {
-        __atomic_store_n(location, value, __ATOMIC_RELEASE);
-    }
-
-    static uint64_t read_local_slot_load(const uint64_t* location) {
-        return __atomic_load_n(location, __ATOMIC_ACQUIRE);
-    }
-
-    static bool read_local_probe_sequence_equal(uint64_t first, uint64_t second) {
-        // The legacy pending bit is an independent owner-fallback hint. Per-key filter publication
-        // may toggle it for an unrelated key without changing topology, so it is not part of the
-        // point-probe seqlock comparison.
-        return ((first ^ second) & ~kReadLocalPendingBit) == 0;
-    }
-
-    bool read_local_snapshot_topology(uint64_t state, ReadLocalTopology& topology) const {
-        for (int table = 0; table < 2; table++) {
-            topology.tables[table].slots = __atomic_load_n(&tab_[table], __ATOMIC_ACQUIRE);
-            topology.tables[table].cap = __atomic_load_n(&cap_[table], __ATOMIC_ACQUIRE);
-            topology.tables[table].mask = __atomic_load_n(&mask_[table], __ATOMIC_ACQUIRE);
-        }
-        // Validate before using a pointer/capacity pair. A final validation alone is too late: a
-        // mixed grow/shrink snapshot could otherwise calculate an out-of-bounds slot first.
-        return read_local_probe_sequence_equal(read_local_state_acquire(), state);
-    }
-
-    const KvObj* read_local_find_in(const ReadLocalTable& table, uint64_t hash, Slice key) const {
-        if (!table.slots || !table.cap) return nullptr;
-        const uint16_t tag = tag_of(hash);
-        uint32_t slot = static_cast<uint32_t>(mix64(hash)) & table.mask;
-        for (uint32_t probes = 0; probes <= table.cap; probes++) {
-            const uint64_t word = read_local_slot_load(table.slots + slot);
-            if (word == 0) return nullptr;
-            const KvObj* object = ptr_of(word);
-            if (object && tag_of_word(word) == tag) {
-                const uint8_t flags = object->read_local_flags();
-                // MEMCMP HERE, not Slice::key_eq -- the same measured exception insert_into makes,
-                // and for the same reason: this loop holds enough live state (the topology
-                // snapshot, the slot cursor, the mask, the tag) that inlining the byte compare
-                // costs more in spill than the call costs. It is not a small effect and it is not
-                // on a cold path. Armed GET hit, instructions per operation, read-local probe slope
-                // over 9M ops, --shards 64 --thread-mode 1s --read-local 1 --atomic 1, two threads:
-                //     key           16       24       40
-                //     key_eq    1789.7   1814.1   1848.3
-                //     memcmp    1764.2   1783.2   1813.1     (-25.5, -30.9, -35.2)
-                // The unarmed replay the inline compare was tuned on never reaches this function,
-                // which is how it came to be converted: read_local_find_in and
-                // read_local_capture_in only run with --read-local 1 in fused mode.
-                // Both spellings are exact byte equality over the same bytes, so no path can
-                // answer differently; only the inlining policy differs.
-                if (object->read_local_key(flags) == key) return object;
-            }
-            slot = (slot + 1) & table.mask;
-        }
-        return nullptr;
-    }
-
-    const KvObj* read_local_capture_in(const ReadLocalTable& table, uint64_t hash, Slice key,
-                                       const uint64_t*& captured_slot) const {
-        captured_slot = nullptr;
-        if (!table.slots || !table.cap) return nullptr;
-        const uint16_t tag = tag_of(hash);
-        uint32_t slot = static_cast<uint32_t>(mix64(hash)) & table.mask;
-        for (uint32_t probes = 0; probes <= table.cap; probes++) {
-            captured_slot = table.slots + slot;
-            const uint64_t word = read_local_slot_load(captured_slot);
-            if (word == 0) return nullptr;
-            const KvObj* object = ptr_of(word);
-            if (object && tag_of_word(word) == tag) {
-                const uint8_t flags = object->read_local_flags();
-                // memcmp, for the reason spelled out in read_local_find_in above.
-                if (object->read_local_key(flags) == key) return object;
-            }
-            slot = (slot + 1) & table.mask;
-        }
-        return nullptr;
-    }
-
-    static void read_local_prefetch_object(const KvObj* object) {
-        __builtin_prefetch(object, 0, 1);
-        if (static_cast<Type>(object->type) != Type::String) return;
-
-        const uint8_t flags = object->read_local_flags();
-        const char* value = object->read_local_key_ptr(flags) +
-                            object->read_local_klen(flags);
-        if (object->encoding() != Enc::Extern) {
-            __builtin_prefetch(value, 0, 1);
-            return;
-        }
-
-        const void* external = nullptr;
-        std::memcpy(&external, value, sizeof(external));
-        if (external) __builtin_prefetch(external, 0, 1);
-    }
-
-    void write_eviction_meta_read_local(KvObj* object, uint8_t meta) {
-        object->set_eviction_meta_atomic(meta);
-    }
-
-    void write_object_flags_read_local(KvObj* object, uint8_t flags) {
-        object->store_flags_atomic(flags);
-    }
-
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    ReadLocalSetTaxStats& settax_stats() const {
-        ReadLocalSetTaxStats* stats =
-            read_local_store_state_required().retire_sink.diagnostics();
-        if (!stats) std::abort();
-        return *stats;
-    }
-#endif
-
-    static void read_local_reclaim_table(void*, void* payload, size_t) {
-        std::free(payload);
-    }
-
-    // `capacity` is kvobj_capacity(object) as decoded at retire time (the ring's auxiliary word).
-    // THE GRACE FLOOR HAS PASSED: no reader can still be holding this pointer and only this shard's
-    // owner may touch the block, which is exactly the licence the old code used to call free() on
-    // it. Offer it to the shard's block cache first; anything the cache refuses is destroyed on the
-    // unchanged path (including the borrowed-value retention destroy_retired_obj owns).
-    static void read_local_reclaim_object(void* owner, void* payload, size_t capacity) {
-        FlatStore* store = static_cast<FlatStore*>(owner);
-        KvObj* object = static_cast<KvObj*>(payload);
-        if (!store->read_local_cache_put(object, capacity))
-            store->destroy_retired_obj(object, capacity);
-    }
-
-    static void read_local_reclaim_atomic_object(void* owner, void* payload, size_t capacity) {
-        FlatStore* store = static_cast<FlatStore*>(owner);
-        KvObj* object = static_cast<KvObj*>(payload);
-        if (store->atomic_recycle_value(object)) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            store->settax_stats().recycle_atomic_pool_accepts++;
-#endif
-            return;
-        }
-        if (!store->read_local_cache_put(object, capacity))
-            store->destroy_retired_obj(object, capacity);
-    }
-
-    void retire_table_read_local(uint64_t* table) {
-        if (!table) return;
-        read_local_store_state_required().retire_sink.retire(
-            this, table, 0, &FlatStore::read_local_reclaim_table);
-    }
-
-    void read_local_table_mutation_begin() {
-        if (__builtin_expect(!read_local_enabled_, true)) return;
-        ReadLocalStoreState& state = read_local_store_state_required();
-        if (state.table_mutation_depth++ == 0)
-            read_local_advance_generation(state.probe_sequence, false);
-    }
-
-    void read_local_table_mutation_end() {
-        if (__builtin_expect(!read_local_enabled_, true)) return;
-        ReadLocalStoreState& state = read_local_store_state_required();
-        if (!state.table_mutation_depth) std::abort();
-        if (--state.table_mutation_depth == 0)
-            read_local_advance_generation(state.probe_sequence, true);
-    }
-
-    // Ownership supplies the only writer, so the table word needs no locked RMW. The acq_rel fence
-    // after the release odd-store keeps that marker before later data stores; the final release
-    // store publishes the incremented even generation. Wrap becomes permanently fail-closed.
-    static void read_local_advance_generation(std::atomic<uint64_t>& sequence, bool ending) {
-        if (!ending) {
-            const uint64_t previous = sequence.load(std::memory_order_relaxed);
-            if (previous & kReadLocalTableMutationBit) std::abort();
-            sequence.store(previous | kReadLocalTableMutationBit, std::memory_order_release);
-            std::atomic_thread_fence(std::memory_order_acq_rel);
-            return;
-        }
-        const uint64_t observed = sequence.load(std::memory_order_relaxed);
-        if (!(observed & kReadLocalTableMutationBit)) std::abort();
-        const uint64_t generation = observed >> kReadLocalGenerationShift;
-        const uint64_t next = generation == kReadLocalGenerationMask
-            ? generation : generation + 1;
-        const uint64_t desired = (next << kReadLocalGenerationShift) |
-                                 (observed & kReadLocalPendingBit);
-        sequence.store(desired, std::memory_order_release);
-    }
-
-    void read_local_pending_publish(AtomicEntry& entry) {
-        if (!read_local_enabled_) std::abort();
-        if (entry.foreign_read_unsafe_published) std::abort();
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.add_span(entry.capacity, [&](uint32_t index) {
-            return atomic_entry_hash(entry, index);
-        });
-        foreign_read_pending_witness_open(state);
-        entry.foreign_read_unsafe_published = true;
-    }
-
-    void read_local_pending_unpublish(AtomicEntry& entry) {
-        if (__builtin_expect(!entry.foreign_read_unsafe_published, true)) return;
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.close_span(entry.capacity, [&](uint32_t index) {
-            return atomic_entry_hash(entry, index);
-        });
-        foreign_read_pending_witness_close(state);
-        entry.foreign_read_unsafe_published = false;
-    }
-
-    void foreign_read_pending_witness_open(ReadLocalStoreState& state) {
-        if (state.pending_count == UINT32_MAX) {
-            state.foreign_reads.fail_closed_permanently();
-            state.probe_sequence.fetch_or(kReadLocalPendingBit, std::memory_order_release);
-            return;
-        }
-        if (state.pending_count++ != 0) return;
-        const uint64_t previous = state.probe_sequence.fetch_or(
-            kReadLocalPendingBit, std::memory_order_acq_rel);
-        if ((previous & kReadLocalPendingBit) &&
-            !state.foreign_reads.permanently_poisoned()) std::abort();
-    }
-
-    void foreign_read_pending_witness_close(ReadLocalStoreState& state) {
-        if (!state.pending_count) {
-            if (state.foreign_reads.permanently_poisoned()) return;
-            std::abort();
-        }
-        state.pending_count--;
-        if (state.pending_count != 0 || state.foreign_reads.permanently_poisoned()) return;
-        const uint64_t previous = state.probe_sequence.fetch_and(
-            ~kReadLocalPendingBit, std::memory_order_release);
-        if (!(previous & kReadLocalPendingBit)) std::abort();
-    }
-
-    void foreign_read_poison_open() {
-        ReadLocalTableGuard publication(*this);
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.poison_open();
-        foreign_read_pending_witness_open(state);
-    }
-
-    void foreign_read_poison_close() {
-        ReadLocalStoreState& state = read_local_store_state_required();
-        state.foreign_reads.poison_close();
-        foreign_read_pending_witness_close(state);
-    }
-
     bool is_borrowed(const char* ptr) const { return borrow_find(ptr) != kNoBorrow; }
-
-    // The experiment targets the physical cache lines jemalloc may return from its LIFO tcache to
-    // the next SET. Bound hints to the KvObj allocation itself (kvobj_size may include an external
-    // value allocation), and issue them only at the point where ownership really passes to free.
-    // `capacity` is kvobj_capacity(object), decoded by whoever retired it; the sized free needs it.
-    void free_retired_obj_now(KvObj* object, size_t capacity) {
-        if constexpr (kReadLocalReclaimPrefetchw) {
-            if (read_local_enabled_) {
-                constexpr size_t kLineBytes = 64;
-                constexpr uint32_t kMaxLines = 3;
-                const char* const base = reinterpret_cast<const char*>(object);
-                __builtin_prefetch(base, 1, 3);
-                size_t offset = kLineBytes -
-                    (reinterpret_cast<uintptr_t>(base) & (kLineBytes - 1));
-                for (uint32_t line = 1; line < kMaxLines && offset < capacity;
-                     line++, offset += kLineBytes)
-                    __builtin_prefetch(base + offset, 1, 3);
-            }
-        }
-        kvobj_free_with_capacity(object, capacity);
-    }
-
-    // Post-grace destruction. Only the rare borrowed path needs the full footprint again, and it
-    // rebuilds it from the retire-time capacity plus the external block (== kvobj_size).
-    void destroy_retired_obj(KvObj* object, size_t capacity) {
-        if (outstanding_borrows_ == 0) { free_retired_obj_now(object, capacity); return; }
-        const char* ptr = (static_cast<Type>(object->type) == Type::String && !object->is_int())
-                              ? object->str_data() : nullptr;
-        const uint32_t at = ptr ? borrow_find(ptr) : kNoBorrow;
-        if (at != kNoBorrow) {
-            borrows_[at].retired = object;
-            pending_bytes_ += capacity + read_local_external_bytes(object);
-            return;
-        }
-        free_retired_obj_now(object, capacity);
-    }
 
     // Logical removal updates the live-store footprint immediately. Physical destruction is the
     // common case and pays one branch; registry work exists only while some wire borrow is live.
-    // The header is decoded once: the class computed for accounting is the sized-free length.
     void retire_obj(KvObj* o) {
-        const size_t capacity = kvobj_capacity(o);
-        const size_t bytes = capacity + kvobj_external_bytes(o);
+        const size_t bytes = kvobj_size(o);
         obj_bytes_ -= bytes;
-        if (outstanding_borrows_ == 0) { kvobj_free_with_capacity(o, capacity); return; }
+        if (outstanding_borrows_ == 0) { kvobj_free(o); return; }
         const char* ptr = (static_cast<Type>(o->type) == Type::String && !o->is_int())
-                              ? o->str_data() : nullptr;
+                              ? o->str_value().p : nullptr;
         const uint32_t at = ptr ? borrow_find(ptr) : kNoBorrow;
         if (at != kNoBorrow) {
             borrows_[at].retired = o;
             pending_bytes_ += bytes;
             return;
         }
-        kvobj_free_with_capacity(o, capacity);
+        kvobj_free(o);
     }
 
     // ---- incremental resize -----------------------------------------------------------------
-    bool maybe_start_grow() {
-        if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + 1) * 100 <
-            static_cast<uint64_t>(cap_[0]) * kLoadPct) return true;
-        if (snapshot_prepared_) return true;
+    void maybe_start_grow() {
+        if ((live_[0] + tombs_[0] + 1) * 100 < cap_[0] * kLoadPct) return;
+        if (snapshot_prepared_) return;
         // Double only when the LIVE set alone justifies it. The trigger counts tombstones, so a
         // delete-heavy workload trips it with almost no live keys and doubling there would inflate
         // the table forever. Otherwise rehash at the same size, which costs the same walk and
         // reclaims every tombstone.
-        const bool double_it = static_cast<uint64_t>(live_[0]) * 200 >=
-                               static_cast<uint64_t>(cap_[0]) * kLoadPct;
-        uint64_t wanted = cap_[0];
-        if (double_it) wanted *= uint64_t{2};
-        if (wanted > UINT32_MAX) return false;
-        return start_rehash(static_cast<uint32_t>(wanted));
+        const bool double_it = (live_[0] * 200 >= cap_[0] * kLoadPct);
+        start_rehash(double_it ? cap_[0] * 2 : cap_[0]);
     }
 
     void maybe_start_shrink() {
@@ -3724,53 +1936,41 @@ private:
         // Hysteresis: grow triggers at kLoadPct and leaves the table at kLoadPct/2, so shrinking
         // only below kLoadPct/4 keeps the two far enough apart that a workload sitting near a
         // boundary cannot rebuild on every other operation.
-        if (static_cast<uint64_t>(live_[0]) * 400 >
-            static_cast<uint64_t>(cap_[0]) * kLoadPct) return;
+        if (live_[0] * 400 > cap_[0] * kLoadPct) return;
         if (snapshot_prepared_) return;
-        (void)start_rehash(cap_[0] / 2);  // shrinking is opportunistic; OOM keeps the old table
+        start_rehash(cap_[0] / 2);
     }
 
     // Demote the current table to the old slot and install a fresh one. NOTHING is copied here —
     // that is the whole point; the slot-word migration is spread across later operations.
-    bool start_rehash(uint32_t newcap) {
-        if (__builtin_expect(read_local_enabled_, false)) return start_rehash_read_local(newcap);
-        if (rehashing()) return true;                       // one at a time; finish before starting
+    void start_rehash(uint32_t newcap) {
+        if (rehashing()) return;                            // one at a time; finish before starting
         if (newcap < kMinCap) newcap = kMinCap;
-        uint64_t* fresh = allocate_table(newcap);
-        if (!fresh) return false;
         if (rehash_counter_) (*rehash_counter_)++;
         tab_[1]  = tab_[0];  cap_[1] = cap_[0];  mask_[1] = mask_[0];
         live_[1] = live_[0]; tombs_[1] = tombs_[0];
-        install_empty_table(0, fresh, newcap);
+        alloc_table(0, newcap);
         rehash_pos_ = 0;
-        return true;
     }
 
-    // Move a bounded number of slot words during mutations/owner maintenance, never lookup.
-    // Armed completion hands off a preallocated retirement record without waiting for grace.
+    // Move a BOUNDED number of SLOT WORDS from the old table to the current one. Called at the head
+    // of every operation, so the cost is amortised and no single operation stalls. The KvObjs those
+    // words point at are not touched.
     void rehash_step() {
-        if (__builtin_expect(read_local_enabled_, false)) {
-            rehash_step_read_local();
-            return;
-        }
-        // The window's slot words share a cache line; the objects behind them do not, and every
-        // move needs one (hash_key(o->key()) -- the hash is not stored). Warm them together so the
-        // misses overlap instead of serializing, eight deep, inside one operation.
-        const uint32_t end = std::min(rehash_pos_ + kRehashSlotsPerOp, cap_[1]);
-        for (uint32_t i = rehash_pos_; i < end; i++)
-            if (const KvObj* o = ptr_of(tab_[1][i])) __builtin_prefetch(o, 0, 1);
-        while (rehash_pos_ < end) {
+        uint32_t budget = kRehashSlotsPerOp;
+        while (budget && rehash_pos_ < cap_[1]) {
             const uint64_t w = tab_[1][rehash_pos_];
             if (KvObj* o = ptr_of(w)) {
-                // Preserve the source if admission's capacity invariant is ever violated.
-                if (!insert_into(0, hash_key(o->key()), o, false)) return;
                 // TOMBSTONE, not EMPTY. Writing 0 here would terminate any probe run passing
                 // through this slot, making every key that probed past it unreachable in the old
                 // table for the rest of the rehash — a silent, transient, load-dependent miss.
                 tab_[1][rehash_pos_] = kTombBit;
                 live_[1]--; tombs_[1]++;
+                obj_bytes_ -= kvobj_size(o);                // insert_into adds it back
+                insert_into(0, hash_key(o->key()), o, false); // rehash from key: hash is not stored
             }
             rehash_pos_++;
+            budget--;
         }
         if (rehash_pos_ >= cap_[1]) {
             std::free(tab_[1]);
@@ -3779,118 +1979,37 @@ private:
         }
     }
 
-    friend struct FlatStoreLayoutLock;
-#ifdef TOMO_STORE_REGRESSION_TEST
-    friend struct FlatStoreRegressionTest;
-#endif
-
-    // ============================================================================================
-    // THE READER BLOCK vs TWO SETS OF OWNER WRITES — NONE OF WHICH MAY SHARE A 64-BYTE LINE.
-    //
-    // Under --read-local every FOREIGN GET loads tab_/cap_/mask_ (both tables) and the two
-    // boot-latched gates below straight out of this object, while the OWNER writes live_, tombs_,
-    // rehash_pos_ on every insert of a NEW key and every DEL, and obj_bytes_ on top of that.
-    // Declared adjacently — which they were, tab_ at +208 and live_ at +240 — those two sets landed
-    // on ONE line, so every owner insert invalidated the exact line every remote reader was loading:
-    // a write obstructing reads in a store whose entire premise is that it never does. Nothing in
-    // the source showed it; only the byte offsets did.
-    //
-    // atomic_pending_ is the SECOND half of the same defect, on the atomic side. Every foreign
-    // probe dereferences it — read_local_state_acquire() reaches probe_sequence through it, and it
-    // is reloaded at each acquire because that load stops the compiler reusing the previous one:
-    // seven static sites in read_local_probe alone — yet it was declared as the second word of the
-    // atomic block, eight bytes past atomic_version_bytes_ (owner-written by
-    // every atomic_admit / atomic_gauge_sub / atomic_install_plain) and immediately ahead of the
-    // three collapse scratch vectors, whose control blocks the owner rewrites on every collapse
-    // pass. The vectors were the live collision: at +16/+40/+64 against a foreign read at +8 they
-    // shared one line at EVERY alignment the allocator can return. atomic_version_bytes_ at +0 was
-    // the latent one, separated from +8 only by ShardLayoutLock::store_offset landing on 56 and by
-    // the Shard happening to be 64-byte aligned — with plain 16-byte-aligned storage three of the
-    // four possible alignments put them back on one line. Same accident class, same fix: the read
-    // moved out, and the distance is now stated in offsets.
-    //
-    // The separation is expressed in OFFSETS, not addresses (see FlatStoreLayoutLock below). Two
-    // bytes whose offsets differ by >= 64 cannot share a line for ANY base address, so the property
-    // survives whatever alignment the allocator hands `new Shard` (operator new promises 16, not
-    // 64) and whatever ShardLayoutLock::store_offset becomes. The old layout only looked split
-    // because store_offset happened to be 56 and the allocator happened to over-align the Shard.
-    // ============================================================================================
-
-    // ---- READER BLOCK. Loaded by every foreign probe; written only by a topology move (tab_/cap_/
-    // mask_) or by arming the store (atomic_pending_, the read-local gates). Co-locating the whole
-    // foreign read here is the point: one FlatStore line per probe, not two. -------------------
-    //
-    // Null until the first atomic group reaches this owner. The object stays as a pool after the
-    // list drains; its zero live count is the common ON read test. KvObj remains byte-identical.
-    // It belongs to the READER, not to the atomic block it is declared beside in
-    // flatstore_atomic.inc: every foreign probe loads it before it can reach probe_sequence, while
-    // the owner writes it only in atomic_ensure_pending / ensure_read_local_store_state /
-    // atomic_destroy_pending — arming and teardown, never a per-operation write.
-    AtomicPendingState* atomic_pending_ = nullptr;
     uint64_t* tab_[2]   = {nullptr, nullptr};
-    // Capacities are power-of-two and intentionally stop at 2^31: slot/probe indices are uint32_t
-    // and insert_into's tombstone sentinel is int32_t. A requested next doubling (2^32 slots,
-    // already 32 GiB for one shard's slot words) returns InsertResult::Failed before any swap.
-    // Tables beyond four billion slots are therefore outside this store's representation rather
-    // than a legitimate reason to widen these hot fields.
     uint32_t  cap_[2]   = {0, 0};
     uint32_t  mask_[2]  = {0, 0};
-    // Boot-latched, and the first byte a foreign probe tests before it touches anything else.
-    // It belongs ON the topology line rather than 200 bytes past it: co-located, the whole foreign
-    // read reduces to one line of FlatStore. Armed state itself stays sidecarred.
-    bool      read_local_enabled_ = false;
-    // Consumes the reserved byte without moving either cache-line boundary. Written only on
-    // field-index allocation failure or FLUSH; ordinary reads/writes never consult this byte.
-    bool      field_ttl_index_incomplete_ = false;
-
-    // ---- SEPARATOR. Read-mostly only: config, bind-once counter bindings, and the snapshot
-    // scalars that are latched once when a capture is prepared. NOTHING here is written by an
-    // ordinary read or write of a key, so a foreign reader sharing a line with any of it still
-    // never sees an owner invalidation. The live snapshot cursor is deliberately NOT here.
-    bool      maxmemory_enabled_ = false;
-    MaxmemoryPolicy maxmemory_policy_ = MaxmemoryPolicy::NoEviction;
-    // THE hash-field-TTL gate: read by every hash command, so it must share the first cache line
-    // that find() touches rather than sit next to its own (cold) index hundreds of bytes further
-    // down. Four bytes behind mask_ keeps it on that line and off the owner's.
-    uint32_t  field_ttl_gate_ = 0;
-    uint32_t  maxmemory_samples_ = 5;
-    int32_t   snapshot_shard_id_ = -1;
-    uint64_t  maxmemory_limit_ = 0;
-    uint64_t* snapshot_new_tab_ = nullptr;
-    uint64_t* evicted_counter_ = nullptr;
-    uint64_t* rehash_counter_ = nullptr;
-    uint64_t  snapshot_epoch_ = 0;
-    int64_t   snapshot_cut_ms_ = 0;
-    uint32_t  snapshot_new_cap_ = 0;
-    // Explicit tail of the separator. The read-mostly fields above fall 28 bytes short of the 64
-    // that make the guarantee base-independent, and this is that balance — it is also why the
-    // object still measures 944 bytes instead of 916. Repurposing it is fine only for a field that
-    // is never written on the key path, and only if FlatStoreLayoutLock still passes.
-    char      reader_owner_gap_[28] = {};
-
-    // ---- OWNER BLOCK. Written by the single owner on the ordinary insert/DEL path. The first
-    // eight fields are 48 bytes, so the whole per-operation counter set is one line for the owner
-    // (it used to straddle two), and that line is now private to the owner.
     uint32_t  live_[2]  = {0, 0};
     uint32_t  tombs_[2] = {0, 0};
     uint32_t  rehash_pos_ = 0;
-    uint32_t  active_expire_reap_lag_ms_max_ = 0;
+    // THE hash-field-TTL gate, deliberately placed in the 4-byte hole the surrounding fields
+    // already leave: it is read by every hash command, so it must share the first cache line that
+    // find() touches rather than sit next to its own (cold) index 200 bytes further down.
+    uint32_t  field_ttl_gate_ = 0;
     size_t    obj_bytes_  = 0;
     size_t    pending_bytes_ = 0;
     uint32_t  outstanding_borrows_ = 0;
+    std::vector<Borrow> borrows_;
+    std::vector<uint32_t> borrow_idx_;   // empty == scan mode; see kBorrowIndexMin
     uint32_t  borrow_tombs_ = 0;
-    // The live snapshot cursor is owner-written under ordinary write traffic, so it belongs on this
-    // side of the split even though the rest of the capture's scalars are latched once and sit in
-    // the separator above.
-    uint32_t snapshot_pos_ = 0;
-    uint32_t snapshot_sequence_ = 0;
-    // SECOND OWNER LINE, and its composition is deliberate: every field an insert reads outside the
-    // counters above — the clock pair, the expiry counter binding, the snapshot gates — is inside
-    // one 64-byte window here, which is what keeps the owner's per-insert line count at what it was
-    // before the split (the counters simply moved from the reader's line to their own).
+    ExpireIndex expires_;
     int64_t     cached_now_ms_ = 0;
     uint8_t     cached_lru_clock_ = 0;
     bool        no_touch_ = false;      // per-task, owner-written; see set_no_touch
+    uint64_t*   expired_counter_ = nullptr;
+    uint64_t*   evicted_counter_ = nullptr;
+    uint64_t*   rehash_counter_ = nullptr;
+    bool        maxmemory_enabled_ = false;
+    uint64_t    maxmemory_limit_ = 0;
+    MaxmemoryPolicy maxmemory_policy_ = MaxmemoryPolicy::NoEviction;
+    uint32_t    maxmemory_samples_ = 5;
+    uint64_t    random_state_ = 0x9e3779b97f4a7c15ULL;
+    uint64_t    sample_cursor_ = 0;
+
+
     // Snapshot state is owner-only.  No atomics or locks enter FlatStore, and the ordinary lookup
     // still searches exactly t_[0] then t_[1] — during capture those already-existing tables mean
     // "post-cut" and "frozen cut" respectively.
@@ -3898,81 +2017,25 @@ private:
     bool snapshot_active_ = false;
     bool snapshot_failed_ = false;
     bool snapshot_finished_ = false;
-    uint64_t*   expired_counter_ = nullptr;
-    uint64_t    random_state_ = 0x9e3779b97f4a7c15ULL;
-    uint64_t    sample_cursor_ = 0;
+    uint64_t snapshot_epoch_ = 0;
+    int64_t snapshot_cut_ms_ = 0;
+    int32_t snapshot_shard_id_ = -1;
+    uint64_t* snapshot_new_tab_ = nullptr;
+    uint32_t snapshot_new_cap_ = 0;
+    uint32_t snapshot_pos_ = 0;
     uint64_t snapshot_preimages_ = 0;   // pre-images emitted ahead of the cursor (write-gate fired)
-    std::vector<Borrow> borrows_;
-    std::vector<uint32_t> borrow_idx_;   // empty == scan mode; see kBorrowIndexMin
-    ExpireIndex expires_;
+    uint32_t snapshot_sequence_ = 0;
     SnapshotRecordState snapshot_record_;
     std::unique_ptr<SnapshotChunk> snapshot_build_;
     std::unique_ptr<SnapshotChunk> snapshot_ready_;
     AofProducer aof_;
-    // COLD TAIL. The hash-field-TTL index and read-local publication stay after the established hot
-    // fields on purpose: placing cold state mid-struct pushed cached_now_ms_ / maxmemory_ / snapshot_
-    // further out, which showed up as a measurable instr/op regression on workloads that never use
-    // those features. The TTL index allocates nothing until the first HEXPIRE in the shard.
+    // COLD TAIL. The hash-field-TTL index and its counter go last on purpose: only the 4-byte gate
+    // above is on a hot path, and placing these mid-struct pushed cached_now_ms_ / maxmemory_ /
+    // snapshot_ 96 bytes further out, which showed up as a measurable instr/op regression on a
+    // workload that never uses the feature. Allocates nothing until the first HEXPIRE in the shard.
     ExpireIndex field_expires_;
     uint64_t    field_expired_ = 0;
 };
-
-// THE READER/OWNER LINE SPLIT, pinned in offsets so nothing about it depends on where a Shard
-// happens to land in memory. `new Shard` promises 16-byte alignment, not 64, and the store sits at
-// ShardLayoutLock::store_offset inside it; both are free to change. Two bytes whose OFFSETS differ
-// by at least 64 are on different lines for every possible base address, which is the only form of
-// this guarantee that a static_assert can actually make.
-struct FlatStoreLayoutLock {
-    // Every byte a foreign reader loads out of FlatStore on the GET path, and nothing else.
-    // atomic_pending_ is the FIRST of them: read_local_probe() cannot reach probe_sequence, the
-    // read-local filter or the retire sink without loading it.
-    static constexpr size_t reader_first = offsetof(FlatStore, atomic_pending_);
-    static constexpr size_t reader_last  = offsetof(FlatStore, read_local_enabled_);
-    // Every byte the owner writes on the ordinary insert-a-new-key / DEL path.
-    static constexpr size_t owner_first  = offsetof(FlatStore, live_);
-    static constexpr size_t owner_last   = offsetof(FlatStore, borrow_tombs_) + 3;
-    // Every byte the owner writes on the ATOMIC path, declared ahead of the reader block:
-    // atomic_version_bytes_ is the first word of the object, the three collapse scratch vectors and
-    // the seen-key vector follow, and the per-operation read context closes the range.
-    static constexpr size_t atomic_owner_first = offsetof(FlatStore, atomic_version_bytes_);
-    static constexpr size_t atomic_owner_last  =
-        offsetof(FlatStore, atomic_read_origin_conn_id_) + 7;
-    // First word of the bind-once separator that buys the distance below it.
-    static constexpr size_t atomic_separator_first = offsetof(FlatStore, atomic_ticket_fn_);
-    static constexpr size_t line         = 64;
-    static constexpr size_t gap_bytes    = sizeof(FlatStore::reader_owner_gap_);
-};
-
-// THE INVARIANT, STATED TWICE BECAUSE THE READER BLOCK HAS OWNER WRITES ON BOTH SIDES OF IT: no
-// word the owner writes per operation may share a cache line with a word a foreign GET reads, for
-// any Shard base address. Adding a per-operation counter above or below the separators, or a
-// foreign read inside either owner block, breaks this build rather than quietly reintroducing the
-// false sharing.
-static_assert(FlatStoreLayoutLock::owner_first - FlatStoreLayoutLock::reader_last >=
-                  FlatStoreLayoutLock::line,
-              "owner-written counters may share a cache line with the reader topology words");
-static_assert(FlatStoreLayoutLock::reader_first - FlatStoreLayoutLock::atomic_owner_last >=
-                  FlatStoreLayoutLock::line,
-              "atomic accounting words may share a cache line with the reader's probe words");
-// Both blocks stay compact enough to be one line each when the Shard is 64-byte aligned, which is
-// what the allocator does today: the reader pays one line per foreign GET, the owner one line per
-// insert. These are the budgets the split was bought with.
-static_assert(FlatStoreLayoutLock::reader_last - FlatStoreLayoutLock::reader_first <
-                  FlatStoreLayoutLock::line, "reader topology block no longer fits one line");
-static_assert(FlatStoreLayoutLock::owner_last - FlatStoreLayoutLock::owner_first <
-                  FlatStoreLayoutLock::line, "owner counter block no longer fits one line");
-// The distance above is bought entirely by the bind-once bindings, which start where the atomic
-// owner block ends. An owner-written field appended to that block would extend it PAST the assert's
-// named last word and stay invisible to it; this is what refuses that edit. Widening the separator
-// with more bind-once state is fine — move atomic_separator_first onto the new first field.
-static_assert(FlatStoreLayoutLock::atomic_separator_first ==
-                  FlatStoreLayoutLock::atomic_owner_last + 1,
-              "a field slipped in between the atomic owner block and its read-mostly separator");
-// The gap is padding on purpose; if a future field shrinks it below the line, say so here.
-static_assert(FlatStoreLayoutLock::gap_bytes == 28);
-
-// atomic_torn's disabled geometry is contractual: armed state must never grow this baseline object.
-static_assert(sizeof(FlatStore) == 944);
 
 
 // RAII bracket for any mutation of an EXISTING object: samples kvobj_size before, reports the

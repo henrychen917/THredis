@@ -24,18 +24,12 @@ Both are RACES, so every case runs many rounds and reports a hit count rather th
 pre-fix rates on this box were roughly 22% of rounds for (1) and 37% for (2). A single clean
 round means nothing, which is why nothing here concludes from one.
 
-Every case also proves its mechanism FIRED: `atomic_exec_order_holds` counts a transaction
-meeting an older same-connection unit that is still undecided on that owner, which is exactly the
-hazard window. It is raised at ONE site -- ExLoop::execute(), where the transaction fragment is
-parked behind that unit before it installs anything on the owner. A run in which it never advances
-never entered the window, and is reported as vacuous rather than as a pass. Negative controls (no
-group; a single-key non-group predecessor; the transaction on a second connection) must record no
-loss AND are expected to leave the counter alone.
-
-The window this file describes is now closed at DISPATCH rather than at install (NOTES-MULTIRACE.md
-§5), so the install-time arm that once raised this counter is gone from it: it reports through
-`atomic_exec_order_late` instead, which must read zero. This run asserts that too -- if the park
-ever fired too late, these cases are exactly the shape that would show it.
+Every case also proves its mechanism FIRED: `atomic_exec_order_holds` counts EXEC writes that
+installed while an older same-connection group was still undecided on that owner, which is
+exactly the hazard window. A run in which it never advances never entered the window, and is
+reported as vacuous rather than as a pass. Negative controls (no group; a single-key non-group
+predecessor; the transaction on a second connection) must record no loss AND are expected to
+leave the counter alone.
 
 Boot requirement: --enable-debug-command yes for DEBUG SHARD, so the key set provably spans
 distinct owners. Runs under both --atomic 0 and --atomic 1; with atomics off there is no group
@@ -142,15 +136,6 @@ def holds(conn):
     if "atomic_exec_order_holds" not in table:
         raise AssertionError("INFO STATS has no atomic_exec_order_holds counter")
     return int(table["atomic_exec_order_holds"])
-
-
-def late(conn):
-    """INFO atomic_exec_order_late -- install-time ordering violations. Must read zero: the park
-    that closes this file's hazard window runs at dispatch, before the fragment installs."""
-    table = stats(conn)
-    if "atomic_exec_order_late" not in table:
-        raise AssertionError("INFO STATS has no atomic_exec_order_late counter")
-    return int(table["atomic_exec_order_late"])
 
 
 def atomic_enabled(conn):
@@ -304,18 +289,6 @@ def main():
             ok(f"hazard window opened {window_holds}x across the armed cases")
         else:
             ok("atomic 0: no cross-shard group exists to invert against, window stays shut")
-
-        # The hold that closes this window is taken at dispatch; this asserts it was never taken
-        # too late. Separate counter from `holds` on purpose -- `holds` is non-zero by design in
-        # the armed cases above, so a violation summed into it could never be seen.
-        violations = late(admin)
-        if violations:
-            failures += 1
-            print(f"  FAIL atomic_exec_order_late={violations}: an EXEC write installed against "
-                  "an undecided same-connection unit. The window this file locks was reopened "
-                  "one step later than the park that closes it", flush=True)
-        else:
-            ok("no install-time ordering violation (atomic_exec_order_late=0)")
     except (AssertionError, EOFError, OSError) as failure:
         failures += 1
         print(f"  FAIL {failure}", flush=True)

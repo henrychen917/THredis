@@ -174,106 +174,6 @@
         return false;
     }
 
-    // A ModifyRequest with `rebind` set updates the existing registration in place.  It never
-    // creates a subscription: if an unsubscribe raced an old migration event, absence wins.  The
-    // live directory read also makes repeated migrations converge even when requests from two
-    // former owners reach this home in the opposite order.
-    void pubsub_home_rebind_channel(const std::string& channel, uint64_t conn, bool shard) {
-        uint32_t live_io = 0;
-        if (!command_client_directory_find(conn, live_io)) return;
-        auto& index = shard ? pubsub_shard_channels_ : pubsub_channels_;
-        auto found = index.find(channel);
-        if (found == index.end()) return;
-        std::vector<PubSubRef>& refs = found->second;
-        bool kept = false;
-        size_t out = 0;
-        for (const PubSubRef& ref : refs) {
-            if (ref.conn != conn) {
-                refs[out++] = ref;
-                continue;
-            }
-            if (!kept) {
-                refs[out++] = PubSubRef{live_io, conn};
-                kept = true;
-            } else {
-                srv_->pubsub_home_entry_removed();
-            }
-        }
-        refs.resize(out);
-    }
-
-    void pubsub_home_rebind_pattern(const std::string& pattern, uint64_t conn) {
-        uint32_t live_io = 0;
-        if (!command_client_directory_find(conn, live_io)) return;
-        bool kept = false;
-        size_t out = 0;
-        for (size_t i = 0; i < pubsub_patterns_.size(); i++) {
-            PubSubPatternRef& entry = pubsub_patterns_[i];
-            if (entry.ref.conn != conn || entry.pattern != pattern) {
-                if (out != i) pubsub_patterns_[out] = std::move(entry);
-                out++;
-                continue;
-            }
-            if (!kept) {
-                entry.ref.io = live_io;
-                if (out != i) pubsub_patterns_[out] = std::move(entry);
-                out++;
-                kept = true;
-            } else {
-                srv_->pubsub_home_entry_removed();
-            }
-        }
-        pubsub_patterns_.resize(out);
-    }
-
-    void pubsub_home_ensure_channel(const std::string& channel, uint64_t conn, bool shard) {
-        uint32_t live_io = 0;
-        if (!command_client_directory_find(conn, live_io)) return;
-        const PubSubRef ref{live_io, conn};
-        auto& index = shard ? pubsub_shard_channels_ : pubsub_channels_;
-        auto found = index.find(channel);
-        if (found != index.end()) {
-            for (PubSubRef& current : found->second) {
-                if (current.conn != conn) continue;
-                current.io = live_io;
-                return;
-            }
-        }
-        (void)pubsub_home_add_channel(channel, ref, shard);
-    }
-
-    void pubsub_home_ensure_pattern(const std::string& pattern, uint64_t conn) {
-        uint32_t live_io = 0;
-        if (!command_client_directory_find(conn, live_io)) return;
-        for (PubSubPatternRef& entry : pubsub_patterns_) {
-            if (entry.ref.conn != conn || entry.pattern != pattern) continue;
-            entry.ref.io = live_io;
-            return;
-        }
-        (void)pubsub_home_add_pattern(pattern, PubSubRef{live_io, conn});
-    }
-
-    void pubsub_clear_home_indexes() {
-        for (const auto& entry : pubsub_channels_) {
-            for (size_t i = 0; i < entry.second.size(); i++) srv_->pubsub_home_entry_removed();
-            srv_->pubsub_active_channel_removed(false);
-        }
-        for (const auto& entry : pubsub_shard_channels_) {
-            for (size_t i = 0; i < entry.second.size(); i++) srv_->pubsub_home_entry_removed();
-            srv_->pubsub_active_channel_removed(true);
-        }
-        for (size_t i = 0; i < pubsub_patterns_.size(); i++) srv_->pubsub_home_entry_removed();
-        pubsub_channels_.clear();
-        pubsub_shard_channels_.clear();
-        pubsub_patterns_.clear();
-    }
-
-    void pubsub_begin_rehome_epoch(uint64_t epoch) {
-        if (!epoch || pubsub_rehome_epoch_ == epoch) return;
-        pubsub_clear_home_indexes();
-        pubsub_rehome_epoch_ = epoch;
-    }
-
     void pubsub_home_cleanup_channels(
             std::unordered_map<std::string, std::vector<PubSubRef>>& index,
             const PubSubRef& ref, bool shard) {
@@ -363,22 +263,8 @@
 
     void pubsub_deliver_batch(std::vector<PubSubDelivery>& items) {
         for (PubSubDelivery& item : items) {
-            Client* client = nullptr;
-            auto local = pubsub_local_.find(item.conn);
-            if (local != pubsub_local_.end()) client = local->second.client;
-            uint32_t live_io = self_->id();
-            const bool live = client ? ((live_io = client->ifid_thread()), true)
-                                     : command_client_directory_find(item.conn, live_io);
-            if (live && live_io != self_->id()) {
-                // Transfer the item's existing blob reference to the forwarded outbox. No ref/unref
-                // pair is needed, and the next final owner repeats this same live check.
-                pubsub_outbox_for(live_io).deliveries.push_back(std::move(item));
-                item.blob = nullptr;
-                srv_->pubsub_forwarded_stale_added();
-                continue;
-            }
-            if (live) pubsub_deliver_one(item);
-            if (item.blob) pubsub_blob_unref(item.blob);
+            pubsub_deliver_one(item);
+            pubsub_blob_unref(item.blob);
         }
         srv_->pubsub_deliveries_added(items.size());
         items.clear();
@@ -526,22 +412,6 @@
         const PubSubRef ref{event.origin_io, event.conn_id};
         switch (event.kind) {
             case PubSubEventKind::ModifyRequest: {
-                if (event.rebind) {
-                    if (event.op_id) pubsub_begin_rehome_epoch(event.op_id);
-                    for (const PubSubEventItem& item : event.items) {
-                        if (event.op_id && event.subscribe) {
-                            if (event.pattern)
-                                pubsub_home_ensure_pattern(item.value, event.conn_id);
-                            else
-                                pubsub_home_ensure_channel(item.value, event.conn_id, event.shard);
-                        } else if (event.pattern) {
-                            pubsub_home_rebind_pattern(item.value, event.conn_id);
-                        } else {
-                            pubsub_home_rebind_channel(item.value, event.conn_id, event.shard);
-                        }
-                    }
-                    break;
-                }
                 PubSubEvent* result = pubsub_new_event(PubSubEventKind::ModifyResult);
                 result->conn_id = event.conn_id;
                 result->op_id = event.op_id;
@@ -716,11 +586,6 @@
         Op& op = client->rob().at(pending.op_id);
         auto sink = op.sink();
 
-        // Publications are independent frames. Suppression may discard only the command reply.
-        if (op.reply_skip() && !pending.deferred.empty()) {
-            wb_.defer_oob(*client, pending.deferred.data(), pending.deferred.size());
-            pending.deferred.clear();
-        }
         switch (pending.kind) {
             case PubSubPendingKind::Modify:
                 if (!pending.subscribe && !pending.deferred.empty())
@@ -768,9 +633,6 @@
                 break;
         }
 
-        if (pending.kind != PubSubPendingKind::Modify && pending.kind != PubSubPendingKind::Reset &&
-            !pending.deferred.empty())
-            sink.append(pending.deferred.data(), pending.deferred.size());
         op.state.store(OpState::Done, std::memory_order_release);
         enqueue_serve(client);
         mark_active(client);
@@ -971,87 +833,6 @@
         auto [it, inserted] = pubsub_local_.try_emplace(client->id());
         if (inserted) it->second.client = client;
         return it->second;
-    }
-
-    bool pubsub_prepare_rebind_events(const PubSubLocalConn& local, uint64_t client_id,
-                                      uint32_t destination,
-                                      std::vector<PubSubEvent*>& events) {
-        auto make = [&](uint32_t target, bool pattern, bool shard) -> PubSubEvent* {
-            auto* event = new (std::nothrow) PubSubEvent;
-            if (!event) return nullptr;
-            event->kind = PubSubEventKind::ModifyRequest;
-            event->target_io = target;
-            event->origin_io = destination;
-            event->conn_id = client_id;
-            event->pattern = pattern;
-            event->shard = shard;
-            event->rebind = true;
-            events.push_back(event);
-            return event;
-        };
-        auto exact = [&](const auto& values, bool shard) {
-            std::unordered_map<uint32_t, PubSubEvent*> homes;
-            for (const std::string& value : values) {
-                const uint32_t home = pubsub_home_for(value);
-                PubSubEvent*& event = homes[home];
-                if (!event && !(event = make(home, false, shard))) return false;
-                event->items.push_back(PubSubEventItem{0, false, 0, value});
-            }
-            return true;
-        };
-        if (!exact(local.channels, false) || !exact(local.shard_channels, true)) return false;
-        for (uint32_t io : srv_->placement().ifid_threads()) {
-            if (local.patterns.empty()) break;
-            PubSubEvent* event = make(io, true, false);
-            if (!event) return false;
-            for (const std::string& pattern : local.patterns)
-                event->items.push_back(PubSubEventItem{0, false, 0, pattern});
-        }
-        return true;
-    }
-
-    void pubsub_rehome_local(uint64_t epoch) {
-        pubsub_begin_rehome_epoch(epoch);
-        for (const auto& local_entry : pubsub_local_) {
-            const uint64_t client_id = local_entry.first;
-            const PubSubLocalConn& local = local_entry.second;
-            auto post_exact = [&](const auto& values, bool shard) {
-                std::unordered_map<uint32_t, PubSubEvent*> homes;
-                for (const std::string& value : values) {
-                    const uint32_t home = pubsub_home_for(value);
-                    PubSubEvent*& event = homes[home];
-                    if (!event) {
-                        event = pubsub_new_event(PubSubEventKind::ModifyRequest);
-                        event->target_io = home;
-                        event->origin_io = self_->id();
-                        event->conn_id = client_id;
-                        event->op_id = epoch;
-                        event->subscribe = true;
-                        event->shard = shard;
-                        event->rebind = true;
-                    }
-                    event->items.push_back(PubSubEventItem{0, false, 0, value});
-                }
-                for (auto& entry : homes) pubsub_post(entry.first, entry.second);
-            };
-            post_exact(local.channels, false);
-            post_exact(local.shard_channels, true);
-            if (!local.patterns.empty()) {
-                for (uint32_t io : srv_->placement().ifid_threads()) {
-                    PubSubEvent* event = pubsub_new_event(PubSubEventKind::ModifyRequest);
-                    event->target_io = io;
-                    event->origin_io = self_->id();
-                    event->conn_id = client_id;
-                    event->op_id = epoch;
-                    event->pattern = true;
-                    event->subscribe = true;
-                    event->rebind = true;
-                    for (const std::string& pattern : local.patterns)
-                        event->items.push_back(PubSubEventItem{0, false, 0, pattern});
-                    pubsub_post(io, event);
-                }
-            }
-        }
     }
 
     __attribute__((noinline)) PubSubStartResult pubsub_begin_pending(
@@ -1445,4 +1226,3 @@
     std::vector<PubSubOutbox> pubsub_outbox_;      // sized on first pub/sub use, never before
     std::vector<uint32_t> pubsub_outbox_dirty_;
     bool pubsub_pass_pending_ = false;             // the one hot-path bit flush_ready tests
-    uint64_t pubsub_rehome_epoch_ = 0;

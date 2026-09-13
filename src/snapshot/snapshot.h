@@ -61,7 +61,6 @@ public:
     Phase phase() const { return phase_.load(std::memory_order_acquire); }
     uint64_t epoch() const { return epoch_.load(std::memory_order_acquire); }
     int64_t cut_ms() const { return cut_ms_.load(std::memory_order_acquire); }
-    uint64_t cut_ticket() const { return cut_ticket_.load(std::memory_order_relaxed); }
     bool blocking() const { return blocking_.load(std::memory_order_relaxed); }
     uint32_t save_current_shard() const {
         return save_current_shard_.load(std::memory_order_acquire);
@@ -104,7 +103,7 @@ private:
     bool finish_file_metadata(Ring* ring);
     bool complete_file_success();
     uint32_t pump_io_completions(ThreadCtx& writer, Ring& ring);
-    void drain_atomic_groups(Server& server, ThreadCtx& writer);
+    void drain_atomic_groups(Server& server);
     void abort_file();
     void discard_chunks();
     void set_error(const char* text);
@@ -118,7 +117,6 @@ private:
     std::atomic<Phase> phase_{Phase::Idle};
     std::atomic<uint64_t> epoch_{0};
     std::atomic<int64_t> cut_ms_{0};
-    std::atomic<uint64_t> cut_ticket_{0};
     std::atomic<uint32_t> ready_owners_{0};
     std::atomic<uint32_t> frozen_owners_{0};
     std::atomic<uint32_t> marked_owners_{0};

@@ -212,11 +212,8 @@ def script_watch_declared_keys_only():
         for key in candidates:
             owner = writer.cmd("DEBUG", "SHARD", key)
             if not isinstance(owner, int):
-                # Needs the DEBUG SHARD hook. Refuse loudly instead of failing so a
-                # debug-disabled boot doesn't read as a MULTI/WATCH defect (atomfix
-                # pattern; this exact false alarm was chased as a latent bug once).
-                print("  SKIP script WATCH declared-key detector: DEBUG SHARD "
-                      "unavailable (%r); boot with --enable-debug-command yes" % (owner,))
+                note("script WATCH declared-key detector", False,
+                     "DEBUG SHARD unavailable: %r" % (owner,))
                 return
             by_owner.setdefault(owner, []).append(key)
         pair = next((keys[:2] for keys in by_owner.values() if len(keys) >= 2), None)
@@ -321,7 +318,6 @@ def torn_arm(seconds=2.0):
     # version of this window lives in tests/execatomic.py (DEBUG ATOMIC-FANOUT-DEFER).
     keys = ["multi:torn:%d" % i for i in range(8)]
     before_cuts = info_field("atomic_fanout_cuts")
-    before_pend = info_field("read_local_fallback_atomic_pending")
     init = Resp()
     for key in keys:
         init.cmd("SET", key, "0")
@@ -386,11 +382,10 @@ def torn_arm(seconds=2.0):
         thread.join(35)
     alive = [thread.name for thread in threads if thread.is_alive()]
     cuts = (info_field("atomic_fanout_cuts") or 0) - (before_cuts or 0)
-    pend = (info_field("read_local_fallback_atomic_pending") or 0) - (before_pend or 0)
     note("EXEC one-ticket torn-read arm",
-         not errors and not alive and torn == 0 and reads > 100 and commits > 10 and (cuts > 0 or pend > 0),
-         "reads=%d commits=%d torn=%d fanout_cuts=+%d pending_fallbacks=+%d errors=%r alive=%r" %
-         (reads, commits, torn, cuts, pend, errors[:2], alive))
+         not errors and not alive and torn == 0 and reads > 100 and commits > 10 and cuts > 0,
+         "reads=%d commits=%d torn=%d fanout_cuts=+%d errors=%r alive=%r" %
+         (reads, commits, torn, cuts, errors[:2], alive))
 
 
 def watch_race(rounds=100):

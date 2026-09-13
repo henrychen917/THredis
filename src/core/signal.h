@@ -1,10 +1,18 @@
-// signal.h — cross-thread handoffs and LoopSignals in common units for the IO and EX roles.
+// signal.h — ONE cross-thread signalling mechanism, used by all three loops, reporting in ONE set
+// of units.
 //
-// Channels pair queue publication with notification, so load measurements use the same units
-// across directions. Ready-mask completion notifications share those wake and work counters.
+// WHY THIS FILE EXISTS. The three handoffs started out as three different mechanisms: IO->EX was a
+// bare queue push with no wake, EX->IO was a msg_ring poke plus a scan of every active client, and
+// the WB handoff was a queue plus a poke. A flip/LB controller reading those would be comparing
+// three incomparable things — a depth, a scan cost, and a wake rate — and would have to special-case
+// each one. Every balancer defect in the fork came from comparing mismatched quantities.
 //
-//   IO -> EX    MaskedChannelArray dispatch a parsed Task to the shard's owner
-//   EX -> IO    ready mask / Channel<Client*> notify the connection owner to retire and send
+// So: every cross-thread handoff is a Channel, and every loop reports LoopSignals. Same shape, same
+// units, whatever the direction.
+//
+//   IO -> EX    Channel<Task>      dispatch a parsed op to the shard's owner
+//   EX -> IO    Channel<Client*>   tell the owner it has completed ops to retire
+//   IO/EX -> WB Channel<Client*>   tell the sender it has bytes to write
 //
 // UNITS, fixed here so nothing has to be converted at the point of comparison:
 //   work      operations (uint64 monotonic count)
@@ -19,23 +27,13 @@
 // counters are plain non-atomic uint64 written only by their owning thread; the only atomic on the
 // hot path is the peer-blocked flag, and it is read, not written.
 #pragma once
-#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <ctime>
-#include <vector>
 #include "../exec/exqueue.h"
-#include "../exec/masked_queue.h"
 #include "../net/uring.h"
 
 namespace tomo {
-
-// A scheduling-pressure signal older than one minute has already saturated every useful control
-// decision. More importantly, the low-32-bit enqueue clock's "producer is a few microseconds ahead
-// of the consumer's cached beat" sentinel must never become a multi-billion-us observation. Clamp
-// at the source and again at export so neither future arithmetic drift nor a racy capture can put
-// an absurd age on the operator/controller surface.
-inline constexpr uint64_t kLbAgeSaneMaxUs = 60ull * 1000 * 1000;
 
 inline uint64_t now_ns() {
     timespec ts;
@@ -47,7 +45,7 @@ inline uint64_t now_ns() {
 // that will be compared against a deadline must come from here and never from now_ns() above --
 // that one is CLOCK_MONOTONIC, so its "milliseconds" are milliseconds since boot and sit roughly
 // five orders of magnitude below any real deadline. A monotonic value used as an expiry cut does
-// not skew the answer, it disables expiry outright.
+// not skew the answer, it disables expiry outright; see NOTES-EXPWIDE.md defect W3.
 inline int64_t now_realtime_ms() {
     timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -79,17 +77,6 @@ struct LoopSignals {
     uint64_t depth_sum     = 0; // sum of sampled inbound depths, in ENTRIES
     uint64_t depth_samples = 0; // divide to get a time-average rather than a spot reading
     uint64_t full_events   = 0; // outbound push refused: real backpressure, not a guess
-
-    // Sampled queue/age signals. Timestamps come from the loop's already-paid busy Span clock;
-    // queue-delay observation therefore adds no clock read or atomic to a per-operation path.
-    // EWMAs use x256 fixed point so writers stay plain owner-local uint64 stores.
-    uint64_t queue_delay_samples = 0;
-    uint64_t queue_delay_ewma_x256 = 0;
-    uint64_t oldest_age_us = 0;          // current role-specific gauge at the 100us signal beat
-    uint64_t oldest_age_samples = 0;
-    uint64_t oldest_age_ewma_x256 = 0;
-    uint64_t oldest_age_min_us = 0;
-    uint64_t oldest_age_max_us = 0;
 
     // ---- signalling --------------------------------------------------------------------------
     uint64_t wakes_sent = 0;
@@ -136,65 +123,9 @@ struct LoopSignals {
     uint64_t epoll_events = 0;          // readiness events returned by epoll_wait
     uint64_t epoll_recvs = 0;           // recv syscalls that returned bytes
 
-    // Boot-latched producer sampling state. A zero rate takes the direct Channel push path: no
-    // stamp writes, countdown work, arrays, or EWMA updates. cached_now_us is refreshed from
-    // Span::start_ns(), not by another clock read.
-    uint64_t cached_now_us = 0;
-    uint32_t age_sample_rate = 0;
-    uint32_t age_sample_countdown = 0;
-
-    void configure_age_sampling(uint32_t rate) {
-        age_sample_rate = rate;
-        age_sample_countdown = rate;
-    }
-    uint32_t next_age_stamp() {
-        if (--age_sample_countdown != 0) return 0;
-        age_sample_countdown = age_sample_rate;
-        const uint32_t low = static_cast<uint32_t>(cached_now_us);
-        return low;                        // zero loses one sample per 2^32us; it is the sentinel
-    }
-    bool sampled_age(uint32_t enqueue_us_low, uint64_t& age_us) const {
-        const uint32_t modular = static_cast<uint32_t>(cached_now_us) - enqueue_us_low;
-        // The producer stamped after this consumer cached its current beat. This is the transient
-        // empty-queue/future-stamp sentinel, not a task that waited for roughly UINT32_MAX us.
-        if (static_cast<int32_t>(modular) < 0) return false;
-        age_us = std::min<uint64_t>(modular, kLbAgeSaneMaxUs);
-        return true;
-    }
-    bool observe_queue_delay(uint32_t enqueue_us_low, uint64_t& delay) {
-        if (!sampled_age(enqueue_us_low, delay)) return false;
-        observe_ewma(delay, queue_delay_samples, queue_delay_ewma_x256);
-        return true;
-    }
-    void observe_oldest_age(uint64_t age_us) {
-        age_us = std::min(age_us, kLbAgeSaneMaxUs);
-        oldest_age_us = age_us;
-        if (!oldest_age_samples) {
-            oldest_age_min_us = oldest_age_max_us = age_us;
-        } else {
-            oldest_age_min_us = std::min(oldest_age_min_us, age_us);
-            oldest_age_max_us = std::max(oldest_age_max_us, age_us);
-        }
-        observe_ewma(age_us, oldest_age_samples, oldest_age_ewma_x256);
-    }
-    void clear_oldest_age() { oldest_age_us = 0; }
-
     // Derived, computed on read so the hot path never divides.
     double avg_depth() const {
         return depth_samples ? static_cast<double>(depth_sum) / static_cast<double>(depth_samples) : 0.0;
-    }
-
-private:
-    static void observe_ewma(uint64_t sample, uint64_t& samples, uint64_t& ewma_x256) {
-        const uint64_t scaled = sample << 8;
-        if (!samples) {
-            ewma_x256 = scaled;
-        } else if (scaled >= ewma_x256) {
-            ewma_x256 += (scaled - ewma_x256 + 7) / 8;
-        } else {
-            ewma_x256 -= (ewma_x256 - scaled + 7) / 8;
-        }
-        samples++;
     }
 };
 
@@ -204,7 +135,6 @@ class Span {
 public:
     explicit Span(uint64_t& sink) : sink_(sink), t0_(now_ns()) {}
     ~Span() { sink_ += now_ns() - t0_; }
-    uint64_t start_ns() const { return t0_; }
     Span(const Span&) = delete;
     Span& operator=(const Span&) = delete;
 private:
@@ -271,13 +201,6 @@ public:
         if (!words_[word].load(std::memory_order_relaxed)) return 0;
         return words_[word].exchange(0, std::memory_order_acquire);
     }
-    // Owner-only teardown/migration fence. Once the ROB is quiescent no executor can set this
-    // slot again; clearing it before recycling the slot prevents a stale ready bit from naming the
-    // next connection assigned the same index.
-    void clear(uint32_t slot) {
-        const uint64_t bit = 1ull << (slot & 63);
-        words_[(slot >> 6) % kWords].fetch_and(~bit, std::memory_order_acq_rel);
-    }
     bool any() const {
         for (uint32_t i = 0; i < kWords; i++)
             if (words_[i].load(std::memory_order_relaxed)) return true;
@@ -311,23 +234,8 @@ public:
 
     // Consumer side. Takes and clears one word's worth of flags. Acquire pairs with the producer's
     // release so the queue contents behind the bit are visible.
-    //
-    // Load-first, for the same reason ReadyMask::take is: an exchange is a locked RMW that takes
-    // the line exclusive even when the word is zero, and every consumer pass takes every word of
-    // every mask it drains -- four locked RMWs per io pass and four per ex pass, ~100 cycles that
-    // at p1 are paid per OP because a pass is one op. A zero word is the common case and the
-    // relaxed read costs a shared-line load. A bit set between the load and the skipped exchange
-    // is not lost: it is still set, the next pass takes it, and the park path re-checks masks AND
-    // queue depths behind a seq_cst fence (ThreadCtx::arm_blocked) so no wake can be missed.
     uint64_t take(uint32_t word) {
-        if (!words_[word].load(std::memory_order_relaxed)) return 0;
         return words_[word].exchange(0, std::memory_order_acquire);
-    }
-
-    // Read-only optimization hint. Correctness consumers still use take(); a stale or missing bit
-    // here may suppress optional filler work but can never strand the underlying queue.
-    uint64_t peek(uint32_t word) const {
-        return words_[word].load(std::memory_order_relaxed);
     }
 
     bool any() const {
@@ -362,31 +270,9 @@ public:
         if (!q_.push(v)) { sig.full_events++; return false; }
         return true;
     }
-    template <typename Prepare>
-    bool push_prepared(T v, LoopSignals& sig, Prepare&& prepare) {
-        if (!q_.push_prepared(v, static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
     bool push_batch(const T* values, uint32_t count, LoopSignals& sig) {
         if (!q_.push_batch(values, count)) { sig.full_events++; return false; }
         return true;
-    }
-    template <typename Prepare>
-    bool push_batch_prepared(const T* values, uint32_t count, LoopSignals& sig,
-                             Prepare&& prepare) {
-        if (!q_.push_batch_prepared(values, count, static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-
-    template <typename Extract>
-    uint32_t newest_nonzero(Extract&& extract) const {
-        return q_.newest_nonzero(static_cast<Extract&&>(extract));
     }
 
     // Call ONLY when the caller performed the mask's empty->flagged transition. That RMW is a full
@@ -421,149 +307,6 @@ public:
 
 private:
     ExQueue<T, Cap>   q_;
-    std::atomic<bool> blocked_{false};
-};
-
-// One wake endpoint around one consumer-owned masked slot array.  Queue frontiers remain per
-// producer; only the blocked flag is shared, which is equivalent to the old code arming every task
-// channel together and removes nproducer stores from the sleep-only path.
-template <typename T, uint32_t MaxProducers>
-class MaskedChannelArray {
-public:
-    bool init_local(uint32_t producers, uint32_t slots_per_thread,
-                    const std::vector<uint32_t>& io,
-                    const std::vector<uint32_t>& ex) {
-        return q_.init_local(producers, slots_per_thread, io, ex);
-    }
-    template <uint32_t SlotsPerProducer>
-    bool init_local_fused(uint32_t producers) {
-        return q_.template init_local_fused<SlotsPerProducer>(producers);
-    }
-    bool remask_quiesced(const std::vector<uint32_t>& io,
-                         const std::vector<uint32_t>& ex) {
-        return q_.remask_quiesced(io, ex);
-    }
-    bool grow_quiesced(uint32_t slots, const std::vector<uint32_t>& io,
-                       const std::vector<uint32_t>& ex) {
-        return q_.grow_quiesced(slots, io, ex);
-    }
-
-    bool push(uint32_t producer, T value, LoopSignals& sig) {
-        if (!q_.push(producer, value)) { sig.full_events++; return false; }
-        return true;
-    }
-    template <typename Prepare>
-    bool push_prepared(uint32_t producer, T value, LoopSignals& sig, Prepare&& prepare) {
-        if (!q_.push_prepared(producer, value, static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    bool push_batch(uint32_t producer, const T* values, uint32_t count, LoopSignals& sig) {
-        if (!q_.push_batch(producer, values, count)) { sig.full_events++; return false; }
-        return true;
-    }
-    bool reserve(uint32_t producer, uint32_t count) {
-        return q_.reserve(producer, count);
-    }
-    void cancel_reservation(uint32_t producer, uint32_t count) {
-        q_.cancel_reservation(producer, count);
-    }
-    void push_reserved(uint32_t producer, T value) {
-        q_.push_reserved(producer, value);
-    }
-    template <typename Prepare>
-    void push_reserved_prepared(uint32_t producer, T value, Prepare&& prepare) {
-        q_.push_reserved_prepared(producer, value, static_cast<Prepare&&>(prepare));
-    }
-    template <typename Prepare>
-    bool push_batch_prepared(uint32_t producer, const T* values, uint32_t count,
-                             LoopSignals& sig, Prepare&& prepare) {
-        if (!q_.push_batch_prepared(producer, values, count,
-                                    static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    template <uint32_t SlotsPerProducer>
-    bool push_fused_private(uint32_t producer, T value, LoopSignals& sig) {
-        if (!q_.template push_fused_private<SlotsPerProducer>(producer, value)) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    template <uint32_t SlotsPerProducer, typename Prepare>
-    bool push_fused_private_prepared(uint32_t producer, T value, LoopSignals& sig,
-                                     Prepare&& prepare) {
-        if (!q_.template push_fused_private_prepared<SlotsPerProducer>(
-                producer, value, static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    template <uint32_t SlotsPerProducer>
-    bool push_fused_private_batch(uint32_t producer, const T* values, uint32_t count,
-                                  LoopSignals& sig) {
-        if (!q_.template push_fused_private_batch<SlotsPerProducer>(
-                producer, values, count)) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    template <uint32_t SlotsPerProducer, typename Prepare>
-    bool push_fused_private_batch_prepared(uint32_t producer, const T* values,
-                                           uint32_t count, LoopSignals& sig,
-                                           Prepare&& prepare) {
-        if (!q_.template push_fused_private_batch_prepared<SlotsPerProducer>(
-                producer, values, count, static_cast<Prepare&&>(prepare))) {
-            sig.full_events++;
-            return false;
-        }
-        return true;
-    }
-    template <uint32_t SlotsPerProducer>
-    uint32_t fused_private_free_slots(uint32_t producer) const {
-        return q_.template fused_private_free_slots<SlotsPerProducer>(producer);
-    }
-    template <typename Extract>
-    uint32_t newest_nonzero(uint32_t producer, Extract&& extract) const {
-        return q_.newest_nonzero(producer, static_cast<Extract&&>(extract));
-    }
-    void wake(Ring& my_ring, LoopSignals& sig, Ring* peer_ring) {
-        if (peer_ring && blocked_.load(std::memory_order_acquire)) {
-            my_ring.msg_to(*peer_ring, ur_tag(UrKind::Wake, nullptr));
-            sig.wakes_sent++;
-        }
-    }
-    bool recv(uint32_t producer, T& out) { return q_.pop(producer, out); }
-    template <uint32_t SlotsPerProducer>
-    bool recv_fused_private(uint32_t producer, T& out) {
-        return q_.template pop_fused_private_unretired<SlotsPerProducer>(producer, out);
-    }
-    bool pop_unretired(uint32_t producer, T& out) {
-        return q_.pop_unretired(producer, out);
-    }
-    void retire(uint32_t producer) { q_.retire(producer); }
-    void retire_n(uint32_t producer, uint32_t count) { q_.retire_n(producer, count); }
-    bool quiesced(uint32_t producer) const { return q_.quiesced(producer); }
-    bool all_quiesced() const { return q_.all_quiesced(); }
-    uint32_t depth(uint32_t producer) const { return q_.depth(producer); }
-    uint32_t sample_depth(uint32_t producer) { return q_.sample_depth(producer); }
-    uint32_t producer_free_slots(uint32_t producer) const {
-        return q_.producer_free_slots(producer);
-    }
-    void arm_blocked() { blocked_.store(true, std::memory_order_release); }
-    void clear_blocked() { blocked_.store(false, std::memory_order_release); }
-    uint32_t total_slots() const { return q_.total_slots(); }
-    MaskedQueueDiagnostics diagnostics() const { return q_.diagnostics(); }
-
-private:
-    MaskedSpscArray<T, MaxProducers> q_;
     std::atomic<bool> blocked_{false};
 };
 

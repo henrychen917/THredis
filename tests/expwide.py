@@ -122,17 +122,6 @@ def info_counter(conn, field):
     return -1
 
 
-def info_text(conn, section, field):
-    """One INFO field as text, or None when the server (the redis oracle) has no such field."""
-    text = conn.cmd("INFO", section)
-    if not isinstance(text, (bytes, bytearray)):
-        return None
-    for line in text.decode(errors="replace").splitlines():
-        if line.startswith(field + ":"):
-            return line.split(":", 1)[1]
-    return None
-
-
 # --------------------------------------------------------------------------------------------
 # geometry and arming
 
@@ -228,39 +217,27 @@ def test_fanout_hook(conn):
     check_true("S1 geometry spans eight owners", shards is not None and len(shards) == 8,
                "shards=%r" % (shards,))
     defer_us = 400000
-    # On a fused boot with the read-local lane armed a clean MGET never enters the scatter engine;
-    # the hook then widens the local MGET window instead (ex_loop.h, debug_fanout_stall_local),
-    # between the pinned expiry cut and the value loads. The lane's own counter proves it was that
-    # path -- not an owner fallback widened in the scatter engine -- that answered inside the
-    # widened window, so the row cannot pass by the local lane quietly demoting the command.
-    # EXISTS is not lane-eligible and always fans out. The redis oracle reports no lane at all.
-    read_local = info_text(conn, "server", "read_local") == "1"
 
     def widened(command, offset_ms):
         arm(conn, keys, offset_ms)
         if conn.cmd("DEBUG", "ATOMIC-FANOUT-DEFER", str(defer_us)) != b"OK":
             raise AssertionError("fan-out defer hook rejected")
-        local_before = info_counter(conn, "read_local_mget_local_hits")
         start = time.monotonic()
         reply = conn.cmd(*command)
         elapsed = time.monotonic() - start
-        local_hits = info_counter(conn, "read_local_mget_local_hits") - local_before
         conn.cmd("DEBUG", "ATOMIC-FANOUT-DEFER", "0")
-        return reply, elapsed, local_hits
+        return reply, elapsed
 
     for name, command, alive, dead in (
             ("MGET", ("MGET",) + tuple(keys), [b"v"] * 8, [None] * 8),
             ("EXISTS", ("EXISTS",) + tuple(keys), 8, 0)):
-        reply, elapsed, local_hits = widened(command, defer_us // 2000)
+        reply, elapsed = widened(command, defer_us // 2000)
         check_true("S1 %s: the hook really widened the fan-out" % name,
                    elapsed >= defer_us / 2.0e6, "elapsed=%.3fs" % elapsed)
-        if read_local and name == "MGET":
-            check("S1 MGET: the widened window was the read-local lane's own", local_hits, 1)
-            NOTES.append("S1 MGET served on the read-local lane, widened %.3fs" % elapsed)
         check("S1 %s across a deadline inside the fan-out" % name, reply, alive)
-        reply, _, _ = widened(command, FAR)
+        reply, _ = widened(command, FAR)
         check("S1 %s control, deadline an hour out" % name, reply, alive)
-        reply, _, _ = widened(command, ELAPSED)
+        reply, _ = widened(command, ELAPSED)
         check("S1 %s control, elapsed before the command" % name, reply, dead)
     set_active(conn, 1)
 

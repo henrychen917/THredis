@@ -42,8 +42,7 @@ void reply_corrupt(Op& op) {
 }
 
 template <bool kNotify>
-bool load_hll(Shard& shard, Op& op, KvObj*& object, Slice& image,
-              KvObjRawReadBuffer& raw) {
+bool load_hll(Shard& shard, Op& op, KvObj*& object, Slice& image) {
     object = shard.store_find<kNotify>(op.hash, op.arg(2));
     if (!object) {
         reply_err(op.sink(), "ERR The specified key does not exist");
@@ -57,7 +56,7 @@ bool load_hll(Shard& shard, Op& op, KvObj*& object, Slice& image,
         reply_bad_header(op);
         return false;
     }
-    image = kvobj_string_value(object, raw);
+    image = object->str_value();
     if (!hll::header_valid(image)) {
         reply_bad_header(op);
         return false;
@@ -70,12 +69,10 @@ bool store_dense(Shard& shard, Op& op, KvObj* object, const std::string& image) 
     const XshardStringStoreResult result = kNotify
         ? xshard_store_string_notify(shard, op.arg(2), op.hash,
                                      Slice(image.data(), static_cast<uint32_t>(image.size())),
-                                     shard.store().deadline(op.hash, object), false,
-                                     object->has_ttl_slot())
+                                     object->expire_at_ms(), false)
         : xshard_store_string(shard, op.arg(2), op.hash,
                              Slice(image.data(), static_cast<uint32_t>(image.size())),
-                             shard.store().deadline(op.hash, object), false,
-                             object->has_ttl_slot());
+                             object->expire_at_ms(), false);
     switch (result) {
         case XshardStringStoreResult::Stored:
             return true;
@@ -97,8 +94,7 @@ template <bool kNotify>
 void cmd_pfdebug_impl(Shard& shard, Op& op) {
     KvObj* object = nullptr;
     Slice image;
-    KvObjRawReadBuffer raw;
-    if (!load_hll<kNotify>(shard, op, object, image, raw)) return;
+    if (!load_hll<kNotify>(shard, op, object, image)) return;
 
     const Slice subcommand = op.arg(1);
     if (eq_icase(subcommand, "ENCODING")) {

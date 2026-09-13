@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Directed cross-owner element-mover battery. Usage: tests/xmove.py HOST PORT [--release-build]"""
+"""Directed cross-owner element-mover battery. Usage: tests/xmove.py HOST PORT"""
 
 import select
 import socket
@@ -7,9 +7,7 @@ import sys
 import time
 
 
-RELEASE_BUILD = "--release-build" in sys.argv[1:]
-ARGS = [arg for arg in sys.argv[1:] if arg != "--release-build"]
-HOST, PORT = ARGS[0], int(ARGS[1])
+HOST, PORT = sys.argv[1], int(sys.argv[2])
 
 
 class RespError(Exception):
@@ -310,11 +308,7 @@ def main():
     source, destination, blocker = find_geometry(admin)
     print(f"xmove directed battery atomic={atomic}", flush=True)
     correctness(admin, source, destination)
-    if RELEASE_BUILD:
-        complexity_cell(admin, source, destination, atomic)
-    else:
-        print("  skip size-ratio timing: requires --release-build; correctness checks remain active",
-              flush=True)
+    complexity_cell(admin, source, destination, atomic)
     concurrent_push_cell(admin, source, destination, blocker, atomic)
     print(f"PASS xmove atomic={atomic}", flush=True)
 

@@ -48,8 +48,6 @@
 #include <mutex>
 #include <vector>
 
-#include "../core/signal_doorbell.h"
-
 namespace tomo {
 
 // BOOT-LATCHED, WRITTEN ONCE, before any thread that reads it exists (main.cc, before the pool is
@@ -65,7 +63,6 @@ enum class UrKind : uint8_t {
     Wake   = 5,   // cross-ring notification via msg_ring
     UnixAccept = 6,
     SnapshotStart = 7,  // epoch barrier request; pointer is SnapshotManager
-    Shutdown = 8,       // process signal doorbell; no pointer payload
     TlsAccept = 9,
     TlsRecv = 10,
     TlsSend = 11,
@@ -73,7 +70,6 @@ enum class UrKind : uint8_t {
     SnapshotIo = 13,    // persistence-engine request; pointer is writer-private request state
     TlsReadPoll = 14,
     TlsWritePoll = 15,
-    MigrateCancel = 16, // source-ring cancellation request; original Recv CQE is the fence
 };
 
 inline uint64_t ur_tag(UrKind k, void* p) {
@@ -86,12 +82,14 @@ inline T* ur_ptr(uint64_t tag) { return reinterpret_cast<T*>(tag & ((1ULL << 48)
 class Ring {
 public:
     Ring() = default;
-    ~Ring() { shutdown(); }
+    ~Ring() {
+        if (inited_) io_uring_queue_exit(&r_);
+        if (wake_fd_ >= 0) ::close(wake_fd_);
+    }
     Ring(const Ring&) = delete;
     Ring& operator=(const Ring&) = delete;
 
     bool init(unsigned entries) {
-        shutdown_fd_ = signal_doorbell_fd();
         if (g_ring_epoll_mode) {
             // EFD_NONBLOCK so a spurious drain of an already-empty counter cannot park the loop.
             wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -117,43 +115,8 @@ public:
             deferred_ = false;
         }
         inited_ = true;
-        if (shutdown_fd_ >= 0) {
-            io_uring_sqe* shutdown = io_uring_get_sqe(&r_);
-            if (!shutdown) return false;
-            io_uring_prep_poll_add(shutdown, shutdown_fd_, POLLIN);
-            shutdown->user_data = ur_tag(UrKind::Shutdown, nullptr);
-            if (io_uring_submit(&r_) < 1) return false;
-        }
         return true;
     }
-
-    // POST-JOIN FENCE. io_uring CQEs carry raw Client*/buffer pointers and the epoll fallback's
-    // mailbox carries the same tagged pointers. Queue teardown must therefore precede destruction
-    // of any connection those entries can name. Only the coordinator calls this, after every ring
-    // issuer has joined; making it idempotent also keeps partially initialized boot failures safe.
-    void shutdown() {
-        if (inited_) {
-            io_uring_queue_exit(&r_);
-            inited_ = false;
-        }
-        if (wake_fd_ >= 0) {
-            ::close(wake_fd_);
-            wake_fd_ = -1;
-        }
-        shutdown_fd_ = -1;  // borrowed process doorbell; Ring never closes it
-        deferred_cqes_.clear();
-        {
-            std::lock_guard<std::mutex> lock(mail_mu_);
-            mail_.clear();
-        }
-        raw_callback_active_ = false;
-        raw_callback_taken_ = false;
-        raw_callback_index_ = 0;
-        send_pending_ = false;
-        sq_full_submit_ = false;
-    }
-
-    bool shutdown_complete() const { return !inited_ && wake_fd_ < 0; }
 
     io_uring* raw() { return &r_; }
     bool deferred() const { return deferred_; }
@@ -161,7 +124,6 @@ public:
     // >= 0 exactly in epoll mode. The io loop registers it in its epoll set; that is what turns a
     // peer's msg_to() into a return from epoll_wait.
     int wake_fd() const { return wake_fd_; }
-    int shutdown_fd() const { return shutdown_fd_; }
 
     // Drain the doorbell counter. Level-triggered registration plus this read is deliberate: an
     // edge-triggered eventfd that we forgot to read would go quiet forever, and the price of
@@ -176,32 +138,22 @@ public:
     // every caller would otherwise have to invent the same retry and one of them would get it
     // wrong. In epoll mode there is no submission queue and this returns nullptr -- every caller
     // already handles that (it is the sqe-starved path), and no caller reaches it: network
-    // submission is engine-selected in IoLoop, and persistence derives the syscall engine.
+    // submission is engine-selected in IoLoop, and persistence is forced to --persist-io normal.
     io_uring_sqe* sqe() {
         if (__builtin_expect(wake_fd_ >= 0, false)) return nullptr;
         io_uring_sqe* s = io_uring_get_sqe(&r_);
-        if (!s) {
-            submit();
-            // A forced-full flush is a real boundary for the pipeline-1 SEND classifier. Keep
-            // this reset on the rare slow arm instead of charging every explicit submit.
-            send_pending_ = false;
-            sq_full_submit_ = true;
-            s = io_uring_get_sqe(&r_);
-        }
+        if (!s) { submit(); s = io_uring_get_sqe(&r_); }
         return s;
     }
 
     // A linked pair must not be split by sqe()'s full-ring flush between its two entries.
     void ensure_sq_space(unsigned needed) {
         if (__builtin_expect(wake_fd_ >= 0, false)) return;
-        if (io_uring_sq_space_left(&r_) < needed) {
-            submit();
-            send_pending_ = false;
-            sq_full_submit_ = true;
-        }
+        if (io_uring_sq_space_left(&r_) < needed) submit();
     }
 
     int submit() {
+        pending_ = 0;
         if (__builtin_expect(wake_fd_ >= 0, false)) return 0;
         return io_uring_submit(&r_);
     }
@@ -217,9 +169,8 @@ public:
     //
     // Measured cost of getting this wrong: a uniform ~3.9 ms per operation at p1, matching p99
     // exactly, i.e. paid by every request rather than a tail.
-    template <bool ClearSendClassification = false>
     int submit_and_reap() {
-        if constexpr (ClearSendClassification) send_pending_ = false;
+        pending_ = 0;
         if (__builtin_expect(wake_fd_ >= 0, false)) return 0;
         return io_uring_submit_and_get_events(&r_);
     }
@@ -228,16 +179,14 @@ public:
     // The timeout is not decoration: without it a thread parked here never re-reads its stop flag,
     // so shutdown hangs and the process has to be SIGKILLed. It also bounds the damage from any
     // missed wake — the loop recovers on the next tick instead of sleeping forever.
-    template <bool ClearSendClassification = false>
     int submit_and_wait(unsigned want = 1, unsigned timeout_ms = 50) {
-        if constexpr (ClearSendClassification) send_pending_ = false;
+        pending_ = 0;
         if (__builtin_expect(wake_fd_ >= 0, false)) {
             // The ex loop's park. Same contract as the uring path: block until a peer rings the
             // doorbell OR the timeout expires, so the stop flag is re-read on every tick.
-            pollfd waits[2] = {{wake_fd_, POLLIN, 0}, {shutdown_fd_, POLLIN, 0}};
-            const nfds_t count = shutdown_fd_ >= 0 ? 2 : 1;
-            const int n = ::poll(waits, count, static_cast<int>(timeout_ms));
-            if (n > 0 && (waits[0].revents & POLLIN)) drain_wake_fd();
+            pollfd p{wake_fd_, POLLIN, 0};
+            const int n = ::poll(&p, 1, static_cast<int>(timeout_ms));
+            if (n > 0) drain_wake_fd();
             return n < 0 ? 0 : n;
         }
         __kernel_timespec ts{};
@@ -316,38 +265,11 @@ public:
         return consumed;
     }
 
-    // Kept as the common marker at SQE producer sites. liburing owns the real pending count; the
-    // former shadow counter had no consumer and added a load/add/store to every prepared SQE.
-    void note_pending() {}
+    void note_pending() { pending_++; }
+    unsigned pending() const { return pending_; }
 
-    // SEND-bearing batches are latency carrying: a request/response client cannot create the next
-    // arrival until this SQE reaches the kernel. Keep only that classification rather than
-    // restoring the generic per-SQE shadow counter removed by the instruction-diet stack.
-    template <bool Classify>
-    void note_send_pending() {
-        if constexpr (Classify) send_pending_ = true;
-    }
-    bool send_pending() const { return send_pending_; }
-
-    // sqe()/ensure_sq_space() must flush synchronously when the SQ is full. A coalescing owner uses
-    // this edge to restart its rotation budget; consuming it does not describe ordinary explicit
-    // submit boundaries, which already restart that budget at their call site.
-    bool take_sq_full_submit() {
-        if (!sq_full_submit_) return false;
-        sq_full_submit_ = false;
-        return true;
-    }
-
-    // Schedule boundaries occasionally need to know whether a later stage prepared real SQEs.
-    // Query liburing's own tail/head state there instead of restoring the per-SQE shadow counter
-    // removed by the instruction-diet stack.
-    unsigned sq_ready() const {
-        return __builtin_expect(wake_fd_ >= 0, false) ? 0 : io_uring_sq_ready(&r_);
-    }
-
-    // Post a completion into ANOTHER thread's ring. This is how an executor wakes a parked io
-    // thread that has replies to retire (ThreadCtx::wake_if_parked), and how any producer pokes a
-    // parked consumer (Channel::wake), without a shared queue or an eventfd round trip.
+    // Post a completion into ANOTHER thread's ring. This is how an IO thread tells a WB thread that
+    // a client has replies to send, without a shared queue or an eventfd round trip.
     bool msg_to(Ring& target, uint64_t tag) {
         if (__builtin_expect(target.wake_fd_ >= 0, false)) return target.post_mail(tag);
         io_uring_sqe* s = sqe();
@@ -393,8 +315,7 @@ private:
     io_uring r_{};
     bool     inited_   = false;
     bool     deferred_ = true;
-    bool     send_pending_ = false;
-    bool     sq_full_submit_ = false;
+    unsigned pending_  = 0;
     std::vector<io_uring_cqe> deferred_cqes_;
     bool raw_callback_active_ = false;
     bool raw_callback_taken_ = false;
@@ -402,7 +323,6 @@ private:
     // Epoll-mode doorbell state. -1 in uring mode, which is the single test every method above
     // branches on; the vector and mutex are never constructed into use there.
     int wake_fd_ = -1;
-    int shutdown_fd_ = -1;  // borrowed from main; never drained or closed by a Ring
     std::mutex mail_mu_;
     std::vector<uint64_t> mail_;
 };

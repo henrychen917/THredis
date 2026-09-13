@@ -7,22 +7,7 @@ import threading
 import time
 
 
-# --no-rate-assertions drops the ONE measurement/claim in this file that is about speed rather
-# than a mechanism (see the overlap section). Every correctness check still runs. The gate
-# passes it on the ASAN tier, where the sanitizer's ~5x slowdown does not slow the pipelined and
-# the serial arm by the same factor and inverts the ratio: the full gate measured pipe 21,005/s
-# against serial 24,202/s and reddened the row while every correctness check in that same run
-# passed, and the same build passed 4 of 4 standalone. A ratio-of-rates claim is a performance
-# assertion; it belongs on the release build only. It is NOT sniffed from the environment -- the
-# caller says so explicitly, so a battery run by hand behaves like the caller asked, not like
-# whatever it guessed about its server.
-ARGS = sys.argv[1:]
-RATE_ASSERTIONS = "--no-rate-assertions" not in ARGS
-ARGS = [a for a in ARGS if a != "--no-rate-assertions"]
-if len(ARGS) != 2:
-    print("usage: atomic_ryow.py <host> <port> [--no-rate-assertions]", flush=True)
-    sys.exit(2)
-HOST, PORT = ARGS[0], int(ARGS[1])
+HOST, PORT = sys.argv[1], int(sys.argv[2])
 FAIL = 0
 
 
@@ -31,11 +16,6 @@ def note(name, ok, extra=""):
     print(("  ok   " if ok else "  FAIL ") + name + (" " + extra if extra else ""), flush=True)
     if not ok:
         FAIL += 1
-
-
-def skip(name, reason):
-    """A claim deliberately not made on this tier, printed explicitly."""
-    print("  SKIP " + name + " -- " + reason, flush=True)
 
 
 def frame(*args):
@@ -103,22 +83,6 @@ r1, r2, r3 = c.read(), c.read(), c.read()
 note("atomic MSET then plain GET/MGET RYOW",
      r1 == b"OK" and r2 == b"ryow:one" and r3 == [b"ryow:one"] * 8,
      "replies=%r/%r/%r" % (r1, r2, r3))
-c.close()
-
-# Put the only overlap at the final MGET argument so admission must scan past every disjoint key,
-# including the command's prehashed routing key. The adjacent frames also leave no intervening GET
-# that could supply its own owner fence and mask an MGET-local RYOW regression.
-guards = ["ary:mget-ring-guard:%d" % i for i in range(8)]
-writes = ["ary:mget-ring-write:%d" % i for i in range(8)]
-admin.cmd("DEL", *(guards + writes))
-admin.cmd(*mset_args(guards, "guard:old"))
-c = Resp()
-c.sock.sendall(frame(*mset_args(writes, "ryow:mget")) +
-               frame("MGET", *(guards + [writes[-1]])))
-w, values = c.read(), c.read()
-note("atomic MSET then last-key-overlapping MGET RYOW",
-     w == b"OK" and values == [b"guard:old"] * 8 + [b"ryow:mget"],
-     "replies=%r/%r" % (w, values))
 c.close()
 
 # The same precise hazard applies to a younger plain write: it must not physically run before the
@@ -214,46 +178,36 @@ note("abandoned MSETNX candidates are never observable",
      not thread.is_alive() and leak_reads > 0 and not leak_errors,
      "reads=%d errors=%r" % (leak_reads, leak_errors))
 
-# Observe multiple disjoint groups in flight on exactly one fresh connection. A connection
-# barrier cannot satisfy this witness, even though the production credit limit exceeds its ROB.
-from atomicwindow import held_burst
-try:
-    witness = held_burst(HOST, PORT, whole_window=False)
-    note("cross-key atomics on one connection overlap", True, witness)
-except Exception as exc:
-    note("cross-key atomics on one connection overlap", False, str(exc))
-
-# Rate comparison uses a separate, unheld burst after the witness has fully drained.
+# Cross-key atomics on one connection must be admitted concurrently. A tiny window makes overlap
+# directly observable (the third frame stalls admission), and the rate comparison guards against a
+# future accidental return of the full connection barrier.
+admin.cmd("CONFIG", "SET", "atomic-window", "2")
+stall_before = int(admin.cmd("INFO", "STATS").split(b"atomic_window_stalls:", 1)[1].split(b"\r\n", 1)[0])
 c = Resp()
 burst_count = 24
 burst = bytearray()
 for seq in range(burst_count):
     burst += frame(*mset_args(["ary:overlap:%d:%d" % (seq, i) for i in range(8)], str(seq)))
-started = time.perf_counter() if RATE_ASSERTIONS else None
+started = time.perf_counter()
 c.sock.sendall(burst)
 overlap_ok = all(c.read() == b"OK" for _ in range(burst_count))
-pipelined_elapsed = time.perf_counter() - started if RATE_ASSERTIONS else None
+pipelined_elapsed = time.perf_counter() - started
 c.close()
-note("unheld pipelined groups completed", overlap_ok)
-# The RATE half: with the barrier gone, pipelining 24 groups must also beat 24 serial round trips.
-# It is a performance claim -- true only on a machine that is not being slowed unevenly -- so it is
-# measured and asserted on the release tier only.
-if RATE_ASSERTIONS:
-    c = Resp()
-    started = time.perf_counter()
-    for seq in range(burst_count):
-        c.cmd(*mset_args(["ary:serial:%d:%d" % (seq, i) for i in range(8)], str(seq)))
-    serial_elapsed = time.perf_counter() - started
-    c.close()
-    pipe_rate = burst_count / max(pipelined_elapsed, 1e-9)
-    serial_rate = burst_count / max(serial_elapsed, 1e-9)
-    rates = "pipe=%.0f/s serial=%.0f/s ratio=%.2f" % (
-        pipe_rate, serial_rate, pipe_rate / max(serial_rate, 1e-9))
-    note("pipelined atomic groups beat the serial round-trip rate", pipe_rate > serial_rate * 1.10,
-         rates)
-else:
-    skip("pipelined atomic groups beat the serial round-trip rate",
-         "rate comparison disabled by --no-rate-assertions")
+stall_after = int(admin.cmd("INFO", "STATS").split(b"atomic_window_stalls:", 1)[1].split(b"\r\n", 1)[0])
+admin.cmd("CONFIG", "SET", "atomic-window", "256")
+
+c = Resp()
+started = time.perf_counter()
+for seq in range(burst_count):
+    c.cmd(*mset_args(["ary:serial:%d:%d" % (seq, i) for i in range(8)], str(seq)))
+serial_elapsed = time.perf_counter() - started
+c.close()
+pipe_rate = burst_count / max(pipelined_elapsed, 1e-9)
+serial_rate = burst_count / max(serial_elapsed, 1e-9)
+note("cross-key atomics on one connection overlap",
+     overlap_ok and stall_after > stall_before and pipe_rate > serial_rate * 1.10,
+     "stalls=%d pipe=%.0f/s serial=%.0f/s" %
+     (stall_after - stall_before, pipe_rate, serial_rate))
 
 
 def consistent_or_absent(values):

@@ -23,6 +23,7 @@
 // Output: one machine-parseable line,  <mode> ops <n> secs <s> rate <ops/s> [deliv <n> drate <d/s>]
 // where ops = EXECs completed / pops completed / publishes acked, and deliv = message frames
 // counted at the subscribers (fanout only). Rates are the steady window (after a warm fraction).
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>

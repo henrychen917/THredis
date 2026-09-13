@@ -340,25 +340,20 @@ def reservation_release_paths():
 
 
 # The cut-slot reservation exists so scripts cannot starve MGET/MSET/EXEC of snapshot registrations
-# on an IO thread. Hold more than four activations per IO owner: an owner receiving its fifth
-# must refuse it with -BUSY rather than stopping
+# on an IO thread. Boot with --script-crossshard-cut-slots 1 and hold activations open: any IO
+# thread that ends up carrying two at once must refuse the second with -BUSY rather than stopping
 # the parse pass. Many connections are used because the IO thread a connection lands on is not
 # selectable from here; the refusal counter is the proof the arm actually fired.
 def cut_window_refusal():
     admin = Resp()
-    info = dict(line.split(":", 1) for line in admin.cmd("INFO", "SERVER").decode().splitlines()
-                if ":" in line)
-    io_threads = int(info.get("client_threads", info.get("io_threads", "0")))
-    if io_threads < 1:
-        raise AssertionError("INFO server omitted the serving thread count")
-    clients = [Resp() for _ in range(4 * io_threads + 1)]
+    clients = [Resp() for _ in range(24)]
     try:
         distinct, _ = geometry(admin)
         pair = distinct[:2]
         admin.cmd("MSET", pair[0], "w", pair[1], "w")
         source_ro = "return {redis.call('GET',KEYS[1]),redis.call('GET',KEYS[2])}"
 
-        # ZERO CONTROL, same boot and connections, issued ONE AT A TIME so at most one cut
+        # ZERO CONTROL, same boot and same 24 connections, issued ONE AT A TIME so at most one cut
         # is registered at any moment. None of these may be refused; a refusal counter that also
         # fires here would be measuring load, not the window.
         control_before = stats(admin)
@@ -373,26 +368,18 @@ def cut_window_refusal():
                  control_before.get("script_crossshard_window_refusals", 0),
                  [r for r in control if r != [b"w", b"w"]][:2]))
 
-        for attempt in range(3):
-            before = stats(admin)
-            admin.cmd("DEBUG", "SCRIPT-STAGE-DEFER", "500000")
-            for client in clients:
-                client.sock.sendall(frame("EVAL", source_ro, "2", *pair))
-            replies = [client.read() for client in clients]
-            admin.cmd("DEBUG", "SCRIPT-STAGE-DEFER", "0")
-            after = stats(admin)
-            busy = [r for r in replies if isinstance(r, RespError) and r.message.startswith("BUSY ")]
-            good = [r for r in replies if r == [b"w", b"w"]]
-            other = [r for r in replies
-                     if not (r in ([b"w", b"w"],) or
-                             (isinstance(r, RespError) and r.message.startswith("BUSY ")))]
-            if busy:
-                break
-            if settle(admin) != 0:
-                raise AssertionError("cut-slot re-arm leaked script intents")
-            for client in clients:
-                client.close()
-            clients = [Resp() for _ in range(4 * io_threads + 1)]
+        before = stats(admin)
+        admin.cmd("DEBUG", "SCRIPT-STAGE-DEFER", "500000")
+        for client in clients:
+            client.sock.sendall(frame("EVAL", source_ro, "2", *pair))
+        replies = [client.read() for client in clients]
+        admin.cmd("DEBUG", "SCRIPT-STAGE-DEFER", "0")
+        after = stats(admin)
+        busy = [r for r in replies if isinstance(r, RespError) and r.message.startswith("BUSY ")]
+        good = [r for r in replies if r == [b"w", b"w"]]
+        other = [r for r in replies
+                 if not (r in ([b"w", b"w"],) or
+                         (isinstance(r, RespError) and r.message.startswith("BUSY ")))]
         note("cut-slot window refusal fires and is counted",
              len(busy) >= 1 and
              after.get("script_crossshard_window_refusals", 0) -
@@ -584,55 +571,44 @@ def contention_and_deadlock():
     admin = Resp()
     distinct, _ = geometry(admin)
     keys = distinct[:4]
+    admin.cmd("DEL", *keys)
+    admin.cmd("MSET", *sum(([key, "0"] for key in keys), []))
+    before = stats(admin)
+    errors = []
+    successes = [0, 0]
     source = "for i=1,#KEYS do redis.call('INCR',KEYS[i]) end return 1"
 
-    # The correctness half (no deadlock, exact counts) must hold on EVERY round. The contention
-    # half needs the two OCC windows to actually collide, which is scheduling luck: one round of
-    # 2x40 executions occasionally interleaves cleanly and reports retries=+0 with nothing wrong
-    # (first seen after the multi program-order fix shifted EX timing). Roll up to four rounds
-    # and stop at the first observed restart -- the mechanism assertion stays non-vacuous, it
-    # just gets enough collisions offered to it.
-    retry_delta = 0
-    for _ in range(4):
-        admin.cmd("DEL", *keys)
-        admin.cmd("MSET", *sum(([key, "0"] for key in keys), []))
-        before = stats(admin)
-        errors = []
-        successes = [0, 0]
+    def worker(slot, ordered):
+        client = Resp()
+        try:
+            while successes[slot] < 40:
+                reply = client.cmd("EVAL", source, str(len(ordered)), *ordered)
+                if reply == 1:
+                    successes[slot] += 1
+                elif isinstance(reply, RespError) and reply.message.startswith("TRYAGAIN "):
+                    continue
+                else:
+                    errors.append((slot, reply))
+                    return
+        finally:
+            client.close()
 
-        def worker(slot, ordered):
-            client = Resp()
-            try:
-                while successes[slot] < 40:
-                    reply = client.cmd("EVAL", source, str(len(ordered)), *ordered)
-                    if reply == 1:
-                        successes[slot] += 1
-                    elif isinstance(reply, RespError) and reply.message.startswith("TRYAGAIN "):
-                        continue
-                    else:
-                        errors.append((slot, reply))
-                        return
-            finally:
-                client.close()
-
-        threads = [threading.Thread(target=worker, args=(0, keys)),
-                   threading.Thread(target=worker, args=(1, list(reversed(keys))))]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(20)
-        alive = [thread.name for thread in threads if thread.is_alive()]
-        values = admin.cmd("MGET", *keys)
-        after = stats(admin)
-        retry_delta = after.get("script_group_occ_retries", 0) - \
-            before.get("script_group_occ_retries", 0)
-        note("opposite-order overlapping scripts terminate without deadlock",
-             not alive and not errors and successes == [40, 40] and
-             values == [b"80"] * len(keys),
-             "success=%r alive=%r errors=%r values=%r" %
-             (successes, alive, errors[:2], values))
-        if alive or errors or retry_delta > 0:
-            break
+    threads = [threading.Thread(target=worker, args=(0, keys)),
+               threading.Thread(target=worker, args=(1, list(reversed(keys))))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    values = admin.cmd("MGET", *keys)
+    after = stats(admin)
+    retry_delta = after.get("script_group_occ_retries", 0) - \
+        before.get("script_group_occ_retries", 0)
+    note("opposite-order overlapping scripts terminate without deadlock",
+         not alive and not errors and successes == [40, 40] and
+         values == [b"80"] * len(keys),
+         "success=%r alive=%r errors=%r values=%r" %
+         (successes, alive, errors[:2], values))
     note("contention detector forced at least one OCC restart", retry_delta > 0,
          "retries=+%d" % retry_delta)
 
@@ -744,6 +720,32 @@ def maxmemory_pressure():
         client.close()
 
 
+def feature_off_control():
+    client = Resp()
+    try:
+        distinct, same = geometry(client)
+        before = stats(client)
+        refused = client.cmd("EVAL", "return {KEYS[1],KEYS[2]}", "2",
+                             distinct[0], distinct[1])
+        local = client.cmd("EVAL", "return {KEYS[1],KEYS[2]}", "2", same[0], same[1])
+        after = stats(client)
+        counters = ("script_stage_owner_tasks", "script_run_attempts",
+                    "script_validate_owner_tasks", "script_apply_owner_tasks",
+                    "script_crossshard_activations", "script_keys_armed",
+                    "script_write_tickets_forced")
+        deltas = {name: after.get(name, 0) - before.get(name, 0) for name in counters}
+        note("feature-off cross-owner refusal is byte-exact",
+             isinstance(refused, RespError) and
+             refused.message == "CROSSSLOT Keys in request don't hash to the same slot",
+             repr(refused))
+        note("feature-off same-owner scripts remain available",
+             local == [same[0].encode(), same[1].encode()], repr(local))
+        note("feature-off control allocates/executes no cross engine", all(v == 0 for v in deltas.values()),
+             repr(deltas))
+    finally:
+        client.close()
+
+
 def staging_limit_control():
     client = Resp()
     try:
@@ -752,10 +754,7 @@ def staging_limit_control():
         client.cmd("DEL", *keys)
         before = stats(client)
         small = client.cmd("EVAL", "return #KEYS", "2", *keys)
-        if client.cmd("CONFIG", "GET", "maxmemory") != [b"maxmemory", b"0"]:
-            raise AssertionError("staging control needs the default maxmemory=0 boot")
-        size = 2 * 1024 * 1024 + 1  # two staged values exceed the automatic 4 MiB budget
-        client.cmd("MSET", keys[0], "A" * size, keys[1], "B" * size)
+        client.cmd("MSET", keys[0], "A" * 200, keys[1], "B" * 200)
         refused = client.cmd(
             "EVAL", "redis.call('SET',KEYS[1],'changed'); return 1", "2", *keys)
         values = client.cmd("MGET", *keys)
@@ -764,7 +763,7 @@ def staging_limit_control():
         note("staging budget fires before RUN and preserves values",
              isinstance(refused, RespError) and
              refused.message == "ERR cross-shard script staging limit exceeded" and
-             values == [b"A" * size, b"B" * size] and
+             values == [b"A" * 200, b"B" * 200] and
              after.get("script_group_aborts_oom", 0) ==
              before.get("script_group_aborts_oom", 0) + 1,
              "reply=%r aborts=+%d" %
@@ -774,7 +773,7 @@ def staging_limit_control():
         client.close()
 
 
-if MODE not in ("stage0", "all", "limit", "reserve", "window"):
+if MODE not in ("stage0", "all", "off", "limit", "reserve", "window"):
     raise SystemExit("unknown xscript battery mode %r" % MODE)
 
 if MODE != "reserve":
@@ -788,6 +787,8 @@ if MODE == "all":
 elif MODE == "reserve":
     reservation_counterexample()
     reservation_release_paths()
+elif MODE == "off":
+    feature_off_control()
 elif MODE == "limit":
     staging_limit_control()
 elif MODE == "window":

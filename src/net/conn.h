@@ -2,19 +2,16 @@
 //
 // UNIFIED (owner order, 2026-08-24, after the pure-2s ruling). The ConnIn/ConnOut split — with an
 // alignas(64) firewall between the halves — existed so the parsing thread (ifid) and a remote
-// sending thread (wb/exwb) could not false-share. In pure 2s ONE io thread owns both halves at a
-// time; a migration changes that owner only after the connection is quiescent. Thus the split
-// bought padding and a pointer hop for a hazard that no longer exists. The layout rule inverts:
-// pack the io thread's recv+send scalars TIGHT (they are touched together every pass), and give the
-// fields the EXECUTOR reads per completion — the two atomics it signals through, plus ifid_thread_
-// and id_ — their own line at the tail, which nothing writes per op.
+// sending thread (wb/exwb) could not false-share. In pure 2s ONE io thread owns both halves for
+// the connection's whole life, so the split bought padding and a pointer hop for a hazard that no
+// longer exists. The layout rule inverts: pack the io thread's recv+send scalars TIGHT (they are
+// touched together every pass), and give the only genuinely cross-thread fields — the two atomics
+// the EXECUTOR signals through — their own line at the tail.
 //
 // What ex touches, and nothing else: ROB slots (Op state/reply/direct region — Rob manages its own
 // cross-thread layout), the bytes of rbuf via argv Slices (heap data, not this struct), the direct-
-// reply region inside buf_[] (data bytes, published by the op's Done), and the executor-facing
-// tail line (retire_queued_, wb_slot_, ifid_thread_, id_ — read per completion, written only at
-// accept/migration/close). Every scalar above it is single-writer io state; io's per-op counters
-// (obuf_bytes_, atomic_groups_io_) live on io-private lines so no completion ever misses on them.
+// reply region inside buf_[] (data bytes, published by the op's Done), and the two atomics at the
+// tail (retire_queued_, wb_slot_). Every scalar above them is single-writer io state.
 //
 // ============================================================================================
 // THE READ BUFFER MUST NEVER MOVE LIVE BYTES. This is the subtle one.
@@ -58,21 +55,22 @@ class Client;
 struct MultiSession;
 void multi_session_destroy(MultiSession* session);
 
-// kRobWindow is defined by net/rob.h (included above), beside the ring that is sized from it.
+inline constexpr uint32_t kRobWindow    = 64;          // max in-flight ops per connection
 inline constexpr size_t   kRbufInitial  = 16 * 1024;
 inline constexpr size_t   kRbufSoftCap  = 1 * 1024 * 1024;  // stop BUFFERING BACKLOG past this
-// The soft cap bounds buffered backlog. One incomplete command can contain several individually
-// legal bulks and may grow to the 32-bit receive cursor's bound. Growth requires ROB quiescence,
-// and the buffer is shed after the command completes.
-inline constexpr size_t   kRbufHardCap = UINT32_MAX;
+// The parser accepts redis-compatible bulks (512MB). A single command must therefore be allowed to
+// exceed the soft cap, or a 2MB SET stalls its connection forever: the parser reports Incomplete,
+// read_space refuses to grow, and neither side can ever make progress -- a silent wedge with no
+// error, found by the perfected-checkpoint audit. The soft cap bounds BACKLOG (many buffered
+// commands); one oversized in-flight command may grow to the protocol bound. Memory tracks bytes
+// actually received, and reset_rbuf_at_quiescence sheds the growth after the command completes.
+inline constexpr size_t   kRbufFrameSlack = 64 * 1024;
+inline constexpr size_t   kRbufHardCap  = 512ull * 1024 * 1024 + kRbufFrameSlack;
 // Item 4: 512B inline, heap beyond. Two 16KB inline buffers made every connection carry 32KB of
 // worst-case staging whether it ever pipelined or not; SmallBuf grows on demand and clear() keeps
 // the allocation, so a busy connection pays ONE grow to its working size and idles at 1KB + that.
 inline constexpr size_t   kWbufInline   = 512;
 inline constexpr size_t   kWbufShed     = 64 * 1024;   // reply staging above this is a burst; shed it
-// Largest single send the kernel accepts (Linux MAX_RW_COUNT); a CQE res is an int. Caps every
-// legacy send request and the segment iovec window alike.
-inline constexpr uint32_t kMaxSendBytes = 0x7ffff000u;
 
 // Item 6: connection-lived execution-side state -- the third lifetime. Session-mutating commands
 // are ConnLocal and run on the io thread, single-threaded per connection; handlers never see it,
@@ -83,11 +81,10 @@ struct Session {
 
 // WHO IS HOLDING THE PARSE BARRIER. Six independent mechanisms park a connection's parse pass, and
 // they used to share ONE bool -- so any one of them could clear a barrier another one still needed.
-// No reachable interleaving overlapped two owners: a blocking op waits for an empty ROB, then sets
-// the barrier and ends parsing, so it has neither older nor younger neighbours; every other owner
-// also ends the parse pass on the spot. That is exactly why the bool survived: the hazard is one
-// relaxed guard away, not present. Owner bits make the release symmetric with the acquire --
-// whoever set it is the one whose release can drop it --
+// No reachable interleaving overlapped two owners (see NOTES-BARRIER.md section 2: a blocking op is
+// provably alone in its ROB, and every other owner ends the parse pass on the spot), which is
+// exactly why the bool survived: the hazard is one relaxed guard away, not present. Owner bits make
+// the release symmetric with the acquire -- whoever set it is the one whose release can drop it --
 // and cost nothing: the byte was already there, and "is any owner holding" is still one byte test.
 //
 // Adding an owner? Add a bit here and acquire it at the site that parks the connection. Do NOT
@@ -99,9 +96,8 @@ enum class BarrierOwner : uint8_t {
     Exec     = 1u << 3,  // EXEC fan-out; multi.inc
     PubSub   = 1u << 4,  // (P|S)(UN)SUBSCRIBE transition awaiting its channel homes
     Climon   = 1u << 5,  // CLIENT UNBLOCK (remote owner), CLIENT LIST / CLIENT KILL fan-out
-    Sleep    = 1u << 6,  // deferred DEBUG SLEEP connection timer
-    // Client is footprint-locked. All seven production bits are now assigned; an eighth owner
-    // needs a real layout decision, not a wider field.
+    // 1u << 6 is the one spare production bit. Client is footprint-locked, so a SEVENTH owner
+    // takes it; an eighth needs a real layout decision, not a wider field.
     //
     // Test-only, and deliberately NOT released by the quiescence backstop -- it exists to hold the
     // barrier PAST ROB quiescence, which is the state no production sequence can currently produce
@@ -121,9 +117,8 @@ struct ReplySegment {
 // Metadata stays inline for the common [header, value, CRLF] case. BUF payloads own independent
 // blocks because queue growth and continued retirement must never move bytes named by an in-flight
 // sendmsg. BORROW and STATIC payloads are non-owning under their respective lifetime protocols.
-template <uint32_t Inline, size_t MaxSegmentBytes = UINT32_MAX>
+template <uint32_t Inline>
 class SegmentQueue {
-    static_assert(MaxSegmentBytes > 0 && MaxSegmentBytes <= UINT32_MAX);
 public:
     SegmentQueue() = default;
     ~SegmentQueue() { clear_without_releases(); if (segs_ != inline_) std::free(segs_); }
@@ -143,7 +138,7 @@ public:
 
     void append_buf(const char* ptr, size_t len) {
         while (len) {
-            const size_t take = std::min(len, MaxSegmentBytes);
+            const size_t take = std::min(len, static_cast<size_t>(std::numeric_limits<uint32_t>::max()));
             char* copy = static_cast<char*>(std::malloc(take));
             std::memcpy(copy, ptr, take);
             push(ReplySegment{SegmentKind::Buf, copy, static_cast<uint32_t>(take), -1});
@@ -153,12 +148,6 @@ public:
     }
 
     void append_buf(const char* a, size_t an, const char* b, size_t bn) {
-        // Each segment has a 32-bit length, even when a whole collection reply is larger.
-        if (an > MaxSegmentBytes || bn > MaxSegmentBytes - an) {
-            append_buf(a, an);
-            append_buf(b, bn);
-            return;
-        }
         const size_t total = an + bn;
         if (!total) return;
         char* copy = static_cast<char*>(std::malloc(total));
@@ -220,26 +209,6 @@ public:
         head_ = size_ = offset_ = 0;
     }
 
-    // Drop segments from the TAIL back to `keep` entries; returns the bytes removed. Only ever
-    // applied to segments appended since the last pump: the iovec window is built from the head
-    // at pump time and pump never runs while a send is in flight, so nothing appended afterwards
-    // can be named by the kernel. A partially sent head is by definition older than any such
-    // segment -- the abort is the invariant, not a code path.
-    template <typename ReleaseFn>
-    uint64_t truncate(uint32_t keep, ReleaseFn&& release) {
-        uint64_t bytes = 0;
-        while (size_ > keep) {
-            ReplySegment& s = segs_[head_ + size_ - 1];
-            if (size_ == 1 && offset_) std::abort();
-            bytes += s.len;
-            if (s.kind == SegmentKind::Borrow) release(s.shard, s.ptr);
-            else if (s.kind == SegmentKind::Buf) std::free(const_cast<char*>(s.ptr));
-            size_--;
-        }
-        if (!size_) head_ = offset_ = 0;
-        return bytes;
-    }
-
 private:
     void push(const ReplySegment& s) {
         if (head_ + size_ == cap_) make_tail_room();
@@ -277,6 +246,13 @@ private:
         head_ = size_ = offset_ = 0;
     }
 
+public:
+    uint64_t pending_bytes() const {
+        uint64_t bytes = 0;
+        for (uint32_t i = 0; i < size_; i++) bytes += segs_[head_ + i].len;
+        return bytes - offset_;
+    }
+
 private:
     ReplySegment  inline_[Inline];
     ReplySegment* segs_ = inline_;
@@ -297,11 +273,6 @@ public:
     Client& operator=(const Client&) = delete;
 
     int  fd() const { return fd_; }
-    int replace_fd(int replacement) {
-        const int previous = fd_;
-        fd_ = replacement;
-        return previous;
-    }
 
     // ---- read side -----------------------------------------------------------------------------
     char*    rbuf()      { return rbuf_; }
@@ -329,10 +300,7 @@ public:
         // Past the soft cap, growth continues ONLY while the entire buffer is one incomplete
         // command (rpos_ == 0 after the quiescence reset: nothing parsed, nothing in flight --
         // which is also what makes may_grow true). Backlog never grows past the soft cap.
-        // The parser enforces the limit PER BULK. A complete MSET can contain many legal bulks.
-        // The receive cursor's representation, not one argument's limit, bounds this buffer.
-        (void)proto_max_bulk_len;
-        const size_t hard_cap = kRbufHardCap;
+        const size_t hard_cap = static_cast<size_t>(proto_max_bulk_len) + kRbufFrameSlack;
         const size_t cap = (rpos_ == 0) ? hard_cap : kRbufSoftCap;
         if (avail < want && may_grow && rcap_ < cap) {
             size_t ncap = rcap_ * 2;
@@ -341,7 +309,7 @@ public:
             char* n = static_cast<char*>(std::realloc(rbuf_, ncap));
             if (n) { rbuf_ = n; rcap_ = ncap; avail = rcap_ - rlen_; }
         }
-        if (avail < kMinRecv && rcap_ != hard_cap) { out_avail = 0; return nullptr; }
+        if (avail < kMinRecv) { out_avail = 0; return nullptr; }
         out_avail = avail;
         return rbuf_ + rlen_;
     }
@@ -406,15 +374,10 @@ public:
         fill_buf().commit_raw(len);
         if (obuf_tracking_) obuf_bytes_ += len;
     }
-    // Writable cursor at the fill frontier, published with commit_fill(). The coded-reply path
-    // renders into this instead of formatting a temporary and memcpy-ing it in. Safe on exactly
-    // the terms append_fill is: only the owner calls it, and a live Op::direct region can only
-    // belong to the op at the head of this very drain (see the direct-reply note in io_loop).
-    char* reserve_fill(size_t len) { return fill_buf().reserve(len); }
 
     bool     has_pending_fill() const { return buf_[fill_].size() > 0; }
-    uint64_t wsent() const { return wsent_; }
-    void     commit_write(size_t n) {
+    uint32_t wsent() const { return wsent_; }
+    void     commit_write(uint32_t n) {
         wsent_ += n;
         if (obuf_tracking_) {
             if (n > obuf_bytes_) std::abort();
@@ -530,22 +493,12 @@ public:
         segments_.release_all(std::forward<ReleaseFn>(release));
         obuf_bytes_ = 0;
     }
-    // Take back segments a retire hook staged for an op whose reply is being suppressed. See
-    // SegmentQueue::truncate for why only just-appended segments may ever be removed.
-    template <typename ReleaseFn>
-    void truncate_segments(uint32_t keep, ReleaseFn&& release) {
-        const uint64_t bytes = segments_.truncate(keep, std::forward<ReleaseFn>(release));
-        if (obuf_tracking_) {
-            if (bytes > obuf_bytes_) std::abort();
-            obuf_bytes_ -= bytes;
-        }
-    }
 
     uint64_t obuf_bytes() const { return obuf_bytes_; }
     void start_obuf_tracking() {
         if (obuf_tracking_) return;
         obuf_bytes_ = fill_buf().size() + (send_buf().size() - wsent_) +
-                      segments_.byte_size();
+                      segments_.pending_bytes();
         obuf_tracking_ = true;
     }
     void stop_obuf_tracking() {
@@ -570,10 +523,8 @@ public:
     // ---- io-thread bookkeeping -----------------------------------------------------------------
     uint64_t id() const { return id_; }
     void set_id(uint64_t v) { id_ = v; }
-    // This release/acquire store is the connection ownership edge. Registration and queue
-    // membership follow it; neither is allowed to stand in for it.
-    uint32_t ifid_thread() const { return ifid_thread_.load(std::memory_order_acquire); }
-    void set_ifid_thread(uint32_t t) { ifid_thread_.store(t, std::memory_order_release); }
+    uint32_t ifid_thread() const { return ifid_thread_; }
+    void set_ifid_thread(uint32_t t) { ifid_thread_ = t; }
     Session& session() { return session_; }
     const Session& session() const { return session_; }
 
@@ -618,20 +569,11 @@ public:
         barrier_owners_ =
             static_cast<uint8_t>(barrier_owners_ & static_cast<uint8_t>(BarrierOwner::Debug));
     }
-    // Parse backpressure is deliberately distinct from the semantic scatter barrier. Each owner
-    // parks this connection's unconsumed head frame without publishing a ROB slot, and clears only
-    // its own reason. The byte is a mask because atomic admission and FLIP can overlap.
-    bool parse_backpressure() const { return parse_backpressure_ != 0; }
-    bool atomic_backpressure() const { return parse_backpressure_ & kAtomicBackpressure; }
-    void set_atomic_backpressure(bool v) {
-        if (v) parse_backpressure_ |= kAtomicBackpressure;
-        else parse_backpressure_ &= static_cast<uint8_t>(~kAtomicBackpressure);
-    }
-    bool flip_backpressure() const { return parse_backpressure_ & kFlipBackpressure; }
-    void set_flip_backpressure(bool v) {
-        if (v) parse_backpressure_ |= kFlipBackpressure;
-        else parse_backpressure_ &= static_cast<uint8_t>(~kFlipBackpressure);
-    }
+    // Resource backpressure is deliberately distinct from the semantic scatter barrier. It keeps
+    // this connection's unconsumed frame parked only while the global memory valve is full; as
+    // soon as any group retires, parsing may resume without waiting for this connection's ROB.
+    bool atomic_backpressure() const { return atomic_backpressure_; }
+    void set_atomic_backpressure(bool v) { atomic_backpressure_ = v; }
     bool subscriber_mode() const { return subscriber_mode_; }
     void set_subscriber_mode(bool v) { subscriber_mode_ = v; }
     bool blocked() const { return connection_flags_ & kBlocked; }
@@ -654,8 +596,7 @@ public:
     }
     // Bit 2 deliberately matches Op::route_flags_'s Resp3 assignment. Passing the byte through
     // Op::reset folds protocol capture into the ROB's existing flags store: RESP2 pays one load,
-    // no mask and no branch. The armed coarse parser masks kBlocked before reusing its bit for a
-    // hash-precise write stamp; ordinary acquisitions continue to ignore that high bit.
+    // no mask and no branch. kBlocked occupies an Op-ignored high bit.
     uint8_t op_route_flags() const { return connection_flags_; }
     static constexpr size_t connection_flags_offset();
     // The owning IO thread captures this into each Op before dispatch. Executors never read Client
@@ -669,14 +610,6 @@ public:
     }
     bool in_active() const { return in_active_; }
     void set_in_active(bool v) { in_active_ = v; }
-    // IOFUSED IFID readiness is owner-local and shares the connection flag byte instead of
-    // growing the footprint-locked hot scalar run. Ordinary Op consumers ignore bit 6; the
-    // overlap-0 read-local parser masks it before reusing that bit for a classified slot.
-    bool ifid_pending() const { return connection_flags_ & kIfidPending; }
-    void set_ifid_pending(bool value) {
-        if (value) connection_flags_ |= kIfidPending;
-        else connection_flags_ &= static_cast<uint8_t>(~kIfidPending);
-    }
 
     // MULTI/WATCH state is cold and allocated only on first use.  These fields consume padding in
     // the executor-facing tail; the signed 1984-byte Client footprint remains unchanged.
@@ -715,25 +648,6 @@ public:
                !retire_queued_.load(std::memory_order_acquire) &&
                watched_refs_.load(std::memory_order_acquire) == 0;
     }
-    bool migration_protocol_idle() const {
-        // Ordinary unread input and admission/FLIP backpressure move with the Client.
-        return rob_.quiesced() &&
-               !send_inflight_ && !serve_pending_ &&
-               !retire_queued_.load(std::memory_order_acquire) &&
-               watched_refs_.load(std::memory_order_acquire) == 0 &&
-               barrier_owners_ == 0 && atomic_groups_io_ == 0 && !blocked() &&
-               multi_session_ == nullptr && nothing_to_write();
-    }
-    bool flip_drain_idle() const {
-        // Global dispatch is paused, but connections which remain on this IO may retain durable
-        // owner-local modes (subscriptions, WATCH/MULTI session metadata, tracking). Only work
-        // which can still touch an executor, ROB pointer, output borrow, or barrier must drain.
-        return rob_.quiesced() &&
-               !send_inflight_ && !serve_pending_ &&
-               !retire_queued_.load(std::memory_order_acquire) &&
-               barrier_owners_ == 0 && atomic_groups_io_ == 0 && !blocked() &&
-               nothing_to_write();
-    }
 
     // Set by a worker before it tells the owning IO thread this client has ops to retire; cleared by
     // that IO thread when it picks the client up. Without it, a pipelined burst of N completions
@@ -744,7 +658,6 @@ public:
     // kNoWbSlot at close), read by every worker deciding how to signal completion. A stale read
     // falls back to the channel path, which is always correct -- so relaxed is enough.
     static constexpr uint32_t kNoWbSlot = UINT32_MAX;
-    static constexpr uint32_t kWbMigrationInstalling = UINT32_MAX - 1;
     uint32_t wb_slot() const { return wb_slot_.load(std::memory_order_relaxed); }
     void set_wb_slot(uint32_t s) { wb_slot_.store(s, std::memory_order_release); }
 
@@ -757,13 +670,6 @@ public:
     uint32_t tls_slot() const { return tls_slot_; }
     void set_tls_slot(uint32_t slot) { tls_slot_ = slot; }
     static constexpr size_t tls_slot_offset();
-    // Layout probes for the coherence lock below the class (see the static_asserts there).
-    static constexpr size_t executor_line_offset();
-    static constexpr size_t wb_slot_offset();
-    static constexpr size_t ifid_thread_offset();
-    static constexpr size_t id_offset();
-    static constexpr size_t obuf_bytes_offset();
-    static constexpr size_t atomic_groups_io_offset();
 
 #ifdef TOMO_WEDGE_FORENSICS
     // FORENSICS for the stranded-reply class: claims (worker won the CAS), defers (lost it),
@@ -781,14 +687,8 @@ private:
     uint32_t  last_interaction_s_ = 0; // monotonic whole seconds; occupies the rbuf_ alignment hole
     char*     rbuf_ = nullptr;
     size_t    rcap_ = 0;
-    // wsent_ accumulates across resubmits of ONE send buffer, and that buffer is bounded only by
-    // client-output-buffer-limit (0 = unlimited by default, as in redis): a client that pipelines
-    // large GETs and never reads grows it past 4GB. A 32-bit cursor then wrapped, write_drained()
-    // never held, and submit_legacy resent from the wrapped offset -- garbage on the wire instead
-    // of memory growth. 64-bit, paid for by fill_ shrinking to the 0/1 index it always was, so the
-    // io-hot line keeps its layout (offsets 32..47 are the same eight-plus-eight bytes).
-    uint64_t  wsent_ = 0;         // bytes of the SEND buffer already written
-    uint8_t   fill_  = 0;         // index of the buffer replies append to
+    uint32_t  fill_  = 0;         // index of the buffer replies append to
+    uint32_t  wsent_ = 0;         // bytes of the SEND buffer already written
     bool      recv_armed_    = false;
     bool      send_inflight_ = false;
     bool      segmented_send_ = false;
@@ -803,28 +703,19 @@ private:
     // uint8_t would displace connection_flags_ and grow the 64-byte-aligned Client -- a seventh
     // owner takes the one spare bit (1u << 6), it does not grow the field.
     uint8_t   barrier_owners_ = 0;
-    static constexpr uint8_t kAtomicBackpressure = 1u << 0;
-    static constexpr uint8_t kFlipBackpressure = 1u << 1;
-    uint8_t   parse_backpressure_ = 0;
+    bool      atomic_backpressure_ = false;
     bool      subscriber_mode_ = false;  // IO-owned; consumes existing alignment padding
     // The former blocked_ bool is a one-byte flag cell. RESP3 shares it instead of extending the
     // already-full 48..55 bool run and moving id_ (which would grow the 64-byte-aligned Client).
     static constexpr uint8_t kBlocked = 1u << 7;
     static constexpr uint8_t kResp3 = 1u << 2;
     static constexpr uint8_t kNoTouch = 1u << 4;
-    static constexpr uint8_t kIfidPending = 1u << 6;
     uint8_t   connection_flags_ = 0;
-    // Output accounting is rewritten on every reply append while a client output limit is armed.
-    // It sits here, on the io-private hot line, so that write never invalidates the executor-
-    // facing tail line it used to share with wb_slot_.
-    uint64_t  obuf_bytes_ = 0;          // 56..63: fill + unsent send + segment bytes
 
-    // --- io-only bookkeeping (line 1: the parser reads session_, nothing else touches it) ------
-    // The per-connection atomic-group count moves at dispatch and retire of every atomic
-    // multi-key command, io-side only. Same rule as obuf_bytes_: io's per-op writes stay off the
-    // line executors read on every completion.
-    uint32_t  atomic_groups_io_ = 0;    // 64..67
-    Session   session_;                 // 68..71
+    // --- cold io state --------------------------------------------------------------------------
+    uint64_t  id_ = 0;
+    uint32_t  ifid_thread_ = 0;
+    Session   session_;
 
     // --- the ROB (manages its own cross-thread layout) ------------------------------------------
     Rob<kRobWindow> rob_;
@@ -834,31 +725,25 @@ private:
 
     // sendmsg reads both the iovec array and msghdr asynchronously, so both live with the Client.
     static constexpr uint32_t kMaxSendIov = 16;
+    static constexpr uint32_t kMaxSendBytes = 0x7ffff000u;  // Linux MAX_RW_COUNT; CQE res is int
     SegmentQueue<8> segments_;
     iovec           send_iov_[kMaxSendIov] = {};
     msghdr          send_msg_ = {};
 
-    // --- the executor-facing line: READ by executors on every completion, written per op by
-    // nobody. notify_sender loads ifid_thread_ and wb_slot_ for every completed op, and id_ for
-    // every cross-shard one; keeping all three here means ONE shared line per completion that
-    // stays cached in every executor. Everything else on it changes only at accept, migration,
-    // close, WATCH/MULTI/AUTH, or on the slot-less first-contact path (retire_queued_). The
-    // per-op io writes that used to share this line -- obuf_bytes_ (per append under an armed
-    // output limit) and atomic_groups_io_ (per atomic multi-key op) -- moved to io-private
-    // lines above; the static_asserts after the class pin both facts.
-    alignas(64) std::atomic<bool>     retire_queued_{false};   // 1920
-    std::atomic<uint32_t> wb_slot_{kNoWbSlot};                 // 1924
-    std::atomic<uint32_t> ifid_thread_{0};                     // 1928
-    MultiSession* multi_session_ = nullptr;                    // 1936
-    std::atomic<uint64_t> watch_generation_{0};                // 1944
-    std::atomic<uint32_t> watched_refs_{0};                    // 1952
-    std::atomic<bool> watch_dirty_{false};                     // 1956
-    uint64_t id_ = 0;                                          // 1960
-    uint32_t obuf_soft_since_s_ = 0;   // 1968: cron-written only; 0 = not continuously over soft
-    bool obuf_tracking_ = false;        // 1972: flips once per arm/disarm, never per append
-    bool authenticated_ = false;        // 1973: requirepass state
-    uint32_t acl_user_idx_ = 0;          // 1976: ACL user handle
-    uint32_t tls_slot_ = kNoTlsSlot;     // 1980: out-of-line TlsConn handle
+    // --- executor-facing atomics, on their own line ---------------------------------------------
+    alignas(64) std::atomic<bool>     retire_queued_{false};
+    std::atomic<uint32_t> wb_slot_{kNoWbSlot};
+    uint32_t atomic_groups_io_ = 0; // connection-IO-owned; captured into Op before dispatch
+    MultiSession* multi_session_ = nullptr;
+    std::atomic<uint64_t> watch_generation_{0};
+    std::atomic<uint32_t> watched_refs_{0};
+    std::atomic<bool> watch_dirty_{false};
+    uint64_t obuf_bytes_ = 0;          // fill + unsent send + segment bytes
+    uint32_t obuf_soft_since_s_ = 0;   // 0 = not continuously at/over the soft limit
+    bool obuf_tracking_ = false;        // enabled once per serve/cron arm, not per reply append
+    bool authenticated_ = false;        // requirepass state; shares the documented cold-tail hole
+    uint32_t acl_user_idx_ = 0;          // ACL user handle; occupies the final 4-byte aligned hole
+    uint32_t tls_slot_ = kNoTlsSlot;     // out-of-line TlsConn handle; occupies tail padding
 };
 
 constexpr size_t Client::acl_user_idx_offset() { return offsetof(Client, acl_user_idx_); }
@@ -869,30 +754,6 @@ static_assert(Client::connection_flags_offset() == 55,
 constexpr size_t Client::tls_slot_offset() { return offsetof(Client, tls_slot_); }
 static_assert(Client::tls_slot_offset() == 1980,
               "TLS slot moved: re-run the declaration-order Client mirror probe");
-
-// COHERENCE LOCK. Executors read ifid_thread_, wb_slot_ and id_ once per completed op: they must
-// share one 64-byte line, and that line must carry nothing io writes per op. obuf_bytes_ (written
-// per append while an output limit is armed) and atomic_groups_io_ (per atomic multi-key op) are
-// therefore pinned to io-private lines. Moving any of these back is a per-completion cross-CCX
-// miss on every executor, invisible in pure GET/SET and paid in full by atomic and cross-shard
-// workloads.
-constexpr size_t Client::executor_line_offset() { return offsetof(Client, retire_queued_); }
-constexpr size_t Client::wb_slot_offset() { return offsetof(Client, wb_slot_); }
-constexpr size_t Client::ifid_thread_offset() { return offsetof(Client, ifid_thread_); }
-constexpr size_t Client::id_offset() { return offsetof(Client, id_); }
-constexpr size_t Client::obuf_bytes_offset() { return offsetof(Client, obuf_bytes_); }
-constexpr size_t Client::atomic_groups_io_offset() { return offsetof(Client, atomic_groups_io_); }
-static_assert(Client::executor_line_offset() % 64 == 0, "executor-facing line must start a line");
-static_assert(Client::wb_slot_offset() / 64 == Client::executor_line_offset() / 64,
-              "wb_slot_ left the executor-facing line");
-static_assert(Client::ifid_thread_offset() / 64 == Client::executor_line_offset() / 64,
-              "ifid_thread_ left the executor-facing line");
-static_assert(Client::id_offset() / 64 == Client::executor_line_offset() / 64,
-              "id_ left the executor-facing line");
-static_assert(Client::obuf_bytes_offset() / 64 == 0,
-              "obuf_bytes_ is written per append: it belongs on the io-hot line");
-static_assert(Client::atomic_groups_io_offset() / 64 == 1,
-              "atomic_groups_io_ is written per atomic op: it belongs on io-only line 1");
 
 // Same footprint law as Op: Client is per-connection resident memory and its io-hot head is
 // layout-tuned. Growing it is allowed -- knowingly. 1984 = 1408 + the zero-copy send state

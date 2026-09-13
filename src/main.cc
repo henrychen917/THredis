@@ -1,123 +1,44 @@
 // main.cc — boot, thread launch, pinning, shutdown.
 //
-// Split mode keeps the pure 2s design. Fused startup is isolated in genthread.cc so boot mode
-// selection cannot change the split loop translation unit's optimization or object code.
-#include <pthread.h>
-#include <sched.h>
-#include <sys/random.h>
+// PURE 2s (owner ruling 2026-08-24): io threads receive, parse, dispatch, retire and send;
+// executors execute. The 3s posture was measured exhaustively and deleted -- see wb.h's header
+// for the evidence. --mode/--wb survive only to reject scripts that still ask for 3s.
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
-#include <array>
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <condition_variable>
 #include <csignal>
-#include <cstdint>
+#include <cerrno>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
-#include <mutex>
-#include <new>
+#include <sys/random.h>
 #include <string>
+#include <mutex>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "core/server.h"
 #include "base/alloc.h"
 #include "core/io_loop.h"
 #include "core/ex_loop.h"
-#include "core/genthread.h"
-#include "core/signal_doorbell.h"
-#include "core/shutdown_report.h"
 #include "cmd/command.h"
 #include "cmd/acl.h"
-#include "net/unix_listener.h"
 #include "persist/aof.h"
 
 using namespace tomo;
 
-// Signal-handler state. A handler may only touch lock-free atomics, so the thread table is a
-// fixed array of atomics published through an atomic count: arm() fills the slots, then stores the
-// count (release); the handler loads the count (acquire) and walks exactly that many entries. No
-// vector, no reallocation, no torn size/data pair. Everything is cleared again before Server is
-// destroyed, so a late signal finds nothing to poke instead of a dead object.
-//
-// Publication happens with SIGINT/SIGTERM blocked on this thread and the handlers are installed
-// only afterwards. Until arm() returns, SIGINT/SIGTERM keep the default action (terminate), which
-// is the right answer while Server::init is still allocating tables and no thread exists to stop
-// -- an earlier revision installed the handlers first and a signal in that window was silently
-// swallowed. disarm() restores SIG_IGN, so a signal after teardown cannot re-enter the handler.
-static std::atomic<Server*> g_signal_server{nullptr};
-static std::array<std::atomic<ThreadCtx*>, kMaxThreads> g_signal_threads{};
-static std::atomic<uint32_t> g_signal_thread_count{0};
-static std::atomic<bool> g_signal_armed{false};
-
-static_assert(std::atomic<Server*>::is_always_lock_free);
-static_assert(std::atomic<ThreadCtx*>::is_always_lock_free);
-static_assert(std::atomic<uint32_t>::is_always_lock_free);
-static_assert(std::atomic<bool>::is_always_lock_free);
+static Server*                   g_srv = nullptr;
+static std::vector<ThreadCtx*>   g_threads;
 
 static void on_signal(int) {
-    if (!g_signal_armed.load(std::memory_order_acquire)) return;
-    if (Server* server = g_signal_server.load(std::memory_order_acquire))
-        server->shutting_down().store(true, std::memory_order_relaxed);
-    const uint32_t count = g_signal_thread_count.load(std::memory_order_acquire);
-    for (uint32_t i = 0; i < count; i++) {
-        ThreadCtx* thread = g_signal_threads[i].load(std::memory_order_relaxed);
-        if (thread) thread->stop_flag().store(true, std::memory_order_relaxed);
-    }
-    signal_doorbell_notify();
+    if (g_srv) g_srv->shutting_down().store(true, std::memory_order_relaxed);
+    for (auto* t : g_threads) t->stop_flag().store(true, std::memory_order_relaxed);
 }
-
-class ScopedSignalHandlers {
-public:
-    bool arm(Server& server) {
-        if (server.nthreads() > kMaxThreads) return false;
-        sigset_t blocked{}, previous{};
-        sigemptyset(&blocked);
-        sigaddset(&blocked, SIGINT);
-        sigaddset(&blocked, SIGTERM);
-        if (::pthread_sigmask(SIG_BLOCK, &blocked, &previous) != 0) return false;
-
-        for (uint32_t i = 0; i < server.nthreads(); i++)
-            g_signal_threads[i].store(&server.thread(i), std::memory_order_relaxed);
-        g_signal_server.store(&server, std::memory_order_release);
-        g_signal_thread_count.store(server.nthreads(), std::memory_order_release);
-
-        struct sigaction action{};
-        action.sa_handler = on_signal;
-        sigemptyset(&action.sa_mask);
-        action.sa_flags = SA_RESTART;
-        const bool installed = ::sigaction(SIGINT, &action, nullptr) == 0 &&
-                               ::sigaction(SIGTERM, &action, nullptr) == 0;
-        if (installed) g_signal_armed.store(true, std::memory_order_release);
-        (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
-        if (!installed) disarm();
-        return installed;
-    }
-
-    ~ScopedSignalHandlers() { disarm(); }
-
-private:
-    void disarm() {
-        if (!g_signal_server.load(std::memory_order_relaxed) &&
-            !g_signal_armed.load(std::memory_order_relaxed)) return;
-        struct sigaction ignore{};
-        ignore.sa_handler = SIG_IGN;
-        sigemptyset(&ignore.sa_mask);
-        (void)::sigaction(SIGINT, &ignore, nullptr);
-        (void)::sigaction(SIGTERM, &ignore, nullptr);
-        g_signal_armed.store(false, std::memory_order_release);
-        g_signal_thread_count.store(0, std::memory_order_release);
-        g_signal_server.store(nullptr, std::memory_order_release);
-        for (auto& thread : g_signal_threads)
-            thread.store(nullptr, std::memory_order_relaxed);
-    }
-};
 
 // Pins to one cpu. Relative to the process's ALLOWED set by construction, because the caller takes
 // the cpu from Topology, which intersects with sched_getaffinity. A pin to a cpu outside the mask
@@ -131,10 +52,6 @@ static void pin_to(int cpu) {
 }
 
 int main(int argc, char** argv) {
-    // Declared before every other automatic: once armed on a clean runtime shutdown, this emits
-    // only after all later-declared objects (including server/loops/listeners/signals) destruct.
-    ShutdownReportFinalLine final_shutdown_line;
-
     // Hash key material, before anything hashes. getrandom never fails for 24 bytes on any kernel
     // we run; if it somehow does, a zero seed degrades to the old deterministic behavior rather
     // than refusing to boot.
@@ -150,10 +67,13 @@ int main(int argc, char** argv) {
     std::vector<std::string> token_store;      // owns conf-file tokens; Config keeps views into it
     std::vector<const char*> conf_tokens, cli_tokens;
 
-    // Redis-style optional first argument: ./tomokv tomokv.conf. Flags override that file.
+    // Pre-scan: --conf FILE anywhere, or a bare first argument (redis-style ./tomokv tomokv.conf).
     const char* conf_path = nullptr;
     for (int i = 1; i < argc; i++) {
-        if (i == 1 && argv[i][0] != '-') {
+        if (!std::strcmp(argv[i], "--conf")) {
+            if (i + 1 >= argc) { std::fprintf(stderr, "--conf wants a file path\n"); return 1; }
+            conf_path = argv[++i];
+        } else if (i == 1 && argv[i][0] != '-') {
             conf_path = argv[i];
         } else {
             cli_tokens.push_back(argv[i]);
@@ -180,7 +100,15 @@ int main(int argc, char** argv) {
     // thread has been spawned yet, so this store needs no synchronisation.
     if (cfg.net_io == NetIoEngine::Epoll) {
         g_ring_epoll_mode = true;
-        std::fprintf(stderr, "--net-io epoll: using syscall persistence (no io_uring ring)\n");
+        // --persist-io uring submits its writes and fsyncs as SQEs on the writer io thread's ring,
+        // and under this engine that ring does not exist. Rather than half-support it, the network
+        // choice implies the persistence one: same kernel interface, one decision. Announced, not
+        // silent -- a run whose durability path changed under it must say so.
+        if (cfg.persist_io != PersistIoEngine::Normal) {
+            cfg.persist_io = PersistIoEngine::Normal;
+            std::fprintf(stderr, "--net-io epoll: persist-io forced to normal "
+                                 "(the uring persistence engine needs a ring)\n");
+        }
     }
     std::unique_ptr<TlsContext> tls_context;
     if (cfg.tls_port) {
@@ -191,15 +119,12 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (!command_registry_init(cfg.tls_port != 0, cfg.thread_mode == ThreadMode::Fused,
-                               Server::read_local_enabled(cfg))) {
-        std::fprintf(stderr, "command registry init failed\n");
+    if (cfg.load_path && !*cfg.load_path) {
+        std::fprintf(stderr, "--load requires a non-empty path\n");
         return 1;
     }
-
-    Server srv;
-    if (!srv.prepare_boot(cfg)) {
-        std::fprintf(stderr, "placement/geometry resolution failed\n");
+    if (!command_registry_init(cfg.tls_port != 0)) {
+        std::fprintf(stderr, "command registry init failed\n");
         return 1;
     }
 
@@ -227,26 +152,13 @@ int main(int argc, char** argv) {
     }
 
     std::unique_ptr<SnapshotLoadPlan> load_plan;
-    if (!aof_base_plan && aof_plans.empty()) {
-        // The recovery input derives from the existing persistence destination. AOF recovery
-        // keeps precedence; a missing dump boots empty, while an unreadable/corrupt dump fails.
-        // Path construction and filesystem work remain entirely behind this boot-only gate.
-        const std::string load_path = std::string(cfg.dir) + "/" + cfg.dbfilename;
-        struct stat dump_stat;
-        if (::stat(load_path.c_str(), &dump_stat) == 0) {
-            std::string error;
-            load_plan = snapshot_read_plan(load_path.c_str(), cfg.shards, error);
-            if (!load_plan) {
-                std::fprintf(stderr, "snapshot load plan failed: %s\n", error.c_str());
-                return 1;
-            }
-        } else if (errno != ENOENT) {
-            std::fprintf(stderr, "snapshot stat failed for '%s': %s\n",
-                         load_path.c_str(), std::strerror(errno));
+    if (cfg.load_path && !aof_base_plan && aof_plans.empty()) {
+        std::string error;
+        load_plan = snapshot_read_plan(cfg.load_path, cfg.shards, error);
+        if (!load_plan) {
+            std::fprintf(stderr, "snapshot load plan failed: %s\n", error.c_str());
             return 1;
         }
-    }
-    if (load_plan) {
         // The router consumes the keyed hash, so its key material is part of the persisted format.
         // Restore it before Server::init builds shard ownership and before any loaded key is hashed.
         g_hash_kind = static_cast<HashKind>(load_plan->hash_kind);
@@ -255,30 +167,18 @@ int main(int argc, char** argv) {
         g_sip_k1 = load_plan->sip_k1;
     }
 
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
     std::signal(SIGPIPE, SIG_IGN);      // send() errors arrive as -EPIPE on the CQE instead
-    // SIGINT/SIGTERM handlers are armed later, once the threads they stop exist.
 
     if (!good_size_matches_allocator()) {
         std::fprintf(stderr, "good_size() disagrees with the allocator's size classes\n");
         return 1;
     }
-    if (!FlatStore::pointer_encoding_supported()) {
-        std::fprintf(stderr,
-                     "fatal: FlatStore requires KvObj allocations below 2^48; "
-                     "this virtual-address layout is unsupported\n");
-        return 1;
-    }
+    Server srv;
     const AofReplayPlan* active_aof_plan = aof_plans.empty() ? nullptr : aof_plans.back().get();
-    try {
-        if (!srv.init(cfg, active_aof_plan)) {
-            std::fprintf(stderr, "server init failed\n");
-            return 1;
-        }
-    } catch (const std::bad_alloc&) {
-        std::fprintf(stderr, "server init failed: out of memory allocating shard tables\n");
-        return 1;
-    }
-    srv.set_loading(true);
+    if (!srv.init(cfg, active_aof_plan)) { std::fprintf(stderr, "server init failed\n"); return 1; }
+    g_srv = &srv;
     command_bind_server(&srv);
     {
         std::string acl_error;
@@ -288,45 +188,58 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ONE RAII owner for the AF_UNIX pathname and its untransferred fd (LateUnixListener also
-    // carries the non-socket / already-accepting probes the inline version used to do here), and
-    // open() is deliberately deferred until after the persistence-load barrier in the selected
-    // runtime below, so no unix client can connect before every owner has decoded its shards.
-    // The pathname and any not-yet-transferred fd have one lifetime owner. open() is deliberately
-    // called only after the persistence-load barrier in the selected runtime below.
-    LateUnixListener unix_listener(cfg.unixsocket);
-    SignalDoorbell signal_doorbell;
-    if (!signal_doorbell.init()) {
-        std::perror("eventfd shutdown doorbell");
-        return 1;
-    }
-    ScopedSignalHandlers signal_handlers;
-    if (!signal_handlers.arm(srv)) {
-        std::perror("install signal handlers");
-        return 1;
-    }
-
-    if (cfg.thread_mode == ThreadMode::Fused) {
-        srv.topo().dump(stdout);
-        return run_fused_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
-                                tls_context.get(), unix_listener, final_shutdown_line);
-    }
-    if (srv.read_local_enabled()) {
-        srv.topo().dump(stdout);
-        return run_split_read_local_server(srv, aof_base_plan.get(), aof_plans, load_plan.get(),
-                                           tls_context.get(), unix_listener, final_shutdown_line);
+    // The bind probe moved AFTER the boot load: no listener may exist until every owner has
+    // decoded its shard sections (see the post-load probe below).
+    int unix_listener = -1;
+    if (cfg.unixsocket && *cfg.unixsocket) {
+        struct stat st{};
+        if (::lstat(cfg.unixsocket, &st) == 0) {
+            if (!S_ISSOCK(st.st_mode)) {
+                std::fprintf(stderr, "refusing to replace non-socket unix path '%s'\n", cfg.unixsocket);
+                return 1;
+            }
+            sockaddr_un sa{};
+            sa.sun_family = AF_UNIX;
+            if (std::strlen(cfg.unixsocket) >= sizeof(sa.sun_path)) {
+                std::fprintf(stderr, "unixsocket path is too long\n");
+                return 1;
+            }
+            std::memcpy(sa.sun_path, cfg.unixsocket, std::strlen(cfg.unixsocket) + 1);
+            const int probe_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            if (probe_fd < 0) { std::perror("socket unixsocket probe"); return 1; }
+            if (::connect(probe_fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0) {
+                ::close(probe_fd);
+                std::fprintf(stderr, "unixsocket path '%s' is already accepting connections\n",
+                             cfg.unixsocket);
+                return 1;
+            }
+            const int connect_error = errno;
+            ::close(probe_fd);
+            if (connect_error != ECONNREFUSED && connect_error != ENOENT) {
+                errno = connect_error;
+                std::perror("connect unixsocket probe");
+                return 1;
+            }
+            if (::unlink(cfg.unixsocket) != 0) { std::perror("unlink unixsocket"); return 1; }
+        } else if (errno != ENOENT) {
+            std::perror("stat unixsocket"); return 1;
+        }
+        unix_listener = IoLoop::make_unix_listener(cfg.unixsocket, srv.cfg().tcp_backlog);
+        if (unix_listener < 0) { std::perror("bind unixsocket"); return 1; }
     }
 
     srv.topo().dump(stdout);
-    std::printf("tomokv-cpp: %u threads (%zu io + %zu ex), %u shard(s),"
-                " thread-mode=2s, overlap=%u, %s, alloc=%s\n", srv.nthreads(),
+    const char* mname = "2s (io sends)";
+    std::printf("tomokv-cpp: %u threads (%zu io + %zu ex), %u shard(s), %s,"
+                " %s, alloc=%s\n", srv.nthreads(),
                 srv.placement().ifid_threads().size(), srv.placement().ex_threads().size(),
-                cfg.shards, cfg.overlap,
+                cfg.shards, mname,
                 cfg.net_io == NetIoEngine::Epoll ? "epoll" : "io_uring", alloc_backend());
     for (const ThreadPlacement& p : srv.placement().threads()) {
-        const char* role = p.role == Role::Ifid ? "ifid" : p.role == Role::Ex ? "ex" : "idle";
-        std::printf("  thread t%u: role=%s cpu=%d L3=%u shards=%zu\n", p.id, role, p.cpu,
+        const char* role = p.role == Role::Ifid ? "ifid" : p.role == Role::Ex ? "ex" : "wb";
+        std::printf("  thread t%u: role=%s cpu=%d L3=%u shards=%zu send=", p.id, role, p.cpu,
                     p.domain, srv.thread(p.id).shards().size());
+        std::printf("self\n");
     }
     std::fflush(stdout);
 
@@ -341,26 +254,10 @@ int main(int argc, char** argv) {
     uint32_t loaders_done = 0;
     bool load_ok = true;
     std::string load_error;
-    // An io thread that fails to provision after the listeners were probed cannot report through
-    // load_ok (that barrier has passed); it stops every thread and records the failure here so
-    // the exit status says what happened instead of a silent 0.
-    std::atomic<bool> io_boot_failed{false};
+    for (uint32_t i = 0; i < nthreads; i++) g_threads.push_back(&srv.thread(i));
 
     auto pin_for = [&](uint32_t tid) {
         if (cfg.pin_threads) pin_to(srv.placement().cpu_of_thread(tid));
-    };
-    auto report_graceful_shutdown = [&] {
-        // All owners and readers are quiescent. Release pending-entry references before IoLoop
-        // destruction, then return their deferred ScatterState arenas to the correct IO-owned
-        // pools. Server normally outlives those pools, so leaving this to FlatStore destructors
-        // would leak the retained arenas.
-        for (uint32_t sid = 0; sid < srv.nshards(); sid++)
-            srv.shard(static_cast<int32_t>(sid)).store().atomic_shutdown_release_records();
-        for (IoLoop& io : ios) io.reap_atomic_deferred();
-        ShutdownReport report = collect_shutdown_report(srv, ios);
-        print_shutdown_report_human(report);
-        final_shutdown_line.arm(std::move(report));
-        acl_shutdown();
     };
 
     // Workers and senders BEFORE io: an io thread that dispatches or hands off to a thread whose
@@ -372,9 +269,7 @@ int main(int argc, char** argv) {
             ThreadCtx& self = srv.thread(tid);
             self.latch_placement(srv.topo());   // after pinning: sched_getcpu is only now truthful
             bind_thread_arena();                // per-worker jemalloc arena; no-op without it
-            bool ok = self.init_task_inbox_local(srv.placement().ifid_threads(),
-                                                 srv.placement().ex_threads());
-            if (ok) ok = exs[tid].init(&srv, &self);
+            bool ok = exs[tid].init(&srv, &self);
             std::string local_error;
             if (ok && aof_base_plan)
                 ok = snapshot_load_owned(*aof_base_plan, srv, self, local_error);
@@ -385,30 +280,6 @@ int main(int argc, char** argv) {
             } else if (ok && load_plan) {
                 ok = snapshot_load_owned(*load_plan, srv, self, local_error);
             }
-            // Provision the opposite loop before runtime mutation is possible. Dormant IO creates
-            // its ring/epoll/WB state but no listener and does not bind AOF, so boot loading still
-            // happens before any connection can arrive and before the initial AOF writer exists.
-            if (ok)
-                ok = ios[tid].init(&srv, &self, cfg.bind_addr, cfg.port, -1,
-                                   tls_context.get(), true);
-            if (ok)
-                self.bind_io_role_hooks(
-                    &ios[tid],
-                    [](void* p) { return static_cast<IoLoop*>(p)->prepare_activation(); },
-                    [](void* p) { static_cast<IoLoop*>(p)->cancel_prepared_activation(); });
-            if (ok)
-                self.bind_client_registration_hooks(
-                    [](void* p, Client* client) {
-                        return static_cast<IoLoop*>(p)->prepare_client_registration(client);
-                    },
-                    [](void* p, Client* client) {
-                        static_cast<IoLoop*>(p)->cancel_client_registration(client);
-                    });
-            if (ok)
-                self.bind_client_capacity_hook(
-                    [](void* p, uint32_t incoming) {
-                        return static_cast<IoLoop*>(p)->prepare_client_transfer_capacity(incoming);
-                    });
             {
                 std::lock_guard<std::mutex> lock(load_mu);
                 if (!ok) {
@@ -420,28 +291,11 @@ int main(int argc, char** argv) {
             }
             load_cv.notify_one();
             if (!ok) return;
-            for (;;) {
-                if (self.stop_flag().load(std::memory_order_relaxed)) break;
-                const Role role = self.role();
-                if (role == Role::Ex) {
-                    exs[tid].activate();
-                    self.publish_ready_role(Role::Ex);
-                    exs[tid].run();
-                    self.publish_ready_role(Role::Idle);
-                } else if (role == Role::Ifid) {
-                    if (!ios[tid].activate()) std::abort();
-                    self.publish_ready_role(Role::Ifid);
-                    ios[tid].run();
-                    self.publish_ready_role(Role::Idle);
-                    if (!self.stop_flag().load(std::memory_order_relaxed)) ios[tid].deactivate();
-                } else {
-                    std::this_thread::yield();
-                }
-            }
+            exs[tid].run();
         });
 
     // Main performed every read(2); the real owning executor threads now deserialize their own
-    // shard sections in parallel. No TCP listener exists until all owners report success.
+    // shard sections in parallel.  No listener exists until all owners report success.
     {
         std::unique_lock<std::mutex> lock(load_mu);
         load_cv.wait(lock, [&] {
@@ -451,22 +305,8 @@ int main(int argc, char** argv) {
     if (!load_ok) {
         for (uint32_t i = 0; i < nthreads; i++) srv.thread(i).stop_flag().store(true);
         for (auto& thread : pool) thread.join();
-        if (srv.shutting_down().load(std::memory_order_relaxed)) {
-            srv.set_loading(false);
-            report_graceful_shutdown();
-            return 0;
-        }
         std::fprintf(stderr, "persistence load failed: %s\n", load_error.c_str());
         return 1;
-    }
-    srv.set_loading(false);
-    if (srv.shutting_down().load(std::memory_order_relaxed)) {
-        for (uint32_t i = 0; i < nthreads; i++)
-            srv.thread(i).stop_flag().store(true, std::memory_order_relaxed);
-        for (auto& thread : pool)
-            if (thread.joinable()) thread.join();
-        report_graceful_shutdown();
-        return 0;
     }
 
     // Probe only after boot load. Each io thread then opens its own SO_REUSEPORT listener.
@@ -492,107 +332,180 @@ int main(int argc, char** argv) {
         }
         ::close(probe);
     }
-    std::string unix_error;
-    if (!unix_listener.open(cfg.tcp_backlog, unix_error)) {
-        std::fprintf(stderr, "%s\n", unix_error.c_str());
-        for (uint32_t i = 0; i < nthreads; i++) srv.thread(i).stop_flag().store(true);
-        for (auto& thread : pool) thread.join();
-        return 1;
-    }
 
-    const uint32_t unix_owner = srv.unix_owner_tid();
+    const uint32_t unix_owner = srv.placement().ifid_threads().front();
     for (uint32_t tid : srv.placement().ifid_threads())
         pool.emplace_back([&, tid] {
             pin_for(tid);
             ThreadCtx& self = srv.thread(tid);
             self.latch_placement(srv.topo());
-            bind_thread_arena();
-            auto boot_failed = [&](const char* what) {
-                std::fprintf(stderr, "%s failed on t%u\n", what, tid);
-                io_boot_failed.store(true, std::memory_order_relaxed);
-                for (uint32_t i = 0; i < nthreads; i++)
-                    srv.thread(i).stop_flag().store(true, std::memory_order_relaxed);
-            };
-            if (!self.init_task_inbox_local(srv.placement().ifid_threads(),
-                                            srv.placement().ex_threads())) {
-                boot_failed("task inbox initialization");
-                return;
-            }
-            // Provision dormant EX first; active IO then republishes its own ring as the current
-            // role endpoint. No runtime conversion can fail later for lack of a ring. A failure
-            // here must not let the thread vanish silently: the join below waits for it, and the
-            // other threads would keep serving with one reuseport listener missing.
-            if (!exs[tid].init(&srv, &self, true)) {
-                boot_failed("executor loop provisioning");
-                return;
-            }
-            // Dormant, exactly like the executor pool above: the SO_REUSEPORT listeners and the
-            // AOF writer binding are opened by activate() in the role loop below instead of here,
-            // which is what leaves the loop cold enough to accept the transferred unix fd.
-            if (!ios[tid].init(&srv, &self, cfg.bind_addr, cfg.port, -1,
-                               tls_context.get(), true)) {
-                boot_failed("io loop provisioning");
-                return;
-            }
-            if (tid == unix_owner && unix_listener.fd() >= 0) {
-                if (!ios[tid].attach_listener(unix_listener.fd())) {
-                    boot_failed("unix listener attach");
-                    return;
-                }
-                (void)unix_listener.release_fd();
-            }
-            self.bind_io_role_hooks(
-                &ios[tid],
-                [](void* p) { return static_cast<IoLoop*>(p)->prepare_activation(); },
-                [](void* p) { static_cast<IoLoop*>(p)->cancel_prepared_activation(); });
-            self.bind_client_registration_hooks(
-                [](void* p, Client* client) {
-                    return static_cast<IoLoop*>(p)->prepare_client_registration(client);
-                },
-                [](void* p, Client* client) {
-                    static_cast<IoLoop*>(p)->cancel_client_registration(client);
-                });
-            self.bind_client_capacity_hook(
-                [](void* p, uint32_t incoming) {
-                    return static_cast<IoLoop*>(p)->prepare_client_transfer_capacity(incoming);
-                });
-            for (;;) {
-                if (self.stop_flag().load(std::memory_order_relaxed)) break;
-                const Role role = self.role();
-                if (role == Role::Ifid) {
-                    if (!ios[tid].activate()) std::abort();
-                    self.publish_ready_role(Role::Ifid);
-                    ios[tid].run();
-                    self.publish_ready_role(Role::Idle);
-                    if (!self.stop_flag().load(std::memory_order_relaxed)) ios[tid].deactivate();
-                } else if (role == Role::Ex) {
-                    exs[tid].activate();
-                    self.publish_ready_role(Role::Ex);
-                    exs[tid].run();
-                    self.publish_ready_role(Role::Idle);
-                } else {
-                    std::this_thread::yield();
-                }
-            }
+            const int unix_fd = tid == unix_owner ? unix_listener : -1;
+            if (!ios[tid].init(&srv, &self, cfg.bind_addr, cfg.port, unix_fd,
+                               tls_context.get())) return;
+            ios[tid].run();
         });
 
     if (cfg.port) std::printf("listening on %s:%u\n", cfg.bind_addr, cfg.port);
     if (cfg.tls_port) std::printf("listening with TLS on %s:%u\n", cfg.bind_addr, cfg.tls_port);
-    if (unix_listener.bound()) std::printf("listening on unix:%s\n", cfg.unixsocket);
+    if (unix_listener >= 0) std::printf("listening on unix:%s\n", cfg.unixsocket);
     std::fflush(stdout);
 
-    // The automatic split controller has exactly one writer: this main/monitor thread. Worker
-    // loops only publish owner-local counters and execute the unchanged FLIP stage machine. With
-    // the default --flip-auto 0 this block does not run and allocates/schedules nothing.
-    if (srv.flipctl_enabled()) {
-        while (!srv.shutting_down().load(std::memory_order_relaxed)) {
-            (void)srv.flipctl_tick(now_ns() / 1000000ull);
-            if (srv.shutting_down().load(std::memory_order_relaxed)) break;
-            (void)signal_doorbell_wait(srv.flipctl_wait_ms());
-        }
-    }
-
     for (auto& t : pool) t.join();
-    report_graceful_shutdown();
-    return io_boot_failed.load(std::memory_order_relaxed) ? 1 : 0;
+    if (cfg.unixsocket && *cfg.unixsocket) ::unlink(cfg.unixsocket);
+
+    // All owners and readers are quiescent. Release pending-entry references before IoLoop destruction,
+    // then return their deferred ScatterState arenas to the correct IO-owned pools. Server normally
+    // outlives those pools, so leaving this to FlatStore destructors would leak the retained arenas.
+    for (uint32_t sid = 0; sid < srv.nshards(); sid++)
+        srv.shard(static_cast<int32_t>(sid)).store().atomic_shutdown_release_records();
+    for (IoLoop& io : ios) io.reap_atomic_deferred();
+
+    // One line of accounting on the way out. Cheap, and the absence of it is how a run ends with no
+    // evidence of what it did.
+    uint64_t ops = 0, disp = 0;
+    for (uint32_t i = 0; i < srv.nthreads(); i++) {
+        const LoopSignals& s = srv.thread(i).sig();
+        (srv.thread(i).role() == Role::Ifid ? disp : ops) += s.ops;
+    }
+    uint64_t acc = 0, aerr = 0, arearm = 0, starved = 0, ndrop = 0;
+    for (uint32_t i = 0; i < srv.nthreads(); i++) {
+        const LoopSignals& s = srv.thread(i).sig();
+        acc += s.accepts; aerr += s.accept_err; arearm += s.accept_rearm; starved += s.sqe_starved;
+        ndrop += s.notify_drop;
+    }
+    // Per-thread breakdown. The aggregate hides the thing you actually need: whether a stage is
+    // saturated, starved, or spending its life in the kernel waiting to be told there is work.
+    std::printf("\n%-6s %-4s %12s %10s %9s %9s %9s %9s %8s\n",
+                "thread","role","ops","iters","busy_ms","idle_ms","cpu_ms","wake_tx","wake_rx");
+    for (uint32_t i = 0; i < srv.nthreads(); i++) {
+        const LoopSignals& s = srv.thread(i).sig();
+        const Role r = srv.thread(i).role();
+        std::printf("t%-5u %-4s %12llu %10llu %9.1f %9.1f %9.1f %9llu %8llu\n", i,
+                    r == Role::Ifid ? "io" : "ex",
+                    (unsigned long long)s.ops, (unsigned long long)s.iterations,
+                    s.busy_ns / 1e6, s.idle_ns / 1e6, s.cpu_ns / 1e6,
+                    (unsigned long long)s.wakes_sent, (unsigned long long)s.wakes_recv);
+    }
+    // WHERE DID THE REPLIES GO. dispatched==executed only proves the STORE finished its work; it
+    // says nothing about whether the answer reached the socket. These three levels localise a stall
+    // to one hop: retired < executed means replies are stranded in the ROB (the sender was never
+    // told). retired == executed with bytes_sent short means they are staged but unsent (the pump
+    // was never re-triggered). Both looked identical from outside before this existed.
+    WbEngine::Stats w{};
+    auto addw = [&](const WbEngine::Stats& x) {
+        w.sends_submitted += x.sends_submitted; w.sends_completed += x.sends_completed;
+        w.short_writes    += x.short_writes;    w.send_errors     += x.send_errors;
+        w.peer_aborts     += x.peer_aborts;
+        w.bytes_sent      += x.bytes_sent;      w.retired         += x.retired;
+        w.direct          += x.direct;
+        w.zc_sends        += x.zc_sends;        w.zc_bytes        += x.zc_bytes;
+        w.zc_releases     += x.zc_releases;
+        w.serves          += x.serves;          w.serves_empty    += x.serves_empty;
+    };
+    for (uint32_t i = 0; i < srv.nthreads(); i++) {
+        addw(ios[i].engine().stats()); addw(exs[i].engine().stats());
+    }
+    uint64_t tls_accepts = 0, tls_started = 0, tls_completed = 0, tls_failed = 0,
+             tls_freed = 0, tls_want_read = 0, tls_want_write = 0,
+             tls_cipher_in = 0, tls_plain_in = 0, tls_cipher_out = 0,
+             tls_plain_out = 0, tls_zc_suppressed = 0, tls_ktls_active = 0,
+             tls_ktls_fallback = 0;
+    for (uint32_t i = 0; i < srv.nthreads(); i++) {
+        const LoopSignals& s = srv.thread(i).sig();
+        tls_accepts += s.tls_accepts;
+        tls_started += s.tls_handshakes_started;
+        tls_completed += s.tls_handshakes_completed;
+        tls_failed += s.tls_handshakes_failed;
+        tls_freed += s.tls_connections_freed;
+        tls_want_read += s.tls_want_read;
+        tls_want_write += s.tls_want_write;
+        tls_cipher_in += s.tls_ciphertext_input_bytes;
+        tls_plain_in += s.tls_plaintext_input_bytes;
+        tls_cipher_out += s.tls_ciphertext_output_bytes;
+        tls_plain_out += s.tls_plaintext_output_bytes;
+        tls_zc_suppressed += s.tls_zc_suppressed;
+        tls_ktls_active += s.tls_ktls_active;
+        tls_ktls_fallback += s.tls_ktls_fallback;
+    }
+    // And the smoking gun: connections still holding work at shutdown, by WHICH kind.
+    uint64_t stuck_rob = 0, stuck_wr = 0, live = 0;
+    uint64_t st_done = 0, st_issued = 0, st_free = 0, st_flag = 0;
+    for (uint32_t i = 0; i < srv.nthreads(); i++)
+        for (Client* c : srv.thread(i).clients()) {
+            if (!c) continue;
+            live++;
+            if (!c->rob().quiesced()) {
+                stuck_rob++;
+                // THE DEDUP FLAG ON A STRANDED CLIENT. retire_queued is the whole notification
+                // protocol: a worker claims the client by CASing it false->true and then posts it to
+                // the sender, and the sender clears it before serving. So on a client whose replies
+                // are Done and unretired there are exactly two stories, and this bit tells them apart:
+                //   true  -> someone claimed it and the post never took effect (claim leaked)
+                //   false -> nobody was holding a claim, so the notification was simply never made
+                if (c->retire_queued().load(std::memory_order_acquire)) st_flag++;
+#ifdef TOMO_WEDGE_FORENSICS
+                std::printf("  stranded conn: claims=%u defers=%u serves=%u inflight=%u flag=%d\n",
+                            c->n_claims.load(std::memory_order_relaxed),
+                            c->n_defers.load(std::memory_order_relaxed),
+                            c->n_serves.load(std::memory_order_relaxed),
+                            c->rob().in_flight(),
+                            (int)c->retire_queued().load(std::memory_order_acquire));
+#endif
+                // WHICH KIND OF STRANDED. The counts above prove ops were dispatched and never
+                // retired; they cannot say why. The state of each un-retired slot does:
+                //   Done   -> it executed and the sender was never told  (a lost-notification bug)
+                //   Issued -> it never executed at all                   (a lost-dispatch bug)
+                // Those need opposite fixes, so guessing between them is how you fix the wrong one.
+                for (uint64_t i = c->rob().flush_id(), d = c->rob().dispatch_id(); i != d; i++) {
+                    switch (c->rob().at(i).state.load(std::memory_order_acquire)) {
+                        case OpState::Done:   st_done++;   break;
+                        case OpState::Issued: st_issued++; break;
+                        default:              st_free++;   break;
+                    }
+                }
+            }
+            if (!c->nothing_to_write()) stuck_wr++;        }
+    std::printf("wb: retired=%llu direct=%llu sends=%llu/%llu short=%llu err=%llu"
+                " peer_aborts=%llu bytes=%llu"
+                " zc_sends=%llu zc_bytes=%llu zc_releases=%llu serves=%llu empty=%llu\n",
+                (unsigned long long)w.retired, (unsigned long long)w.direct, (unsigned long long)w.sends_completed,
+                (unsigned long long)w.sends_submitted, (unsigned long long)w.short_writes,
+                (unsigned long long)w.send_errors, (unsigned long long)w.peer_aborts,
+                (unsigned long long)w.bytes_sent,
+                (unsigned long long)w.zc_sends, (unsigned long long)w.zc_bytes,
+                (unsigned long long)w.zc_releases,
+                (unsigned long long)w.serves, (unsigned long long)w.serves_empty);
+    std::printf("tls: accepts=%llu handshakes=%llu/%llu failed=%llu freed=%llu"
+                " want_read=%llu want_write=%llu cipher_in=%llu plain_in=%llu"
+                " cipher_out=%llu plain_out=%llu zc_suppressed=%llu"
+                " ktls_active=%llu ktls_fallback=%llu\n",
+                (unsigned long long)tls_accepts, (unsigned long long)tls_completed,
+                (unsigned long long)tls_started, (unsigned long long)tls_failed,
+                (unsigned long long)tls_freed, (unsigned long long)tls_want_read,
+                (unsigned long long)tls_want_write, (unsigned long long)tls_cipher_in,
+                (unsigned long long)tls_plain_in, (unsigned long long)tls_cipher_out,
+                (unsigned long long)tls_plain_out, (unsigned long long)tls_zc_suppressed,
+                (unsigned long long)tls_ktls_active, (unsigned long long)tls_ktls_fallback);
+    std::printf("stuck: live_conns=%llu rob_not_quiesced=%llu unsent_bytes_pending=%llu"
+                " | slots done=%llu issued=%llu free=%llu flag_set=%llu\n",
+                (unsigned long long)live, (unsigned long long)stuck_rob, (unsigned long long)stuck_wr,
+                (unsigned long long)st_done, (unsigned long long)st_issued, (unsigned long long)st_free,
+                (unsigned long long)st_flag);
+    if (cfg.net_io == NetIoEngine::Epoll) {
+        uint64_t epoll_events = 0, epoll_recvs = 0;
+        for (uint32_t i = 0; i < srv.nthreads(); i++) {
+            epoll_events += srv.thread(i).sig().epoll_events;
+            epoll_recvs += srv.thread(i).sig().epoll_recvs;
+        }
+        std::printf("epoll: events=%llu recvs=%llu\n",
+                    (unsigned long long)epoll_events, (unsigned long long)epoll_recvs);
+    }
+    std::printf("shutdown: dispatched=%llu executed=%llu accepts=%llu accept_err=%llu "
+                "rearm=%llu sqe_starved=%llu notify_drop=%llu\n",
+                static_cast<unsigned long long>(disp), static_cast<unsigned long long>(ops),
+                static_cast<unsigned long long>(acc), static_cast<unsigned long long>(aerr),
+                static_cast<unsigned long long>(arearm), static_cast<unsigned long long>(starved),
+                static_cast<unsigned long long>(ndrop));
+    acl_shutdown();
+    return 0;
 }

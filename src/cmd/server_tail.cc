@@ -18,7 +18,6 @@
 #include "../core/config.h"
 #include "../core/server.h"
 #include "../core/shard.h"
-#include "../core/signal_doorbell.h"
 #include "../core/thread.h"
 #include "../exec/op.h"
 #include "../net/conn.h"
@@ -32,7 +31,6 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -173,7 +171,7 @@ void cmd_wait(Shard&, Op& op) {
 // against vanilla redis. The numlocal == 1 form -- "block until my writes are covered by a local
 // fsync" -- is NOT implemented and returns an explicit error rather than a plausible number.
 //
-// Why it is not implemented here, and what it needs:
+// Why it is not implemented here, and what it needs (NOTES-SERVERTAIL.md carries the full design):
 // a connection-local handler runs at PARSE time, before the ops ahead of it on the same connection
 // have executed, so the AOF sequence it could sample does not yet cover the caller's own writes.
 // Waiting synchronously cannot fix that: retiring those older ops requires this very IO thread, so
@@ -230,7 +228,7 @@ void cmd_failover(Shard&, Op& op) {
 
 // DELIBERATE DEVIATION. Redis answers +OK and starts replicating. TomoKV has no replication at
 // all, and silently accepting the command would leave a client believing it had a replica. An
-// explicit error is the honest answer.
+// explicit error is the honest answer; it is documented in NOTES-SERVERTAIL.md.
 void cmd_replicaof(Shard&, Op& op) {
     reply_err(op.sink(), "ERR replication is not supported by tomokv");
 }
@@ -288,7 +286,6 @@ void cmd_shutdown(Shard&, Op& op) {
         if (Ring* ring = self->ring())
             for (uint32_t i = 0; i < server->nthreads(); i++)
                 server->thread(i).wake_if_parked(*ring, self->sig());
-    signal_doorbell_notify();
     // Deliberately no reply: the client observes a closed connection, exactly like redis.
 }
 
@@ -387,8 +384,8 @@ void cmd_object_impl(Shard& shard, Op& op) {
     // ENCODING/REFCOUNT go through the notify-aware lookup so an armed keymiss event still fires.
     // IDLETIME/FREQ must not touch the metadata they are about to report.
     KvObj* object = (idletime || freq)
-        ? shard.store_find_read_no_touch(op.hash, op.arg(2))
-        : shard.store_find_read<kNotify>(op.hash, op.arg(2));
+        ? shard.store().find_no_touch(op.hash, op.arg(2))
+        : shard.store_find<kNotify>(op.hash, op.arg(2));
     if (!object) { reply_null(op.sink(), op.resp3()); return; }
     if (encoding) {
         const char* name = encoding_name(object);
@@ -406,10 +403,13 @@ void cmd_object_impl(Shard& shard, Op& op) {
     // maxmemory is enabled. With eviction off the bits are meaningless, so report a fresh key.
     if (!shard.store().maxmemory_enabled()) { reply_int(op.sink(), 0); return; }
     if (freq) { reply_int(op.sink(), object->eviction_meta()); return; }
-    // The fixed five-bit clock quantises age to 256 seconds and wraps after 8192 seconds.
+    // Age is quantised to 1<<lru-clock-shift seconds and wraps after 32 buckets (~8192s at the
+    // default shift of 8) because the clock is five bits wide. Documented, not hidden.
+    const Server* server = command_server();
+    const uint32_t shift = server ? server->cfg().lru_clock_shift : 8;
     const uint8_t age = static_cast<uint8_t>(
         (shard.store().published_lru_clock() - object->eviction_meta()) & 0x1f);
-    reply_int(op.sink(), static_cast<long long>(age) << kLruClockShift);
+    reply_int(op.sink(), static_cast<long long>(age) << shift);
 }
 
 void cmd_object(Shard& shard, Op& op) { cmd_object_impl<false>(shard, op); }
@@ -638,9 +638,11 @@ const char* const kConfigHelpText[] = {
     "    Print this help.",
 };
 
-// CONFIG REWRITE replaces runtime-owned directives and preserves boot-only directives absent
-// from the runtime table. Only names accepted by the boot parser are generated; the fixed
-// aof-use-rdb-preamble declaration is not a configurable boot directive.
+// CONFIG REWRITE writes a COMPLETE file of the knobs we own, not a patch of the original. Two
+// consequences, both deliberate and both documented: comments and unknown-to-us directives in the
+// booted file are not preserved, and only names the boot parser actually accepts are emitted --
+// Every compatibility knob except aof-use-rdb-preamble is boot-parsed. The latter remains a fixed
+// declaration of the snapshot-based AOF format and is omitted from generated files.
 bool config_name_is_rewritable(const std::string& name) {
     static const char* const kNotBootParsed[] = {
         "aof-use-rdb-preamble",
@@ -648,24 +650,6 @@ bool config_name_is_rewritable(const std::string& name) {
     for (const char* skip : kNotBootParsed)
         if (name == skip) return false;
     return true;
-}
-
-std::string config_quote(std::string_view value) {
-    // Keep the existing spelling of simple scalars; quote only tokens whose bytes need escaping.
-    if (!value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-            return ch > 32 && ch < 127 && ch != '\\' && ch != '"' && ch != '\'';
-        })) return std::string(value);
-    std::string out = "\"";
-    constexpr char hex[] = "0123456789abcdef";
-    for (unsigned char ch : value) {
-        if (ch == '\\' || ch == '"') { out.push_back('\\'); out.push_back(ch); }
-        else if (ch < 32 || ch >= 127) {
-            out += "\\x";
-            out.push_back(hex[ch >> 4]); out.push_back(hex[ch & 15]);
-        } else out.push_back(ch);
-    }
-    out.push_back('"');
-    return out;
 }
 
 bool config_rewrite(std::string& error) {
@@ -677,31 +661,10 @@ bool config_rewrite(std::string& error) {
     std::vector<std::pair<std::string, std::string>> items;
     command_config_snapshot(items);
 
-    std::string body = "# Generated by tomokv CONFIG REWRITE.\n";
-    // The runtime table covers live knobs. Preserve directives it does not own, including
-    // repeatable inline ACL users and boot-only recovery/placement settings.
-    std::ifstream original(path);
-    if (!original) { error = "cannot read original config"; return false; }
-    std::string line;
-    while (std::getline(original, line)) {
-        const size_t first = line.find_first_not_of(" \t\r");
-        if (first == std::string::npos || line[first] == '#') continue;
-        std::vector<std::string> words;
-        if (!cfg_split_args(line.c_str(), words)) {
-            error = "invalid original config line"; return false;
-        }
-        if (words.empty()) continue;
-        // Encoding aliases belong to the same runtime directive as their canonical name.
-        // Keeping an old alias would preserve a stale value beside the rewritten live value.
-        const int encoding = EncodingConfig::find(Slice(words.front().data(), words.front().size()));
-        const std::string_view name = encoding >= 0
-            ? EncodingConfig::settings[encoding].name : std::string_view(words.front());
-        const bool replaced = std::any_of(items.begin(), items.end(), [&](const auto& item) {
-            return item.first == name;
-        });
-        if (!replaced) body += line + "\n";
-    }
-    if (original.bad()) { error = "cannot read original config"; return false; }
+    std::string body =
+        "# Generated by tomokv CONFIG REWRITE. This file is a complete, self-consistent dump of\n"
+        "# the runtime knobs this build owns; comments and unrecognised directives from the file\n"
+        "# that was originally loaded are not carried over.\n";
     for (const auto& item : items) {
         if (!config_name_is_rewritable(item.first)) continue;
         if (item.first == "save") {
@@ -718,21 +681,16 @@ bool config_rewrite(std::string& error) {
         }
         body += item.first;
         body.push_back(' ');
-        // Output limits are a multi-token directive; every other value is one parser token.
-        if (item.first == "client-output-buffer-limit") body += item.second;
-        else body += config_quote(item.second);
+        // An empty value must still round-trip through the `name value` grammar.
+        if (item.second.empty()) body += "\"\"";
+        else body += item.second;
         body.push_back('\n');
     }
 
     // Write-then-rename so a failure part way through cannot leave a truncated config behind.
-    std::string temporary = std::string(path) + ".rewrite.XXXXXX";
-    const int fd = ::mkstemp(temporary.data());
-    if (fd < 0) { error = std::strerror(errno); return false; }
-    FILE* file = ::fdopen(fd, "w");
-    if (!file) {
-        error = std::strerror(errno);
-        ::close(fd); std::remove(temporary.c_str()); return false;
-    }
+    std::string temporary = std::string(path) + ".rewrite.tmp";
+    FILE* file = std::fopen(temporary.c_str(), "w");
+    if (!file) { error = std::strerror(errno); return false; }
     const size_t written = std::fwrite(body.data(), 1, body.size(), file);
     const bool flushed = std::fflush(file) == 0;
     const bool closed = std::fclose(file) == 0;

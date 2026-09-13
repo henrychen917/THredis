@@ -89,7 +89,7 @@ def run():
         names = c.cmd("COMMAND", "LIST")
         name_set = set(names) if isinstance(names, list) else set()
         expect("PFDEBUG inventory row listed", b"pfdebug" in name_set, True)
-        expect("COMMAND COUNT moved by one", c.cmd("COMMAND", "COUNT"), 243)
+        expect("COMMAND COUNT moved by one", c.cmd("COMMAND", "COUNT"), 242)
         info = c.cmd("COMMAND", "INFO", "PFDEBUG")
         routing = ((info[0][0], info[0][1], info[0][3], info[0][4], info[0][5])
                    if isinstance(info, list) and info and isinstance(info[0], list)

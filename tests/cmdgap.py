@@ -90,7 +90,7 @@ def run():
         added = {b"asking", b"readonly", b"readwrite", b"restore-asking"}
         expect("all four inventory rows listed", added <= name_set, True)
         # The first lane contributed four rows; the follow-on PFDEBUG lane contributes one more.
-        expect("COMMAND COUNT includes both inventory lanes", c.cmd("COMMAND", "COUNT"), 243)
+        expect("COMMAND COUNT includes both inventory lanes", c.cmd("COMMAND", "COUNT"), 242)
         info = c.cmd("COMMAND", "INFO", "ASKING", "READONLY", "READWRITE",
                      "RESTORE-ASKING")
         routing = [(row[0], row[1], row[3], row[4], row[5]) for row in info]

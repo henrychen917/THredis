@@ -1,8 +1,5 @@
-import ast, os, socket, sys, random, tempfile
+import socket, sys, random
 PORT=int(sys.argv[1]); MODE=sys.argv[2]
-# Restart legs share the battery's private TMPDIR and port. The former fixed path allowed an
-# unrelated snapshot battery to overwrite the expected state between SAVE and verification.
-STATE_PATH=os.path.join(tempfile.gettempdir(), "gate-snap-state-%d.txt" % PORT)
 def enc(a):
     o=b"*%d\r\n"%len(a)
     for x in a:
@@ -82,7 +79,7 @@ def statefile():
 if MODE=="build_save":
     build()
     state = statefile()
-    open(STATE_PATH,"w").write(repr(state))
+    open("/tmp/claude-1000/snap_state_a.txt","w").write(repr(state))
     save_reply = c.cmd("SAVE")
     if save_reply != b"+OK":
         raise RuntimeError("SAVE failed: %r" % (save_reply,))
@@ -90,7 +87,7 @@ if MODE=="build_save":
     print("state captured: %d checks" % len(state))
 elif MODE=="verify":
     state = statefile()
-    expect = ast.literal_eval(open(STATE_PATH).read())
+    expect = eval(open("/tmp/claude-1000/snap_state_a.txt").read())
     bad = [ (KEYS_CHECK[i], expect[i], state[i]) for i in range(len(state)) if state[i]!=expect[i] ]
     for b in bad[:6]: print("  MISMATCH", b[0], "expect", str(b[1])[:60], "got", str(b[2])[:60])
     print("TYPED ROUNDTRIP", "PASS (%d/%d)"%(len(state)-len(bad),len(state)) if not bad else "FAIL")

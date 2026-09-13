@@ -317,161 +317,6 @@ bool classify(const Op& op, Kind& kind) {
     return false;
 }
 
-bool append_key_span(const Op& op, XshardKeyPlan& keys, uint32_t first,
-                     uint32_t count, uint32_t step, XshardKeyUse use) {
-    if (!count) return true;
-    if (!step || keys.span_count >= 2 ||
-        count > UINT32_MAX - keys.key_count) return false;
-    const uint64_t last = static_cast<uint64_t>(first) +
-                          static_cast<uint64_t>(count - 1) * step;
-    if (last >= op.argc()) return false;
-    keys.spans[keys.span_count++] = XshardKeySpan{first, count, step, use};
-    keys.key_count += count;
-    return true;
-}
-
-bool classify_keys(const Op& op, Kind kind, const XshardKeyHints& hints,
-                   XshardKeyPlan& keys) {
-    keys = XshardKeyPlan{};
-    const auto add_read = [&](uint32_t first, uint32_t count, uint32_t step = 1) {
-        return append_key_span(op, keys, first, count, step, XshardKeyUse::Read);
-    };
-    const auto add_write = [&](uint32_t first, uint32_t count, uint32_t step = 1) {
-        return append_key_span(op, keys, first, count, step, XshardKeyUse::SnapshotWrite);
-    };
-    const uint32_t after_command = op.argc() > 1 ? op.argc() - 1 : 0;
-
-    switch (kind) {
-        case Kind::AllShards:
-        case Kind::DebugReload:
-        case Kind::DebugLoadAof:
-        case Kind::DebugBorrowCount:
-        case Kind::DbsizeExact:
-        case Kind::Keys:
-            return true;
-        case Kind::Mget:
-        case Kind::Exists:
-        case Kind::Touch:
-        case Kind::Pfcount:
-        case Kind::Sinter:
-        case Kind::Sunion:
-        case Kind::Sdiff:
-            return add_read(1, after_command);
-        case Kind::Mset:
-        case Kind::Msetnx:
-            return add_write(1, after_command / 2, 2);
-        case Kind::Del:
-        case Kind::Unlink:
-            return add_write(1, after_command);
-        // Option-hidden stream positions live here once for routing, the own-write fence, and
-        // snapshot COW. Keeping XREADGROUP writable is the S2 invariant.
-        case Kind::Xread:
-            return add_read(hints.first, hints.count);
-        case Kind::Xreadgroup:
-            return add_write(hints.first, hints.count);
-        case Kind::Lcs:
-            return add_read(1, 2);
-        case Kind::Rename:
-        case Kind::Renamenx:
-        case Kind::Smove:
-        case Kind::Lmove:
-        case Kind::Rpoplpush:
-            return add_write(1, 2);
-        case Kind::Copy:
-            return add_read(1, 1) && add_write(2, 1);
-        case Kind::Sintercard:
-            return add_read(2, hints.count);
-        case Kind::Sinterstore:
-        case Kind::Sunionstore:
-        case Kind::Sdiffstore:
-            return add_write(1, 1) && add_read(2, op.argc() - 2);
-        case Kind::Zunion:
-        case Kind::Zinter:
-        case Kind::Zdiff:
-        case Kind::Zintercard:
-            return add_read(2, hints.count);
-        case Kind::Zunionstore:
-        case Kind::Zinterstore:
-        case Kind::Zdiffstore:
-            return add_write(1, 1) && add_read(3, hints.count);
-        case Kind::Bitop:
-            return add_write(2, 1) && add_read(3, op.argc() - 3);
-        case Kind::Pfmerge:
-            return add_write(1, 1) && add_read(2, op.argc() - 2);
-        case Kind::Lmpop:
-        case Kind::Zmpop:
-            return add_write(2, hints.count);
-        case Kind::Zrangestore:
-            return add_write(1, 1) && add_read(2, 1);
-        case Kind::Sort:
-            if (hints.store)
-                return add_write(hints.destination, 1) && add_read(1, 1);
-            return add_read(1, 1);
-        case Kind::Geosearchstore:
-        case Kind::Georadius:
-        case Kind::Georadiusbymember:
-            if (hints.store)
-                return add_write(hints.destination, 1) && add_read(hints.source, 1);
-            return add_read(hints.source, 1);
-        case Kind::Script: {
-            const bool needs_snapshot_cow =
-                (op.spec->flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)) != 0;
-            return needs_snapshot_cow
-                ? add_write(hints.first, hints.count)
-                : add_read(hints.first, hints.count);
-        }
-    }
-    return false;
-}
-
-// Owner-side localfast consumers reconstruct only the dynamic positions. xshard_prepare already
-// validated the full grammar before marking an op local, so count-only families do not allocate
-// the weights/result scratch their execution parser already built and discarded on IO.
-bool classify_keys(Op& op, Kind kind, XshardKeyPlan& keys) {
-    XshardKeyHints hints;
-    if (kind == Kind::Sintercard) {
-        int64_t count = 0;
-        if (!parse_i64(op.arg(1), count) || count < 1 ||
-            static_cast<uint64_t>(count) > UINT32_MAX) return false;
-        hints.count = static_cast<uint32_t>(count);
-    } else if (is_any_zsetop(kind)) {
-        int64_t count = 0;
-        const uint32_t count_arg = is_store_zsetop(kind) ? 2 : 1;
-        if (!parse_i64(op.arg(count_arg), count) || count < 1 ||
-            static_cast<uint64_t>(count) > UINT32_MAX) return false;
-        hints.count = static_cast<uint32_t>(count);
-    } else if (kind == Kind::Lmpop || kind == Kind::Zmpop) {
-        int64_t count = 0;
-        if (!parse_i64(op.arg(1), count) || count < 1 ||
-            static_cast<uint64_t>(count) > UINT32_MAX) return false;
-        hints.count = static_cast<uint32_t>(count);
-    } else if (kind == Kind::Sort) {
-        SortOptions options;
-        if (!parse_sort_options(op, options)) return false;
-        hints.store = options.store;
-        hints.destination = options.store_arg;
-    } else if (is_geo_kind(kind)) {
-        GeoRoute route;
-        if (!geo_prepare_route(op, route)) return false;
-        hints.store = route.store;
-        hints.source = route.source_arg;
-        hints.destination = route.destination_arg;
-    } else if (kind == Kind::Xread) {
-        StreamXreadArgs parsed;
-        if (!stream_parse_xread(op, parsed)) return false;
-        hints.first = parsed.first_key;
-        hints.count = parsed.key_count;
-    } else if (kind == Kind::Xreadgroup) {
-        StreamXreadGroupArgs parsed;
-        if (!stream_parse_xreadgroup(op, parsed)) return false;
-        hints.first = parsed.key_arg;
-        hints.count = 1;
-    } else if (kind == Kind::Script) {
-        if (!command_script_key_range(op, hints.first, hints.count)) return false;
-    }
-    return classify_keys(static_cast<const Op&>(op), kind, hints, keys);
-}
-
 
 bool decode_elements(const ObjectImage& image, std::vector<std::string>& out) {
     out.clear();
@@ -494,7 +339,7 @@ bool decode_elements(const ObjectImage& image, std::vector<std::string>& out) {
 }
 
 bool encode_elements(const std::vector<std::string>& elements, ObjectImage& image, Type type,
-                     int64_t expire_at_ms, bool reserve_ttl_slot = false) {
+                     int64_t expire_at_ms) {
     uint64_t total = 0;
     for (const std::string& element : elements) total += 4ull + element.size();
     if (total > UINT32_MAX) return false;
@@ -505,7 +350,6 @@ bool encode_elements(const std::vector<std::string>& elements, ObjectImage& imag
         image.encoding = 0;
         image.entries = static_cast<uint32_t>(elements.size());
         image.expire_at_ms = expire_at_ms;
-        image.reserve_ttl_slot = reserve_ttl_slot;
         image.payload.resize(static_cast<size_t>(total));
     } catch (const std::bad_alloc&) {
         return false;
@@ -722,8 +566,8 @@ bool encode_zset_image(const std::vector<ZImageItem>& items, ObjectImage& image)
     return true;
 }
 
-// Retain source encoding in this image interface; the current LIMIT-offset rule is
-// encoding-independent and shared with the single-shard range path.
+// `expanded` is the SOURCE key's encoding (skiplist vs listpack): it selects how a negative LIMIT
+// offset resolves, exactly as on the single-shard range path.
 bool select_zrange(const std::vector<ZImageItem>& input, const ImageRangeOptions& options,
                    const ImageRangeSpec& range, bool expanded,
                    std::vector<ZImageItem>& selected) {
@@ -1229,7 +1073,6 @@ bool compute_pfmerge(ScatterState& state) {
         apply.type = Type::String;
         apply.encoding = static_cast<uint8_t>(Enc::Extern);
         apply.expire_at_ms = destination.present ? destination.expire_at_ms : -1;
-        apply.reserve_ttl_slot = destination.present && destination.reserve_ttl_slot;
         apply.payload.assign(merged.begin(), merged.end());
     } catch (const std::bad_alloc&) {
         state.final_reply = FinalReply::Work;
@@ -1306,12 +1149,7 @@ bool finish_phase1(ScatterState& state, Op& op) {
                 (!state.atomic_apply && state.images[1].present && !state.copy_replace)) {
                 state.final_reply = FinalReply::Integer; state.final_integer = 0; return true;
             }
-            try {
-                state.apply[1] = state.images[0];
-                // COPY creates a new destination lifetime. A live TTL allocates its own slot;
-                // a source that was merely PERSISTed does not donate its historical reservation.
-                state.apply[1].reserve_ttl_slot = false;
-            }
+            try { state.apply[1] = state.images[0]; }
             catch (const std::bad_alloc&) {
                 state.final_reply = FinalReply::Work; state.final_error = WorkError::Oom; return true;
             }
@@ -1353,13 +1191,11 @@ bool finish_phase1(ScatterState& state, Op& op) {
                 state.final_reply = FinalReply::Work; state.final_error = WorkError::Oom; return true;
             }
             if (src.empty()) state.apply[0] = ObjectImage{};
-            else if (!encode_elements(src, state.apply[0], Type::Set, source.expire_at_ms,
-                                      source.reserve_ttl_slot)) {
+            else if (!encode_elements(src, state.apply[0], Type::Set, source.expire_at_ms)) {
                 state.final_reply = FinalReply::Work; state.final_error = WorkError::Oom; return true;
             }
             if (!encode_elements(dst, state.apply[1], Type::Set,
-                                 dest.present ? dest.expire_at_ms : -1,
-                                 dest.present && dest.reserve_ttl_slot)) {
+                                 dest.present ? dest.expire_at_ms : -1)) {
                 state.final_reply = FinalReply::Work; state.final_error = WorkError::Oom; return true;
             }
             state.final_integer = 1; state.hop2[0] = 0; state.hop2[1] = 1; state.hop2_count = 2;
@@ -1398,21 +1234,17 @@ bool finish_phase1(ScatterState& state, Op& op) {
                 if (same_key(op)) {
                     if (state.to_left) src.insert(src.begin(), result_heap->bulk);
                     else src.push_back(result_heap->bulk);
-                    if (!encode_elements(src, state.apply[0], Type::List, source.expire_at_ms,
-                                         source.reserve_ttl_slot))
+                    if (!encode_elements(src, state.apply[0], Type::List, source.expire_at_ms))
                         throw std::bad_alloc();
                     state.hop2[0] = 0; state.hop2_count = 1;
                 } else {
                     if (state.to_left) dst.insert(dst.begin(), result_heap->bulk);
                     else dst.push_back(result_heap->bulk);
                     if (src.empty()) state.apply[0] = ObjectImage{};
-                    else if (!encode_elements(src, state.apply[0], Type::List,
-                                              source.expire_at_ms,
-                                              source.reserve_ttl_slot))
+                    else if (!encode_elements(src, state.apply[0], Type::List, source.expire_at_ms))
                         throw std::bad_alloc();
                     if (!encode_elements(dst, state.apply[1], Type::List,
-                                         dest.present ? dest.expire_at_ms : -1,
-                                         dest.present && dest.reserve_ttl_slot))
+                                         dest.present ? dest.expire_at_ms : -1))
                         throw std::bad_alloc();
                     state.hop2[0] = 0; state.hop2[1] = 1; state.hop2_count = 2;
                 }
@@ -1644,25 +1476,24 @@ bool finish_phase1(ScatterState& state, Op& op) {
     }
 }
 
-bool finish_phase2(ScatterState& state) {
+void finish_phase2(ScatterState& state) {
     WorkError error;
     if (first_error(state, error)) {
         if (state.atomic_apply) state.aborted.store(true, std::memory_order_release);
-        state.final_reply = FinalReply::Work; state.final_error = error; return false;
+        state.final_reply = FinalReply::Work; state.final_error = error; return;
     }
-    if (state.atomic_direct && state.final_reply != FinalReply::None) return false;
-    bool commit_ready = false;
+    if (state.atomic_direct && state.final_reply != FinalReply::None) return;
     if (state.atomic_apply) {
         if (state.conditional_failed.load(std::memory_order_acquire)) {
             state.final_reply = FinalReply::Integer;
             state.final_integer = 0;
-            return false;
+            return;
         }
         if (state.aborted.load(std::memory_order_acquire)) {
             state.final_reply = FinalReply::Internal;
-            return false;
+            return;
         }
-        commit_ready = !state.multi_child;
+        if (!state.multi_child) state.server->atomic_commit_group(state.epoch);
     }
     switch (state.kind) {
         case Kind::Msetnx: state.final_reply = FinalReply::Integer; state.final_integer = 1; break;
@@ -1695,7 +1526,6 @@ bool finish_phase2(ScatterState& state) {
         case Kind::Sort: state.final_reply = FinalReply::Integer; break;
         default: state.final_reply = FinalReply::Internal; break;
     }
-    return commit_ready;
 }
 
 void assemble_mget(Client& client, Op& op, ScatterState& state, void* release_ctx,
@@ -1730,16 +1560,6 @@ void assemble_mget(Client& client, Op& op, ScatterState& state, void* release_ct
     }
 
     client.seal_fill_segment();
-    // NO CODED REPLIES FOR THE REST OF THIS OP. flush_bytes below hands bytes to the connection
-    // and then EMPTIES the sink, mid-op. A coded reply is only equivalent to its bytes because a
-    // code is taken on an empty sink and therefore stands for the WHOLE reply; here the sink goes
-    // empty again with elements already on the wire, so the very next reply_null() would code a
-    // "$-1" that retire then emits ahead of everything staged after it. That desynchronises the
-    // connection -- it is exactly how the MGET-with-a-hole row in tests/edgeenc.py failed.
-    // Disarming for the remainder of the op keeps this whole assembly on the byte path it has
-    // always used; it runs once per borrowed MGET, not per reply.
-    op.reply_code_ok_ = 0;
-    op_materialise_code(op);        // anything already coded becomes bytes, in place, in order
     auto flush_bytes = [&] {
         client.append_buf_segment(op.direct, op.direct_len, op.reply.data(), op.reply.size());
         op.direct_len = 0;
@@ -1967,7 +1787,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         reply_array_header(op.sink(), op.argc() - 1);
         for (uint32_t arg = 1; arg < op.argc(); arg++) {
             const uint64_t hash = arg == 1 ? op.hash : FlatStore::hash_key(op.arg(arg));
-            KvObj* object = shard.store_find_read<kNotify>(hash, op.arg(arg));
+            KvObj* object = shard.store_find<kNotify>(hash, op.arg(arg));
             if (!object || static_cast<Type>(object->type) != Type::String) {
                 reply_null(op.sink(), op.resp3()); continue;
             }
@@ -1975,10 +1795,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
                 char integer[24];
                 const uint32_t n = i64_to_dec(integer, object->int_value());
                 reply_bulk(op.sink(), Slice(integer, n));
-            } else {
-                KvObjRawReadBuffer raw;
-                reply_bulk(op.sink(), kvobj_string_value(object, raw));
-            }
+            } else reply_bulk(op.sink(), object->str_value());
         }
         return;
     }
@@ -2084,7 +1901,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
             !parse_zrangestore_range(op, options, range)) return;
         ObjectImage source;
         const uint64_t source_hash = FlatStore::hash_key(op.arg(2));
-        KvObj* object = shard.store_find_read<kNotify>(source_hash, op.arg(2));
+        KvObj* object = shard.store_find<kNotify>(source_hash, op.arg(2));
         if (object && static_cast<Type>(object->type) != Type::Zset) {
             reply_wrongtype(op.sink());
             return;
@@ -2117,7 +1934,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         const uint64_t source_hash = FlatStore::hash_key(op.arg(1));
         // Before the pointer is taken: promoting replaces an embedded zset object.
         zset_sort_promote(shard, source_hash, op.arg(1), kNotify);
-        KvObj* object = shard.store_find_read<kNotify>(source_hash, op.arg(1));
+        KvObj* object = shard.store_find<kNotify>(source_hash, op.arg(1));
         if (object && static_cast<Type>(object->type) != Type::List &&
             static_cast<Type>(object->type) != Type::Set &&
             static_cast<Type>(object->type) != Type::Zset) {
@@ -2168,7 +1985,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         std::string values[2];
         for (uint32_t i = 0; i < 2; i++) {
             const Slice key = op.arg(1 + i);
-            KvObj* object = shard.store_find_read<kNotify>(
+            KvObj* object = shard.store_find<kNotify>(
                 i == 0 ? op.hash : FlatStore::hash_key(key), key);
             if (!object) continue;
             if (static_cast<Type>(object->type) != Type::String) {
@@ -2179,8 +1996,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
                 char integer[24];
                 values[i].assign(integer, i64_to_dec(integer, object->int_value()));
             } else {
-                KvObjRawReadBuffer raw;
-                const Slice value = kvobj_string_value(object, raw);
+                const Slice value = object->str_value();
                 try { values[i].assign(value.p, value.n); }
                 catch (const std::bad_alloc&) { set_oom(op); return; }
             }
@@ -2221,15 +2037,8 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
                                   local_zset_limit)) return;
         gather_end = gather_first + local_zset_count;
     }
-    const bool sources_are_reads = kind == Kind::Pfcount || kind == Kind::Pfmerge ||
-                                   kind == Kind::Bitop || is_any_zsetop(kind) ||
-                                   is_plain_setop(kind) || is_store_setop(kind) ||
-                                   kind == Kind::Sintercard;
     for (uint32_t arg = gather_first; arg < gather_end; arg++) {
-        const uint64_t hash = FlatStore::hash_key(op.arg(arg));
-        const bool read_lookup = sources_are_reads || (kind == Kind::Copy && arg == 1);
-        KvObj* object = read_lookup ? shard.store_find_read<kNotify>(hash, op.arg(arg))
-                                    : shard.store_find<kNotify>(hash, op.arg(arg));
+        KvObj* object = shard.store_find<kNotify>(FlatStore::hash_key(op.arg(arg)), op.arg(arg));
         if (!serialize_object(object, images[arg])) { set_oom(op); return; }
     }
     WorkError error = WorkError::None;
@@ -2255,10 +2064,7 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         bool replace = false;
         for (uint32_t i = 3; i < op.argc(); i++) if (op.arg(i).eq_icase("replace")) replace = true;
         if (!images[1].present || (images[2].present && !replace)) { reply_int(op.sink(), 0); return; }
-        try {
-            apply[2] = images[1];
-            apply[2].reserve_ttl_slot = false;
-        } catch (const std::bad_alloc&) { set_oom(op); return; }
+        try { apply[2] = images[1]; } catch (const std::bad_alloc&) { set_oom(op); return; }
         local_apply<kNotify>(shard, op, apply, {2}, error);
         if (error != WorkError::None) reply_work_error(op, error);
         else {
@@ -2282,11 +2088,8 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         try { erase_member(src, op.arg(3)); if (!contains(dst, op.arg(3))) dst.emplace_back(op.arg(3).p, op.arg(3).n); }
         catch (const std::bad_alloc&) { set_oom(op); return; }
         if (src.empty()) apply[1] = ObjectImage{};
-        else if (!encode_elements(src, apply[1], Type::Set, images[1].expire_at_ms,
-                                  images[1].reserve_ttl_slot)) { set_oom(op); return; }
-        if (!encode_elements(dst, apply[2], Type::Set,
-                             images[2].present ? images[2].expire_at_ms : -1,
-                             images[2].present && images[2].reserve_ttl_slot)) {
+        else if (!encode_elements(src, apply[1], Type::Set, images[1].expire_at_ms)) { set_oom(op); return; }
+        if (!encode_elements(dst, apply[2], Type::Set, images[2].present ? images[2].expire_at_ms : -1)) {
             set_oom(op); return;
         }
         local_apply<kNotify>(shard, op, apply, {1, 2}, error);
@@ -2316,17 +2119,13 @@ void cmd_xshard_only_impl(Shard& shard, Op& op) {
         if (from_left) src.erase(src.begin()); else src.pop_back();
         if (same_key(op)) {
             if (to_left) src.insert(src.begin(), moved); else src.push_back(moved);
-            if (!encode_elements(src, apply[1], Type::List, images[1].expire_at_ms,
-                                 images[1].reserve_ttl_slot)) { set_oom(op); return; }
+            if (!encode_elements(src, apply[1], Type::List, images[1].expire_at_ms)) { set_oom(op); return; }
             local_apply<kNotify>(shard, op, apply, {1}, error);
         } else {
             if (to_left) dst.insert(dst.begin(), moved); else dst.push_back(moved);
             if (src.empty()) apply[1] = ObjectImage{};
-            else if (!encode_elements(src, apply[1], Type::List, images[1].expire_at_ms,
-                                      images[1].reserve_ttl_slot)) { set_oom(op); return; }
-            if (!encode_elements(dst, apply[2], Type::List,
-                                 images[2].present ? images[2].expire_at_ms : -1,
-                                 images[2].present && images[2].reserve_ttl_slot)) {
+            else if (!encode_elements(src, apply[1], Type::List, images[1].expire_at_ms)) { set_oom(op); return; }
+            if (!encode_elements(dst, apply[2], Type::List, images[2].present ? images[2].expire_at_ms : -1)) {
                 set_oom(op); return;
             }
             local_apply<kNotify>(shard, op, apply, {1, 2}, error);

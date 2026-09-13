@@ -7,31 +7,24 @@
 // LoopSignals, both single-writer; INFO sums them on request.
 //
 // THE ONE MUTABLE HOT-PATH STRUCTURE is shard_owner_: shard id -> thread id, one atomic load per
-// dispatch. Router's packed bucket array remains the bucket-granularity authority; shard_owner_ is
-// its derived shard-granularity fast path, published only at a quiesced commit. Shards move only
-// after executing, deferred, group and pinned-read work drains; destination routes publish after
-// the ownership edge. An IO may enqueue using an old route after that edge, so tasks and borrow
-// releases recheck ownership and forward before shard access instead of carrying routing epochs.
+// dispatch. That indirection is deliberate and it is what makes pointer-handoff load balancing
+// possible later — an LB moves a shard by storing a different thread id, with no data movement and
+// no change to routing. See placement.h for the ordering contract that makes such a move safe.
 #pragma once
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <climits>
 #include <ctime>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <sys/resource.h>
-#include <unordered_map>
 #include <vector>
 #include "shard.h"
 #include "thread.h"
-#include "flipctl.h"
-#include "weighted_lb.h"
 #include "placement.h"
 #include "config.h"        // struct Config: every runtime knob, one home
-#include "live_config.h"
-#include "atomic_admission.h"
-#include "orthog.h"
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -39,187 +32,42 @@
 #include "../snapshot/snapshot.h"
 #include "../persist/aof.h"
 
-#ifdef TOMO_RL_CACHE_DEBUG
-#include <cstdio>
-#endif
-
 namespace tomo {
 
-struct LbClientObservation {
-    uint64_t id = 0;
-    uint64_t dispatched_ops = 0;
-    uint32_t pipeline_depth = 0;
+struct LiveConfigSnapshot {
+    uint64_t version;
+    uint64_t maxmemory;
+    MaxmemoryPolicy policy;
+    uint32_t samples;
+    uint32_t notify_events;
+    // Lane F: CLIENT TRACKING arms the same executor-side write observer keyspace notifications
+    // use.  It rides the existing live-config snapshot so ExLoop's per-pass shard mask refresh
+    // stays one load, and so a shard never reads a second armed word per operation.
+    bool     tracking_armed;
+    // Appended at the tail: executors latch these once per pass through the same seqlock, so the
+    // slow-log arming decision costs the pass nothing beyond the version compare it already made.
+    int64_t  slowlog_log_slower_than;
+    uint32_t latency_monitor_threshold;
+    bool     save_armed;
+    uint64_t proto_max_bulk_len;
 };
 
-struct LbClientSignal {
-    uint64_t last_ops = 0;
-    double weight = 0;
-    uint64_t last_move_ms = 0;
-    uint32_t owner = UINT32_MAX;
+struct ClientLimitsConfigSnapshot {
+    uint64_t version = 0;
+    uint32_t timeout = 0;
+    ClientBufferLimit normal{};
+    ClientBufferLimit pubsub{};
 };
-
-enum class FlipStage : uint8_t {
-    Idle = 0,
-    Planning,
-    IoDrain,
-    IoPrepare,
-    ExDrain,
-    ClientPrepare,
-    ClientCommit,
-    ClientInstall,
-    RoleReady,
-    ShardCommit,
-    ExInstall,
-    Rollback,
-};
-
-enum class LbStage : uint8_t {
-    Idle = 0,
-    ExDrain,
-    ClientDrain,
-    ClientMoving,
-    IoDrain,
-};
-
-struct LbShardMove {
-    uint32_t sid = UINT32_MAX;
-    uint32_t source = UINT32_MAX;
-    uint32_t destination = UINT32_MAX;
-    double weight = 0;
-    uint64_t bytes = 0;
-};
-
-struct LbClientMove {
-    uint64_t id = 0;
-    uint32_t source = UINT32_MAX;
-    uint32_t destination = UINT32_MAX;
-    double weight = 0;
-};
-
-struct FlipReport {
-    uint32_t live_io = 0;
-    uint32_t live_ex = 0;
-    uint32_t target_io = 0;
-    uint32_t target_ex = 0;
-    uint32_t smt_mode = 0;
-    uint32_t unit_threads = 1;
-    uint32_t bucket_min = 0;
-    uint32_t bucket_max = 0;
-    uint32_t client_min = 0;
-    uint32_t client_max = 0;
-    uint64_t last_transfers = 0;
-    bool moving = false;
-};
-
-// Allocated only for the boot-armed read-local lane. The Server keeps only one pointer at its
-// true tail, so baseline member offsets and cache-line sharing remain unchanged.
-struct ReadLocalServerState {
-    std::atomic<uint64_t> epoch{1};
-};
-
-// A snapshot/placement drain is the only reader, while opens and closes happen on unrelated
-// physical threads.  Monotonic halves avoid the false-zero a signed per-thread delta can expose
-// when a scan observes an executor's close before the admitting IO's open.  Cache-line spacing
-// keeps those writers independent.
-struct alignas(64) AtomicApplySlot {
-    std::atomic<uint64_t> opened{0};
-    std::atomic<uint64_t> closed{0};
-};
-static_assert(sizeof(AtomicApplySlot) == 64);
-static_assert(alignof(AtomicApplySlot) == 64);
 
 class Server {
-    friend struct CoreConcurrencyTest;
 public:
-    // Done releases the ROB slot, but executor code may still be notifying its IO.
-    // Odd means an executor scope can hold Client pointers; an even value ends that
-    // scope. Nested calls retain the outer scope. Writers own separate cache lines.
-    class ClientWorkScope {
-    public:
-        ClientWorkScope(Server& server, uint32_t tid)
-            : epoch_(server.client_work_[tid].epoch) {
-            const uint64_t before = epoch_.load(std::memory_order_relaxed);
-            outer_ = !(before & 1);
-            if (outer_) {
-                end_ = before + 2;
-                epoch_.store(before + 1, std::memory_order_release);
-            }
-        }
-        ~ClientWorkScope() {
-            if (outer_) epoch_.store(end_, std::memory_order_release);
-        }
-        ClientWorkScope(const ClientWorkScope&) = delete;
-        ClientWorkScope& operator=(const ClientWorkScope&) = delete;
-    private:
-        std::atomic<uint64_t>& epoch_;
-        uint64_t end_ = 0;
-        bool outer_ = false;
-    };
-    uint64_t client_work_epoch(uint32_t tid) const {
-        return client_work_[tid].epoch.load(std::memory_order_acquire);
-    }
     static constexpr uint64_t kAtomicEnabledBit = uint64_t{1} << 63;
 
     Server() = default;
-    friend struct NetcmdRegression;
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
-    // Resolve placement and the shard default once, before AOF/snapshot recovery reads geometry.
-    bool prepare_boot(Config& cfg) {
-        const char* domains = std::getenv("TOMOKV_L3_DOMAINS");
-        if (domains && *domains) {
-            if (!topo_.declare(domains)) {
-                std::fprintf(stderr, "fatal: TOMOKV_L3_DOMAINS '%s' invalid\n", domains);
-                return false;
-            }
-        } else if (!topo_.discover()) {
-            std::fprintf(stderr, "fatal: could not discover any allowed cpu\n");
-            return false;
-        }
-        if (!topo_.discover_thread_siblings()) {
-            std::fprintf(stderr, "fatal: could not read Linux thread_siblings_list topology\n");
-            return false;
-        }
-        smt_mode_ = topo_.allowed_sibling_pairs() != 0;
-        bool placed = false;
-        if (cfg.thread_mode == ThreadMode::Fused) {
-            placed = placement_.build_fused(topo_, cfg.place);
-        } else {
-            // Default shape: an even io/ex split of every allowed cpu, io taking the odd one out --
-            // the measured 2s center (4:4-class) generalized to any core count.
-            uint32_t di = cfg.even_ifid, de = cfg.even_ex;
-            if (!cfg.place && !(di | de)) {
-                uint32_t n = 0;
-                for (uint32_t d = 0; d < topo_.ndomains(); d++)
-                    n += static_cast<uint32_t>(topo_.cpus_in(d).size());
-                if (smt_mode_) {
-                    n = 2 * topo_.allowed_sibling_pairs();
-                    de = (n / 4) * 2;
-                } else de = n / 2;
-                di = n - de;
-            }
-            placed = cfg.place
-                ? placement_.build_explicit(topo_, cfg.place)
-                : placement_.build_even(topo_, di, de, smt_mode_ != 0);
-        }
-        if (!placed) return false;
-        if (!placement_.configure_smt_units(topo_, smt_mode_ != 0)) return false;
-        if (!placement_.reserve_runtime_roles(placement_.total_threads())) return false;
-        if (placement_.ifid_threads().empty() || placement_.ex_threads().empty()) {
-            std::fprintf(stderr, "placement needs at least one ifid and one ex thread\n");
-            return false;
-        }
-        if (cfg.shards == Config::kShardsAuto)
-            cfg.shards = cfg_default_shards(static_cast<uint32_t>(placement_.ex_threads().size()));
-        return true;
-    }
-
     bool init(const Config& cfg, const AofReplayPlan* aof_replay = nullptr) {
-        if (placement_.total_threads() == 0) {
-            std::fprintf(stderr, "server init requires prepare_boot before persistence recovery\n");
-            return false;
-        }
         cfg_ = cfg;
         if (cfg.shards == 0 || cfg.shards > 256) {
             std::fprintf(stderr, "shards must be between 1 and 256\n");
@@ -229,9 +77,6 @@ public:
             std::fprintf(stderr, "maxmemory-samples must be between 1 and 64\n");
             return false;
         }
-        // #77 diagnostics ship dark with DEBUG itself. The registry is process-cold heap state,
-        // initialized before any worker exists; no Server/Shard/MVCC object gains a field.
-        atomic_tripwire_configure(cfg.enable_debug_command != DebugCommandMode::No);
         live_maxmemory_.store(cfg.maxmemory, std::memory_order_relaxed);
         live_maxmemory_policy_.store(static_cast<uint8_t>(cfg.maxmemory_policy),
                                      std::memory_order_relaxed);
@@ -252,15 +97,61 @@ public:
         save_clauses_ = cfg.save;
         atomic_activity_.store(cfg.atomic ? kAtomicEnabledBit : 0,
                                std::memory_order_relaxed);
-        // Measured in-flight credit optimum, always derived from the resolved geometry.
-        atomic_credits_.init(std::min<uint32_t>(16u * cfg.shards, 1024u));
-        script_stage_bytes_ = cfg.maxmemory
+        // AUTO resolves against the shard count: the measured three-point optimum (see config.h).
+        const uint32_t resolved_window = cfg.atomic_window == Config::kAtomicWindowAuto
+            ? std::min<uint32_t>(16u * cfg.shards, 1024u)
+            : cfg.atomic_window;
+        cfg_.atomic_window = resolved_window;
+        live_atomic_window_.store(resolved_window, std::memory_order_relaxed);
+        atomic_credit_pool_.store(resolved_window, std::memory_order_relaxed);
+        const uint64_t auto_stage = cfg.maxmemory
             ? std::max<uint64_t>(4ull * 1024 * 1024,
                   std::min<uint64_t>(cfg.maxmemory / cfg.shards / 16, 64ull * 1024 * 1024))
             : 4ull * 1024 * 1024;
+        if (cfg_.script_crossshard_max_bytes == -1)
+            cfg_.script_crossshard_max_bytes = static_cast<int64_t>(auto_stage);
+        if (cfg_.script_crossshard_workbench_bytes == -1)
+            cfg_.script_crossshard_workbench_bytes = static_cast<int64_t>(auto_stage * 2);
+        if (cfg_.script_crossshard_conflict_retries == -1)
+            cfg_.script_crossshard_conflict_retries = 8;
+        if (cfg_.script_crossshard_cut_slots == -1)
+            cfg_.script_crossshard_cut_slots = 4;
         live_config_version_.store(2, std::memory_order_release);  // even versions are stable
-        unix_owner_tid_ = cfg.unixsocket && *cfg.unixsocket
-            ? placement_.ifid_threads().front() : UINT32_MAX;
+        // Declared topology is a legacy lowering input and therefore cannot accompany --place.
+        // A declaration that fails to parse or names cpus outside the affinity mask fails the BOOT,
+        // loudly: silently falling back to discovery would measure a different layout.
+        if (cfg.place && cfg.node_cpus && *cfg.node_cpus) {
+            std::fprintf(stderr, "fatal: --place and --node-cpus are mutually exclusive\n");
+            return false;
+        }
+        if (cfg.node_cpus && *cfg.node_cpus) {
+            if (!topo_.declare(cfg.node_cpus)) {
+                std::fprintf(stderr, "fatal: --l3-domains '%s' invalid\n", cfg.node_cpus);
+                return false;
+            }
+        } else {
+            if (!topo_.discover()) {
+                std::fprintf(stderr, "fatal: could not discover any allowed cpu\n");
+                return false;
+            }
+        }
+        // Default shape: an even io/ex split of every allowed cpu, io taking the odd one out --
+        // the measured 2s center (4:4-class) generalized to any core count.
+        uint32_t di = cfg.even_ifid, de = cfg.even_ex;
+        if (!cfg.place && !(di | de)) {
+            uint32_t n = 0;
+            for (uint32_t d = 0; d < topo_.ndomains(); d++)
+                n += static_cast<uint32_t>(topo_.cpus_in(d).size());
+            di = n - n / 2; de = n / 2;
+        }
+        const bool placed = cfg.place
+            ? placement_.build_explicit(topo_, cfg.place)
+            : placement_.build_even(topo_, di, de);
+        if (!placed) return false;
+        if (placement_.ifid_threads().empty() || placement_.ex_threads().empty()) {
+            std::fprintf(stderr, "placement needs at least one ifid and one ex thread\n");
+            return false;
+        }
         if (!adjust_open_files_limit()) return false;
         check_tcp_backlog_settings();
         // Shard maps are resolved exactly once at boot; parsing never leaks onto a request path.
@@ -273,12 +164,8 @@ public:
             const uint32_t b0 = i * per;
             const uint32_t b1 = (i + 1 == cfg.shards) ? kNumBuckets : (i + 1) * per;
             shards_[i] = std::make_unique<Shard>();
-            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.encodings.type_limits(),
+            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.type_limits,
                              cfg.stream_limits);
-            if (key_lb_signals_enabled() && !shards_[i]->enable_lb_signals()) {
-                std::fprintf(stderr, "fatal: could not allocate weighted-placement signals\n");
-                return false;
-            }
             shards_[i]->bind_atomic_state(
                 [](void* ctx) { return static_cast<Server*>(ctx)->atomic_commit(); }, this,
                 &atomic_activity_, &script_intent_owners_);
@@ -287,94 +174,22 @@ public:
 
         // ---- threads ---------------------------------------------------------------------------
         // Every front-end has already lowered to dense per-thread entries. Every thread still gets
-        // a producer lane from every other, because a role change must not require re-wiring
-        // the mesh; the TASK lanes are a role-partitioned masked monolith whose block sizes are
-        // re-derived at each role change (ThreadCtx::remask_quiesced), while the client, release
-        // and transfer channels stay uniform per-thread arrays.
+        // a channel from every other regardless of role, because a role change must not require
+        // re-wiring the mesh.
         const uint32_t nthreads = placement_.total_threads();
-        if (!flipctl_.init(cfg.thread_mode == ThreadMode::Split && cfg.flip_auto != 0,
-                           nthreads)) {
-            std::fprintf(stderr, "fatal: could not allocate flip controller state\n");
-            return false;
-        }
+        for (uint32_t i = 0; i < kMaxThreads; i++) executor_slots_[i] = UINT8_MAX;
+        for (uint32_t slot = 0; slot < placement_.ex_threads().size(); slot++)
+            executor_slots_[placement_.ex_threads()[slot]] = static_cast<uint8_t>(slot);
         threads_.resize(nthreads);
-        // One consumer per physical worker, plus the serialized ownership-transfer coordinator.
-        live_config_mailboxes_.reset(new (std::nothrow) LiveConfigMailbox[nthreads + 1]);
-        if (!live_config_mailboxes_) {
-            std::fprintf(stderr, "fatal: could not allocate live configuration mailboxes\n");
-            return false;
-        }
-        live_config_committed_ = capture_live_config(2);
-        for (uint32_t i = 0; i <= nthreads; i++)
-            live_config_mailboxes_[i].init(live_config_committed_);
         for (uint32_t i = 0; i < nthreads; i++) {
             threads_[i] = std::make_unique<ThreadCtx>();
-            // The fingerprint writer is armed only when its one reader, the flip controller, is
-            // enabled: with --flip-auto 0 and in 1s mode it is dark and costs
-            // one predicted branch per op. The enabled sampler keeps its measured 1-in-100 policy.
-            threads_[i]->init(i, placement_.role_of(i), nthreads,
-                              0,
-                              flip_fingerprint_window(flipctl_.enabled()));
+            threads_[i]->init(i, placement_.role_of(i), nthreads);
             threads_[i]->init_command_counts(command_registry_size());
-        }
-        if (read_local_enabled()) {
-            read_local_state_.reset(new (std::nothrow) ReadLocalServerState);
-            if (!read_local_state_) {
-                std::fprintf(stderr, "fatal: could not allocate read-local server state\n");
-                return false;
-            }
-            for (const auto& thread : threads_) {
-                if (!thread->init_read_local_state()) {
-                    std::fprintf(stderr, "fatal: could not allocate read-local thread state\n");
-                    return false;
-                }
-            }
-            for (const auto& shard : shards_) {
-                if (!shard->store().prepare_read_local()) {
-                    std::fprintf(stderr, "fatal: could not allocate read-local store state\n");
-                    return false;
-                }
-            }
-        }
-        if (cfg_.overlap || cfg_.reorder) {
-            mode_schedule_stats_.reset(new (std::nothrow) ModeScheduleStats[nthreads]);
-            if (!mode_schedule_stats_) {
-                std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");
-                return false;
-            }
-        }
-        if (lb_controller_enabled()) {
-            lb_policy_ = std::make_unique<LbAutotune>();
-            lb_policy_->last_fold_ns = now_ns();
-        }
-        if (key_lb_signals_enabled()) {
-            try {
-                lb_bucket_last_samples_.assign(kNumBuckets, 0);
-                lb_bucket_weight_.assign(kNumBuckets, 0.0);
-                lb_bucket_last_move_ms_.assign(kNumBuckets, 0);
-            } catch (const std::bad_alloc&) {
-                std::fprintf(stderr, "fatal: could not allocate weighted key-placement windows\n");
-                return false;
-            }
-        }
-        if (lb_controller_enabled()) {
-            try {
-                lb_thread_last_busy_.assign(nthreads, 0);
-                lb_thread_last_idle_.assign(nthreads, 0);
-                lb_thread_occupancy_.assign(nthreads, 0.0);
-            } catch (const std::bad_alloc&) {
-                std::fprintf(stderr, "fatal: could not allocate shared LB windows\n");
-                return false;
-            }
         }
         for (uint32_t i = 0; i < nthreads; i++)
             atomic_read_floors_[i].store(UINT64_MAX, std::memory_order_relaxed);
         for (uint32_t i = 0; i < nthreads; i++)
             atomic_snapshot_completions_[i].store(0, std::memory_order_relaxed);
-        flip_target_io_.store(static_cast<uint32_t>(placement_.ifid_threads().size()),
-                              std::memory_order_relaxed);
-        flip_target_ex_.store(static_cast<uint32_t>(placement_.ex_threads().size()),
-                              std::memory_order_relaxed);
 
         // ---- shards directly onto workers ------------------------------------------------------
         // Locality resolution stops at the individual EX thread. There is no contiguous node range:
@@ -382,7 +197,8 @@ public:
         for (uint32_t sid = 0; sid < cfg.shards; sid++) {
             const uint32_t tid = placement_.shard_home(sid);
             threads_[tid]->shards().push_back(shards_[sid].get());
-            // Populate Router's authoritative bucket entries and its derived dispatch fast path.
+            // The reverse mapping is the ONE load on dispatch and the ONE release store used by a
+            // future migration. Do not mirror ownership in another synchronised structure.
             set_worker_of_shard(static_cast<int32_t>(sid), tid);
             // Seed residency from this exact thread's cpu domain, so note_execution compares at
             // thread resolution even when adjacent tids live in different L3 domains.
@@ -390,7 +206,7 @@ public:
         }
         snapshot_.init(nthreads, cfg.shards,
                        static_cast<uint32_t>(placement_.ex_threads().size()),
-                       cfg.dir, cfg.dbfilename, persistence_engine(cfg));
+                       cfg.dir, cfg.dbfilename, cfg.persist_io);
         aof_.init(*this, cfg, nthreads, cfg.shards,
                   placement_.ifid_threads().back(), aof_replay);
         for (uint32_t sid = 0; sid < cfg.shards; sid++) {
@@ -403,157 +219,10 @@ public:
     }
 
     const Config&    cfg()        const { return cfg_; }
-    ThreadMode thread_mode() const { return cfg_.thread_mode; }
-    const char* thread_mode_name() const {
-        return cfg_.thread_mode == ThreadMode::Fused ? "1s" : "2s";
-    }
-
-    bool key_lb_signals_enabled() const {
-        return cfg_.key_lb != 0;
-    }
-    bool client_lb_signals_enabled() const {
-        return cfg_.client_lb != 0;
-    }
-    bool lb_controller_enabled() const {
-        return key_lb_signals_enabled() || client_lb_signals_enabled();
-    }
-
-    uint32_t lb_sample_rate() const {
-        return lb_policy_ ? lb_policy_->sample_rate.load(std::memory_order_relaxed) : 0;
-    }
-    static constexpr uint32_t lb_tick_ms() { return LbAutotune::kTickMs; }
-
-    bool smt_units_enabled() const { return smt_mode_; }
-
-    bool flipctl_available() const { return cfg_.thread_mode == ThreadMode::Split; }
-    bool flipctl_enabled() const { return flipctl_.enabled(); }
-    uint32_t flipctl_tick_ms() const {
-        return LbAutotune::kTickMs;
-    }
-    bool flipctl_tick(uint64_t now_ms) { return flipctl_.tick(*this, now_ms); }
-    uint32_t flipctl_signal_sample_rate() const { return flipctl_.signal_sample_rate(); }
-    uint32_t effective_age_sample_rate() const {
-        return flipctl_signal_sample_rate();
-    }
-    void flipctl_force_trigger() { flipctl_.request_forced_trigger(); }
-    uint32_t flipctl_wait_ms() const { return flipctl_.wait_ms(flipctl_tick_ms()); }
-    bool flipctl_debug_seek(uint32_t target_io, bool force, std::string& error) {
-        return flipctl_.debug_seek(target_io, force, error);
-    }
-    void flipctl_debug_cost(double commands_per_client) {
-        flipctl_.debug_cost(commands_per_client);
-    }
-    FlipctlReport flipctl_report() const { return flipctl_.report(); }
-    std::string flipctl_debug_dump() const {
-        if (flipctl_available()) return flipctl_.debug_dump();
-        return "state=unavailable\nphase=fused\navailable=0\n"
-               "thread_mode=1s\nreason=threads_are_fused\n"
-               "fused_threads=" + std::to_string(nthreads()) +
-               "\nclient_threads=" + std::to_string(client_serving_thread_count()) +
-               "\nowner_threads=" + std::to_string(shard_owner_count()) + "\n";
-    }
-
-    // Client observations are gathered by the connection owner once per second. ROB dispatch
-    // deltas are the operation-rate signal; live in-flight depth is a floor so a deep connection
-    // that is temporarily backpressured does not look idle. The state is keyed by connection id,
-    // hence survives an IO ownership move without turning that move into a signal discontinuity.
-    void lb_publish_client_observations(uint32_t owner,
-                                        const std::vector<LbClientObservation>& observations) {
-        if (!client_lb_signals_enabled() || owner >= nthreads()) return;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        double total = 0;
-        for (const LbClientObservation& observation : observations) {
-            LbClientSignal& signal = lb_clients_[observation.id];
-            const uint64_t delta = observation.dispatched_ops - signal.last_ops;
-            signal.last_ops = observation.dispatched_ops;
-            const double sample = std::max<double>(delta, observation.pipeline_depth);
-            signal.weight = signal.owner == UINT32_MAX
-                ? sample : 0.25 * sample + 0.75 * signal.weight;
-            signal.owner = owner;
-            total += signal.weight;
-        }
-        lb_client_owner_weight_[owner].store(
-            static_cast<uint64_t>(total * 1024.0 + 0.5), std::memory_order_release);
-    }
-    void lb_forget_client(uint64_t id) {
-        if (!client_lb_signals_enabled()) return;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        lb_clients_.erase(id);
-    }
-    double lb_client_weight(uint64_t id) const {
-        if (!client_lb_signals_enabled()) return 0.0;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        const auto found = lb_clients_.find(id);
-        return found == lb_clients_.end() ? 0.0 : found->second.weight;
-    }
-
-    // The controller owns this fold. Every bucket keeps a monotonic sampled counter on its
-    // physical shard; EWMA history is indexed by immutable bucket id, never by executor owner.
-    void lb_fold_signals() {
-        if (!lb_controller_enabled()) return;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        if (key_lb_signals_enabled()) {
-            uint64_t visits = 0;
-            for (uint32_t sid = 0; sid < nshards(); sid++) {
-                Shard& physical = shard(static_cast<int32_t>(sid));
-                for (uint32_t bucket = physical.bucket_begin();
-                     bucket < physical.bucket_end(); bucket++) {
-                    const uint32_t current = physical.lb_bucket_samples(bucket);
-                    const uint32_t delta = current - lb_bucket_last_samples_[bucket];
-                    lb_bucket_last_samples_[bucket] = current;
-                    visits += delta;
-                    const double sample = static_cast<double>(delta);
-                    lb_bucket_weight_[bucket] = lb_bucket_primed_
-                        ? 0.25 * sample + 0.75 * lb_bucket_weight_[bucket] : sample;
-                }
-            }
-            lb_bucket_primed_ = true;
-            lb_policy_->observe_visits(visits, now_ns());
-        }
-        // Occupancy is 1 - measured idle over the same window. cpu_ns deliberately does not enter:
-        // polling/spinning is scheduled CPU but does not mean the role has useful work available.
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            const LoopSignals& signal = thread(tid).sig();
-            const uint64_t busy = __atomic_load_n(&signal.busy_ns, __ATOMIC_RELAXED);
-            const uint64_t idle = __atomic_load_n(&signal.idle_ns, __ATOMIC_RELAXED);
-            const uint64_t db = busy - lb_thread_last_busy_[tid];
-            const uint64_t di = idle - lb_thread_last_idle_[tid];
-            lb_thread_last_busy_[tid] = busy;
-            lb_thread_last_idle_[tid] = idle;
-            const double occupancy = db + di
-                ? static_cast<double>(db) / static_cast<double>(db + di) : 0.0;
-            lb_thread_occupancy_[tid] = lb_occupancy_primed_
-                ? 0.25 * occupancy + 0.75 * lb_thread_occupancy_[tid] : occupancy;
-        }
-        lb_occupancy_primed_ = true;
-    }
-    double lb_shard_weight(uint32_t sid) const {
-        if (sid >= nshards() || !key_lb_signals_enabled()) return 0.0;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        const Shard& physical = shard(static_cast<int32_t>(sid));
-        double weight = 0;
-        for (uint32_t bucket = physical.bucket_begin(); bucket < physical.bucket_end(); bucket++)
-            weight += lb_bucket_weight_[bucket];
-        return weight;
-    }
-    uint64_t lb_shard_bytes(uint32_t sid) const {
-        if (sid >= nshards() || !key_lb_signals_enabled()) return 0;
-        const Shard& physical = shard(static_cast<int32_t>(sid));
-        uint64_t bytes = 0;
-        for (uint32_t bucket = physical.bucket_begin(); bucket < physical.bucket_end(); bucket++)
-            bytes += physical.lb_bucket_bytes(bucket);
-        return bytes;
-    }
-    double lb_thread_occupancy(uint32_t tid) const {
-        if (tid >= lb_thread_occupancy_.size()) return 0.0;
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        return lb_thread_occupancy_[tid];
-    }
     const Topology&  topo()       const { return topo_; }
     Placement&       placement()        { return placement_; }
     Router&          router()           { return router_; }
     Shard&           shard(int32_t i)   { return *shards_[i]; }
-    const Shard&     shard(int32_t i) const { return *shards_[i]; }
     ThreadCtx&       thread(uint32_t i) { return *threads_[i]; }
     uint32_t         nthreads()   const { return static_cast<uint32_t>(threads_.size()); }
     uint32_t         nshards()    const { return static_cast<uint32_t>(shards_.size()); }
@@ -562,1328 +231,6 @@ public:
     AofManager& aof() { return aof_; }
     const AofManager& aof() const { return aof_; }
     const ThreadCtx& thread(uint32_t i) const { return *threads_[i]; }
-
-    // Role is the split-mode loop state and deliberately remains Ifid/Ex. Capabilities are the
-    // mode-independent truth used by cold control/reporting surfaces: a fused thread serves
-    // clients AND owns shards even though its operational loop role is encoded as Ifid.
-    bool serves_clients(Role role) const {
-        return role != Role::Idle &&
-               (cfg_.thread_mode == ThreadMode::Fused || role == Role::Ifid);
-    }
-    bool owns_shards(Role role) const {
-        return role != Role::Idle &&
-               (cfg_.thread_mode == ThreadMode::Fused || role == Role::Ex);
-    }
-    bool serves_clients(uint32_t tid) const {
-        return tid < nthreads() && serves_clients(thread(tid).role());
-    }
-    bool owns_shards(uint32_t tid) const {
-        return tid < nthreads() && owns_shards(thread(tid).role());
-    }
-    uint32_t client_serving_thread_count() const {
-        uint32_t count = 0;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) count += serves_clients(tid);
-        return count;
-    }
-    // "Owner" is the observable topology term: distinct tids currently named by shard rows. It
-    // can be smaller than the number of owner-capable threads when there are fewer shards.
-    uint32_t shard_owner_count() const {
-        bool seen[kMaxThreads] = {};
-        uint32_t count = 0;
-        for (uint32_t sid = 0; sid < nshards(); sid++) {
-            const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
-            if (owner < nthreads() && !seen[owner]) {
-                seen[owner] = true;
-                count++;
-            }
-        }
-        return count;
-    }
-
-    ModeScheduleStats& mode_schedule_stats(uint32_t tid) {
-        return mode_schedule_stats_[tid];
-    }
-    const ModeScheduleStats* mode_schedule_stats() const { return mode_schedule_stats_.get(); }
-
-    static bool read_local_enabled(const Config& cfg) {
-        // Both modes and both schedules consume local captures before publishing QSBR.
-        return cfg.read_local != 0;
-    }
-    bool read_local_enabled() const { return read_local_enabled(cfg_); }
-    uint64_t read_local_epoch() const {
-        if (!read_local_state_) std::abort();
-        return read_local_state_->epoch.load(std::memory_order_seq_cst);
-    }
-    // Retirement uses the returned OLD value as its stamp. The increment makes a subsequent
-    // rotation publication strictly newer, which is the grace test below.
-    uint64_t advance_read_local_epoch() {
-        if (!read_local_state_) std::abort();
-        return read_local_state_->epoch.fetch_add(1, std::memory_order_seq_cst);
-    }
-    // Grace floor for a QSBR drain, bounded by what the caller needs. `stamp` is the oldest sealed
-    // retirement stamp; the drain releases an entry only when the floor is STRICTLY above its stamp.
-    // Returns the exact floor (minimum tick over active participants) when that floor is above
-    // `stamp`; otherwise returns a value <= `stamp` as soon as one active participant with
-    // tick <= `stamp` is found. Both answers produce exactly the decision a full scan would: with a
-    // blocking participant the true floor is <= its tick <= stamp, so nothing is releasable and the
-    // caller stops at its first batch either way. What changes is the cost of the not-ready case:
-    // one or two foreign tick lines instead of one per thread. `hint` remembers the blocking
-    // participant so the next pass tests it first; it is caller-owned scratch and never read for
-    // anything else. Parked participants contribute infinity because they hold no foreign pointer.
-    uint64_t read_local_grace_floor(uint64_t stamp, uint32_t& hint) const {
-        const uint32_t participants = static_cast<uint32_t>(threads_.size());
-        if (hint < participants) {
-            const uint64_t publication = threads_[hint]->read_local_publication();
-            if (!ThreadCtx::read_local_publication_parked(publication)) {
-                const uint64_t tick = ThreadCtx::read_local_publication_tick(publication);
-                if (tick <= stamp) return tick;
-            }
-        }
-        uint64_t floor = UINT64_MAX;
-        for (uint32_t i = 0; i < participants; i++) {
-            const uint64_t publication = threads_[i]->read_local_publication();
-            if (ThreadCtx::read_local_publication_parked(publication)) continue;
-            const uint64_t tick = ThreadCtx::read_local_publication_tick(publication);
-            if (tick <= stamp) {
-                hint = i;
-                return tick;
-            }
-            floor = std::min(floor, tick);
-        }
-        return floor;
-    }
-
-    uint32_t role_count(Role role, bool ready = false) const {
-        uint32_t count = 0;
-        for (const auto& thread : threads_)
-            if ((ready ? thread->ready_role() : thread->role()) == role) count++;
-        return count;
-    }
-
-    FlipReport flip_report() const {
-        FlipReport report;
-        report.live_io = role_count(Role::Ifid, true);
-        report.live_ex = role_count(Role::Ex, true);
-        report.target_io = flip_target_io_.load(std::memory_order_acquire);
-        report.target_ex = flip_target_ex_.load(std::memory_order_acquire);
-        report.smt_mode = smt_mode_;
-        report.unit_threads = smt_mode_ ? 2u : 1u;
-        uint32_t buckets[kMaxThreads] = {};
-        for (uint32_t sid = 0; sid < nshards(); sid++) {
-            const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
-            if (owner < nthreads()) buckets[owner]++;
-        }
-        report.bucket_min = UINT32_MAX;
-        report.client_min = UINT32_MAX;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            if (thread(tid).ready_role() == Role::Ex) {
-                report.bucket_min = std::min(report.bucket_min, buckets[tid]);
-                report.bucket_max = std::max(report.bucket_max, buckets[tid]);
-            }
-            if (thread(tid).ready_role() == Role::Ifid) {
-                const uint32_t clients = thread(tid).client_count();
-                report.client_min = std::min(report.client_min, clients);
-                report.client_max = std::max(report.client_max, clients);
-            }
-        }
-        if (report.bucket_min == UINT32_MAX) report.bucket_min = 0;
-        if (report.client_min == UINT32_MAX) report.client_min = 0;
-        report.last_transfers = flip_last_transfers_.load(std::memory_order_relaxed);
-        report.moving = flip_stage_.load(std::memory_order_acquire) != FlipStage::Idle;
-        return report;
-    }
-
-    FlipStage flip_stage() const { return flip_stage_.load(std::memory_order_acquire); }
-    uint64_t flip_epoch() const { return flip_epoch_.load(std::memory_order_acquire); }
-    bool flip_dispatch_paused() const { return flip_stage() != FlipStage::Idle; }
-    LbStage lb_stage() const { return lb_stage_.load(std::memory_order_acquire); }
-    uint64_t lb_epoch() const { return lb_epoch_.load(std::memory_order_acquire); }
-    bool lb_dispatch_paused() const {
-        const LbStage stage = lb_stage();
-        return stage == LbStage::IoDrain || stage == LbStage::ExDrain;
-    }
-    bool placement_transition_active() const {
-        return flip_dispatch_paused() || lb_stage() != LbStage::Idle;
-    }
-    bool lb_cron_writer(uint32_t tid) const {
-        if (!lb_controller_enabled() || flip_dispatch_paused()) return false;
-        for (uint32_t candidate = 0; candidate < nthreads(); candidate++)
-            if (thread(candidate).role() == Role::Ifid) return candidate == tid;
-        return false;
-    }
-    uint32_t lb_coordinator() const { return lb_coordinator_; }
-    // The io thread that owns the unix listener (UINT32_MAX without --unixsocket). Latched once
-    // in init(); both boot paths and the FLIP candidate filter read this one value.
-    uint32_t unix_owner_tid() const { return unix_owner_tid_; }
-    LbClientMove lb_client_move() const { return lb_client_move_; }
-    bool lb_should_pause(uint32_t owner, uint64_t id) const {
-        const LbStage stage = lb_stage();
-        return stage == LbStage::IoDrain || stage == LbStage::ExDrain ||
-               (stage == LbStage::ClientDrain && lb_client_move_.source == owner &&
-                lb_client_move_.id == id);
-    }
-    uint64_t lb_deadline_ns() const { return lb_deadline_ns_.load(std::memory_order_acquire); }
-    void lb_ack(uint32_t tid) {
-        lb_ack_[tid].store((lb_epoch() << 8) | static_cast<uint8_t>(lb_stage()),
-                           std::memory_order_release);
-    }
-    bool lb_acked(uint32_t tid) const {
-        return lb_ack_[tid].load(std::memory_order_acquire) ==
-               ((lb_epoch() << 8) | static_cast<uint8_t>(lb_stage()));
-    }
-    bool lb_all_ex_acked() const {
-        for (uint32_t tid = 0; tid < nthreads(); tid++)
-            if (live_executor(tid) && !lb_acked(tid)) return false;
-        return true;
-    }
-    bool lb_all_io_acked() const {
-        for (uint32_t tid : placement_.ifid_threads())
-            if (!lb_acked(tid)) return false;
-        return true;
-    }
-    bool lb_begin_ex_drain() {
-        if (lb_stage() != LbStage::IoDrain || !lb_all_io_acked()) return false;
-        // Every producer has left its parse/post pass. Only now may an empty executor
-        // inbox prove that no old-route task remains unpublished.
-        lb_stage_.store(LbStage::ExDrain, std::memory_order_release);
-        return true;
-    }
-    void lb_start_shard_drain() {
-        lb_stage_.store(LbStage::IoDrain, std::memory_order_release);
-    }
-    uint64_t lb_ticks() const { return lb_ticks_.load(std::memory_order_relaxed); }
-    uint64_t lb_bucket_moves() const {
-        return lb_bucket_moves_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_client_moves() const {
-        return lb_client_moves_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_bucket_cross_domain_moves() const {
-        return lb_bucket_cross_domain_moves_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_client_cross_domain_moves() const {
-        return lb_client_cross_domain_moves_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_no_candidate() const {
-        return lb_no_candidate_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_hysteresis_refused() const {
-        return lb_hysteresis_refused_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_cooldown_refused() const {
-        return lb_cooldown_refused_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_transition_refused() const {
-        return lb_transition_refused_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_capacity_refused() const {
-        return lb_capacity_refused_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_client_refused() const {
-        return lb_client_refused_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_hot_bucket_refused() const {
-        return lb_hot_bucket_refused_.load(std::memory_order_relaxed);
-    }
-    double lb_bucket_weight_spread_current() const {
-        return lb_bucket_weight_spread_current_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double lb_bucket_weight_spread_before() const {
-        return lb_bucket_weight_spread_before_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double lb_bucket_weight_spread_after() const {
-        return lb_bucket_weight_spread_after_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double lb_client_weight_spread_current() const {
-        return lb_client_weight_spread_current_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double lb_client_weight_spread_before() const {
-        return lb_client_weight_spread_before_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double lb_client_weight_spread_after() const {
-        return lb_client_weight_spread_after_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    uint64_t lb_bucket_bytes_spread_current() const {
-        return lb_bucket_bytes_spread_current_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_bucket_bytes_spread_before() const {
-        return lb_bucket_bytes_spread_before_.load(std::memory_order_relaxed);
-    }
-    uint64_t lb_bucket_bytes_spread_after() const {
-        return lb_bucket_bytes_spread_after_.load(std::memory_order_relaxed);
-    }
-    // Serializes only the two publication edges which begin a snapshot or a FLIP. The long-running
-    // operations never hold this mutex: after either publishes Preparing/Planning, the other's
-    // atomic state check is sufficient to refuse it.
-    std::mutex& shape_transition_mutex() { return shape_transition_mu_; }
-    uint32_t flip_coordinator() const { return flip_coordinator_; }
-    uint32_t flip_target_io() const { return flip_target_io_.load(std::memory_order_acquire); }
-    uint32_t flip_target_ex() const { return flip_target_ex_.load(std::memory_order_acquire); }
-    uint64_t flip_completed() const { return flip_completed_.load(std::memory_order_relaxed); }
-    uint64_t flip_refused() const { return flip_refused_.load(std::memory_order_relaxed); }
-    uint64_t flip_last_transfers() const {
-        return flip_last_transfers_.load(std::memory_order_relaxed);
-    }
-    uint64_t flip_clients_transferred() const {
-        return flip_clients_transferred_.load(std::memory_order_relaxed);
-    }
-    double flip_bucket_weight_spread_before() const {
-        return flip_bucket_weight_spread_before_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double flip_bucket_weight_spread_after() const {
-        return flip_bucket_weight_spread_after_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double flip_client_weight_spread_before() const {
-        return flip_client_weight_spread_before_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    double flip_client_weight_spread_after() const {
-        return flip_client_weight_spread_after_.load(std::memory_order_relaxed) / 1024.0;
-    }
-    uint64_t flip_bucket_bytes_spread_before() const {
-        return flip_bucket_bytes_spread_before_.load(std::memory_order_relaxed);
-    }
-    uint64_t flip_bucket_bytes_spread_after() const {
-        return flip_bucket_bytes_spread_after_.load(std::memory_order_relaxed);
-    }
-    void flip_note_client_transferred(uint64_t id, uint32_t destination) {
-        flip_clients_transferred_.fetch_add(1, std::memory_order_relaxed);
-        if (flip_stage() != FlipStage::Idle)
-            flip_active_transfers_.fetch_add(1, std::memory_order_relaxed);
-        if (client_lb_signals_enabled()) {
-            std::lock_guard<std::mutex> lock(lb_signal_mu_);
-            const auto found = lb_clients_.find(id);
-            if (found != lb_clients_.end()) found->second.owner = destination;
-        }
-    }
-    void flip_note_refused() { flip_refused_.fetch_add(1, std::memory_order_relaxed); }
-    uint64_t flip_conservation_checks() const {
-        return flip_conservation_checks_.load(std::memory_order_relaxed);
-    }
-    uint64_t flip_conservation_violations() const {
-        return flip_conservation_violations_.load(std::memory_order_relaxed);
-    }
-    void set_loading(bool loading) { loading_.store(loading ? 1u : 0u, std::memory_order_release); }
-    bool loading_begin() {
-        // Runtime DEBUG loads and placement transitions use the same short admission edge as
-        // snapshots. This makes "refuse while loading" exact even when two IO owners parse the
-        // commands concurrently.
-        std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
-        if (placement_transition_active()) return false;
-        loading_.fetch_add(1, std::memory_order_acq_rel);
-        return true;
-    }
-    void loading_end() {
-        if (loading_.fetch_sub(1, std::memory_order_acq_rel) == 0) std::abort();
-    }
-    bool loading() const { return loading_.load(std::memory_order_acquire) != 0; }
-
-    bool flip_is_candidate(uint32_t tid) const {
-        return tid < nthreads() && flip_convert_[tid] != Role::Idle;
-    }
-    Role flip_candidate_target(uint32_t tid) const {
-        return tid < nthreads() ? flip_convert_[tid] : Role::Idle;
-    }
-    Role flip_final_role(uint32_t tid) const {
-        if (tid >= nthreads()) return Role::Idle;
-        return flip_convert_[tid] == Role::Idle ? thread(tid).role() : flip_convert_[tid];
-    }
-    uint32_t flip_incoming_clients(uint32_t tid) const {
-        return tid < nthreads()
-            ? flip_incoming_clients_[tid].load(std::memory_order_acquire) : 0;
-    }
-    uint32_t flip_client_destination(uint32_t source, uint32_t ordinal) const {
-        if (source >= nthreads() || ordinal >= flip_client_destinations_[source].size())
-            return UINT32_MAX;
-        return flip_client_destinations_[source][ordinal];
-    }
-    Client* flip_client_at(uint32_t source, uint32_t ordinal) const {
-        if (source >= nthreads() || ordinal >= flip_client_plan_[source].size()) return nullptr;
-        return flip_client_plan_[source][ordinal];
-    }
-    uint32_t flip_client_quota(uint32_t tid) const {
-        return tid < nthreads() ? flip_client_quota_[tid] : 0;
-    }
-    uint32_t flip_shard_destination(uint32_t sid) const {
-        return sid < nshards() ? flip_shard_destination_[sid] : UINT32_MAX;
-    }
-    void flip_note_bucket_transferred() {
-        if (flip_stage() == FlipStage::Idle) std::abort();
-        flip_active_transfers_.fetch_add(1, std::memory_order_relaxed);
-    }
-    bool flip_build_client_plan(Client* coordinator_client, std::string& error) {
-        if (!flip_surviving_io_count_) {
-            error = "ERR FLIP would leave no connection owner";
-            return false;
-        }
-
-        uint64_t total64 = 0;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            if (thread(tid).role() != Role::Ifid) continue;
-            total64 += thread(tid).client_count();
-        }
-        if (total64 > UINT32_MAX || total64 != live_clients()) {
-            error = "ERR FLIP connection ownership count is not conserved";
-            return false;
-        }
-        const uint32_t total = static_cast<uint32_t>(total64);
-        try {
-            for (uint32_t tid = 0; tid < nthreads(); tid++) {
-                flip_client_destinations_[tid].clear();
-                flip_client_plan_[tid].clear();
-                flip_client_quota_[tid] = 0;
-                flip_incoming_clients_[tid].store(0, std::memory_order_relaxed);
-                flip_source_clients_[tid].store(0, std::memory_order_relaxed);
-            }
-            std::vector<uint32_t> targets(flip_surviving_io_,
-                                          flip_surviving_io_ + flip_surviving_io_count_);
-            std::vector<WeightedLbItem> items;
-            std::vector<Client*> clients;
-            items.reserve(total);
-            clients.reserve(total);
-            const bool weighted_client = client_lb_signals_enabled();
-            bool coordinator_seen = coordinator_client == nullptr;
-            for (uint32_t owner = 0; owner < nthreads(); owner++) {
-                if (thread(owner).role() != Role::Ifid) continue;
-                for (Client* client : thread(owner).clients()) {
-                    const bool pinned = coordinator_client && client == coordinator_client;
-                    coordinator_seen |= pinned;
-                    items.push_back({client->id(), owner,
-                                     weighted_client ? lb_client_weight(client->id()) : 0.0,
-                                     pinned});
-                    clients.push_back(client);
-                }
-            }
-            if (items.size() != total || !coordinator_seen) {
-                error = "ERR FLIP coordinator connection left the ownership set";
-                return false;
-            }
-            std::vector<WeightedLbAssignment> assignments;
-            if (!weighted_lb_partition(items, targets, assignments) ||
-                assignments.size() != items.size()) {
-                error = "ERR FLIP cannot satisfy weighted client and coordinator constraints";
-                return false;
-            }
-
-            uint32_t lanes[kMaxThreads][kMaxThreads] = {};
-            double before[kMaxThreads] = {};
-            double after[kMaxThreads] = {};
-            uint32_t planned = 0;
-            for (uint32_t i = 0; i < assignments.size(); i++) {
-                const WeightedLbAssignment& assignment = assignments[i];
-                if (assignment.id != clients[i]->id() || assignment.source >= nthreads() ||
-                    assignment.destination >= nthreads()) std::abort();
-                before[assignment.source] += assignment.weight;
-                after[assignment.destination] += assignment.weight;
-                flip_client_quota_[assignment.destination]++;
-                if (assignment.source == assignment.destination) continue;
-                flip_client_plan_[assignment.source].push_back(clients[i]);
-                flip_client_destinations_[assignment.source].push_back(assignment.destination);
-                lanes[assignment.source][assignment.destination]++;
-                flip_incoming_clients_[assignment.destination].fetch_add(
-                    1, std::memory_order_relaxed);
-                planned++;
-            }
-            const uint32_t low = total / flip_surviving_io_count_;
-            const uint32_t high = low + (total % flip_surviving_io_count_ != 0);
-            double before_min = 0, before_max = 0, after_min = 0, after_max = 0;
-            bool before_first = true, after_first = true;
-            for (uint32_t tid = 0; tid < nthreads(); tid++) {
-                if (thread(tid).role() == Role::Ifid) {
-                    if (before_first) before_min = before_max = before[tid];
-                    else { before_min = std::min(before_min, before[tid]);
-                           before_max = std::max(before_max, before[tid]); }
-                    before_first = false;
-                }
-            }
-            for (uint32_t target : targets) {
-                if (flip_client_quota_[target] < low || flip_client_quota_[target] > high) {
-                    error = "ERR FLIP weighted client plan violates count balance";
-                    return false;
-                }
-                if (after_first) after_min = after_max = after[target];
-                else { after_min = std::min(after_min, after[target]);
-                       after_max = std::max(after_max, after[target]); }
-                after_first = false;
-            }
-            flip_client_weight_spread_before_.store(
-                static_cast<uint64_t>((before_max - before_min) * 1024.0 + 0.5),
-                std::memory_order_relaxed);
-            flip_client_weight_spread_after_.store(
-                static_cast<uint64_t>((after_max - after_min) * 1024.0 + 0.5),
-                std::memory_order_relaxed);
-            for (uint32_t source = 0; source < nthreads(); source++) {
-                if (flip_client_plan_[source].size() !=
-                    flip_client_destinations_[source].size()) std::abort();
-                for (uint32_t destination : targets) {
-                    if (lanes[source][destination] >
-                        thread(destination).client_transfer_free_slots(source)) {
-                        error = "ERR FLIP connection-transfer inbox capacity is insufficient";
-                        return false;
-                    }
-                }
-                flip_source_clients_[source].store(
-                    static_cast<uint32_t>(flip_client_plan_[source].size()),
-                    std::memory_order_relaxed);
-            }
-            flip_planned_client_transfers_ = planned;
-            return true;
-        } catch (const std::bad_alloc&) {
-            error = "ERR FLIP could not allocate client balance plan";
-            return false;
-        }
-    }
-    uint32_t flip_source_clients(uint32_t source) const {
-        return source < nthreads()
-            ? flip_source_clients_[source].load(std::memory_order_acquire) : 0;
-    }
-    bool flip_reserve_shard_plan(std::string& error) {
-
-        if (!flip_shard_ownership_conserved()) {
-            error = "ERR FLIP shard ownership is not a complete one-owner partition";
-            return false;
-        }
-        try {
-            std::vector<uint32_t> executors;
-            for (uint32_t tid = 0; tid < nthreads(); tid++)
-                if (flip_final_role(tid) == Role::Ex) executors.push_back(tid);
-            if (executors.empty()) {
-                error = "ERR FLIP would leave no bucket owner";
-                return false;
-            }
-            std::vector<WeightedLbItem> items;
-            items.reserve(nshards());
-            const bool weighted_key = key_lb_signals_enabled();
-            for (uint32_t sid = 0; sid < nshards(); sid++) {
-                const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
-                if (owner >= nthreads()) {
-                    error = "ERR FLIP shard ownership names an invalid thread";
-                    return false;
-                }
-                items.push_back({sid, owner,
-                                 weighted_key ? lb_shard_weight(sid) : 0.0, false,
-                                 weighted_key ? static_cast<double>(lb_shard_bytes(sid)) : 0.0});
-            }
-            std::sort(executors.begin(), executors.end());
-            std::vector<WeightedLbAssignment> assignments;
-            if (!weighted_lb_partition(items, executors, assignments) ||
-                assignments.size() != items.size()) {
-                error = "ERR FLIP cannot satisfy weighted bucket and count constraints";
-                return false;
-            }
-
-            uint32_t incoming[kMaxThreads] = {};
-            double before_weight[kMaxThreads] = {};
-            double after_weight[kMaxThreads] = {};
-            double before_bytes[kMaxThreads] = {};
-            double after_bytes[kMaxThreads] = {};
-            for (uint32_t sid = 0; sid < nshards(); sid++)
-                flip_shard_destination_[sid] = UINT32_MAX;
-            uint32_t moves = 0;
-            for (const WeightedLbAssignment& assignment : assignments) {
-                if (assignment.id >= nshards() || assignment.destination >= nthreads())
-                    std::abort();
-                const uint32_t sid = static_cast<uint32_t>(assignment.id);
-                flip_shard_destination_[sid] = assignment.destination;
-                flip_bucket_quota_[assignment.destination]++;
-                before_weight[assignment.source] += assignment.weight;
-                after_weight[assignment.destination] += assignment.weight;
-                before_bytes[assignment.source] += assignment.secondary;
-                after_bytes[assignment.destination] += assignment.secondary;
-                if (assignment.source != assignment.destination) {
-                    incoming[assignment.destination]++;
-                    moves++;
-                }
-            }
-            const uint32_t low = nshards() / static_cast<uint32_t>(executors.size());
-            const uint32_t high = low + (nshards() % executors.size() != 0);
-            double bw_min = 0, bw_max = 0, aw_min = 0, aw_max = 0;
-            double bb_min = 0, bb_max = 0, ab_min = 0, ab_max = 0;
-            bool before_first = true, after_first = true;
-            for (uint32_t tid = 0; tid < nthreads(); tid++) {
-                if (thread(tid).role() != Role::Ex) continue;
-                if (before_first) {
-                    bw_min = bw_max = before_weight[tid];
-                    bb_min = bb_max = before_bytes[tid];
-                } else {
-                    bw_min = std::min(bw_min, before_weight[tid]);
-                    bw_max = std::max(bw_max, before_weight[tid]);
-                    bb_min = std::min(bb_min, before_bytes[tid]);
-                    bb_max = std::max(bb_max, before_bytes[tid]);
-                }
-                before_first = false;
-            }
-            for (uint32_t tid : executors) {
-                if (flip_bucket_quota_[tid] < low || flip_bucket_quota_[tid] > high) {
-                    error = "ERR FLIP weighted bucket plan violates count balance";
-                    return false;
-                }
-                if (after_first) {
-                    aw_min = aw_max = after_weight[tid];
-                    ab_min = ab_max = after_bytes[tid];
-                } else {
-                    aw_min = std::min(aw_min, after_weight[tid]);
-                    aw_max = std::max(aw_max, after_weight[tid]);
-                    ab_min = std::min(ab_min, after_bytes[tid]);
-                    ab_max = std::max(ab_max, after_bytes[tid]);
-                }
-                after_first = false;
-                if (!reserve_shard_capacity(tid, incoming[tid])) {
-                    error = "ERR FLIP could not reserve executor shard ownership";
-                    return false;
-                }
-            }
-            flip_bucket_weight_spread_before_.store(
-                static_cast<uint64_t>((bw_max - bw_min) * 1024.0 + 0.5),
-                std::memory_order_relaxed);
-            flip_bucket_weight_spread_after_.store(
-                static_cast<uint64_t>((aw_max - aw_min) * 1024.0 + 0.5),
-                std::memory_order_relaxed);
-            flip_bucket_bytes_spread_before_.store(
-                static_cast<uint64_t>(bb_max - bb_min + 0.5), std::memory_order_relaxed);
-            flip_bucket_bytes_spread_after_.store(
-                static_cast<uint64_t>(ab_max - ab_min + 0.5), std::memory_order_relaxed);
-            flip_planned_shard_transfers_ = moves;
-            return true;
-        } catch (const std::bad_alloc&) {
-            error = "ERR FLIP could not allocate bucket balance plan";
-            return false;
-        }
-    }
-
-    // One cron-owned controller beat. It computes candidates from the same immutable-id signal
-    // windows consumed by FLIP, then publishes either a short EX quiescence transaction or one
-    // connection drain request. Nothing here runs on an operation path.
-    bool lb_controller_tick(uint32_t coordinator, uint64_t now_ms) {
-        if (!lb_controller_enabled() || coordinator >= nthreads()) return false;
-        const bool key_enabled = key_lb_signals_enabled();
-        const bool client_enabled = client_lb_signals_enabled();
-        lb_ticks_.fetch_add(1, std::memory_order_relaxed);
-        try {
-            {
-                std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
-                if (lb_stage() != LbStage::Idle || flip_dispatch_paused() ||
-                    snapshot_.in_progress() || loading()) {
-                    lb_transition_refused_.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-                // FLIP folds the same windows while holding this admission mutex. Serialising the
-                // fold prevents a losing concurrent planner from consuming and decaying its tick.
-                lb_fold_signals();
-            }
-            std::vector<uint32_t> executors;
-            std::vector<uint32_t> ios;
-            if (cfg_.thread_mode == ThreadMode::Fused) {
-                if (key_enabled) executors = placement_.ex_threads();
-                if (client_enabled) ios = placement_.ifid_threads();
-            } else {
-                for (uint32_t tid = 0; tid < nthreads(); tid++) {
-                    const Role role = thread(tid).role();
-                    if (key_enabled && role == Role::Ex) executors.push_back(tid);
-                    else if (client_enabled && role == Role::Ifid) ios.push_back(tid);
-                }
-            }
-
-            auto spread = [](const double* loads, const std::vector<uint32_t>& owners) {
-                if (owners.empty()) return 0.0;
-                double lo = loads[owners.front()], hi = lo;
-                for (uint32_t tid : owners) {
-                    lo = std::min(lo, loads[tid]);
-                    hi = std::max(hi, loads[tid]);
-                }
-                return hi - lo;
-            };
-            auto ratio_pct = [&](double span, const double* loads,
-                                 const std::vector<uint32_t>& owners) {
-                double total = 0;
-                for (uint32_t tid : owners) total += loads[tid];
-                return total > 0 && !owners.empty()
-                    ? span * 100.0 * owners.size() / total : 0.0;
-            };
-            const uint64_t cooldown_ms = lb_policy_->cooldown_ms();
-            auto update_streak = [&](double ratio, LbAutotune::QuietJitter& noise,
-                                     uint32_t& streak) {
-                if (!noise.observe(ratio)) {
-                    lb_hysteresis_refused_.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-                const double fire = noise.band();
-                const double release = fire * 0.8; // Schmitt release band
-                if (ratio > fire) streak = std::min<uint32_t>(streak + 1, 3);
-                else if (ratio < release || ratio == 0) streak = 0;
-                if (streak < 3) {
-                    lb_hysteresis_refused_.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-                return true;
-            };
-
-            std::vector<LbShardMove> shard_plan;
-            double shard_before = 0, shard_after = 0;
-            double bytes_before = 0, bytes_after = 0;
-            if (key_enabled && executors.size() >= 2) {
-                double loads[kMaxThreads] = {};
-                double byte_loads[kMaxThreads] = {};
-                std::vector<WeightedLbItem> shard_items;
-                shard_items.reserve(nshards());
-                std::vector<uint64_t> last_move;
-                bool dominant_bucket = false;
-                {
-                    std::lock_guard<std::mutex> lock(lb_signal_mu_);
-                    last_move = lb_bucket_last_move_ms_;
-                    double total = 0, hottest = 0;
-                    for (double weight : lb_bucket_weight_) {
-                        total += weight;
-                        hottest = std::max(hottest, weight);
-                    }
-                    dominant_bucket = total > 0 && hottest * 2.0 > total;
-                }
-                uint32_t cooldown_seen = 0;
-                for (uint32_t sid = 0; sid < nshards(); sid++) {
-                    const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
-                    const double weight = lb_shard_weight(sid);
-                    const uint64_t bytes = lb_shard_bytes(sid);
-                    const Shard& physical = shard(static_cast<int32_t>(sid));
-                    bool cooling = false;
-                    for (uint32_t bucket = physical.bucket_begin();
-                         bucket < physical.bucket_end(); bucket++) {
-                        const uint64_t moved = last_move[bucket];
-                        if (moved && now_ms - moved < cooldown_ms) {
-                            cooling = true;
-                            break;
-                        }
-                    }
-                    if (cooling) cooldown_seen++;
-                    shard_items.push_back(
-                        {sid, owner, weight, cooling, static_cast<double>(bytes)});
-                    loads[owner] += weight;
-                    byte_loads[owner] += static_cast<double>(bytes);
-                }
-                shard_before = spread(loads, executors);
-                bytes_before = spread(byte_loads, executors);
-                const double weight_ratio = ratio_pct(shard_before, loads, executors);
-                const double byte_ratio = ratio_pct(bytes_before, byte_loads, executors);
-                lb_bucket_weight_spread_current_.store(
-                    static_cast<uint64_t>(shard_before * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                lb_bucket_bytes_spread_current_.store(
-                    static_cast<uint64_t>(bytes_before + 0.5), std::memory_order_relaxed);
-                if (dominant_bucket && weight_ratio > lb_policy_->key_jitter.band()) {
-                    // A bucket carrying at least half of all observed demand cannot be decomposed
-                    // by the single-owner actuator. It may contain a hot key; record and stop
-                    // instead of merely relocating the bottleneck.
-                    lb_hot_bucket_refused_.fetch_add(1, std::memory_order_relaxed);
-                    lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                    lb_bucket_hot_streak_ = 0;
-                } else if (update_streak(
-                               std::max(weight_ratio, byte_ratio), lb_policy_->key_jitter,
-                               lb_bucket_hot_streak_)) {
-                    for (uint32_t step = 0; step < lb_policy_->move_cap(nshards()); step++) {
-                        const double old_weight_span = spread(loads, executors);
-                        const double old_byte_span = spread(byte_loads, executors);
-                        const bool demand_hot = ratio_pct(old_weight_span, loads, executors) >
-                                                lb_policy_->key_jitter.band();
-                        const bool memory_hot = ratio_pct(old_byte_span, byte_loads, executors) >
-                                                lb_policy_->key_jitter.band();
-                        if (!demand_hot && !memory_hot) break;
-                        WeightedLbMoveChoice choice;
-                        if (!weighted_lb_best_incremental_move(
-                                shard_items, executors, demand_hot, memory_hot, choice)) {
-                            if (cooldown_seen)
-                                lb_cooldown_refused_.fetch_add(1, std::memory_order_relaxed);
-                            else
-                                lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        }
-                        WeightedLbItem& item = shard_items[choice.item_index];
-                        shard_plan.push_back({static_cast<uint32_t>(item.id), choice.source,
-                                             choice.destination, item.weight,
-                                             static_cast<uint64_t>(item.secondary)});
-                        loads[choice.source] -= item.weight;
-                        loads[choice.destination] += item.weight;
-                        byte_loads[choice.source] -= item.secondary;
-                        byte_loads[choice.destination] += item.secondary;
-                        item.owner = choice.destination;
-                        item.pinned = true;
-                    }
-                    shard_after = spread(loads, executors);
-                    bytes_after = spread(byte_loads, executors);
-                }
-            } else if (key_enabled) {
-                lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                lb_bucket_hot_streak_ = 0;
-            }
-
-            LbClientMove client_plan;
-            double client_before = 0, client_after = 0;
-            if (client_enabled && ios.size() >= 2) {
-                double loads[kMaxThreads] = {};
-                std::vector<WeightedLbItem> clients;
-                uint32_t cooldown_seen = 0;
-                {
-                    std::lock_guard<std::mutex> lock(lb_signal_mu_);
-                    clients.reserve(lb_clients_.size());
-                    for (const auto& entry : lb_clients_) {
-                        const LbClientSignal& signal = entry.second;
-                        if (signal.owner >= nthreads() ||
-                            thread(signal.owner).role() != Role::Ifid) continue;
-                        const bool cooling = signal.last_move_ms &&
-                            now_ms - signal.last_move_ms < cooldown_ms;
-                        if (cooling) cooldown_seen++;
-                        clients.push_back(
-                            {entry.first, signal.owner, signal.weight, cooling, 0.0});
-                        loads[signal.owner] += signal.weight;
-                    }
-                }
-                client_before = spread(loads, ios);
-                lb_client_weight_spread_current_.store(
-                    static_cast<uint64_t>(client_before * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                const double client_ratio = ratio_pct(client_before, loads, ios);
-                if (update_streak(client_ratio, lb_policy_->client_jitter, lb_client_hot_streak_)) {
-                    WeightedLbMoveChoice choice;
-                    if (!weighted_lb_best_incremental_move(
-                            clients, ios, true, false, choice)) {
-                        if (cooldown_seen)
-                            lb_cooldown_refused_.fetch_add(1, std::memory_order_relaxed);
-                        else
-                            lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        const WeightedLbItem& client = clients[choice.item_index];
-                        client_plan = {client.id, choice.source, choice.destination, client.weight};
-                        client_after = choice.after_weight_spread;
-                    }
-                }
-            } else if (client_enabled) {
-                lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                lb_client_hot_streak_ = 0;
-            }
-
-            const bool have_bucket = !shard_plan.empty();
-            const bool have_client = client_plan.id != 0;
-            if (!have_bucket && !have_client) {
-                lb_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            const bool choose_client = have_client && (!have_bucket || lb_prefer_client_);
-
-            std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
-            if (lb_stage() != LbStage::Idle || flip_dispatch_paused() ||
-                snapshot_.in_progress() || loading()) {
-                lb_transition_refused_.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            for (uint32_t tid = 0; tid < nthreads(); tid++)
-                lb_ack_[tid].store(0, std::memory_order_relaxed);
-            lb_coordinator_ = coordinator;
-            lb_epoch_.fetch_add(1, std::memory_order_acq_rel);
-            lb_deadline_ns_.store(now_ns() + LbAutotune::kMoveTimeoutNs,
-                                  std::memory_order_release);
-            if (choose_client) {
-                lb_client_move_ = client_plan;
-                lb_client_weight_spread_before_.store(
-                    static_cast<uint64_t>(client_before * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                lb_client_weight_spread_after_.store(
-                    static_cast<uint64_t>(client_after * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                lb_client_hot_streak_ = 0; // consume sustain before touching a candidate
-                lb_stage_.store(LbStage::ClientDrain, std::memory_order_release);
-            } else {
-                lb_shard_moves_ = std::move(shard_plan);
-                lb_bucket_weight_spread_before_.store(
-                    static_cast<uint64_t>(shard_before * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                lb_bucket_weight_spread_after_.store(
-                    static_cast<uint64_t>(shard_after * 1024.0 + 0.5),
-                    std::memory_order_relaxed);
-                lb_bucket_bytes_spread_before_.store(
-                    static_cast<uint64_t>(bytes_before + 0.5), std::memory_order_relaxed);
-                lb_bucket_bytes_spread_after_.store(
-                    static_cast<uint64_t>(bytes_after + 0.5), std::memory_order_relaxed);
-                lb_bucket_hot_streak_ = 0;
-                lb_start_shard_drain();
-            }
-            lb_prefer_client_ = !choose_client;
-            return true;
-        } catch (const std::bad_alloc&) {
-            lb_capacity_refused_.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-    }
-
-    bool lb_commit_shard_plan(uint64_t now_ms) {
-        if (lb_stage() != LbStage::ExDrain || !lb_all_ex_acked()) return false;
-        uint32_t incoming[kMaxThreads] = {};
-        for (const LbShardMove& move : lb_shard_moves_) incoming[move.destination]++;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            if (!incoming[tid]) continue;
-            if (!reserve_shard_capacity(tid, incoming[tid])) {
-                lb_capacity_refused_.fetch_add(1, std::memory_order_relaxed);
-                lb_stage_.store(LbStage::Idle, std::memory_order_release);
-                lb_deadline_ns_.store(0, std::memory_order_release);
-                return false;
-            }
-        }
-        for (const LbShardMove& move : lb_shard_moves_) {
-            if (!transfer_shard_quiesced(static_cast<int32_t>(move.sid), move.source,
-                                          move.destination)) std::abort();
-            Shard& physical = shard(static_cast<int32_t>(move.sid));
-            {
-                std::lock_guard<std::mutex> lock(lb_signal_mu_);
-                for (uint32_t bucket = physical.bucket_begin();
-                     bucket < physical.bucket_end(); bucket++)
-                    lb_bucket_last_move_ms_[bucket] = now_ms;
-            }
-            lb_bucket_moves_.fetch_add(1, std::memory_order_relaxed);
-            if (placement_.domain_of_thread(move.source) !=
-                placement_.domain_of_thread(move.destination))
-                lb_bucket_cross_domain_moves_.fetch_add(1, std::memory_order_relaxed);
-        }
-        lb_note_transfer(static_cast<uint32_t>(lb_shard_moves_.size()));
-        lb_stage_.store(LbStage::Idle, std::memory_order_release);
-        lb_deadline_ns_.store(0, std::memory_order_release);
-        return true;
-    }
-
-    void lb_note_transfer(uint32_t count) {
-        const uint64_t deadline = lb_deadline_ns();
-        if (!lb_policy_ || !deadline) return;
-        const uint64_t started = deadline - LbAutotune::kMoveTimeoutNs;
-        const uint64_t finished = now_ns();
-        if (finished >= started) lb_policy_->note_transfer(finished - started, count);
-    }
-
-    bool lb_client_move_started(uint64_t id, uint64_t now_ms) {
-        if (lb_client_move_.id != id) return false;
-        LbStage expected = LbStage::ClientDrain;
-        if (!lb_stage_.compare_exchange_strong(expected, LbStage::ClientMoving,
-                                               std::memory_order_acq_rel)) return false;
-        {
-            std::lock_guard<std::mutex> lock(lb_signal_mu_);
-            const auto found = lb_clients_.find(id);
-            if (found != lb_clients_.end()) found->second.last_move_ms = now_ms;
-        }
-        lb_client_inflight_id_.store(id, std::memory_order_release);
-        return true;
-    }
-    void lb_refuse_client_request() {
-        if (lb_stage() != LbStage::ClientDrain) return;
-        lb_client_refused_.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        const auto found = lb_clients_.find(lb_client_move_.id);
-        if (found != lb_clients_.end())
-            found->second.last_move_ms = now_ns() / 1000000ull;
-        lb_stage_.store(LbStage::Idle, std::memory_order_release);
-        lb_deadline_ns_.store(0, std::memory_order_release);
-    }
-    void lb_client_move_committed(uint64_t id, uint32_t source, uint32_t destination) {
-        uint64_t expected = id;
-        if (!lb_client_inflight_id_.compare_exchange_strong(
-                expected, 0, std::memory_order_acq_rel)) return;
-        lb_client_moves_.fetch_add(1, std::memory_order_relaxed);
-        if (placement_.domain_of_thread(source) != placement_.domain_of_thread(destination))
-            lb_client_cross_domain_moves_.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(lb_signal_mu_);
-        const auto found = lb_clients_.find(id);
-        if (found != lb_clients_.end()) found->second.owner = destination;
-        lb_note_transfer(1);
-        lb_stage_.store(LbStage::Idle, std::memory_order_release);
-        lb_deadline_ns_.store(0, std::memory_order_release);
-    }
-    void lb_client_move_cancelled(uint64_t id) {
-        uint64_t expected = id;
-        if (lb_client_inflight_id_.compare_exchange_strong(
-                expected, 0, std::memory_order_acq_rel)) {
-            lb_client_refused_.fetch_add(1, std::memory_order_relaxed);
-            lb_stage_.store(LbStage::Idle, std::memory_order_release);
-            lb_deadline_ns_.store(0, std::memory_order_release);
-        }
-    }
-    bool lb_timed_out() const {
-        const uint64_t deadline = lb_deadline_ns();
-        return deadline && now_ns() >= deadline;
-    }
-    void lb_stage_timed_out() {
-        const LbStage stage = lb_stage();
-        if (stage == LbStage::Idle || stage == LbStage::ClientMoving) return;
-        if (stage == LbStage::ClientDrain) {
-            lb_client_refused_.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lock(lb_signal_mu_);
-            const auto found = lb_clients_.find(lb_client_move_.id);
-            if (found != lb_clients_.end())
-                found->second.last_move_ms = now_ns() / 1000000ull;
-        }
-        else
-            lb_transition_refused_.fetch_add(1, std::memory_order_relaxed);
-        lb_stage_.store(LbStage::Idle, std::memory_order_release);
-        lb_deadline_ns_.store(0, std::memory_order_release);
-    }
-    bool flip_timed_out() const {
-        return flip_deadline_ns_.load(std::memory_order_acquire) != 0 &&
-               now_ns() >= flip_deadline_ns_.load(std::memory_order_acquire);
-    }
-    bool flip_begin(uint32_t target_io, uint32_t target_ex, uint32_t coordinator,
-                    std::string& error) {
-        if (cfg_.thread_mode == ThreadMode::Fused) {
-            error = "ERR FLIP is unavailable with --thread-mode 1s: threads are fused";
-            return false;
-        }
-        std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
-        const LbStage live_lb_stage = lb_stage();
-        if (live_lb_stage == LbStage::IoDrain || live_lb_stage == LbStage::ExDrain ||
-            live_lb_stage == LbStage::ClientDrain) {
-            // An explicit shape change wins over an uncommitted cron candidate. No ownership edge
-            // exists in either stage, so withdrawing it is exact. A ClientMoving request has
-            // already crossed its reversible preflight; FLIP admits it and IoDrain waits for that
-            // existing transfer to settle before it counts or moves any connection.
-            lb_transition_refused_.fetch_add(1, std::memory_order_relaxed);
-            lb_stage_.store(LbStage::Idle, std::memory_order_release);
-            lb_deadline_ns_.store(0, std::memory_order_release);
-        }
-        FlipStage expected = FlipStage::Idle;
-        if (!flip_stage_.compare_exchange_strong(expected, FlipStage::Planning,
-                                                 std::memory_order_acq_rel)) {
-            error = "ERR a FLIP is already in progress";
-            flip_refused_.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        // Publish intent before validation. A refused request remains observable as live != target
-        // through the report form; erasing it was the fork's most damaging control-plane blind spot.
-        flip_target_io_.store(target_io, std::memory_order_release);
-        flip_target_ex_.store(target_ex, std::memory_order_release);
-        auto refuse = [&](const std::string& message) {
-            error = message;
-            flip_refused_.fetch_add(1, std::memory_order_relaxed);
-            flip_stage_.store(FlipStage::Idle, std::memory_order_release);
-            return false;
-        };
-        if (!target_io || !target_ex)
-            return refuse("ERR FLIP requires at least one io and one ex thread");
-        if (static_cast<uint64_t>(target_io) + static_cast<uint64_t>(target_ex) != nthreads())
-            return refuse("ERR FLIP io + ex must equal the existing total thread count");
-        if (smt_mode_ && ((target_io & 1u) || (target_ex & 1u)))
-            return refuse(flip_smt_pairing_error(target_io));
-        if (coordinator >= nthreads() || thread(coordinator).role() != Role::Ifid)
-            return refuse("ERR FLIP coordinator is not a live io thread");
-        if (loading()) return refuse("ERR FLIP is not allowed while loading");
-        if (snapshot_.in_progress()) return refuse("ERR FLIP is not allowed during a snapshot");
-        if (role_count(Role::Ifid) + role_count(Role::Ex) != nthreads())
-            return refuse("ERR FLIP thread conservation is already violated");
-        flip_conservation_check();
-        if (lb_controller_enabled()) lb_fold_signals();
-
-        const uint32_t live_io = role_count(Role::Ifid);
-        for (uint32_t tid = 0; tid < kMaxThreads; tid++) {
-            flip_convert_[tid] = Role::Idle;
-            flip_client_plan_[tid].clear();
-            flip_client_destinations_[tid].clear();
-            flip_client_quota_[tid] = 0;
-            flip_bucket_quota_[tid] = 0;
-            flip_incoming_clients_[tid].store(0, std::memory_order_relaxed);
-            flip_source_clients_[tid].store(0, std::memory_order_relaxed);
-            flip_ack_[tid].store(0, std::memory_order_relaxed);
-        }
-        for (uint32_t sid = 0; sid < 256; sid++) flip_shard_destination_[sid] = UINT32_MAX;
-        flip_planned_client_transfers_ = 0;
-        flip_planned_shard_transfers_ = 0;
-        flip_active_transfers_.store(0, std::memory_order_relaxed);
-        const uint32_t conversions = live_io > target_io ? live_io - target_io
-                                                          : target_io - live_io;
-        if (conversions == 0) {
-            // A same-split request is a completed no-op, not a rebalance trigger: weight-driven
-            // movement belongs to the cron mover with its hysteresis and cooldown. Entering the
-            // stage machine with an empty plan is not an option either -- every stage predicate
-            // (client quotas, RoleReady acks, the completion balance audit) judges distributions
-            // a no-op deliberately leaves alone. Complete here; the caller replies OK on seeing
-            // Idle. (The reshuffle this replaces moved a hundred buckets on a balanced no-op.)
-            flip_last_transfers_.store(0, std::memory_order_relaxed);
-            flip_completed_.fetch_add(1, std::memory_order_relaxed);
-            flip_target_io_.store(target_io, std::memory_order_release);
-            flip_target_ex_.store(target_ex, std::memory_order_release);
-            flip_stage_.store(FlipStage::Idle, std::memory_order_release);
-            return true;
-        }
-        struct RoleUnit {
-            uint32_t first = UINT32_MAX;
-            uint32_t second = UINT32_MAX;
-            double occupancy = 0;
-        };
-        RoleUnit units[kMaxThreads];
-        uint32_t unit_count = 0;
-        uint32_t selected = 0;
-        if (target_io < live_io) {
-            // LOAD-BEARING exclusions, not tie-breakers: the AOF writer (and, in smt mode, its
-            // sibling) must never be converted io->ex. writer_shutdown() runs only on the io loop's
-            // exit paths; an executor-state ~AofManager closes without an fsync and discard_chunks()
-            // drops buffered records. The unix-listener owner likewise cannot leave the io role
-            // without taking its listener with it.
-            const uint32_t aof_writer = aof_.writer_tid();
-            for (uint32_t tid : placement_.ifid_threads()) {
-                if (!smt_mode_) {
-                    if (tid == coordinator || tid == aof_writer || tid == unix_owner_tid_) continue;
-                    units[unit_count++] = {tid, UINT32_MAX, lb_thread_occupancy(tid)};
-                    continue;
-                }
-                const uint32_t peer = placement_.smt_peer(tid);
-                if (peer >= nthreads() || tid < peer) continue;
-                if (tid == coordinator || peer == coordinator ||
-                    tid == aof_writer || peer == aof_writer ||
-                    tid == unix_owner_tid_ || peer == unix_owner_tid_) continue;
-                units[unit_count++] = {
-                    tid, peer, (lb_thread_occupancy(tid) + lb_thread_occupancy(peer)) * 0.5};
-            }
-        } else {
-            for (uint32_t tid : placement_.ex_threads()) {
-                if (!smt_mode_) {
-                    units[unit_count++] = {tid, UINT32_MAX, lb_thread_occupancy(tid)};
-                    continue;
-                }
-                const uint32_t peer = placement_.smt_peer(tid);
-                if (peer >= nthreads() || tid < peer) continue;
-                units[unit_count++] = {
-                    tid, peer, (lb_thread_occupancy(tid) + lb_thread_occupancy(peer)) * 0.5};
-            }
-        }
-        std::sort(units, units + unit_count, [](const RoleUnit& a, const RoleUnit& b) {
-            if (a.occupancy != b.occupancy) return a.occupancy < b.occupancy;
-            return a.first > b.first; // disabled/all-zero signal preserves the old reverse-id tie
-        });
-        // Domain-even selection. Boot placement spreads both roles evenly across L3 domains
-        // (build_even); a picker that ignores topology un-evens it -- occupancy ties broke by
-        // reverse id, so with cold signals every conversion clustered into the highest domain and
-        // one L3 went role-lopsided after a single flip. Conversions round-robin across domains
-        // (always the domain with the fewest taken so far, most remaining candidates on ties) and
-        // occupancy keeps deciding WITHIN a domain via the sort above.
-        const Role target_role = target_io < live_io ? Role::Ex : Role::Ifid;
-        uint32_t unit_domain[kMaxThreads];
-        uint32_t domain_taken[kMaxThreads] = {};
-        uint32_t domain_left[kMaxThreads] = {};
-        bool     unit_used[kMaxThreads] = {};
-        uint32_t max_domain = 0;
-        for (uint32_t i = 0; i < unit_count; i++) {
-            unit_domain[i] = placement_.domain_of_thread(units[i].first);
-            if (unit_domain[i] >= kMaxThreads) unit_domain[i] = 0;
-            domain_left[unit_domain[i]]++;
-            max_domain = std::max(max_domain, unit_domain[i]);
-        }
-        while (selected < conversions) {
-            uint32_t pick_domain = UINT32_MAX;
-            for (uint32_t d = 0; d <= max_domain; d++) {
-                if (!domain_left[d]) continue;
-                if (pick_domain == UINT32_MAX ||
-                    domain_taken[d] < domain_taken[pick_domain] ||
-                    (domain_taken[d] == domain_taken[pick_domain] &&
-                     domain_left[d] > domain_left[pick_domain]))
-                    pick_domain = d;
-            }
-            if (pick_domain == UINT32_MAX) break;  // no candidates anywhere: caught below
-            for (uint32_t i = 0; i < unit_count; i++) {
-                if (unit_used[i] || unit_domain[i] != pick_domain) continue;
-                unit_used[i] = true;
-                domain_taken[pick_domain]++;
-                domain_left[pick_domain]--;
-                flip_convert_[units[i].first] = target_role;
-                selected++;
-                if (units[i].second != UINT32_MAX) {
-                    flip_convert_[units[i].second] = target_role;
-                    selected++;
-                }
-                break;
-            }
-        }
-        if (selected != conversions)
-            return refuse("ERR FLIP cannot select enough movable threads (coordinator/AOF/UNIX owner pinned)");
-        if (!flip_candidate_pairs_conserved())
-            return refuse("ERR FLIP candidate plan would split an SMT sibling pair");
-
-        flip_surviving_io_count_ = 0;
-        for (uint32_t tid = 0; tid < nthreads(); tid++)
-            if (flip_final_role(tid) == Role::Ifid)
-                flip_surviving_io_[flip_surviving_io_count_++] = tid;
-        if (!flip_surviving_io_count_)
-            return refuse("ERR FLIP would leave no connection owner");
-
-        flip_coordinator_ = coordinator;
-        flip_target_io_.store(target_io, std::memory_order_release);
-        flip_target_ex_.store(target_ex, std::memory_order_release);
-        flip_failed_.store(false, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(flip_error_mu_);
-            flip_error_.clear();
-        }
-        flip_epoch_.fetch_add(1, std::memory_order_acq_rel);
-        flip_deadline_ns_.store(now_ns() + 5ull * 1000 * 1000 * 1000,
-                                std::memory_order_release);
-        flip_stage_.store(FlipStage::IoDrain, std::memory_order_release);
-        return true;
-    }
-
-    void flip_set_stage(FlipStage stage) {
-        if (stage == FlipStage::Idle) std::abort();
-        flip_stage_.store(stage, std::memory_order_release);
-    }
-    void flip_ack(uint32_t tid, FlipStage stage) {
-        const uint64_t token = (flip_epoch() << 8) | static_cast<uint8_t>(stage);
-        flip_ack_[tid].store(token, std::memory_order_release);
-    }
-    bool flip_acked(uint32_t tid, FlipStage stage) const {
-        const uint64_t token = (flip_epoch() << 8) | static_cast<uint8_t>(stage);
-        return flip_ack_[tid].load(std::memory_order_acquire) == token;
-    }
-    bool flip_all_role_acked(Role role, FlipStage stage) const {
-        for (uint32_t tid = 0; tid < nthreads(); tid++)
-            if (thread(tid).role() == role && !flip_acked(tid, stage)) return false;
-        return true;
-    }
-    void flip_note_failure(const std::string& error) {
-        bool expected = false;
-        if (!flip_failed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
-            return;
-        std::lock_guard<std::mutex> lock(flip_error_mu_);
-        flip_error_ = error;
-    }
-    bool flip_failed(std::string& error) const {
-        if (!flip_failed_.load(std::memory_order_acquire)) return false;
-        std::lock_guard<std::mutex> lock(flip_error_mu_);
-        error = flip_error_;
-        return true;
-    }
-    void flip_conservation_check(bool ready = false) {
-        flip_conservation_checks_.fetch_add(1, std::memory_order_relaxed);
-        if (role_count(Role::Ifid, ready) + role_count(Role::Ex, ready) == nthreads() &&
-            flip_live_pairs_conserved(ready)) return;
-        flip_conservation_violations_.fetch_add(1, std::memory_order_relaxed);
-        std::abort();
-    }
-    void flip_change_role(uint32_t tid, Role role) {
-        flip_conservation_check();
-        auto change = [&](uint32_t id) {
-            placement_.set_runtime_role(id, role);
-            thread(id).set_role(role);
-        };
-        if (!smt_mode_) {
-            change(tid);
-        } else {
-            const uint32_t peer = placement_.smt_peer(tid);
-            if (peer >= nthreads() || flip_candidate_target(peer) != role) std::abort();
-            change(tid);
-            change(peer);
-        }
-        flip_conservation_check();
-    }
-    void flip_refuse_active() {
-        flip_refused_.fetch_add(1, std::memory_order_relaxed);
-        // Retain the requested target. The no-argument report then exposes live != target after a
-        // refusal instead of erasing the only witness that the requested shape was not reached.
-        flip_stage_.store(FlipStage::Idle, std::memory_order_release);
-        flip_deadline_ns_.store(0, std::memory_order_release);
-    }
-    void flip_complete_active() {
-        flip_conservation_check();
-        flip_conservation_check(true);
-        if (!flip_shard_ownership_conserved()) std::abort();
-        if (role_count(Role::Ifid, true) != flip_target_io() ||
-            role_count(Role::Ex, true) != flip_target_ex()) {
-            flip_conservation_violations_.fetch_add(1, std::memory_order_relaxed);
-            std::abort();
-        }
-        uint32_t buckets[kMaxThreads] = {};
-        for (uint32_t sid = 0; sid < nshards(); sid++) {
-            const uint32_t owner = worker_of_shard(static_cast<int32_t>(sid));
-            if (owner >= nthreads()) std::abort();
-            buckets[owner]++;
-        }
-        uint32_t bucket_min = UINT32_MAX, bucket_max = 0;
-        uint32_t client_min = UINT32_MAX, client_max = 0;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            if (thread(tid).role() == Role::Ex) {
-                if (buckets[tid] != flip_bucket_quota_[tid]) std::abort();
-                bucket_min = std::min(bucket_min, buckets[tid]);
-                bucket_max = std::max(bucket_max, buckets[tid]);
-            } else if (thread(tid).role() == Role::Ifid) {
-                const uint32_t clients = thread(tid).client_count();
-                if (clients != flip_client_quota_[tid]) std::abort();
-                client_min = std::min(client_min, clients);
-                client_max = std::max(client_max, clients);
-            }
-        }
-        if (bucket_min == UINT32_MAX || client_min == UINT32_MAX ||
-            bucket_max - bucket_min > 1 || client_max - client_min > 1)
-            std::abort();
-        const uint64_t transfers = flip_active_transfers_.load(std::memory_order_relaxed);
-        if (transfers != static_cast<uint64_t>(flip_planned_shard_transfers_) +
-                         flip_planned_client_transfers_)
-            std::abort();
-
-        flip_last_transfers_.store(transfers, std::memory_order_relaxed);
-        flip_completed_.fetch_add(1, std::memory_order_relaxed);
-        flip_stage_.store(FlipStage::Idle, std::memory_order_release);
-        flip_deadline_ns_.store(0, std::memory_order_release);
-    }
-
-private:
-    std::string flip_smt_pairing_error(uint32_t requested_io) const {
-        std::string nearest;
-        auto add = [&](uint32_t io) {
-            if (io < 2 || io + 2 > nthreads()) return;
-            if (!nearest.empty()) nearest += " and ";
-            nearest += std::to_string(io) + ":" + std::to_string(nthreads() - io);
-        };
-        add(requested_io & ~1u);
-        add((requested_io & ~1u) + 2);
-        return "ERR FLIP SMT sibling pairs require even io/ex counts; nearest achievable splits are " +
-               nearest;
-    }
-
-    bool flip_live_pairs_conserved(bool ready) const {
-        if (!smt_mode_) return true;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            const uint32_t peer = placement_.smt_peer(tid);
-            if (peer >= nthreads()) return false;
-            const Role role = ready ? thread(tid).ready_role() : thread(tid).role();
-            const Role peer_role = ready ? thread(peer).ready_role() : thread(peer).role();
-            if (role != peer_role) return false;
-        }
-        return true;
-    }
-
-    bool flip_candidate_pairs_conserved() const {
-        if (!smt_mode_) return true;
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            const uint32_t peer = placement_.smt_peer(tid);
-            if (peer >= nthreads()) return false;
-            const Role role = flip_convert_[tid] == Role::Idle
-                ? thread(tid).role() : flip_convert_[tid];
-            const Role peer_role = flip_convert_[peer] == Role::Idle
-                ? thread(peer).role() : flip_convert_[peer];
-            if (role != peer_role) return false;
-        }
-        return true;
-    }
-
-    bool flip_shard_ownership_conserved() const {
-        if (nshards() > 256 || router_.transfer_phase() != Router::TransferPhase::Idle)
-            return false;
-        uint8_t seen[256] = {};
-        for (uint32_t tid = 0; tid < nthreads(); tid++) {
-            const auto& owned = thread(tid).shards();
-            if (thread(tid).role() != Role::Ex && !owned.empty()) return false;
-            for (Shard* shard : owned) {
-                if (!shard || shard->id() < 0 ||
-                    static_cast<uint32_t>(shard->id()) >= nshards() ||
-                    shard != shards_[static_cast<uint32_t>(shard->id())].get() ||
-                    seen[static_cast<uint32_t>(shard->id())]++ ||
-                    worker_of_shard(shard->id()) != tid) return false;
-                for (uint32_t bucket = shard->bucket_begin(); bucket < shard->bucket_end(); bucket++)
-                    if (router_.shard_of_bucket(bucket) != shard->id() ||
-                        router_.owner_of_bucket(bucket) != tid) return false;
-            }
-        }
-        for (uint32_t sid = 0; sid < nshards(); sid++) if (seen[sid] != 1) return false;
-        return true;
-    }
-
-public:
 
     bool save_schedule_armed() const {
         return live_save_armed_.load(std::memory_order_relaxed);
@@ -1956,233 +303,15 @@ public:
         return 1;
     }
 
-    // Exactly one indexed acquire load on dispatch.  The normal optimized build has no bounds
-    // branch; an unoptimized assertion build retains the diagnostic check.
+    // One atomic load on the dispatch path; one atomic store is how an LB moves work.
     uint32_t worker_of_shard(int32_t shard_id) const {
-#if !defined(NDEBUG) && !defined(__OPTIMIZE__)
-        if (shard_id < 0 || static_cast<uint32_t>(shard_id) >= shards_.size()) std::abort();
-#endif
         return shard_owner_[shard_id].load(std::memory_order_acquire);
     }
     void set_worker_of_shard(int32_t shard_id, uint32_t thread_id) {
-        if (shard_id < 0 || static_cast<uint32_t>(shard_id) >= shards_.size()) std::abort();
-        Shard& sh = *shards_[static_cast<uint32_t>(shard_id)];
-        router_.set_initial_owner(sh.bucket_begin(), sh.bucket_end(), thread_id);
         shard_owner_[shard_id].store(thread_id, std::memory_order_release);
     }
-
-    // The caller must hold both executor loops at the safe point:
-    // no executing/retry/group/snapshot work may touch this shard.  Queue entries which arrive via
-    // a stale pre-commit route are harmless because ExLoop rechecks and forwards before access.
-    // Vector capacity and membership are settled while PREPARING still names the source.  The
-    // phase store in commit_transfer() is the sole ownership edge; bucket entries and the derived
-    // shard array publish destination only after that edge.
-    // THE OWNERSHIP EDGE OWNS THE SINK.
-    //
-    // A shard's read-local retire sink names TWO structures that belong to one thread and are
-    // protected by nothing else: the owner's QSBR retire ring (`defer`, a single-producer ring) and
-    // the owner's private block cache (`block_cache`, an unlocked free list). Every armed write on
-    // the shard reaches both through the shard's store, so the sink must name the thread that is
-    // executing that shard's writes -- at every instant, not eventually.
-    //
-    // Moving the shard without moving the sink leaves the DESTINATION executing writes through the
-    // SOURCE's ring and free list. Two threads then splice one unlocked list: the loser's update is
-    // lost, a block ends up linked twice, and the damage surfaces later as either
-    // KvBlockCache::put's `heads[cls] == memory` abort or a take() of a still-linked block whose
-    // KvObj header overwrites the list `next`, so that the NEXT take dereferences a wild pointer.
-    // Both were observed.
-    //
-    // The rebind used to be deferred to the destination's own next executor pass
-    // (`lb_rebind_pending_` -> `read_local_rebind_owned_shards_after_lb`). Nothing ordered that
-    // pass before the destination's first write to the shard it had just been given, and the
-    // reproduction shows exactly that gap: transfer sid 1 to thread 1, then thread 1 executing
-    // cmd_set on it against thread 7's cache, with no rebind in between.
-    //
-    // Here there is no gap. Both callers hold every executor at the quiesced safe point (the LB
-    // commits only once every EX thread has acked ExDrain, which `flip_quiesced()` grants only with
-    // an EMPTY retire ring), so the source has nothing outstanding for this shard and the
-    // destination has not started. The sink moves with ownership, in the same critical section.
-    void adopt_read_local_retire_sink(Shard& shard, uint32_t destination) {
-#ifdef TOMO_RL_CACHE_NO_EAGER_ADOPT
-        // NEGATIVE CONTROL (Makefile target `rlcache-nofix`): restores the pre-fix behaviour, where
-        // the sink was left for the destination's own later pass to rebind. Every invariant added
-        // for this defect MUST fail against this build; a detector that cannot report failure
-        // proves nothing about the runs that pass.
-        (void)shard; (void)destination;
-        return;
-#else
-        if (!shard.store().read_local_enabled()) return;
-        const ReadLocalRetireSink* sink = threads_[destination]->read_local_retire_sink_or_null();
-        if (!sink) std::abort();
-        shard.store().rebind_read_local_retire_sink(*sink);
-#endif
-    }
-
-#ifdef TOMO_RL_CACHE_DEBUG
-    // THE INVARIANT THAT WOULD HAVE CAUGHT THIS, stated where it can be checked cheaply and
-    // continuously rather than only where it is violated.
-    //
-    // Every shard's read-local retire sink must name its CURRENT owner, at every instant. Checking
-    // it only at the point of USE (KvBlockCache's owner assertion) makes detection depend on the
-    // new owner happening to write to the moved shard inside the window, which is a coin flip per
-    // move. Checking the mapping itself makes ANY move with a stale sink fire, deterministically,
-    // whether or not a write lands in the window -- which is what lets a gate row rest on it.
-    //
-    // 16-256 pointer compares, debug builds only, once per executor pass.
-    void debug_assert_read_local_sinks_follow_ownership(uint32_t checker) const {
-        // Only outside a migration stage. The transfer functions publish the sink and the new owner
-        // as two separate stores inside one quiesced critical section, so a thread parked at the
-        // ExDrain ack can observe the instant between them; that transient is not the defect. The
-        // defect outlives the stage -- the pre-fix rebind did not happen until the destination's
-        // own later pass -- so checking at Idle still catches it on the very next pass.
-        if (lb_stage() != LbStage::Idle || flip_stage() != FlipStage::Idle) return;
-        for (uint32_t sid = 0; sid < nshards(); sid++) {
-            const Shard& shard = *shards_[sid];
-            if (!shard.store().read_local_enabled()) continue;
-            const uint32_t owner = shard_owner_[sid].load(std::memory_order_acquire);
-            if (owner >= threads_.size()) continue;
-            const ReadLocalRetireSink* want = threads_[owner]->read_local_retire_sink_or_null();
-            if (!want) continue;
-            const ReadLocalRetireSink& have = shard.store().read_local_retire_sink_debug();
-            if (have.block_cache == want->block_cache && have.context == want->context) continue;
-            std::fprintf(stderr,
-                "\nRLSINK-VIOLATION shard %u owner thread %u expects cache %p/queue %p, store %p "
-                "still names cache %p/queue %p (observed by thread %u)\n",
-                sid, owner, static_cast<void*>(want->block_cache), want->context,
-                static_cast<const void*>(&shard.store()),
-                static_cast<void*>(have.block_cache), have.context, checker);
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-#endif
-
-    bool transfer_bucket_range_quiesced(uint32_t begin, uint32_t end, uint32_t source,
-                                         uint32_t destination) {
-        if (begin >= end || end > kNumBuckets || source >= threads_.size() ||
-            destination >= threads_.size() || source == destination) return false;
-        if (!live_executor(source) || !live_executor(destination))
-            return false;
-
-        // FlatStore is the lock-free physical ownership unit. Accept a range of one or more whole
-        // stores, never a partial store which would give two threads access to the same table.
-        std::vector<Shard*> moving;
-        try {
-            moving.reserve(shards_.size());
-        } catch (...) {
-            return false;
-        }
-        uint32_t cursor = begin;
-        for (const auto& owned : shards_) {
-            Shard* const shard = owned.get();
-            if (shard->bucket_end() <= begin || shard->bucket_begin() >= end) continue;
-            if (shard->bucket_begin() != cursor || shard->bucket_end() > end ||
-                worker_of_shard(shard->id()) != source) return false;
-            moving.push_back(shard);
-            cursor = shard->bucket_end();
-        }
-        if (moving.empty() || cursor != end) return false;
-
-        auto& from = threads_[source]->shards();
-        auto& to = threads_[destination]->shards();
-        for (Shard* shard : moving) {
-            if (std::find(from.begin(), from.end(), shard) == from.end() ||
-                std::find(to.begin(), to.end(), shard) != to.end()) return false;
-        }
-
-        // Allocation is the sole ordinary failure after validation, so force it before publishing
-        // PREPARING. No recoverable operation remains after begin_transfer succeeds.
-        try {
-            to.reserve(to.size() + moving.size());
-        } catch (...) {
-            return false;
-        }
-        if (!router_.begin_transfer(begin, end, source, destination))
-            return false;
-
-        for (Shard* shard : moving) to.push_back(shard);
-        from.erase(std::remove_if(from.begin(), from.end(), [&](Shard* shard) {
-            return std::find(moving.begin(), moving.end(), shard) != moving.end();
-        }), from.end());
-        for (Shard* shard : moving) adopt_shard_owner_state(*shard, destination);
-        router_.commit_transfer();
-        for (Shard* shard : moving)
-            shard_owner_[shard->id()].store(destination, std::memory_order_release);
-        router_.finish_transfer();
-        for (Shard* shard : moving)
-            shard->note_migration(placement_.domain_of_thread(destination));
-        return true;
-    }
-
-    bool transfer_shard_quiesced(int32_t shard_id, uint32_t source, uint32_t destination) {
-        if (shard_id < 0 || static_cast<uint32_t>(shard_id) >= shards_.size()) return false;
-        Shard& shard = *shards_[static_cast<uint32_t>(shard_id)];
-        if (source >= threads_.size() || destination >= threads_.size() || source == destination ||
-            !live_executor(source) ||
-            (!live_executor(destination) &&
-             !(flip_stage() != FlipStage::Idle && flip_final_role(destination) == Role::Ex)) ||
-            worker_of_shard(shard_id) != source) return false;
-        auto& from = threads_[source]->shards();
-        auto& to = threads_[destination]->shards();
-        auto found = std::find(from.begin(), from.end(), &shard);
-        if (found == from.end() || std::find(to.begin(), to.end(), &shard) != to.end() ||
-            to.size() == to.capacity()) return false;
-        if (!router_.begin_transfer(shard.bucket_begin(), shard.bucket_end(), source, destination))
-            return false;
-        to.push_back(&shard);                       // capacity was reserved before PREPARING
-        *found = from.back();
-        from.pop_back();
-        adopt_shard_owner_state(shard, destination);
-        router_.commit_transfer();                 // THE single bucket ownership edge
-        shard_owner_[shard_id].store(destination, std::memory_order_release);
-        router_.finish_transfer();
-        shard.note_migration(placement_.domain_of_thread(destination));
-        return true;
-    }
-    bool reserve_shard_capacity(uint32_t tid, uint32_t incoming) {
-        if (tid >= nthreads()) return false;
-        auto& owned = thread(tid).shards();
-        try {
-            owned.reserve(owned.size() + incoming);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    void bind_owner_notify_pending(uint32_t tid, bool* pending) {
-        owner_notify_pending_[tid] = pending;
-    }
-
-    void adopt_shard_owner_state(Shard& shard, uint32_t destination) {
-        adopt_read_local_retire_sink(shard, destination);
-        // A destination may already have cached this version while the source's last
-        // pass used the previous one. Configure the incoming store at the ownership
-        // edge; an unchanged destination version must never leave it on stale limits.
-        // Transfers are serialized by the shape transition, but IO-side tracking/ACL publication
-        // may continue while executors are quiesced. The coordinator has its OWN mailbox: neither
-        // the writer's mutable committed copy nor the destination's consumer slot is safe here.
-        const LiveConfigSnapshot config =
-            live_config_mailboxes_[nthreads()].read(live_config_version_).live;
-        shard.configure_maxmemory(config.maxmemory != 0, config.maxmemory / nshards(),
-                                  config.policy, config.samples);
-        shard.set_notify_mask(config.notify_events |
-                              (config.tracking_armed ? NOTIFY_TRACKING : 0u) |
-                              (config.save_armed ? NOTIFY_SAVE : 0u));
-        bool* pending = owner_notify_pending_[destination];
-        if (!pending) std::abort();
-        shard.bind_notify_pending(pending);
-        *pending = true; // service any output carried with the shard on the first owner pass
-    }
-
-    bool live_executor(uint32_t tid) const {
-        if (tid >= nthreads()) return false;
-        return cfg_.thread_mode == ThreadMode::Fused
-            ? placement_.is_executor(tid) : thread(tid).role() == Role::Ex;
-    }
     uint32_t executor_slot(uint32_t thread_id) const {
-        // Atomic-group arrays use stable physical thread IDs, including across role changes.
-        return thread_id < nthreads() ? thread_id : UINT8_MAX;
+        return thread_id < kMaxThreads ? executor_slots_[thread_id] : UINT8_MAX;
     }
 
     std::atomic<uint64_t>& next_client_id() { return next_client_id_; }
@@ -2223,8 +352,20 @@ public:
         end_live_config_update(version);
     }
 
-    ClientLimitsConfigSnapshot client_limits_snapshot(uint32_t reader_tid) const {
-        return live_config_mailboxes_[reader_tid].read(live_config_version_).clients;
+    ClientLimitsConfigSnapshot client_limits_snapshot() const {
+        for (;;) {
+            ClientLimitsConfigSnapshot out;
+            out.version = live_config_version_.load(std::memory_order_acquire);
+            if (out.version & 1) continue;
+            out.timeout = live_timeout_.load(std::memory_order_relaxed);
+            out.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
+            out.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
+            out.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
+            out.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
+            out.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
+            out.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
+            if (live_config_version_.load(std::memory_order_acquire) == out.version) return out;
+        }
     }
     void set_client_output_buffer_limits(const ClientOutputBufferLimits& limits) {
         const uint64_t version = begin_live_config_update();
@@ -2254,8 +395,8 @@ public:
     }
     uint64_t climon_monitors() const { return climon_monitors_.load(std::memory_order_relaxed); }
 
-    // Tracking arms shard-side write observation, so it publishes through the same mailboxes
-    // executors already poll (one version compare per pass when nothing changed).
+    // Tracking arms shard-side write observation, so it must publish through the live-config
+    // seqlock the executors already poll (one version compare per pass when nothing changed).
     void climon_tracking_added() {
         const uint64_t version = begin_live_config_update();
         climon_tracking_.fetch_add(1, std::memory_order_relaxed);
@@ -2339,18 +480,6 @@ public:
     }
     uint64_t climon_invalidations() const {
         return climon_invalidations_.load(std::memory_order_relaxed);
-    }
-    void tracking_forwarded_stale_added(uint64_t n = 1) {
-        tracking_forwarded_stale_.fetch_add(n, std::memory_order_relaxed);
-    }
-    uint64_t tracking_forwarded_stale() const {
-        return tracking_forwarded_stale_.load(std::memory_order_relaxed);
-    }
-    void monitor_forwarded_stale_added(uint64_t n = 1) {
-        monitor_forwarded_stale_.fetch_add(n, std::memory_order_relaxed);
-    }
-    uint64_t monitor_forwarded_stale() const {
-        return monitor_forwarded_stale_.load(std::memory_order_relaxed);
     }
     // PROOF-OF-MECHANISM for the out-of-band frame channel, and the reason it exists is the
     // vacuous-validation trap: the geometry that used to splice a push into a borrowed reply is
@@ -2506,59 +635,115 @@ public:
     bool atomic_enabled() const { return atomic_mode_state() & kAtomicEnabledBit; }
     bool atomic_work_active() const { return (atomic_mode_state() & ~kAtomicEnabledBit) != 0; }
     uint32_t atomic_window() const {
-        return atomic_credits_.window();
+        return live_atomic_window_.load(std::memory_order_acquire);
     }
     void set_atomic_enabled(bool enabled) {
         if (enabled) {
+            atomic_reconfigure_credits(atomic_window());
             atomic_activity_.fetch_or(kAtomicEnabledBit, std::memory_order_release);
         } else {
             atomic_activity_.fetch_and(~kAtomicEnabledBit, std::memory_order_release);
+            atomic_reconfigure_credits(atomic_window());
         }
+    }
+    void set_atomic_window(uint32_t window) {
+        atomic_reconfigure_credits(window);
     }
     bool atomic_tracking_active() const {
         return atomic_mode_state() != 0;
     }
-    bool atomic_can_admit(uint32_t /*owner_io*/, bool force = false) const {
+    bool atomic_can_admit(uint32_t owner_io, bool force = false) const {
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return true;
-        return atomic_credits_.can_admit();
+        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        if (generation & 1) return false;
+        const uint32_t window = atomic_window();
+        if (!window) return true;
+        const AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        return (lease.generation == generation && lease.available != 0) ||
+               atomic_credit_pool_.load(std::memory_order_acquire) != 0;
     }
-    bool atomic_try_admit(uint32_t owner_io, uint64_t& admission_token,
+    bool atomic_try_admit(uint32_t owner_io, uint64_t& admitted_generation,
                           bool force = false) {
-        admission_token = 0;
+        admitted_generation = 0;
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return false;
-        const auto attempt = atomic_credits_.try_admit();
-        if (attempt != AtomicAdmissionCredits::Attempt::Admitted) {
-            if (attempt == AtomicAdmissionCredits::Attempt::Full)
-                atomic_window_stalls_.fetch_add(1, std::memory_order_relaxed);
-            return false;
+        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        if (generation & 1) return false;
+        const uint32_t window = atomic_window();
+        if (lease.generation != generation) {
+            lease.generation = generation;
+            lease.available = 0; // the reconfiguration reset the global pool without old leases
         }
-        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
-        const bool first = local.active++ == 0;
+        if (window && lease.available == 0) {
+            atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+            if (atomic_credit_generation_.load(std::memory_order_acquire) != generation) {
+                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+                return false;
+            }
+            uint32_t available = atomic_credit_pool_.load(std::memory_order_relaxed);
+            bool borrowed = false;
+            while (available) {
+                const uint32_t take = std::min<uint32_t>(available, kAtomicLeaseBatch);
+                if (atomic_credit_pool_.compare_exchange_weak(
+                        available, available - take, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    lease.available = take;
+                    borrowed = true;
+                    break;
+                }
+            }
+            atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+            if (!borrowed) {
+                atomic_window_stalls_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        if (window) lease.available--;
+        const bool first = lease.active++ == 0;
+        lease.published_active.store(lease.active, std::memory_order_release);
         if (first) atomic_activity_.fetch_add(1, std::memory_order_release);
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire) ||
+            atomic_credit_generation_.load(std::memory_order_acquire) != generation ||
             (!force && !(atomic_mode_state() & kAtomicEnabledBit))) {
-            local.active--;
+            lease.active--;
+            lease.published_active.store(lease.active, std::memory_order_release);
             if (first) atomic_activity_.fetch_sub(1, std::memory_order_release);
-            atomic_credits_.retire();
+            atomic_release_admission_credit(lease, generation);
             return false;
         }
         thread(owner_io).note_atomic_group();
-        // Existing EXEC/scatter state has a receipt word named admission_generation. Keep its
-        // representation (and layouts) while removing generation-dependent credit accounting.
-        admission_token = 1;
+        admitted_generation = generation;
         return true;
     }
     void set_snapshot_atomic_barrier(bool enabled) {
         snapshot_atomic_barrier_.store(enabled, std::memory_order_release);
     }
-    void atomic_retire_group(uint32_t owner_io, uint64_t admission_token) {
-        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
-        if (admission_token != 1 || !local.active) std::abort();
-        local.active--;
-        atomic_credits_.retire();
-        if (!local.active) atomic_activity_.fetch_sub(1, std::memory_order_release);
+    void atomic_retire_group(uint32_t owner_io, uint64_t admitted_generation) {
+        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        if (!lease.active) std::abort();
+        lease.active--;
+        lease.published_active.store(lease.active, std::memory_order_release);
+
+        atomic_release_admission_credit(lease, admitted_generation);
+
+        if (lease.active == 0) {
+            atomic_activity_.fetch_sub(1, std::memory_order_release);
+            // An idle IO must not strand its lease while a hot peer is window-stalled. The config
+            // generation plus credit_ops handshake makes returning this batch race-free.
+            const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+            if (atomic_window() && !(generation & 1) && lease.generation == generation &&
+                lease.available) {
+                const uint32_t returned = lease.available;
+                atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+                if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
+                    atomic_credit_pool_.fetch_add(returned, std::memory_order_release);
+                    lease.available = 0;
+                }
+                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+            }
+        }
     }
     // GROUP COMMIT IS TWO STEPS AND A READER MUST NEVER SEE THE FIRST WITHOUT THE SECOND.
     // A cross-shard group installs its versions on every owner while the shared epoch word still
@@ -2578,10 +763,9 @@ public:
     // committer that had not would still be holding the count up. Readers load one word exactly
     // as before -- the cost is on the commit side, and it is two RMWs on a line commits already
     // own.
-    uint64_t atomic_commit_reserve(uint64_t tickets = 1) {
-        if (!tickets) std::abort();
+    uint64_t atomic_commit_reserve() {
         atomic_commit_inflight_.fetch_add(1, std::memory_order_seq_cst);
-        return commit_seq_.fetch_add(tickets, std::memory_order_seq_cst) + 1;
+        return commit_seq_.fetch_add(1, std::memory_order_seq_cst) + 1;
     }
     void atomic_commit_publish() {
         // Loaded BEFORE the decrement on purpose: it is the value whose publication the count
@@ -2599,31 +783,21 @@ public:
                !atomic_commit_safe_.compare_exchange_weak(
                    safe, drawn, std::memory_order_release, std::memory_order_relaxed)) {}
     }
-    // Reserve a consecutive run under ONE commit bracket, then let the caller release-store every
-    // decision word in its completion order before the safe watermark moves. The stall before the
-    // first store is the atomic-ON use of DEBUG's shared hop delay: it widens the closed window on
-    // demand, is zero in production, and the load is on an already-cold group/batch path. For a
-    // one-ticket batch this is exactly the historical reserve/delay/store/publish sequence, while a
-    // larger batch widens one common closed window.
-    template <typename StoreTickets>
-    uint64_t atomic_commit_batch(uint64_t tickets, StoreTickets&& store_tickets) {
-        const uint64_t first = atomic_commit_reserve(tickets);
-        const uint32_t stall = debug_hop_delay_.load(std::memory_order_relaxed);
-        if (__builtin_expect(stall != 0, false)) debug_stall_us(stall);
-        store_tickets(first);
-        atomic_commit_publish();
-        return first;
-    }
-    // The whole two-step for a group whose epoch word is `epoch`. `publish_members` lets a
-    // composite group install the SAME ticket into additional decision words before the safe
-    // watermark moves. Readers therefore still see either all of the ticket or none of it.
+    // The whole two-step for a group whose epoch word is `epoch`. The stall between the two is a
+    // TEST HOOK (DEBUG ATOMIC-COMMIT-DELAY) that widens the closed window on demand; it is zero
+    // in production and the load is on an already-cold once-per-group path. `publish_members`
+    // lets a composite group install the SAME ticket into additional decision words before the
+    // safe watermark moves. Readers therefore still see either all of the ticket or none of it.
     template <typename PublishMembers>
     uint64_t atomic_commit_group(std::atomic<uint64_t>& epoch,
                                  PublishMembers&& publish_members) {
-        return atomic_commit_batch(1, [&](uint64_t ticket) {
-            epoch.store(ticket, std::memory_order_release);
-            publish_members(ticket);
-        });
+        const uint64_t ticket = atomic_commit_reserve();
+        const uint32_t stall = debug_atomic_commit_delay_.load(std::memory_order_relaxed);
+        if (__builtin_expect(stall != 0, false)) debug_stall_us(stall);
+        epoch.store(ticket, std::memory_order_release);
+        publish_members(ticket);
+        atomic_commit_publish();
+        return ticket;
     }
     uint64_t atomic_commit_group(std::atomic<uint64_t>& epoch) {
         return atomic_commit_group(epoch, [](uint64_t) {});
@@ -2641,16 +815,16 @@ public:
         return atomic_commit_safe_.load(std::memory_order_seq_cst);
     }
     uint64_t script_crossshard_max_bytes() const {
-        return script_stage_bytes_;
+        return static_cast<uint64_t>(cfg_.script_crossshard_max_bytes);
     }
     uint64_t script_crossshard_workbench_bytes() const {
-        return 2 * script_stage_bytes_;
+        return static_cast<uint64_t>(cfg_.script_crossshard_workbench_bytes);
     }
     uint32_t script_crossshard_conflict_retries() const {
-        return 8;
+        return static_cast<uint32_t>(cfg_.script_crossshard_conflict_retries);
     }
     uint32_t script_crossshard_cut_slots() const {
-        return 4;
+        return static_cast<uint32_t>(cfg_.script_crossshard_cut_slots);
     }
     void note_script_stage_owner(uint64_t bytes) {
         script_stage_owner_tasks_.fetch_add(1, std::memory_order_relaxed);
@@ -2783,7 +957,13 @@ public:
         for (uint32_t io : placement_.ifid_threads()) groups += thread(io).atomic_groups();
         return groups;
     }
-    uint64_t atomic_inflight() const { return atomic_credits_.active(); }
+    uint64_t atomic_inflight() const {
+        uint64_t inflight = 0;
+        for (uint32_t io : placement_.ifid_threads())
+            inflight += thread(io).atomic_admission_lease().published_active.load(
+                std::memory_order_acquire);
+        return inflight;
+    }
     // GROUPS WHOSE RECORDS ARE ONLY PARTLY INSTALLED -- the quantity a snapshot cut must wait on.
     // It is NOT atomic_inflight(). A group leaves atomic_inflight() only when its REPLY retires on
     // the IO thread that admitted it, and that retire runs in the very loop a blocking SAVE is
@@ -2795,31 +975,17 @@ public:
     // either at the owner-side completion or at the synchronous pre-dispatch teardown -- never on a
     // thread a snapshot can be occupying.
     uint64_t atomic_apply_inflight() const {
-        uint64_t closed = 0;
-        uint64_t opened = 0;
-        // CLOSES FIRST, in a distinct whole pass.  If this scan observes a close, that close
-        // acquired the group's published open flag, so the later load of its opening counter
-        // cannot miss the matching open.  A close racing after this first pass only makes the
-        // answer conservatively high.
-        for (uint32_t tid = 0; tid < nthreads(); tid++)
-            closed += atomic_apply_slots_[tid].closed.load(std::memory_order_acquire);
-        for (uint32_t tid = 0; tid < nthreads(); tid++)
-            opened += atomic_apply_slots_[tid].opened.load(std::memory_order_acquire);
-        if (closed > opened) std::abort();
-        return opened - closed;
+        return atomic_apply_inflight_.load(std::memory_order_acquire);
     }
-    void atomic_apply_open(uint32_t tid, std::atomic<bool>& flag) {
-        if (tid >= nthreads()) std::abort();
-        // Publish the counter before making the close claim available to another thread.
-        atomic_apply_slots_[tid].opened.fetch_add(1, std::memory_order_release);
+    void atomic_apply_open(std::atomic<bool>& flag) {
         flag.store(true, std::memory_order_release);
+        atomic_apply_inflight_.fetch_add(1, std::memory_order_acq_rel);
     }
     // Idempotent by construction: whichever of the two ends reaches the group first closes it.
-    void atomic_apply_close(uint32_t tid, std::atomic<bool>& flag) {
-        if (tid >= nthreads()) std::abort();
+    void atomic_apply_close(std::atomic<bool>& flag) {
         if (__builtin_expect(!flag.load(std::memory_order_acquire), true)) return;
         if (flag.exchange(false, std::memory_order_acq_rel))
-            atomic_apply_slots_[tid].closed.fetch_add(1, std::memory_order_release);
+            atomic_apply_inflight_.fetch_sub(1, std::memory_order_acq_rel);
     }
     uint64_t atomic_window_stalls() const {
         return atomic_window_stalls_.load(std::memory_order_relaxed);
@@ -2829,50 +995,19 @@ public:
     // is xshard_prepare()'s already-cold direct-RENAME arm, so the disabled cost is nothing on any
     // other command. It widens -- deterministically -- the window in which a younger whole-owner
     // walker could overtake an older same-connection group on the destination shard.
-    // TEST HOOK: effective local-read LANE CAPACITY for admission. 0 means
-    // derive, which is kInboxSlots and is what production always runs. A non-zero value only makes
-    // the armed parser stop admitting sooner; the physical ring keeps its kInboxSlots entries and
-    // its masking, so this can never overrun anything. It exists because lane oversubscription is
-    // otherwise a RATE RACE the gate cannot win -- a test client cannot push 1024 frames into one
-    // fused thread faster than that thread drains them, so the anti-vacuity row of the lane battery
-    // could only fire on a saturated rig. With a cap, a single connection pipelining more than the
-    // cap in ONE parse pass fills the lane inside that pass, before any drain can run, which makes
-    // the row deterministic at gate scale. Read once per rotation by each fused thread, never per
-    // op. Reachable only through the already-gated DEBUG command.
-    uint32_t debug_read_local_lane_cap() const {
-        return debug_read_local_lane_cap_.load(std::memory_order_relaxed);
-    }
-    void set_debug_read_local_lane_cap(uint32_t cap) {
-        debug_read_local_lane_cap_.store(cap, std::memory_order_relaxed);
-    }
     uint32_t debug_atomic_direct_defer() const {
         return debug_atomic_direct_defer_.load(std::memory_order_relaxed);
     }
     void set_debug_atomic_direct_defer(uint32_t passes) {
         debug_atomic_direct_defer_.store(passes, std::memory_order_relaxed);
     }
-    // TEST HOOK shared by DEBUG ATOMIC-COMMIT-DELAY and ATOMIC-OFF-HOP-DELAY. Atomic ON stalls a
-    // commit batch between its ticket reservation and the decision stores (read by
-    // atomic_commit_batch(), a cold group/batch path); atomic OFF parks non-lead owners at the
-    // first cross-owner mutation wave. Both aliases write this one word, so last writer wins and
-    // zero disarms both. It turns the reserve/publish hole into a window wide enough for a reader
-    // to straddle, which is how the torn MGET is reproduced on demand instead of once per 1.1M
-    // batches. Reads occur only on the cold group/scatter paths, never GET/SET.
-    uint32_t debug_hop_delay() const {
-        return debug_hop_delay_.load(std::memory_order_relaxed);
-    }
-    void set_debug_hop_delay(uint32_t microseconds) {
-        debug_hop_delay_.store(microseconds, std::memory_order_relaxed);
-    }
-    // DEBUG ATOMIC-COMMIT-HOLD: retain the existing owner-private commit queue before drawing
-    // tickets, without blocking the executor. Admission/reconfiguration tests can then run
-    // CONFIG while groups are live. The ticket-publication delay above serves a different test:
-    // it deliberately stalls INSIDE the reserve/publish interval to exercise safe read cuts.
-    bool debug_atomic_commit_hold() const {
-        return debug_atomic_commit_hold_.load(std::memory_order_relaxed);
-    }
-    void set_debug_atomic_commit_hold(bool held) {
-        debug_atomic_commit_hold_.store(held, std::memory_order_relaxed);
+    // TEST HOOK (DEBUG ATOMIC-COMMIT-DELAY). Microseconds a group commit is held between drawing
+    // its ticket and storing that ticket into the shared epoch word. Zero in production; read only
+    // by atomic_commit_group(), a once-per-group cold path. It turns the reserve/publish hole into
+    // a window wide enough for a reader to straddle, which is how the torn MGET is reproduced on
+    // demand instead of once per 1.1M batches.
+    void set_debug_atomic_commit_delay(uint32_t microseconds) {
+        debug_atomic_commit_delay_.store(microseconds, std::memory_order_relaxed);
     }
     // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER). Microseconds every fragment of a cross-shard READ
     // except the one on its lead shard is PARKED -- re-queued, not spun -- after the command is
@@ -2882,29 +1017,11 @@ public:
     // the executor stays free, so the transaction the test is racing can actually run and commit
     // inside the window. Zero in production; read once per cross-shard read at prepare time on the
     // already-cold scatter path, never on GET/SET.
-    // The fused read-local lane serves a clean MGET without the scatter engine, so it has its own
-    // half of this hook (ExLoopT::debug_fanout_stall_local). That path never loads this atomic --
-    // it shares a line with the commit sequence -- so arm/disarm publishes through the live-config
-    // version and every fused executor latches the value on its next pass, like a CONFIG SET.
     void set_debug_atomic_fanout_defer(uint32_t microseconds) {
-        const uint64_t version = begin_live_config_update();
         debug_atomic_fanout_defer_.store(microseconds, std::memory_order_relaxed);
-        end_live_config_update(version);
     }
     uint32_t debug_atomic_fanout_defer() const {
         return debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
-    }
-    // TEST HOOK (DEBUG ATOMIC-CONDITIONAL-DEFER). Microseconds the destination-validation task of
-    // an atomic-OFF RENAMENX/COPY is PARKED during phase one. Two contenders can therefore both
-    // observe the empty destination before either phase-two install runs. Parking keeps the owner
-    // free to execute the competing task; zero is the production default.
-    void set_debug_atomic_conditional_defer(uint32_t microseconds) {
-        const uint64_t deadline = microseconds
-            ? now_ns() + static_cast<uint64_t>(microseconds) * 1000ull : 0;
-        debug_atomic_conditional_deadline_.store(deadline, std::memory_order_relaxed);
-    }
-    uint64_t debug_atomic_conditional_deadline() const {
-        return debug_atomic_conditional_deadline_.load(std::memory_order_relaxed);
     }
     // TEST HOOK (DEBUG SCRIPT-STAGE-DEFER). Microseconds every cross-owner script GATHER task
     // except the one on the coordinator's own shard is PARKED -- re-queued, not spun -- after the
@@ -2937,11 +1054,9 @@ public:
     // is already set. Nothing on GET/SET touches it.
     //
     // Why a hook is needed at all: the barrier's six owners cannot overlap on any reachable
-    // sequence: a blocking op requires an empty ROB, then sets the barrier before any younger
-    // frame can be parsed; a resumed scatter inherits that same slot and barrier. The state the
-    // owner-scoped release exists to survive -- a release that must NOT drop the barrier -- has
-    // to be injected. It is held past ROB quiescence on purpose; barrier_release_quiesced()
-    // exempts this one bit for that reason.
+    // sequence (NOTES-BARRIER.md section 2), so the state the owner-scoped release exists to
+    // survive -- a release that must NOT drop the barrier -- has to be injected. It is held past
+    // ROB quiescence on purpose; barrier_release_quiesced() exempts this one bit for that reason.
     //
     // A LATCH, NOT A DEADLINE, and that is not a style choice. A barred connection's io thread has
     // nothing left to do and parks on submit_and_wait(1) -- unbounded under io_uring. A hold that
@@ -2952,31 +1067,19 @@ public:
     void set_debug_barrier_hold(uint32_t armed) {
         debug_barrier_hold_.store(armed, std::memory_order_relaxed);
     }
+    uint32_t debug_barrier_hold() const {
+        return debug_barrier_hold_.load(std::memory_order_relaxed);
+    }
     bool debug_barrier_hold_armed() const {
         return debug_barrier_hold_.load(std::memory_order_relaxed) != 0;
     }
-    // TEST HOOK (DEBUG BLOCKING-TIMEOUT-REAP). One blocking retirement consumes the arm and makes
-    // its owner's client cron due in that same IO pass. This makes the otherwise probabilistic
-    // ordering between reply retirement and the 100 ms timeout beat deterministic.
-    void set_debug_blocking_timeout_reap(bool armed) {
-        debug_blocking_timeout_reap_.store(armed, std::memory_order_release);
-    }
-    bool debug_blocking_timeout_reap_take() {
-        if (!debug_blocking_timeout_reap_.load(std::memory_order_acquire) ||
-            !debug_blocking_timeout_reap_.exchange(false, std::memory_order_acq_rel))
-            return false;
-        debug_blocking_timeout_reaps_.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    uint64_t debug_blocking_timeout_reaps() const {
-        return debug_blocking_timeout_reaps_.load(std::memory_order_relaxed);
-    }
     // An overlap: some owner took the parse barrier while another owner already held it. With
-    // DEBUG BARRIER-HOLD off this must read ZERO -- if it ever moves on production traffic the
-    // latent case just went live and the owner-scoped release in blocking_retire() became
-    // load-bearing rather than defensive. With the latch ON it advances once per blocking dispatch,
-    // which is the counter's own positive control: a "must be zero" reading proves nothing until
-    // something has been shown able to make it non-zero.
+    // DEBUG BARRIER-HOLD off this must read ZERO -- it is the live form of the reachability verdict
+    // in NOTES-BARRIER.md, and if it ever moves on production traffic the latent case just went
+    // live and the owner-scoped release in blocking_retire() became load-bearing rather than
+    // defensive. With the latch ON it advances once per blocking dispatch, which is the counter's
+    // own positive control: a "must be zero" reading proves nothing until something has been shown
+    // able to make it non-zero.
     void note_barrier_overlap() {
         barrier_owner_overlaps_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3039,18 +1142,45 @@ public:
         const uint64_t deadline = now_ns() + static_cast<uint64_t>(microseconds) * 1000ull;
         while (now_ns() < deadline) __builtin_ia32_pause();
     }
-    uint32_t atomic_credit_pool() const { return atomic_credits_.pool(); }
-    uint32_t atomic_credit_debt() const { return atomic_credits_.debt(); }
-
-    // A mailbox belongs to a physical worker, across fused/split roles and shard migrations.
-    // Callers copy the result before their next snapshot call; only the consumer-owned slot is read.
-    LiveConfigSnapshot live_config_snapshot(uint32_t reader_tid) const {
-        return live_config_mailboxes_[reader_tid].read(live_config_version_).live;
+    uint32_t atomic_credit_pool() const {
+        return atomic_credit_pool_.load(std::memory_order_acquire);
     }
-    bool live_config_snapshot_if_changed(uint32_t reader_tid, uint64_t known_version,
+    uint32_t atomic_credit_debt() const {
+        return atomic_credit_debt_.load(std::memory_order_acquire);
+    }
+
+    LiveConfigSnapshot live_config_snapshot() const {
+        // CONFIG writers make version odd around a change. Executors take this coherent snapshot
+        // once per pass; no atomic reaches an individual operation or store lookup.
+        for (;;) {
+            LiveConfigSnapshot snapshot;
+            snapshot.version = live_config_version_.load(std::memory_order_acquire);
+            if (snapshot.version & 1) continue;
+            snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
+            snapshot.policy = static_cast<MaxmemoryPolicy>(
+                live_maxmemory_policy_.load(std::memory_order_relaxed));
+            snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
+            snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
+            snapshot.tracking_armed =
+                (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
+            snapshot.slowlog_log_slower_than =
+                live_slowlog_us_.load(std::memory_order_relaxed);
+            snapshot.latency_monitor_threshold =
+                live_latency_ms_.load(std::memory_order_relaxed);
+            snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
+            snapshot.proto_max_bulk_len =
+                live_proto_max_bulk_len_.load(std::memory_order_relaxed);
+            if (live_config_version_.load(std::memory_order_acquire) == snapshot.version)
+                return snapshot;
+        }
+    }
+    bool live_config_snapshot_if_changed(uint64_t known_version,
                                          LiveConfigSnapshot& snapshot) const {
-        if (live_config_version_.load(std::memory_order_acquire) == known_version) return false;
-        snapshot = live_config_snapshot(reader_tid);
+        // The unchanged per-pass case is one acquire load. Field loads and the retry loop exist
+        // only after CONFIG has published a different stable version.
+        const uint64_t version = live_config_version_.load(std::memory_order_acquire);
+        if (version == known_version) return false;
+        snapshot = live_config_snapshot();
         return snapshot.version != known_version;
     }
     void set_maxmemory_config(uint64_t memory, MaxmemoryPolicy policy, uint32_t samples,
@@ -3130,18 +1260,12 @@ public:
     void pubsub_delivery_batch_posted() {
         pubsub_delivery_batches_.fetch_add(1, std::memory_order_relaxed);
     }
-    void pubsub_forwarded_stale_added(uint64_t n = 1) {
-        pubsub_forwarded_stale_.fetch_add(n, std::memory_order_relaxed);
-    }
     uint64_t pubsub_blobs() const { return pubsub_blobs_.load(std::memory_order_relaxed); }
     uint64_t pubsub_deliveries() const {
         return pubsub_deliveries_.load(std::memory_order_relaxed);
     }
     uint64_t pubsub_delivery_batches() const {
         return pubsub_delivery_batches_.load(std::memory_order_relaxed);
-    }
-    uint64_t pubsub_forwarded_stale() const {
-        return pubsub_forwarded_stale_.load(std::memory_order_relaxed);
     }
     bool pubsub_notification_reserve(uint64_t count, uint64_t limit) {
         uint64_t current = pubsub_inflight_.load(std::memory_order_relaxed);
@@ -3204,6 +1328,8 @@ public:
     }
 
 private:
+    static constexpr uint32_t kAtomicLeaseBatch = 8;
+
     bool adjust_open_files_limit() {
         rlimit limit{};
         if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
@@ -3279,34 +1405,73 @@ private:
                                  normal || pubsub, std::memory_order_release);
     }
 
-    // Only boot or the serialized CONFIG writer reads these mutable fields as a group. Readers
-    // consume immutable, committed mailbox copies and never collect/revalidate these atomics.
-    LiveConfigValues capture_live_config(uint64_t version) const {
-        LiveConfigValues values;
-        auto& snapshot = values.live;
-        snapshot.version = version;
-        snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
-        snapshot.policy = static_cast<MaxmemoryPolicy>(
-            live_maxmemory_policy_.load(std::memory_order_relaxed));
-        snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
-        snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
-        snapshot.tracking_armed =
-            (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
-        snapshot.slowlog_log_slower_than = live_slowlog_us_.load(std::memory_order_relaxed);
-        snapshot.latency_monitor_threshold = live_latency_ms_.load(std::memory_order_relaxed);
-        snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
-        snapshot.proto_max_bulk_len = live_proto_max_bulk_len_.load(std::memory_order_relaxed);
-        snapshot.debug_fanout_defer_us = debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
-        auto& clients = values.clients;
-        clients.version = version;
-        clients.timeout = live_timeout_.load(std::memory_order_relaxed);
-        clients.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
-        clients.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
-        clients.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
-        clients.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
-        clients.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
-        clients.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
-        return values;
+    void atomic_release_admission_credit(AtomicAdmissionLease& lease,
+                                         uint64_t admitted_generation) {
+        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        while (generation & 1) {
+            __builtin_ia32_pause();
+            generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        }
+        if (!atomic_window()) return;
+        if (admitted_generation == generation && lease.generation == generation) {
+            lease.available++;
+            return;
+        }
+        if (admitted_generation == generation) return;
+        uint32_t carry = lease.reconfig_carry.load(std::memory_order_relaxed);
+        while (carry && !lease.reconfig_carry.compare_exchange_weak(
+                              carry, carry - 1, std::memory_order_acq_rel,
+                              std::memory_order_relaxed)) {}
+        if (carry) atomic_return_reconfigured_credit(generation);
+    }
+
+    void atomic_return_reconfigured_credit(uint64_t generation) {
+        atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+        if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
+            uint32_t debt = atomic_credit_debt_.load(std::memory_order_relaxed);
+            while (debt && !atomic_credit_debt_.compare_exchange_weak(
+                               debt, debt - 1, std::memory_order_acq_rel,
+                               std::memory_order_relaxed)) {}
+            if (!debt) atomic_credit_pool_.fetch_add(1, std::memory_order_release);
+        }
+        atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+    }
+
+    void atomic_reconfigure_credits(uint32_t window) {
+        // Odd generations close admission while CONFIG takes an exact active-group snapshot.
+        // Borrow/return operations announce themselves so the rebuilt pool cannot race a credit
+        // mutation. IO-local available batches are intentionally discarded by the generation
+        // change; only published active groups survive into the new accounting epoch.
+        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        for (;;) {
+            if (generation & 1) {
+                generation = atomic_credit_generation_.load(std::memory_order_acquire);
+                continue;
+            }
+            if (atomic_credit_generation_.compare_exchange_weak(
+                    generation, generation + 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                break;
+        }
+        while (atomic_credit_ops_.load(std::memory_order_acquire) != 0)
+            __builtin_ia32_pause();
+
+        uint64_t active = 0;
+        for (uint32_t io : placement_.ifid_threads()) {
+            AtomicAdmissionLease& lease = thread(io).atomic_admission_lease();
+            const uint32_t live = lease.published_active.load(std::memory_order_acquire);
+            lease.reconfig_carry.store(live, std::memory_order_release);
+            active += live;
+        }
+        live_atomic_window_.store(window, std::memory_order_release);
+        const uint64_t bounded = std::min<uint64_t>(active, UINT32_MAX);
+        atomic_credit_pool_.store(
+            window && bounded < window ? window - static_cast<uint32_t>(bounded) : 0,
+            std::memory_order_release);
+        atomic_credit_debt_.store(
+            window && bounded > window ? static_cast<uint32_t>(bounded - window) : 0,
+            std::memory_order_release);
+        atomic_credit_generation_.store(generation + 2, std::memory_order_release);
     }
 
     uint64_t begin_live_config_update() {
@@ -3322,11 +1487,6 @@ private:
         }
     }
     void end_live_config_update(uint64_t write_version) {
-        const LiveConfigValues next = capture_live_config(write_version + 1);
-        if (live_config_mailboxes_)
-            for (uint32_t tid = 0; tid <= nthreads(); tid++)
-                live_config_mailboxes_[tid].publish(live_config_committed_, next);
-        live_config_committed_ = next;
         live_config_version_.store(write_version + 1, std::memory_order_release);
     }
 
@@ -3339,109 +1499,9 @@ private:
     AofManager aof_;
     // Declared after AOF so its destructor runs first and can detach an active rewrite callback.
     SnapshotManager snapshot_;
-    FlipController flipctl_;
 
-    // Router is authoritative at bucket granularity. This commit-only derivative exists solely so
-    // shard-granularity dispatch remains one flat-array load.
     std::atomic<uint32_t> shard_owner_[256] = {};
-
-    // FLIP is a cold, manually driven control-plane transaction.  The stage store is the global
-    // dispatch barrier; acknowledgements are tagged with the transaction epoch so a late wakeup
-    // from an earlier attempt cannot satisfy a later stage.
-    std::mutex shape_transition_mu_;
-    std::atomic<FlipStage> flip_stage_{FlipStage::Idle};
-    std::atomic<uint64_t> flip_epoch_{0};
-    std::atomic<uint64_t> flip_deadline_ns_{0};
-    std::atomic<uint32_t> flip_target_io_{0};
-    std::atomic<uint32_t> flip_target_ex_{0};
-    std::atomic<uint64_t> flip_ack_[kMaxThreads] = {};
-    Role flip_convert_[kMaxThreads] = {};
-    uint32_t flip_surviving_io_[kMaxThreads] = {};
-    uint32_t flip_surviving_io_count_ = 0;
-    std::vector<Client*> flip_client_plan_[kMaxThreads];
-    std::vector<uint32_t> flip_client_destinations_[kMaxThreads];
-    uint32_t flip_client_quota_[kMaxThreads] = {};
-    uint32_t flip_bucket_quota_[kMaxThreads] = {};
-    uint32_t flip_shard_destination_[256] = {};
-    std::atomic<uint32_t> flip_incoming_clients_[kMaxThreads] = {};
-    std::atomic<uint32_t> flip_source_clients_[kMaxThreads] = {};
-    uint32_t flip_planned_client_transfers_ = 0;
-    uint32_t flip_planned_shard_transfers_ = 0;
-    uint32_t flip_coordinator_ = UINT32_MAX;
-    uint32_t unix_owner_tid_ = UINT32_MAX;
-    std::atomic<bool> flip_failed_{false};
-    mutable std::mutex flip_error_mu_;
-    std::string flip_error_;
-    std::atomic<uint64_t> flip_completed_{0};
-    std::atomic<uint64_t> flip_refused_{0};
-    std::atomic<uint64_t> flip_clients_transferred_{0};
-    std::atomic<uint64_t> flip_active_transfers_{0};
-    std::atomic<uint64_t> flip_last_transfers_{0};
-    std::atomic<uint64_t> flip_bucket_weight_spread_before_{0}; // fixed point, /1024
-    std::atomic<uint64_t> flip_bucket_weight_spread_after_{0};
-    std::atomic<uint64_t> flip_client_weight_spread_before_{0};
-    std::atomic<uint64_t> flip_client_weight_spread_after_{0};
-    std::atomic<uint64_t> flip_bucket_bytes_spread_before_{0};
-    std::atomic<uint64_t> flip_bucket_bytes_spread_after_{0};
-    std::atomic<uint64_t> flip_conservation_checks_{0};
-    std::atomic<uint64_t> flip_conservation_violations_{0};
-
-    // The continuous controller has one cron writer and publishes only these two cold stages.
-    // EX movement reuses FLIP's quiescence fence; client movement pauses one selected connection
-    // until the existing asynchronous transfer primitive takes ownership.
-    std::atomic<LbStage> lb_stage_{LbStage::Idle};
-    std::atomic<uint64_t> lb_epoch_{0};
-    std::atomic<uint64_t> lb_deadline_ns_{0};
-    std::atomic<uint64_t> lb_ack_[kMaxThreads] = {};
-    uint32_t lb_coordinator_ = UINT32_MAX;
-    std::vector<LbShardMove> lb_shard_moves_;
-    LbClientMove lb_client_move_;
-    std::atomic<uint64_t> lb_client_inflight_id_{0};
-    uint32_t lb_bucket_hot_streak_ = 0;
-    uint32_t lb_client_hot_streak_ = 0;
-    bool lb_prefer_client_ = false;
-    std::atomic<uint64_t> lb_ticks_{0};
-    std::atomic<uint64_t> lb_bucket_moves_{0};
-    std::atomic<uint64_t> lb_client_moves_{0};
-    std::atomic<uint64_t> lb_bucket_cross_domain_moves_{0};
-    std::atomic<uint64_t> lb_client_cross_domain_moves_{0};
-    std::atomic<uint64_t> lb_no_candidate_{0};
-    std::atomic<uint64_t> lb_hysteresis_refused_{0};
-    std::atomic<uint64_t> lb_cooldown_refused_{0};
-    std::atomic<uint64_t> lb_transition_refused_{0};
-    std::atomic<uint64_t> lb_capacity_refused_{0};
-    std::atomic<uint64_t> lb_client_refused_{0};
-    std::atomic<uint64_t> lb_hot_bucket_refused_{0};
-    std::atomic<uint64_t> lb_bucket_weight_spread_current_{0};
-    std::atomic<uint64_t> lb_bucket_weight_spread_before_{0};
-    std::atomic<uint64_t> lb_bucket_weight_spread_after_{0};
-    std::atomic<uint64_t> lb_client_weight_spread_current_{0};
-    std::atomic<uint64_t> lb_client_weight_spread_before_{0};
-    std::atomic<uint64_t> lb_client_weight_spread_after_{0};
-    std::atomic<uint64_t> lb_bucket_bytes_spread_current_{0};
-    std::atomic<uint64_t> lb_bucket_bytes_spread_before_{0};
-    std::atomic<uint64_t> lb_bucket_bytes_spread_after_{0};
-
-    // Weighted-placement state is absent when both key-lb and client-lb are 0. Bucket arrays
-    // are indexed by the immutable routing id; client state is keyed by the immutable connection id. The mutex is a
-    // once-per-controller-beat/read-side lock and is never acquired on an operation path.
-    std::unique_ptr<LbAutotune> lb_policy_;
-    mutable std::mutex lb_signal_mu_;
-    std::vector<uint32_t> lb_bucket_last_samples_;
-    std::vector<double> lb_bucket_weight_;
-    std::vector<uint64_t> lb_bucket_last_move_ms_;
-    std::vector<uint64_t> lb_thread_last_busy_;
-    std::vector<uint64_t> lb_thread_last_idle_;
-    std::vector<double> lb_thread_occupancy_;
-    bool lb_bucket_primed_ = false;
-    bool lb_occupancy_primed_ = false;
-    std::unordered_map<uint64_t, LbClientSignal> lb_clients_;
-    std::atomic<uint64_t> lb_client_owner_weight_[kMaxThreads] = {};
-    // Boot-derived cold state, separate from the user configuration.
-    bool smt_mode_ = false;
-    uint64_t script_stage_bytes_ = 4ull * 1024 * 1024;
-    std::atomic<uint32_t> loading_{0};
-
+    uint8_t executor_slots_[kMaxThreads] = {};
     std::atomic<uint64_t> next_client_id_{1};
     std::atomic<bool>     shutting_down_{false};
     std::atomic<uint64_t> live_clients_{0};
@@ -3487,8 +1547,7 @@ private:
     std::atomic<uint64_t> climon_tracking_keys_{0};
     std::atomic<uint64_t> climon_tracking_items_{0};
     std::atomic<uint64_t> climon_tracking_prefixes_{0};
-    // Preserve the commit-watermark block's placement after folding window into atomic_credits_.
-    uint32_t atomic_window_layout_padding_ = 0;
+    std::atomic<uint32_t> live_atomic_window_{256};
     // The drawn sequence and the visible read watermark share a line on purpose: readers used to
     // load commit_seq_ itself, so keeping the watermark beside it leaves reader traffic exactly
     // where it was, and a committer touches all three in one go.
@@ -3496,18 +1555,14 @@ private:
     std::atomic<uint64_t> atomic_commit_inflight_{0};
     std::atomic<uint64_t> atomic_commit_safe_{0};
     std::atomic<bool> snapshot_atomic_barrier_{false};
-    AtomicApplySlot atomic_apply_slots_[kMaxThreads] = {};
+    std::atomic<uint64_t> atomic_apply_inflight_{0};
     std::atomic<uint64_t> atomic_window_stalls_{0};
     std::atomic<uint32_t> debug_atomic_direct_defer_{0};
-    std::atomic<uint32_t> debug_read_local_lane_cap_{0};   // 0 = derive (kInboxSlots)
-    std::atomic<uint32_t> debug_hop_delay_{0};
-    std::atomic<bool> debug_atomic_commit_hold_{false};
+    std::atomic<uint32_t> debug_atomic_commit_delay_{0};
     std::atomic<uint32_t> debug_atomic_read_delay_{0};
     std::atomic<uint32_t> debug_atomic_fanout_defer_{0};
     std::atomic<uint32_t> debug_script_stage_defer_{0};
     std::atomic<uint32_t> debug_barrier_hold_{0};
-    std::atomic<bool> debug_blocking_timeout_reap_{false};
-    std::atomic<uint64_t> debug_blocking_timeout_reaps_{0};
     std::atomic<uint64_t> barrier_owner_overlaps_{0};
     std::atomic<uint64_t> barrier_releases_held_{0};
     std::atomic<uint64_t> atomic_commit_windows_{0};
@@ -3515,11 +1570,11 @@ private:
     std::atomic<uint64_t> atomic_read_cuts_held_{0};
     std::atomic<uint64_t> atomic_fanout_cuts_{0};
     std::atomic<uint64_t> atomic_exec_read_cuts_{0};
-    AtomicAdmissionCredits atomic_credits_;
-    // Preserve every following cache-line offset formerly occupied by pool/debt/credit_ops.
-    uint32_t atomic_credit_layout_padding_[3] = {};
-    // Enabled is the high bit; every IO with admitted groups and every live record contributes
-    // one low-bit unit. Exact group counts belong to atomic_credits_.
+    std::atomic<uint64_t> atomic_credit_generation_{2};
+    std::atomic<uint32_t> atomic_credit_pool_{0};
+    std::atomic<uint32_t> atomic_credit_debt_{0};
+    std::atomic<uint32_t> atomic_credit_ops_{0};
+    // Enabled is the high bit; every admitted group and live record contributes one low-bit unit.
     // Dispatch therefore decides OFF/ON/draining with one acquire load and one predictable test.
     std::atomic<uint64_t> atomic_activity_{0};
     std::atomic<uint64_t> atomic_read_floors_[kMaxThreads] = {};
@@ -3550,7 +1605,6 @@ private:
     std::atomic<uint64_t> pubsub_blobs_{0};
     std::atomic<uint64_t> pubsub_deliveries_{0};
     std::atomic<uint64_t> pubsub_delivery_batches_{0};
-    std::atomic<uint64_t> pubsub_forwarded_stale_{0};
     std::atomic<uint64_t> pubsub_pending_{0};
     std::atomic<uint64_t> pubsub_home_entries_{0};
     std::atomic<uint64_t> pubsub_active_channels_{0};
@@ -3558,8 +1612,6 @@ private:
     std::atomic<uint64_t> pubsub_pattern_subscriptions_{0};
     std::atomic<uint64_t> pubsub_shard_channels_{0};
     std::atomic<uint64_t> pubsub_shard_subscriptions_{0};
-    std::atomic<uint64_t> tracking_forwarded_stale_{0};
-    std::atomic<uint64_t> monitor_forwarded_stale_{0};
     // Security and DEBUG state is cold and appended after every pre-existing hot atomic so this
     // feature cannot reshuffle cache-line sharing in dispatch, atomic admission, or pub/sub.
     std::atomic<uint8_t> security_flags_{0};
@@ -3576,7 +1628,7 @@ private:
     // Cold observability for proving CLIENT catalog work reached every IO owner.
     std::atomic<uint64_t> client_scatter_requests_{0};
     std::atomic<uint64_t> client_scatter_io_responses_{0};
-    // Slow-log arming, published through the same mailboxes as the eviction/notify knobs and read
+    // Slow-log arming, published through the same seqlock as the eviction/notify knobs and read
     // once per executor pass. Appended at the true tail so no pre-existing offset moves.
     std::atomic<int64_t>  live_slowlog_us_{10000};
     std::atomic<uint32_t> live_latency_ms_{0};
@@ -3587,22 +1639,6 @@ private:
     std::atomic<uint64_t> save_change_baseline_{0};
     std::atomic<uint64_t> scheduled_save_triggers_{0};
     std::atomic<uint64_t> save_cron_checks_{0};
-    // Appended cold state: disabled servers allocate no epoch state and no established offset
-    // moves. Later test-only knobs stay behind this pointer for the same reason.
-    std::unique_ptr<ReadLocalServerState> read_local_state_;
-    std::unique_ptr<ModeScheduleStats[]> mode_schedule_stats_;
-    // Appended at the true tail: this test-only knob must not move any production member.
-    std::atomic<uint64_t> debug_atomic_conditional_deadline_{0};
-    // Registered at executor construction (including dormant FLIP roles), then read
-    // only while all executors are quiesced at an ownership transfer. Keep this state
-    // at the tail so existing members retain their offsets.
-    bool* owner_notify_pending_[kMaxThreads] = {};
-    struct alignas(64) ClientWorkEpoch { std::atomic<uint64_t> epoch{0}; };
-    ClientWorkEpoch client_work_[kMaxThreads];
-    // Fixed storage per physical worker plus one transfer consumer, allocated before workers start.
-    // CONFIG copies into this storage; arbitrarily many updates or a stopped reader cannot grow it.
-    std::unique_ptr<LiveConfigMailbox[]> live_config_mailboxes_;
-    LiveConfigValues live_config_committed_{}; // serialized CONFIG writer only
 };
 
 }  // namespace tomo

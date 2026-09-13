@@ -604,9 +604,7 @@ bool externalize_stream(Shard& shard, Op& op, KvObj*& object) {
     if (!value || !build_external(*value, header, records, shard.stream_limits())) {
         delete value; reply_err(op.sink(), "ERR out of memory"); return false;
     }
-    KvObj* replacement = kvobj_new_stream(object->key(), value,
-                                          shard.store().deadline(op.hash, object),
-                                          object->has_ttl_slot());
+    KvObj* replacement = kvobj_new_stream(object->key(), value, object->expire_at_ms());
     if (!replacement) { delete value; reply_err(op.sink(), "ERR out of memory"); return false; }
     replacement->set_eviction_meta(object->eviction_meta());
     const FlatStore::InsertResult inserted = shard.store_insert<kNotify>(op.hash, replacement);
@@ -1049,7 +1047,7 @@ void range_generic(Shard& shard, Op& op, bool reverse) {
         if (!parse_range_bound(op, op.arg(3), true, start) ||
             !parse_range_bound(op, op.arg(2), false, end)) return;
     }
-    KvObj* object = shard.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* object = shard.store_find<kNotify>(op.hash, op.key());
     if (!object) { reply_array_header(op.sink(), 0); return; }
     if (!obj_type_check(object, Type::Stream, op.sink())) return;
     if (!emit_range_reply(op, object, start, end, count, reverse))
@@ -1225,7 +1223,7 @@ void cmd_xadd(Shard& shard, Op& op) {
 
 template <bool kNotify>
 void cmd_xlen(Shard& shard, Op& op) {
-    KvObj* object = shard.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* object = shard.store_find<kNotify>(op.hash, op.key());
     if (!obj_type_check(object, Type::Stream, op.sink())) return;
     reply_int(op.sink(), object ? static_cast<long long>(stream_live_length(object)) : 0);
 }
@@ -1611,8 +1609,8 @@ StreamReadResult stream_xread_gather(Shard& shard, Slice key, uint64_t hash,
                                      const StreamID& cursor, bool latest, uint64_t count,
                                      std::vector<uint8_t>& payload,
                                      const StreamID* upper_bound) {
-    KvObj* object = shard.notify_carrier() ? shard.store_find_read<true>(hash, key)
-                                           : shard.store_find_read<false>(hash, key);
+    KvObj* object = shard.notify_carrier() ? shard.store_find<true>(hash, key)
+                                           : shard.store().find(hash, key);
     if (!object) { payload.clear(); return StreamReadResult::Missing; }
     if (static_cast<Type>(object->type) != Type::Stream) return StreamReadResult::WrongType;
     StreamID start = cursor;

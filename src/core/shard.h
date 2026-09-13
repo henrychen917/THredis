@@ -2,10 +2,8 @@
 //
 // A shard owns a contiguous range of the 16,384 routing buckets and every key hashing into it, plus
 // its own FlatStore. Exactly one thread touches a given shard at a time, which is the invariant the
-// whole design rests on. The boot-disabled fused read-local lane is the narrow exception: foreign
-// threads perform read-only probes under a per-store table generation and rotation QSBR, while
-// every mutation remains on this single owner. With that lane off, DEL retains the immediate-free
-// path unless the allocation is explicitly borrowed by the wire send path.
+// whole design rests on: no locks, no atomics in the store, no cross-thread refcounts, no QSBR.
+// DEL frees immediately unless the allocation is explicitly borrowed by the wire send path.
 //
 // NO NODE LAYER. The keyspace is one flat set of shards over the whole server; there is no NUMA or
 // L3 partitioning of it. That is a deliberate simplification and it gives up a measured gain — on
@@ -25,9 +23,7 @@
 // home_domain() and store().resident_estimate() exist so it can be priced instead of guessed.
 #pragma once
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -40,7 +36,6 @@ namespace tomo {
 class Client;
 class Op;
 class Server;
-struct ShardLayoutLock;
 
 // 16,384 buckets. Chosen so changing the shard count reassigns bucket RANGES rather than rehashing
 // keys: a key's bucket never changes, only which shard owns that bucket.
@@ -137,11 +132,7 @@ public:
                                  &stats_.atomic_entries,
                                  &stats_.atomic_gauge_underflows);
     }
-    uint32_t active_expire(uint32_t budget) {
-        const uint32_t work = store_.active_expire(budget);
-        if (work) publish_active_expire_reap_lag();
-        return work;
-    }
+    uint32_t active_expire(uint32_t budget) { return store_.active_expire(budget); }
 
     // Refreshed once per executor pass through the existing live-config seqlock.  A null store
     // sink is the complete off state: no notification allocation or callback is reachable.
@@ -192,24 +183,6 @@ public:
     KvObj* store_find(uint64_t hash, Slice key) {
         if constexpr (kNotify) return store_.find_notify(hash, key, &flat_notify_sink_);
         return store_.find(hash, key);
-    }
-    // Redis attaches keyspace hit/miss accounting to lookupKeyRead*, not to commands. Keeping the
-    // distinction at TomoKV's equivalent lookup boundary makes multi-key reads count per key while
-    // write lookups remain invisible even when the command returns the old value.
-    void note_keyspace_read(const KvObj* object) {
-        if (object) stats_.hits++;
-        else stats_.misses++;
-    }
-    template <bool kNotify>
-    KvObj* store_find_read(uint64_t hash, Slice key) {
-        KvObj* object = store_find<kNotify>(hash, key);
-        note_keyspace_read(object);
-        return object;
-    }
-    KvObj* store_find_read_no_touch(uint64_t hash, Slice key) {
-        KvObj* object = store_.find_no_touch(hash, key);
-        note_keyspace_read(object);
-        return object;
     }
     template <bool kNotify>
     FlatStore::InsertResult store_insert(uint64_t hash, KvObj* object) {
@@ -315,65 +288,8 @@ public:
     uint32_t published_expires() const {
         return published_expires_.load(std::memory_order_relaxed);
     }
-    uint32_t published_active_expire_reap_lag_ms_max() const {
-        return published_active_expire_reap_lag_ms_max_.load(std::memory_order_relaxed);
-    }
     uint64_t published_evicted() const {
         return published_evicted_.load(std::memory_order_relaxed);
-    }
-
-    // Weighted placement is boot-latched. Keeping all three arrays on the immutable physical
-    // shard makes the signal follow the BUCKET, not its current executor: changing ownership never
-    // resets or transfers controller history. Only the current shard owner writes these arrays.
-    bool enable_lb_signals() {
-        const uint32_t n = bucket_end_ - bucket_begin_;
-        try {
-            lb_bucket_samples_ = std::make_unique<uint32_t[]>(n);
-            lb_bucket_bytes_ = std::make_unique<uint64_t[]>(n);
-            lb_bucket_bytes_staging_ = std::make_unique<uint64_t[]>(n);
-            return true;
-        } catch (const std::bad_alloc&) {
-            lb_bucket_samples_.reset();
-            lb_bucket_bytes_.reset();
-            lb_bucket_bytes_staging_.reset();
-            return false;
-        }
-    }
-    void note_lb_sample(uint64_t hash, uint32_t rate) {
-        const uint32_t bucket = bucket_of(hash);
-        if (!lb_bucket_samples_ || !owns(bucket)) return;
-        lb_bucket_samples_[bucket - bucket_begin_] += rate;
-    }
-    uint32_t lb_bucket_samples(uint32_t bucket) const {
-        if (!lb_bucket_samples_ || !owns(bucket)) return 0;
-        return __atomic_load_n(&lb_bucket_samples_[bucket - bucket_begin_], __ATOMIC_RELAXED);
-    }
-    uint64_t lb_bucket_bytes(uint32_t bucket) const {
-        if (!lb_bucket_bytes_ || !owns(bucket)) return 0;
-        return __atomic_load_n(&lb_bucket_bytes_[bucket - bucket_begin_], __ATOMIC_RELAXED);
-    }
-
-    // A rolling owner-only census keeps memory fairness separate from request demand without a
-    // random counter write on every SET/DEL. One bounded scan slice runs at a time; a complete
-    // pass publishes the bucket vector atomically entry-by-entry, then starts a fresh census.
-    bool lb_scan_bucket_bytes(uint32_t homes) {
-        if (!lb_bucket_bytes_staging_ || !homes) return false;
-        // expire_on_visit=false: this census runs from the executor loop at its own cadence, not
-        // inside any logical operation. Expiring here deletes keys OUTSIDE every in-flight
-        // operation's pinned cut and tears cross-shard reads (the expwide S1 failure). Counting a
-        // dead-but-unreaped key's bytes is a rounding error; deleting it here is a torn read.
-        lb_bytes_cursor_ = store_.scan(lb_bytes_cursor_, homes, [&](KvObj* object) {
-            const uint64_t hash = FlatStore::hash_key(object->key());
-            const uint32_t bucket = bucket_of(hash);
-            if (owns(bucket)) lb_bucket_bytes_staging_[bucket - bucket_begin_] += kvobj_size(object);
-        }, /*expire_on_visit=*/false);
-        if (lb_bytes_cursor_ != 0) return false;
-        const uint32_t n = bucket_end_ - bucket_begin_;
-        for (uint32_t i = 0; i < n; i++) {
-            __atomic_store_n(&lb_bucket_bytes_[i], lb_bucket_bytes_staging_[i], __ATOMIC_RELAXED);
-            lb_bucket_bytes_staging_[i] = 0;
-        }
-        return true;
     }
 
     // Called by the executing worker on every op. `worker_domain` is that thread's L3 domain.
@@ -417,21 +333,13 @@ public:
         // than it charged, which is a real accounting fault worth a test assertion but not worth
         // killing the process for. Must read 0; tests/execfix.py asserts it in both atomic modes.
         uint64_t atomic_gauge_underflows = 0;
-        // Times a transaction met an OLDER, still-UNDECIDED unit of the SAME connection on this
-        // owner -- the window in which those two units' commit tickets can invert AND in which
-        // the older unit's installed-but-withdrawable candidate is exposed to the transaction
-        // through the store's connection-scoped RYOW overlay. ONE site raises it: ExLoop::execute(),
-        // where the transaction FRAGMENT is parked behind such a unit before it installs anything
-        // here. It is a real hold, and it is what stops an aborted MSETNX's candidate from being
-        // cloned into an acknowledged transaction write (tests/multirace.py). Cold, and on a path
-        // that already walks the owner's pending list.
-        // It must be able to read zero -- a transaction with no such predecessor never touches it
-        // -- so a non-zero reading is proof the window opened rather than proof the test ran.
-        // The question "did the park fire EARLY ENOUGH" is a different one and deliberately does
-        // NOT share this counter: multi.inc's prepare_write_key() re-asks it at install time and
-        // reports violations through INFO atomic_exec_order_late (multi_exec_order_late()), which
-        // must read zero. Summing the two would hide a violation inside a number that is non-zero
-        // by design, leaving the park's safety argument with no falsifier.
+        // Times an EXEC write installed its candidate for a key while an OLDER cross-shard group
+        // from the SAME connection was still undecided on this owner -- the window in which those
+        // two units' commit tickets can invert. It OBSERVES that window; nothing waits on it (a
+        // hold there deadlocks, NOTES-MULTIRES.md). Cold: written only from the transaction
+        // write-prepare path, which already walks the owner's pending list. It must be able to
+        // read zero -- a transaction with no such predecessor never touches it -- so a non-zero
+        // reading is proof the window opened rather than proof the test ran.
         uint64_t atomic_exec_order_holds = 0;
         // Times watch_finalize_reservation() answered "not ready" because the reservation's epoch
         // was still 0, i.e. a unit was turned into a Retry by an undecided WATCH reservation. It
@@ -464,13 +372,6 @@ public:
     }
 
 private:
-    void publish_active_expire_reap_lag() {
-        const uint32_t value = store_.active_expire_reap_lag_ms_max();
-        if (value > published_active_expire_reap_lag_ms_max_.load(std::memory_order_relaxed))
-            published_active_expire_reap_lag_ms_max_.store(value, std::memory_order_relaxed);
-    }
-
-    friend struct ShardLayoutLock;
     int32_t   id_ = -1;
     uint32_t  bucket_begin_ = 0;
     uint32_t  bucket_end_   = 0;
@@ -480,8 +381,6 @@ private:
     std::atomic<uint32_t> published_size_{0};
     std::atomic<uint64_t> published_obj_bytes_{0};
     std::atomic<uint32_t> published_expires_{0};
-    // Fills the existing four-byte alignment hole before published_evicted_.
-    std::atomic<uint32_t> published_active_expire_reap_lag_ms_max_{0};
     std::atomic<uint64_t> published_evicted_{0};
     FlatStore store_;
     Stats     stats_;
@@ -503,26 +402,10 @@ private:
     Op* notify_source_ = nullptr;
     bool* notify_pending_ = nullptr;
     std::unique_ptr<NotifyShardState> notify_state_;
-    // Allocated only when lb is enabled. Appended in the cold tail so the hot shard
-    // header and FlatStore offsets remain unchanged when weighted placement is compiled in.
-    std::unique_ptr<uint32_t[]> lb_bucket_samples_;
-    std::unique_ptr<uint64_t[]> lb_bucket_bytes_;
-    std::unique_ptr<uint64_t[]> lb_bucket_bytes_staging_;
-    uint64_t lb_bytes_cursor_ = 0;
     // Cold save-policy tail. Only this shard's owner increments it; the designated IO cron owner
     // samples it once per second. Atomicity makes that cross-thread sample data-race-free.
     std::atomic<uint64_t> save_changes_{0};
 };
-
-struct ShardLayoutLock {
-    static constexpr size_t store_offset = offsetof(Shard, store_);
-    static constexpr size_t stats_offset = offsetof(Shard, stats_);
-};
-
-// atomic_torn's gate geometry depends on the pre-read-local Shard stride and hot stats position.
-static_assert(sizeof(Shard) == 1440);
-static_assert(ShardLayoutLock::store_offset == 56);
-static_assert(ShardLayoutLock::stats_offset == 1000);
 
 // Installs one logical operation's expiry cut on an owner for the length of ONE fragment, and puts
 // the executor's own per-pass clock back afterwards. Every exit restores -- Complete, Retry, or an
@@ -545,132 +428,26 @@ private:
     const bool armed_;
 };
 
-// The one authoritative bucket map.  Each entry carries two independent facts:
-//
-//   * the immutable physical Shard/FlatStore containing the bucket's keys;
-//   * the mutable EX thread which alone may touch that store.
-//
-// Keeping both in one atomic word preserves the historical one-indexed-load shard route while
-// making the ownership flip itself an array write.  A transfer changes only the EX bits; the shard
-// bits, keys, and table never move.
-//
-// Runtime readers never consult the transfer descriptor.  PREPARING leaves owner_[] untouched, so
-// every entry remains a valid source route.  The phase release-store makes the destination valid,
-// after which commit_transfer() publishes destination entries.  A reader may therefore observe
-// only the current or previous owner, and a stale route is forwarded by ExLoop before execution.
+// Maps bucket -> shard id. A plain array: one indexed load on the hot path, and reassigning
+// ownership is a write here rather than a data move. This is what makes O(1) resharding possible —
+// flip the owner of a bucket range without copying a single key.
 class Router {
 public:
-    static constexpr uint32_t kNoOwner = UINT16_MAX;
-
-    enum class TransferPhase : uint8_t { Idle = 0, Preparing = 1, Committed = 2 };
-
     void build_uniform(int32_t nshards) {
         nshards_ = nshards;
         const uint32_t per = kNumBuckets / nshards;
         for (uint32_t b = 0; b < kNumBuckets; b++) {
             int32_t s = static_cast<int32_t>(b / per);
             if (s >= nshards) s = nshards - 1;      // remainder buckets go to the last shard
-            owner_[b].store(pack(s, kNoOwner), std::memory_order_relaxed);
+            owner_[b] = s;
         }
     }
-
-    int32_t shard_of(uint64_t hash) const {
-        return unpack_shard(owner_[bucket_of(hash)].load(std::memory_order_relaxed));
-    }
-    int32_t shard_of_bucket(uint32_t bucket) const {
-        return bucket < kNumBuckets
-            ? unpack_shard(owner_[bucket].load(std::memory_order_acquire)) : -1;
-    }
-
-    uint32_t owner_of(uint64_t hash) const { return owner_of_bucket(bucket_of(hash)); }
-    uint32_t owner_of_bucket(uint32_t bucket) const {
-        // owner_[] is one atomic packed owner+shard word, so this load cannot tear.  PREPARING does
-        // not modify it; after commit, observing the previous owner is a safe stale route.
-        return unpack_owner(owner_[bucket].load(std::memory_order_acquire));
-    }
-
-    // Boot-only population. Runtime ownership changes must use begin/commit/finish_transfer so
-    // destination entries cannot become visible before the ownership edge.
-    void set_initial_owner(uint32_t begin, uint32_t end, uint32_t thread_id) {
-        if (begin >= end || end > kNumBuckets || thread_id >= kNoOwner) std::abort();
-        if (phase_.load(std::memory_order_relaxed) != TransferPhase::Idle) std::abort();
-        for (uint32_t bucket = begin; bucket < end; bucket++) {
-            const uint32_t entry = owner_[bucket].load(std::memory_order_relaxed);
-            owner_[bucket].store(pack(unpack_shard(entry), thread_id),
-                                 std::memory_order_relaxed);
-        }
-    }
-
-    // Both EX loops must be at migration safe points before this call.  The source remains the
-    // owner after a successful begin; commit_transfer() performs the one ownership handoff.
-    bool begin_transfer(uint32_t begin, uint32_t end, uint32_t source,
-                        uint32_t destination) {
-        if (begin >= end || end > kNumBuckets || source == destination ||
-            source >= kNoOwner || destination >= kNoOwner) return false;
-        if (transfer_writer_.test_and_set(std::memory_order_acquire)) return false;
-        if (phase_.load(std::memory_order_acquire) != TransferPhase::Idle) {
-            transfer_writer_.clear(std::memory_order_release);
-            return false;
-        }
-        for (uint32_t bucket = begin; bucket < end; bucket++) {
-            if (unpack_owner(owner_[bucket].load(std::memory_order_acquire)) != source) {
-                transfer_writer_.clear(std::memory_order_release);
-                return false;
-            }
-        }
-
-        transfer_begin_.store(begin, std::memory_order_relaxed);
-        transfer_end_.store(end, std::memory_order_relaxed);
-        transfer_source_.store(source, std::memory_order_relaxed);
-        transfer_destination_.store(destination, std::memory_order_relaxed);
-        phase_.store(TransferPhase::Preparing, std::memory_order_release);
-
-        return true;
-    }
-
-    void commit_transfer() {
-        if (phase_.load(std::memory_order_acquire) != TransferPhase::Preparing) std::abort();
-        const uint32_t begin = transfer_begin_.load(std::memory_order_relaxed);
-        const uint32_t end = transfer_end_.load(std::memory_order_relaxed);
-        const uint32_t destination = transfer_destination_.load(std::memory_order_relaxed);
-
-        // This is the single logical ownership edge.  Both executors are quiesced, and the
-        // destination's bookkeeping is already installed, so old entries are now safe stale
-        // routes.  Publish each destination entry only after the destination is valid.
-        phase_.store(TransferPhase::Committed, std::memory_order_release);
-        for (uint32_t bucket = begin; bucket < end; bucket++) {
-            const uint32_t entry = owner_[bucket].load(std::memory_order_relaxed);
-            owner_[bucket].store(pack(unpack_shard(entry), destination),
-                                 std::memory_order_release);
-        }
-    }
-
-    void finish_transfer() {
-        if (phase_.load(std::memory_order_acquire) != TransferPhase::Committed) std::abort();
-        phase_.store(TransferPhase::Idle, std::memory_order_release);
-        transfer_writer_.clear(std::memory_order_release);
-    }
-
-    TransferPhase transfer_phase() const { return phase_.load(std::memory_order_acquire); }
+    int32_t shard_of(uint64_t hash) const { return owner_[bucket_of(hash)]; }
     int32_t nshards() const { return nshards_; }
 
 private:
-    static uint32_t pack(int32_t shard, uint32_t owner) {
-        return (owner << 16) | static_cast<uint32_t>(shard);
-    }
-    static int32_t unpack_shard(uint32_t entry) {
-        return static_cast<int32_t>(entry & UINT16_MAX);
-    }
-    static uint32_t unpack_owner(uint32_t entry) { return entry >> 16; }
-
     int32_t nshards_ = 0;
-    std::atomic<uint32_t> owner_[kNumBuckets] = {};
-    std::atomic<TransferPhase> phase_{TransferPhase::Idle};
-    std::atomic<uint32_t> transfer_begin_{0};
-    std::atomic<uint32_t> transfer_end_{0};
-    std::atomic<uint32_t> transfer_source_{kNoOwner};
-    std::atomic<uint32_t> transfer_destination_{kNoOwner};
-    std::atomic_flag transfer_writer_ = ATOMIC_FLAG_INIT;
+    int32_t owner_[kNumBuckets] = {};
 };
 
 }  // namespace tomo

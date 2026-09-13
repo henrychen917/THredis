@@ -86,7 +86,6 @@ inline constexpr AclCommandCategoryDefinition kAclCommandCategories[] = {
     {"FAILOVER", 0x000000000002a000ULL}, // admin slow dangerous
     {"FCALL", 0x0000000000108000ULL}, // slow scripting
     {"FCALL_RO", 0x0000000000108000ULL}, // slow scripting
-    {"FLIP", 0x000000000002a004ULL}, // write admin slow dangerous
     {"FLUSHALL", 0x0000000000028005ULL}, // keyspace write slow dangerous
     {"FLUSHDB", 0x0000000000028005ULL}, // keyspace write slow dangerous
     {"FUNCTION", 0x0000000000008000ULL}, // slow

@@ -44,7 +44,6 @@ enum class PubSubEventKind : uint8_t {
     TrackingDeliver,      // redirect hop: owner of the redirect target emits the frame
     ClientUnblockRequest,
     ClientUnblockResult,
-    ClientRoutingInstalled,
 };
 
 enum ClientFilterMask : uint32_t {
@@ -122,12 +121,7 @@ struct PubSubEvent {
     bool pattern = false;
     bool shard = false;
     bool subscribe = false;
-    bool rebind = false;
     uint64_t count = 0;
-    // Snapshot of the IO destinations selected by a MONITOR/tracking broadcast.  A stale owner
-    // forwards only when the target's live owner was absent from this mask, which makes the
-    // migration backstop lossless without duplicating a delivery already posted to the new owner.
-    uint64_t route_mask = 0;
     uint32_t acl_user_index = 0;
     const void* acl_permissions = nullptr;  // immutable AclPerm; intentionally transport-opaque
     uint32_t client_filter_mask = 0;

@@ -1,9 +1,10 @@
-// exqueue.h — fixed-capacity SPSC backing for the remaining pointer/control channels.
+// exqueue.h — the IO -> EX dispatch hop. One SPSC ring per (io thread, worker) pair.
 //
-// Task dispatch moved to masked_queue.h's consumer-owned monolith. Channel still uses this compact
-// fixed-capacity primitive for client completions, borrow releases and connection transfers. Each
-// instance has exactly one producer and one consumer; an MPSC replacement would need an atomic RMW
-// per push, whereas SPSC needs only a release store.
+// SPSC BY CONSTRUCTION. Each ring has exactly one producer (a given IO thread) and one consumer
+// (a given worker). With N io threads and M workers there are N*M rings. That is more memory than a
+// single MPSC inbox per worker, and it is worth it: an MPSC queue needs an atomic RMW per push from
+// every producer, whereas SPSC needs only a release store. The fork measured the handoff cost as
+// instruction volume rather than stalls, so removing the RMW is the direct lever.
 //
 // TWO CACHE LINES, NOT ONE. head and tail sit on separate lines. If they share, the producer's
 // store to tail invalidates the line the consumer is reading head from on every single push — the
@@ -42,22 +43,6 @@ public:
         return true;
     }
 
-    // Same publication path with a producer-local transformation after the capacity decision and
-    // before the release tail store. Sample countdowns therefore advance only for accepted tasks.
-    template <typename Prepare>
-    bool push_prepared(T v, Prepare&& prepare) {
-        const uint32_t t = tail_.load(std::memory_order_relaxed);
-        const uint32_t next = t + 1;
-        if (next - head_cached_ > Capacity) {
-            head_cached_ = head_.load(std::memory_order_acquire);
-            if (next - head_cached_ > Capacity) return false;
-        }
-        prepare(v);
-        slots_[t & kMask] = v;
-        tail_.store(next, std::memory_order_release);
-        return true;
-    }
-
     // Producer-side bundle publication. Capacity is checked against one refreshed consumer
     // frontier and every slot is initialized before the single release-store of tail. This is the
     // same SPSC proof as push(), but a scatter group that touches several shards on one executor
@@ -71,24 +56,6 @@ public:
             if (next - head_cached_ > Capacity) return false;
         }
         for (uint32_t i = 0; i < count; i++) slots_[(t + i) & kMask] = values[i];
-        tail_.store(next, std::memory_order_release);
-        return true;
-    }
-
-    template <typename Prepare>
-    bool push_batch_prepared(const T* values, uint32_t count, Prepare&& prepare) {
-        if (!count) return true;
-        const uint32_t t = tail_.load(std::memory_order_relaxed);
-        const uint32_t next = t + count;
-        if (next - head_cached_ > Capacity) {
-            head_cached_ = head_.load(std::memory_order_acquire);
-            if (next - head_cached_ > Capacity) return false;
-        }
-        for (uint32_t i = 0; i < count; i++) {
-            T value = values[i];
-            prepare(value);
-            slots_[(t + i) & kMask] = value;
-        }
         tail_.store(next, std::memory_order_release);
         return true;
     }
@@ -130,22 +97,6 @@ public:
     // Approximate — for stats and the flip controller's pressure signal, never for control flow.
     uint32_t depth() const {
         return tail_.load(std::memory_order_relaxed) - head_.load(std::memory_order_relaxed);
-    }
-
-    // Consumer-side, sampled-signal helper. The caller supplies a cheap extractor that returns
-    // zero for an unmarked entry. Walking newest-to-oldest gives the age proxy a bounded chance to
-    // stop early while preserving the queue's ordinary publication proof: the acquire tail read
-    // makes every slot below that captured frontier visible. This is never part of dequeue/control
-    // flow and is called only by the 100us signal beat.
-    template <typename Extract>
-    uint32_t newest_nonzero(Extract&& extract) const {
-        const uint32_t h = head_.load(std::memory_order_relaxed);
-        uint32_t t = tail_.load(std::memory_order_acquire);
-        while (t != h) {
-            const uint32_t value = extract(slots_[(--t) & kMask]);
-            if (value) return value;
-        }
-        return 0;
     }
 
 private:

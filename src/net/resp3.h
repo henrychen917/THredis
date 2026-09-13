@@ -6,24 +6,18 @@
 
 namespace tomo {
 
-// The RESP3 forms are fixed too, so they take codes on the same terms as their RESP2 siblings.
-// The protocol choice stays exactly where it was -- at the call site, on op.resp3() -- so a coded
-// reply carries the version's own bytes and nothing has to re-decide at retire.
-template <typename Buf> __attribute__((always_inline)) inline void reply_null(Buf&& b, bool resp3) {
-    if (!resp3) { reply_nil(b); return; }
-    TOMO_CODED_REPLY(b, ReplyCode::NullResp3)
-    b.append("_\r\n", 3);
+template <typename Buf> inline void reply_null(Buf&& b, bool resp3) {
+    if (resp3) b.append("_\r\n", 3);
+    else reply_nil(b);
 }
 
-template <typename Buf> __attribute__((always_inline)) inline void reply_null_array(Buf&& b, bool resp3) {
-    if (!resp3) { reply_null_array(b); return; }
-    TOMO_CODED_REPLY(b, ReplyCode::NullResp3)
-    b.append("_\r\n", 3);
+template <typename Buf> inline void reply_null_array(Buf&& b, bool resp3) {
+    if (resp3) b.append("_\r\n", 3);
+    else reply_null_array(b);
 }
 
-template <typename Buf> __attribute__((always_inline)) inline void reply_bool(Buf&& b, bool value, bool resp3) {
+template <typename Buf> inline void reply_bool(Buf&& b, bool value, bool resp3) {
     if (!resp3) { reply_int(b, value ? 1 : 0); return; }
-    TOMO_CODED_REPLY(b, value ? ReplyCode::True : ReplyCode::False)
     b.append(value ? "#t\r\n" : "#f\r\n", 4);
 }
 

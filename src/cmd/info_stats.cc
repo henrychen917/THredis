@@ -56,20 +56,20 @@ uint64_t info_stats_sample_ops(uint64_t operations) {
     return g_info_stats.published_rate;
 }
 
-uint64_t info_stats_observe_memory(uint64_t used_memory) {
+uint64_t info_stats_observe_memory(uint64_t object_bytes) {
     std::lock_guard<std::mutex> lock(g_info_stats.mu);
-    g_info_stats.memory_peak = std::max(g_info_stats.memory_peak, used_memory);
+    g_info_stats.memory_peak = std::max(g_info_stats.memory_peak, object_bytes);
     return g_info_stats.memory_peak;
 }
 
-void info_stats_reset(uint64_t operations, uint64_t used_memory) {
+void info_stats_reset(uint64_t operations, uint64_t object_bytes) {
     std::lock_guard<std::mutex> lock(g_info_stats.mu);
     g_info_stats.last_sample_ns = now_ns();
     g_info_stats.last_operations = operations;
     g_info_stats.rates.fill(0);
     g_info_stats.rate_sum = 0;
     g_info_stats.published_rate = 0;
-    g_info_stats.memory_peak = used_memory;
+    g_info_stats.memory_peak = object_bytes;
     g_info_stats.rate_cursor = 0;
     g_info_stats.rate_count = 0;
 }

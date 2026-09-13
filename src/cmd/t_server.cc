@@ -8,13 +8,11 @@
 #include "auth.h"
 #include "cmdmeta.h"
 #include "debug.h"
-#include "debug_sleep.h"
 #include "info_stats.h"
 #include "scripting.h"
 #include "server_tail.h"
 #include "slowlog.h"
 #include "../base/alloc.h"
-#include "../core/genthread.h"
 #include "../core/server.h"
 #include "../core/lbsignals.h"
 #include "../core/pubsub_event.h"
@@ -29,6 +27,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
@@ -188,13 +187,6 @@ struct ClientMeta {
 // process-unique connection id used on the IO-to-IO transport.
 thread_local std::unordered_map<uint64_t, ClientMeta> g_client_meta;
 
-// `unordered_map::node_type` retains its allocation when it moves between the source and target
-// thread-local maps. A destination reserves buckets during flip preflight, so installing this node
-// after the connection-owner edge has no ordinary allocation/failure point.
-struct ClientMigrationCatalog {
-    decltype(g_client_meta)::node_type node;
-};
-
 bool valid_client_text(Slice value) {
     for (uint32_t i = 0; i < value.n; i++) {
         const unsigned char ch = static_cast<unsigned char>(value.p[i]);
@@ -284,8 +276,8 @@ std::string client_info_line_impl(const Client& client, const ClientMeta& meta, 
 enum class ConfigKind : uint8_t {
     String, Bool, Unsigned, Bytes, Enum, Policy, ClientOutputBufferLimit, NotifyFlags, Save,
     // slowlog-log-slower-than is the tree's first genuinely signed knob: redis's grammar accepts
-    // and reports -1, so an unsigned representation would not round-trip.
-    Signed, Encoding
+    // and reports -1, so the unsigned sentinel that --atomic-window uses would not round-trip.
+    Signed
 };
 struct ConfigValue {
     const char* name;
@@ -297,7 +289,6 @@ struct ConfigValue {
 std::mutex g_config_mu;
 std::vector<ConfigValue> g_config;
 ClientOutputBufferLimits g_client_obuf_limits;
-std::atomic<uint64_t> g_proto_max_bulk_len{512ull * 1024 * 1024};
 
 void add_config(const char* name, ConfigKind kind, uint64_t value) {
     g_config.push_back(ConfigValue{name, kind, std::to_string(value)});
@@ -306,7 +297,6 @@ void add_config(const char* name, ConfigKind kind, uint64_t value) {
 void init_config(const Config& cfg) {
     std::lock_guard<std::mutex> lock(g_config_mu);
     g_config.clear();
-    g_proto_max_bulk_len.store(cfg.proto_max_bulk_len, std::memory_order_relaxed);
     g_config.push_back({"save", ConfigKind::Save, cfg_save_schedule_string(cfg.save)});
     g_config.push_back({"dir", ConfigKind::String, (cfg.dir && *cfg.dir) ? cfg.dir : "."});
     g_config.push_back({"dbfilename", ConfigKind::String,
@@ -315,22 +305,12 @@ void init_config(const Config& cfg) {
     const char* appendfsync = cfg.appendfsync == AppendFsyncPolicy::Always ? "always" :
                               cfg.appendfsync == AppendFsyncPolicy::No ? "no" : "everysec";
     g_config.push_back({"appendfsync", ConfigKind::Enum, appendfsync});
-    // Boot-only: reported so an operator can confirm which engine a running
+    g_config.push_back({"persist-io", ConfigKind::Enum,
+                        cfg.persist_io == PersistIoEngine::Normal ? "normal" : "uring", true});
+    // Boot-only, like persist-io: reported so an operator can confirm which engine a running
     // server actually chose, and refused by CONFIG SET rather than silently accepted.
     g_config.push_back({"net-io", ConfigKind::Enum,
                         cfg.net_io == NetIoEngine::Epoll ? "epoll" : "uring", true});
-    g_config.push_back({"thread-mode", ConfigKind::Enum,
-                        cfg.thread_mode == ThreadMode::Fused ? "1s" : "2s", true});
-    g_config.push_back({"overlap", ConfigKind::Unsigned,
-                        std::to_string(cfg.overlap), true});
-    g_config.push_back({"read-local", ConfigKind::Unsigned,
-                        std::to_string(cfg.read_local), true});
-    g_config.push_back({"reorder", ConfigKind::Unsigned,
-                        std::to_string(cfg.reorder), true});
-    g_config.push_back({"key-lb", ConfigKind::Unsigned, std::to_string(cfg.key_lb), true});
-    g_config.push_back({"client-lb", ConfigKind::Unsigned, std::to_string(cfg.client_lb), true});
-    g_config.push_back({"flip-auto", ConfigKind::Unsigned,
-                        std::to_string(cfg.flip_auto), true});
     g_config.push_back({"appendfilename", ConfigKind::String, cfg.appendfilename, true});
     g_config.push_back({"appenddirname", ConfigKind::String, cfg.appenddirname, true});
     add_config("auto-aof-rewrite-percentage", ConfigKind::Unsigned,
@@ -344,6 +324,16 @@ void init_config(const Config& cfg) {
     g_config.push_back({"maxmemory-policy", ConfigKind::Policy,
                         maxmemory_policy_name(cfg.maxmemory_policy)});
     add_config("maxmemory-samples", ConfigKind::Unsigned, cfg.maxmemory_samples);
+    g_config.push_back({"script-instruction-limit", ConfigKind::Unsigned,
+                        std::to_string(cfg.script_instruction_limit), true});
+    g_config.push_back({"script-crossshard-max-bytes", ConfigKind::Signed,
+                        std::to_string(cfg.script_crossshard_max_bytes), true});
+    g_config.push_back({"script-crossshard-workbench-bytes", ConfigKind::Signed,
+                        std::to_string(cfg.script_crossshard_workbench_bytes), true});
+    g_config.push_back({"script-crossshard-conflict-retries", ConfigKind::Signed,
+                        std::to_string(cfg.script_crossshard_conflict_retries), true});
+    g_config.push_back({"script-crossshard-cut-slots", ConfigKind::Signed,
+                        std::to_string(cfg.script_crossshard_cut_slots), true});
     add_config("maxclients", ConfigKind::Unsigned, cfg.maxclients);
     add_config("timeout", ConfigKind::Unsigned, cfg.timeout);
     add_config("tcp-keepalive", ConfigKind::Unsigned, cfg.tcp_keepalive);
@@ -368,22 +358,29 @@ void init_config(const Config& cfg) {
                         cfg.tls_ciphersuites ? cfg.tls_ciphersuites : "", true});
     g_config.push_back({"tls-prefer-server-ciphers", ConfigKind::Bool,
                         cfg.tls_prefer_server_ciphers ? "yes" : "no", true});
+    g_config.push_back({"tls-ktls", ConfigKind::Bool, cfg.tls_ktls ? "yes" : "no", true});
     g_client_obuf_limits = cfg.client_output_buffer_limits;
     g_config.push_back({"client-output-buffer-limit", ConfigKind::ClientOutputBufferLimit,
                         cfg_client_output_buffer_limit_string(g_client_obuf_limits)});
     g_config.push_back({"notify-keyspace-events", ConfigKind::NotifyFlags,
                         serialize_notify_flags(cfg.notify_events)});
     // Boot-latched: the io owners read the bound directly out of Config, so it is reported but
-    // not live-settable (redis allows CONFIG SET).
+    // not live-settable (redis allows CONFIG SET; see NOTES-CLIMON2.md).
     g_config.push_back({"tracking-table-max-keys", ConfigKind::Unsigned,
                         std::to_string(cfg.tracking_table_max_keys), true});
     add_config("databases", ConfigKind::Unsigned, cfg.databases);
     add_config("proto-max-bulk-len", ConfigKind::Bytes, cfg.proto_max_bulk_len);
     add_config("zc-min", ConfigKind::Unsigned, cfg.zc_min);
     add_config("atomic", ConfigKind::Unsigned, cfg.atomic);
-    for (uint32_t i = 0; i < EncodingConfig::Count; i++)
-        g_config.push_back({EncodingConfig::settings[i].name, ConfigKind::Encoding,
-                            std::to_string(cfg.encodings.values[i])});
+    add_config("atomic-window", ConfigKind::Unsigned, cfg.atomic_window);
+    add_config("hash-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.hash.max_entries);
+    add_config("hash-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.hash.max_value);
+    add_config("list-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.list.max_entries);
+    add_config("list-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.list.max_value);
+    add_config("set-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.set.max_entries);
+    add_config("set-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.set.max_value);
+    add_config("zset-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.zset.max_entries);
+    add_config("zset-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.zset.max_value);
     add_config("stream-node-max-bytes", ConfigKind::Unsigned,
                cfg.stream_limits.node_max_bytes);
     add_config("stream-node-max-entries", ConfigKind::Unsigned,
@@ -411,11 +408,6 @@ void init_config(const Config& cfg) {
 }
 
 ConfigValue* find_config(Slice name) {
-    const int encoding = EncodingConfig::find(name);
-    if (encoding >= 0) {
-        const char* canonical = EncodingConfig::settings[encoding].name;
-        name = Slice(canonical, std::strlen(canonical));
-    }
     for (ConfigValue& item : g_config)
         if (eq_icase(name, item.name)) return &item;
     return nullptr;
@@ -462,13 +454,6 @@ bool parse_client_output_buffer_limit_slice(Slice input,
 
 bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
     switch (entry.kind) {
-        case ConfigKind::Encoding: {
-            int64_t value = 0;
-            const int key = EncodingConfig::find(Slice(entry.name, std::strlen(entry.name)));
-            if (key < 0 || !EncodingConfig::parse(key, input, value)) return false;
-            out = std::to_string(value);
-            return true;
-        }
         case ConfigKind::String:
             if (!std::strcmp(entry.name, "acl-pubsub-default")) {
                 if (eq_icase(input, "allchannels")) out = "allchannels";
@@ -487,11 +472,12 @@ bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
         case ConfigKind::Unsigned: {
             uint64_t value = 0;
             if (!parse_u64(input, value)) return false;
-            if (!std::strcmp(entry.name, "zc-min") &&
+            if ((std::strstr(entry.name, "compact") || !std::strcmp(entry.name, "zc-min")) &&
                 value > UINT32_MAX) return false;
             if (!std::strcmp(entry.name, "maxmemory-samples") && (value == 0 || value > 64))
                 return false;
             if (!std::strcmp(entry.name, "atomic") && value > 1) return false;
+            if (!std::strcmp(entry.name, "atomic-window") && value > UINT32_MAX) return false;
             if (!std::strcmp(entry.name, "databases") && value != 1) return false;
             if (!std::strcmp(entry.name, "auto-aof-rewrite-percentage") &&
                 value > UINT32_MAX) return false;
@@ -569,13 +555,6 @@ bool collect_config_updates(Op& op,
             std::string msg = "ERR Unknown option or number of arguments for CONFIG SET - '";
             msg.append(op.arg(i).p, op.arg(i).n); msg.push_back('\'');
             reply_err(op.sink(), msg.c_str()); return false;
-        }
-        if (item->kind == ConfigKind::Encoding) {
-            for (const auto& previous : updates) {
-                if (previous.first != item) continue;
-                reply_err(op.sink(), "ERR duplicate configuration parameter");
-                return false;
-            }
         }
         if (!std::strcmp(item->name, "aof-use-rdb-preamble")) {
             if (!eq_icase(op.arg(i + 1), "yes")) {
@@ -766,105 +745,8 @@ void cmd_reset(Shard&, Op& op) {
     reply_simple(op.sink(), "RESET");
 }
 
-void cmd_debug_impl(Shard& shard, Op& op) {
+void cmd_debug_impl(Shard&, Op& op) {
     const Slice subcommand = op.arg(1);
-    // REHASH-STATE is explicitly queued to shard 0 by IoLoop, unlike ordinary ConfigRoute
-    // commands (which are IO-local). Reject an unrouted call before touching owner-only state.
-    if (eq_icase(subcommand, "rehash-state") && op.argc() == 2) {
-        if (op.shard != 0 || shard.id() != 0) {
-            reply_err(op.sink(), "ERR REHASH-STATE requires shard-owner dispatch");
-            return;
-        }
-        const auto progress = shard.store().rehash_progress();
-        auto sink = op.sink();
-        reply_array_header(sink, 7);
-        reply_int(sink, shard.id());
-        reply_int(sink, shard.stats().rehashes);
-        reply_int(sink, progress.current_capacity);
-        reply_int(sink, progress.old_capacity);
-        reply_int(sink, progress.cursor);
-        reply_int(sink, progress.old_live);
-        reply_int(sink, shard.store().size());
-        return;
-    }
-    // Directed transport tests use this cold hook to prove that their retained sockets cover every
-    // live IO producer before a 63:1 -> 1:63 flip. Returning the connection owner is observational;
-    // it does not alter placement and is available only behind the existing DEBUG permission gate.
-    if (eq_icase(subcommand, "io-thread") && op.argc() == 2) {
-        if (!g_client) { reply_err(op.sink(), "ERR no client context"); return; }
-        reply_int(op.sink(), static_cast<long long>(g_client->ifid_thread()));
-        return;
-    }
-    if (eq_icase(subcommand, "flipctl") && op.argc() == 2) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        const std::string out = g_server->flipctl_debug_dump();
-        reply_verbatim(op.sink(), Slice(out.data(), out.size()), "txt", op.resp3());
-        return;
-    }
-    if (eq_icase(subcommand, "flipctl") && op.argc() == 3 &&
-        eq_icase(op.arg(2), "trigger")) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        if (!g_server->flipctl_available()) {
-            reply_err(op.sink(),
-                      "ERR flip controller is unavailable with --thread-mode 1s: threads are fused");
-            return;
-        }
-        if (!g_server->flipctl_enabled()) {
-            reply_err(op.sink(), "ERR flip controller is disabled; boot with --flip-auto 1");
-            return;
-        }
-        g_server->flipctl_force_trigger();
-        reply_ok(op.sink());
-        return;
-    }
-    // DEBUG FLIPCTL SEEK <io> [FORCE] and DEBUG FLIPCTL COST <commands-per-client>: the directed
-    // tests of the cost gate and the outcome loop (flip_policy.h). SEEK proposes a split as the
-    // next maneuver's hypothesis -- judged by the model's projection, the noise bar and the cost
-    // gate, or with FORCE by the outcome loop alone. COST types the measured per-client transfer
-    // cost (negative restores the measurement). Cold, behind the DEBUG permission gate.
-    if (eq_icase(subcommand, "flipctl") && (op.argc() == 4 || op.argc() == 5) &&
-        eq_icase(op.arg(2), "seek")) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        if (!g_server->flipctl_available()) {
-            reply_err(op.sink(),
-                      "ERR flip controller is unavailable with --thread-mode 1s: threads are fused");
-            return;
-        }
-        uint64_t target = 0;
-        if (!parse_u64(op.arg(3), target) || !target || target >= g_server->nthreads()) {
-            reply_err(op.sink(), "ERR SEEK wants an io thread count between 1 and threads-1");
-            return;
-        }
-        const bool force = op.argc() == 5 && eq_icase(op.arg(4), "force");
-        if (op.argc() == 5 && !force) {
-            reply_err(op.sink(), "ERR syntax: DEBUG FLIPCTL SEEK <io> [FORCE]");
-            return;
-        }
-        std::string error;
-        if (!g_server->flipctl_debug_seek(static_cast<uint32_t>(target), force, error)) {
-            reply_err(op.sink(), error.c_str());
-            return;
-        }
-        reply_ok(op.sink());
-        return;
-    }
-    if (eq_icase(subcommand, "flipctl") && op.argc() == 4 && eq_icase(op.arg(2), "cost")) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        if (!g_server->flipctl_available()) {
-            reply_err(op.sink(),
-                      "ERR flip controller is unavailable with --thread-mode 1s: threads are fused");
-            return;
-        }
-        double per_client = 0;
-        if (!parse_double_lenient(op.arg(3), per_client)) {
-            reply_err(op.sink(),
-                      "ERR COST wants commands per transferred client (negative = measured)");
-            return;
-        }
-        g_server->flipctl_debug_cost(per_client);
-        reply_ok(op.sink());
-        return;
-    }
     if (eq_icase(subcommand, "lbsignals") && op.argc() == 2) {
         // Raw monotonic dump; windowing is the reader's job (two calls, subtract). See lbsignals.h.
         if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
@@ -873,46 +755,23 @@ void cmd_debug_impl(Shard& shard, Op& op) {
         reply_verbatim(op.sink(), Slice(out.data(), out.size()), "txt", op.resp3());
         return;
     }
-    if (eq_icase(subcommand, "tripwire") && op.argc() == 2) {
-        // Empty is a meaningful result: no resolver trip has latched since boot (or the probes
-        // were never armed). The ring is a one-shot diagnostic while INFO's two counters continue
-        // advancing after capture.
-        const std::string out = atomic_tripwire_dump();
-        reply_verbatim(op.sink(), Slice(out.data(), out.size()), "txt", op.resp3());
-        return;
-    }
-    if (eq_icase(subcommand, "tripwire") && op.argc() == 3 &&
-        (eq_icase(op.arg(2), "arm") || eq_icase(op.arg(2), "disarm"))) {
-        // Observation is a per-op tax (mutex + pending-list walk on atomic reads), so it never
-        // rides along with --enable-debug-command; a diagnosis session arms it explicitly.
-        if (!atomic_tripwire_arm(eq_icase(op.arg(2), "arm"))) {
-            reply_err(op.sink(), "ERR tripwire state unavailable");
+    if (eq_icase(subcommand, "sleep") && op.argc() == 3) {
+        // DEBUG SLEEP is redis's one unguarded strtod: it validates nothing, so a word sleeps
+        // for zero seconds and answers OK. The upper bound is ours -- redis will happily sleep a
+        // year, and this server is not going to.
+        double seconds = 0;
+        if (!parse_double_lenient(op.arg(2), seconds)) seconds = 0;
+        if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0;
+        if (seconds > 86400.0) {
+            reply_err(op.sink(), "ERR value is not a valid float");
             return;
         }
+        const int64_t nanoseconds = static_cast<int64_t>(seconds * 1000000000.0);
+        timespec remaining{nanoseconds / 1000000000ll, nanoseconds % 1000000000ll};
+        while (::nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
         reply_ok(op.sink());
         return;
     }
-    // NO DEBUG SLEEP BRANCH HERE, AND THAT IS THE POINT. Direct DEBUG SLEEP is intercepted by
-    // IoLoop before this handler, and an EXEC child never arrives either: MULTI execution has no
-    // MultiCommandKind for it, so assemble_cross_reply answers "command is not supported by MULTI
-    // execution" first. Measured on all three geometries (--shards 1, 2s 16 shards, 1s read-local
-    // 64 shards) -- every one returns the generic rejection, so a guard here only ever pretended to
-    // reject a shape that cannot reach it. Falling through to the unknown-subcommand reply is the
-    // honest behaviour if a future route does deliver one; nothing here can block an IO thread.
-#ifndef NDEBUG
-    // Fail the next N FlatStore/ExpireIndex table calloc calls. This is deliberately reachable only
-    // through the already-gated DEBUG command and is compiled out of assertion-disabled builds.
-    if (eq_icase(subcommand, "table-alloc-fail") && op.argc() == 3) {
-        uint64_t count = 0;
-        if (!parse_u64(op.arg(2), count) || count > UINT32_MAX) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        flatstore_debug_fail_table_allocations(static_cast<uint32_t>(count));
-        reply_ok(op.sink());
-        return;
-    }
-#endif
     // Window widener for the cross-shard scan-ordering regression test. Holds a direct RENAME's
     // destination task for N extra owner passes AFTER its source hop is ready, which is exactly
     // the park a younger whole-owner walker used to run past. Production default is 0.
@@ -927,30 +786,12 @@ void cmd_debug_impl(Shard& shard, Op& op) {
         reply_ok(op.sink());
         return;
     }
-    // LANE CAP for the armed local-read lane-admission battery. Lowers only the ADMISSION
-    // threshold of the fused local-read lane (the ring keeps its kInboxSlots entries), so a single
-    // connection pipelining more than the cap in one parse pass oversubscribes the lane inside
-    // that pass. That is what makes the battery's anti-vacuity checks deterministic at gate scale
-    // instead of a rate race against the drain that only a saturated rig can win. 0 restores the
-    // derived value, which is what production always runs.
-    if (eq_icase(subcommand, "read-local-lane-cap") && op.argc() == 3) {
-        uint64_t cap = 0;
-        if (!parse_u64(op.arg(2), cap) || cap > kInboxSlots) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        g_server->set_debug_read_local_lane_cap(static_cast<uint32_t>(cap));
-        reply_ok(op.sink());
-        return;
-    }
     // GEOMETRY INJECTOR for the parse-barrier ownership regression. While armed, every blocking
     // dispatch pins a SECOND owner on its connection's parse barrier, so the blocking command's
-    // retirement releases a barrier it does not solely own. Production blocking dispatch requires
-    // an empty ROB and then bars younger parsing, so the blocking op is alone and cannot meet a
-    // second owner. That is why the overlap must be injected rather than provoked, and why a
-    // battery that only replays real command sequences proves nothing about this code.
-    // Production default is 0.
+    // retirement releases a barrier it does not solely own. That two-owner state is unreachable on
+    // any production sequence (NOTES-BARRIER.md section 2) -- which is why it must be injected
+    // rather than provoked, and why a battery that only replays real command sequences proves
+    // nothing about this code. Production default is 0.
     //
     // Observable while armed: a frame pipelined BEHIND a blocking command stays unparsed after the
     // blocking reply retires, instead of being answered in the same flush pass. Clearing the latch
@@ -972,24 +813,6 @@ void cmd_debug_impl(Shard& shard, Op& op) {
         reply_ok(op.sink());
         return;
     }
-    // One-shot scheduler for the blocking idle-timeout regression. With no argument it reports
-    // how many blocked -> unblocked transitions consumed the arm, so the test cannot pass without
-    // reaching the retirement/cron ordering it claims to cover.
-    if (eq_icase(subcommand, "blocking-timeout-reap")) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        if (op.argc() == 2) {
-            reply_int(op.sink(), g_server->debug_blocking_timeout_reaps());
-            return;
-        }
-        uint64_t armed = 0;
-        if (op.argc() != 3 || !parse_u64(op.arg(2), armed) || armed > 1) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        g_server->set_debug_blocking_timeout_reap(armed != 0);
-        reply_ok(op.sink());
-        return;
-    }
     // Which owner a key routes to. The hash seed is drawn from the kernel at every boot, so a test
     // cannot know from the key name alone whether a two-key command is one owner's work or a real
     // cross-shard group -- and a cross-shard battery that silently ran same-owner proves nothing.
@@ -999,56 +822,17 @@ void cmd_debug_impl(Shard& shard, Op& op) {
         reply_int(op.sink(), g_server->router().shard_of(FlatStore::hash_key(op.arg(2))));
         return;
     }
-    // Batched geometry oracle. Each pair is truthful at the point it is read and preserves the
-    // caller's key order. Deliberately do not take the placement transition lock: DEBUG remains a
-    // non-obstructing observer, so a reply concurrent with FLIP may contain rows from both the old
-    // and new placements rather than pretending to be one coherent placement snapshot.
-    if (eq_icase(subcommand, "shards") && op.argc() >= 3) {
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        auto sink = op.sink();
-        reply_array_header(sink, op.argc() - 2);
-        for (uint32_t i = 2; i < op.argc(); i++) {
-            const int32_t sid = g_server->router().shard_of(FlatStore::hash_key(op.arg(i)));
-            reply_array_header(sink, 2);
-            reply_int(sink, sid);
-            reply_int(sink, g_server->worker_of_shard(sid));
-        }
-        return;
-    }
-    // Geometry oracle for the B+ directed test. The server hash is boot-randomized, so the test
-    // cannot manufacture an unrelated same-shard key whose filter cell is provably negative from
-    // its name alone. Expose only the deterministic cell mapping, never the live cell contents;
-    // the actual GET/MGET result and read-local counters remain the mechanism oracle.
-    if (eq_icase(subcommand, "atomic-filter-cell") && op.argc() == 3) {
-        const uint64_t hash = FlatStore::hash_key(op.arg(2));
-        reply_int(op.sink(), FlatStore::foreign_read_filter_index(hash));
-        return;
-    }
-    // Nonblocking admission witness: unlike COMMIT-DELAY, this latch leaves both executors
-    // available for CONFIG. It retains the existing commit queue until explicitly released.
-    if (eq_icase(subcommand, "atomic-commit-hold") && op.argc() == 3) {
-        uint64_t held = 0;
-        if (!parse_u64(op.arg(2), held) || held > 1) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        g_server->set_debug_atomic_commit_hold(held != 0);
-        reply_ok(op.sink());
-        return;
-    }
-    // One shared DEBUG delay word, with names for its two mode-specific boundaries. Atomic ON
-    // holds a group between ticket draw and publication; atomic OFF parks non-lead mutation
-    // owners at the scatter hop. Last writer wins, and zero through either alias disarms both.
-    if ((eq_icase(subcommand, "atomic-commit-delay") ||
-         eq_icase(subcommand, "atomic-off-hop-delay")) && op.argc() == 3) {
+    // Window widener for the torn-read regression. Holds a cross-shard group between drawing its
+    // commit ticket and storing that ticket into its shared epoch word -- the hole in which the
+    // sequence already named a commit whose records still answered "undecided". Production 0.
+    if (eq_icase(subcommand, "atomic-commit-delay") && op.argc() == 3) {
         uint64_t microseconds = 0;
         if (!parse_u64(op.arg(2), microseconds) || microseconds > 1000000) {
             reply_err(op.sink(), "ERR value is not an integer or out of range");
             return;
         }
         if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        g_server->set_debug_hop_delay(static_cast<uint32_t>(microseconds));
+        g_server->set_debug_atomic_commit_delay(static_cast<uint32_t>(microseconds));
         reply_ok(op.sink());
         return;
     }
@@ -1079,21 +863,6 @@ void cmd_debug_impl(Shard& shard, Op& op) {
         }
         if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
         g_server->set_debug_atomic_fanout_defer(static_cast<uint32_t>(microseconds));
-        reply_ok(op.sink());
-        return;
-    }
-    // Deterministic positive control for the atomic-OFF conditional-mover race. The hook parks a
-    // RENAMENX/COPY destination validation without blocking its executor, so a second contender can
-    // validate the same empty destination before either publishes phase two. Atomic-ON groups do
-    // not arm it; their reservation/revalidation semantics are unchanged.
-    if (eq_icase(subcommand, "atomic-conditional-defer") && op.argc() == 3) {
-        uint64_t microseconds = 0;
-        if (!parse_u64(op.arg(2), microseconds) || microseconds > 10000000) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        g_server->set_debug_atomic_conditional_defer(static_cast<uint32_t>(microseconds));
         reply_ok(op.sink());
         return;
     }
@@ -1245,10 +1014,6 @@ void cmd_client(Shard&, Op& op) {
         reply_err(op.sink(), "ERR CLIENT scatter is unavailable in this execution context");
     } else if (eq_icase(sub, "NO-EVICT") && op.argc() == 3 &&
                (eq_icase(op.arg(2), "ON") || eq_icase(op.arg(2), "OFF"))) {
-        // Compatibility facade: Redis uses this bit to exempt a connection from
-        // maxmemory-clients output-buffer eviction. TomoKV has neither maxmemory-clients nor a
-        // client-output-buffer eviction path, so retain/report the bit but deliberately do not
-        // present it as protection from FlatStore's key eviction.
         command_client_set_no_evict(g_client, eq_icase(op.arg(2), "ON"));
         reply_ok(op.sink());
     } else if (eq_icase(sub, "NO-EVICT")) {
@@ -1351,20 +1116,11 @@ void cmd_config(Shard& sh, Op& op) {
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             for (const ConfigValue& item : g_config) {
-                auto match = [&](const char* spelling) {
-                    const Slice name(spelling, std::strlen(spelling));
-                    for (uint32_t i = 2; i < op.argc(); i++) {
-                        if (!command_glob_match(op.arg(i), name, true)) continue;
-                        matches.emplace_back(spelling, item.value);
-                        break;
-                    }
-                };
-                match(item.name);
-                if (item.kind == ConfigKind::Encoding) {
-                    const int key = EncodingConfig::find(Slice(item.name, std::strlen(item.name)));
-                    if (key >= 0 && EncodingConfig::settings[key].alias)
-                        match(EncodingConfig::settings[key].alias);
-                }
+                Slice name(item.name, std::strlen(item.name));
+                bool matched = false;
+                for (uint32_t i = 2; i < op.argc() && !matched; i++)
+                    matched = command_glob_match(op.arg(i), name, true);
+                if (matched) matches.emplace_back(item.name, item.value);
             }
         }
         auto sink = op.sink();
@@ -1415,7 +1171,7 @@ void cmd_config(Shard& sh, Op& op) {
                                (save_armed ? NOTIFY_SAVE : 0u));
         }
 
-        // Eviction config is process-global (committed mailbox copies read each pass); publish
+        // Eviction config is process-global (odd/even snapshot read by owners each pass); publish
         // it once from shard 0's task rather than per shard.
         if (sh.id() == 0 && g_server) {
             for (const auto& update : updates) {
@@ -1429,11 +1185,9 @@ void cmd_config(Shard& sh, Op& op) {
                     if (!parse_u64(Slice(update.second.data(), update.second.size()), value))
                         std::abort();
                     g_server->set_proto_max_bulk_len(value);
-                    g_proto_max_bulk_len.store(value, std::memory_order_relaxed);
                 }
             }
-            LiveConfigSnapshot desired =
-                g_server->live_config_snapshot(g_server->worker_of_shard(sh.id()));
+            LiveConfigSnapshot desired = g_server->live_config_snapshot();
             bool set_memory = false, set_policy = false, set_samples = false;
             for (const auto& update : updates) {
                 const Slice text(update.second.data(),
@@ -1497,6 +1251,8 @@ void cmd_config(Shard& sh, Op& op) {
                     set_auto_rewrite = true;
                 } else if (!std::strcmp(update.first->name, "atomic"))
                     g_server->set_atomic_enabled(value != 0);
+                else if (!std::strcmp(update.first->name, "atomic-window"))
+                    g_server->set_atomic_window(static_cast<uint32_t>(value));
                 else if (!std::strcmp(update.first->name, "maxclients"))
                     g_server->set_maxclients(static_cast<uint32_t>(value));
                 else if (!std::strcmp(update.first->name, "timeout"))
@@ -1546,18 +1302,18 @@ void cmd_config(Shard& sh, Op& op) {
         TypeLimits limits = sh.type_limits();
         StreamLimits stream_limits = sh.stream_limits();
         for (const auto& update : updates) {
-            if (update.first->kind == ConfigKind::Encoding) {
-                const char* name = update.first->name;
-                const int key = EncodingConfig::find(Slice(name, std::strlen(name)));
-                int64_t value = 0;
-                if (key < 0 || !cfg_parse_i64(update.second.c_str(), value)) std::abort();
-                EncodingConfig::apply(limits, key, value);
-                continue;
-            }
             uint64_t value = 0;
             if (!parse_u64(Slice(update.second.data(), update.second.size()), value)) continue;
             const uint32_t v = static_cast<uint32_t>(value);
             if (!std::strcmp(update.first->name, "zc-min")) sh.set_zc_min(v);
+            else if (!std::strcmp(update.first->name, "hash-max-compact-entries")) limits.hash.max_entries = v;
+            else if (!std::strcmp(update.first->name, "hash-max-compact-value")) limits.hash.max_value = v;
+            else if (!std::strcmp(update.first->name, "list-max-compact-entries")) limits.list.max_entries = v;
+            else if (!std::strcmp(update.first->name, "list-max-compact-value")) limits.list.max_value = v;
+            else if (!std::strcmp(update.first->name, "set-max-compact-entries")) limits.set.max_entries = v;
+            else if (!std::strcmp(update.first->name, "set-max-compact-value")) limits.set.max_value = v;
+            else if (!std::strcmp(update.first->name, "zset-max-compact-entries")) limits.zset.max_entries = v;
+            else if (!std::strcmp(update.first->name, "zset-max-compact-value")) limits.zset.max_value = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-bytes")) stream_limits.node_max_bytes = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-entries")) stream_limits.node_max_entries = v;
         }
@@ -1580,64 +1336,13 @@ struct StatBaseline {
     uint64_t hits = 0, misses = 0, expired = 0, evicted = 0;
     uint64_t rejected = 0, auth_failures = 0;
     uint64_t net_input_bytes = 0, net_output_bytes = 0;
-    uint64_t keys = 0;
     uint64_t object_bytes = 0;
     uint64_t acl_denied_cmd = 0, acl_denied_key = 0, acl_denied_channel = 0, acl_denied_auth = 0;
-    ReadLocalStats read_local;
     std::vector<uint64_t> command_calls;
 };
 
 std::mutex g_stat_baseline_mu;
 StatBaseline g_stat_baseline;
-
-void add_read_local_stats(ReadLocalStats& total, const ReadLocalStats& local) {
-    total.hits += local.hits;
-    total.keyspace_hits += local.keyspace_hits;
-    total.keyspace_misses += local.keyspace_misses;
-    total.fallback_multi += local.fallback_multi;
-    total.fallback_watch += local.fallback_watch;
-    total.fallback_context += local.fallback_context;
-    total.fallback_context_owner_key += local.fallback_context_owner_key;
-    total.fallback_context_connection_state += local.fallback_context_connection_state;
-    total.fallback_context_route += local.fallback_context_route;
-    total.fallback_context_keymiss_notify += local.fallback_context_keymiss_notify;
-    total.fallback_inflight_write += local.fallback_inflight_write;
-    total.fallback_arm_transient += local.fallback_arm_transient;
-    total.arm.arms += local.arm.arms;
-    total.arm.sidecars += local.arm.sidecars;
-    total.arm.write_ring_records += local.arm.write_ring_records;
-    total.fallback_atomic_pending += local.fallback_atomic_pending;
-    total.fallback_missing += local.fallback_missing;
-    total.fallback_typed += local.fallback_typed;
-    total.fallback_expired += local.fallback_expired;
-    total.fallback_seq_churn += local.fallback_seq_churn;
-    total.fallback_generation += local.fallback_generation;
-    total.fallback_lane_full += local.fallback_lane_full;
-    total.defer_lane_full += local.defer_lane_full;
-    total.defer_quota += local.defer_quota;
-    total.mget_local_hits += local.mget_local_hits;
-    total.mget_fallback_multi += local.mget_fallback_multi;
-    total.mget_fallback_watch += local.mget_fallback_watch;
-    total.mget_fallback_context += local.mget_fallback_context;
-    total.mget_fallback_context_owner_key += local.mget_fallback_context_owner_key;
-    total.mget_fallback_context_connection_state +=
-        local.mget_fallback_context_connection_state;
-    total.mget_fallback_context_route += local.mget_fallback_context_route;
-    total.mget_fallback_context_keymiss_notify +=
-        local.mget_fallback_context_keymiss_notify;
-    total.mget_fallback_inflight_write += local.mget_fallback_inflight_write;
-    total.mget_fallback_arm_transient += local.mget_fallback_arm_transient;
-    total.mget_fallback_atomic_pending += local.mget_fallback_atomic_pending;
-    total.mget_fallback_typed += local.mget_fallback_typed;
-    total.mget_fallback_expired += local.mget_fallback_expired;
-    total.mget_fallback_seq_churn += local.mget_fallback_seq_churn;
-    total.mget_generation_retries += local.mget_generation_retries;
-    total.mget_fallback_generation += local.mget_fallback_generation;
-    total.mget_fallback_lane_full += local.mget_fallback_lane_full;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    total.settax.add(local.settax);
-#endif
-}
 
 void collect_stat_totals(StatBaseline& out) {
     out = StatBaseline{};
@@ -1648,7 +1353,6 @@ void collect_stat_totals(StatBaseline& out) {
         out.misses += sh.stats().misses;
         out.expired += sh.stats().expired;
         out.evicted += sh.published_evicted();
-        out.keys += sh.published_size();
         out.object_bytes += sh.published_obj_bytes();
     }
     out.command_calls.assign(command_registry_size(), 0);
@@ -1669,12 +1373,6 @@ void collect_stat_totals(StatBaseline& out) {
         out.net_input_bytes += sig.net_input_bytes;
         out.net_output_bytes += sig.net_output_bytes;
     }
-    if (g_server->read_local_enabled()) {
-        for (uint32_t t = 0; t < g_server->nthreads(); t++)
-            add_read_local_stats(out.read_local, g_server->thread(t).read_local_stats());
-        out.hits += out.read_local.keyspace_hits;
-        out.misses += out.read_local.keyspace_misses;
-    }
     out.rejected = g_server->rejected_conns() + g_server->rejected_connections();
     out.auth_failures = g_server->auth_failures();
 }
@@ -1685,67 +1383,18 @@ inline uint64_t minus_baseline(uint64_t live, uint64_t base) {
     return live >= base ? live - base : 0;
 }
 
-uint64_t accounted_memory_bytes(uint64_t object_bytes, uint64_t keys) {
-    constexpr uint64_t overhead = FlatStore::kSlotOverheadPerKey;
-    if (keys > (std::numeric_limits<uint64_t>::max() - object_bytes) / overhead)
-        return std::numeric_limits<uint64_t>::max();
-    return object_bytes + keys * overhead;
-}
-
-bool info_section(Op& op, const char* wanted, bool included_by_default = true) {
+bool info_section(Op& op, const char* wanted) {
     // EVERYTHING is the reference's alias for ALL plus module-generated sections. We load no
     // modules, so the two are identical here -- but omitting it made `INFO everything` match no
     // section at all and return an EMPTY reply, where the reference returns every section.
-    if (op.argc() == 1) return included_by_default;
-    for (uint32_t i = 1; i < op.argc(); i++) {
-        if (eq_icase(op.arg(i), "ALL") || eq_icase(op.arg(i), "EVERYTHING") ||
-            eq_icase(op.arg(i), wanted) ||
-            (included_by_default && eq_icase(op.arg(i), "DEFAULT"))) return true;
-    }
-    return false;
-}
-
-void cmd_flip(Shard&, Op& op) {
-    if (!g_server) { reply_err(op.sink(), "ERR server is not initialized"); return; }
-    if (op.argc() != 1) {
-        // The three-argument mutation form is intercepted by IoLoop and completed asynchronously.
-        // Reaching the ordinary local handler means the grammar was neither report nor mutation.
-        reply_err(op.sink(), "ERR wrong number of arguments for 'flip' command");
-        return;
-    }
-    const FlipReport report = g_server->flip_report();
-    auto sink = op.sink();
-    reply_map_header(sink, 12, op.resp3());
-    reply_bulk(sink, Slice("live_io", 7));
-    reply_int(sink, report.live_io);
-    reply_bulk(sink, Slice("live_ex", 7));
-    reply_int(sink, report.live_ex);
-    reply_bulk(sink, Slice("target_io", 9));
-    reply_int(sink, report.target_io);
-    reply_bulk(sink, Slice("target_ex", 9));
-    reply_int(sink, report.target_ex);
-    reply_bulk(sink, Slice("smt_mode", 8));
-    reply_int(sink, report.smt_mode);
-    reply_bulk(sink, Slice("unit_threads", 12));
-    reply_int(sink, report.unit_threads);
-    reply_bulk(sink, Slice("bucket_min", 10));
-    reply_int(sink, report.bucket_min);
-    reply_bulk(sink, Slice("bucket_max", 10));
-    reply_int(sink, report.bucket_max);
-    reply_bulk(sink, Slice("client_min", 10));
-    reply_int(sink, report.client_min);
-    reply_bulk(sink, Slice("client_max", 10));
-    reply_int(sink, report.client_max);
-    reply_bulk(sink, Slice("last_transfers", 14));
-    reply_int(sink, report.last_transfers);
-    reply_bulk(sink, Slice("moving", 6));
-    reply_bool(sink, report.moving, op.resp3());
+    return op.argc() == 1 || eq_icase(op.arg(1), "ALL") || eq_icase(op.arg(1), "DEFAULT") ||
+           eq_icase(op.arg(1), "EVERYTHING") || eq_icase(op.arg(1), wanted);
 }
 
 void cmd_info(Shard&, Op& op) {
     std::string body;
     uint64_t keys = 0, expires = 0, obj_bytes = 0, hits = 0, misses = 0, expired = 0,
-             evicted = 0, keyspace_rehashes = 0, active_expire_reap_lag_ms_max = 0;
+             evicted = 0, keyspace_rehashes = 0;
     uint64_t total_ops = 0, sampled_ops = 0, connections = 0, rejected = 0;
     uint64_t net_input_bytes = 0, net_output_bytes = 0, auth_failures = 0;
     uint64_t sends_submitted = 0, short_writes = 0, bytes_sent = 0,
@@ -1761,9 +1410,6 @@ void cmd_info(Shard&, Op& op) {
              watch_reservation_waits = 0, watch_reservation_coexist = 0,
              watch_reservation_precommit_aborts = 0;
     uint64_t hash_field_expires = 0, expired_hash_fields = 0;
-    uint64_t foreign_read_unsafe_refs = 0, foreign_read_occupied_cells = 0,
-             foreign_read_wildcard_cells = 0, foreign_read_saturated_cells = 0,
-             foreign_read_poisoned_shards = 0;
     uint64_t plain_accepts = 0, tls_accepts = 0, tls_handshakes_started = 0,
              tls_handshakes_completed = 0, tls_handshakes_failed = 0,
              tls_connections_freed = 0, tls_want_read = 0, tls_want_write = 0,
@@ -1774,7 +1420,6 @@ void cmd_info(Shard&, Op& op) {
     // as a live FIRED-MECHANISM proof: a test that claims to be running on epoll and sees
     // net_io_epoll_events at 0 is not running on epoll, and its other assertions prove nothing.
     uint64_t epoll_events = 0, epoll_recvs = 0;
-    ReadLocalStats read_local;
     if (g_server) {
         for (uint32_t i = 0; i < g_server->nshards(); i++) {
             const Shard& sh = g_server->shard(static_cast<int32_t>(i));
@@ -1785,9 +1430,6 @@ void cmd_info(Shard&, Op& op) {
             hits += sh.stats().hits; misses += sh.stats().misses; expired += sh.stats().expired;
             evicted += sh.published_evicted();
             keyspace_rehashes += sh.stats().rehashes;
-            active_expire_reap_lag_ms_max = std::max(
-                active_expire_reap_lag_ms_max,
-                static_cast<uint64_t>(sh.published_active_expire_reap_lag_ms_max()));
             atomic_predecessor_reads += sh.stats().atomic_predecessor_reads;
             atomic_chain_max = std::max(atomic_chain_max, sh.stats().atomic_chain_max);
             atomic_promotions += sh.stats().atomic_promotions;
@@ -1802,11 +1444,6 @@ void cmd_info(Shard&, Op& op) {
             atomic_pending_entries += sh.store().atomic_pending_entries();
             atomic_cleanup_fast += sh.store().atomic_cleanup_fast();
             atomic_cleanup_slow += sh.store().atomic_cleanup_slow();
-            foreign_read_unsafe_refs += sh.store().foreign_read_unsafe_refs();
-            foreign_read_occupied_cells += sh.store().foreign_read_occupied_cells();
-            foreign_read_wildcard_cells += sh.store().foreign_read_wildcard_cells();
-            foreign_read_saturated_cells += sh.store().foreign_read_saturated_cells();
-            foreign_read_poisoned_shards += sh.store().foreign_read_poisoned();
             blocking_waiters += sh.blocking_waiters();
         }
         for (uint32_t t = 0; t < g_server->nthreads(); t++) {
@@ -1853,22 +1490,12 @@ void cmd_info(Shard&, Op& op) {
                 zc_releases += stats.zc_releases;
             }
         }
-        if (g_server->read_local_enabled()) {
-            for (uint32_t t = 0; t < g_server->nthreads(); t++)
-                add_read_local_stats(read_local, g_server->thread(t).read_local_stats());
-        }
         // Redis counts BOTH accept-time reject classes in rejected_connections: maxclients
         // (networking.c:1355) and protected-mode denials (networking.c:1306).
         rejected = g_server->rejected_conns() + g_server->rejected_connections();
         auth_failures = g_server->auth_failures();
     }
-    if (g_server && g_server->read_local_enabled()) {
-        hits += read_local.keyspace_hits;
-        misses += read_local.keyspace_misses;
-    }
-    // Apply the CONFIG RESETSTAT baseline to exactly the counters redis's RESETSTAT zeroes. The
-    // active-expiry lag value is an absolute lifetime high-water gauge, so it is deliberately not
-    // rebased: subtracting two maxima would no longer be a duration in milliseconds.
+    // Apply the CONFIG RESETSTAT baseline to exactly the counters redis's RESETSTAT zeroes.
     StatBaseline baseline;
     {
         std::lock_guard<std::mutex> lock(g_stat_baseline_mu);
@@ -1888,247 +1515,22 @@ void cmd_info(Shard&, Op& op) {
     acl_denied_key = minus_baseline(acl_denied_key, baseline.acl_denied_key);
     acl_denied_channel = minus_baseline(acl_denied_channel, baseline.acl_denied_channel);
     acl_denied_auth = minus_baseline(acl_denied_auth, baseline.acl_denied_auth);
-    if (g_server && g_server->read_local_enabled()) {
-        read_local.hits = minus_baseline(read_local.hits, baseline.read_local.hits);
-        read_local.keyspace_hits = minus_baseline(
-            read_local.keyspace_hits, baseline.read_local.keyspace_hits);
-        read_local.keyspace_misses = minus_baseline(
-            read_local.keyspace_misses, baseline.read_local.keyspace_misses);
-        read_local.fallback_multi = minus_baseline(
-            read_local.fallback_multi, baseline.read_local.fallback_multi);
-        read_local.fallback_watch = minus_baseline(
-            read_local.fallback_watch, baseline.read_local.fallback_watch);
-        read_local.fallback_context = minus_baseline(
-            read_local.fallback_context, baseline.read_local.fallback_context);
-        read_local.fallback_context_owner_key = minus_baseline(
-            read_local.fallback_context_owner_key,
-            baseline.read_local.fallback_context_owner_key);
-        read_local.fallback_context_connection_state = minus_baseline(
-            read_local.fallback_context_connection_state,
-            baseline.read_local.fallback_context_connection_state);
-        read_local.fallback_context_route = minus_baseline(
-            read_local.fallback_context_route, baseline.read_local.fallback_context_route);
-        read_local.fallback_context_keymiss_notify = minus_baseline(
-            read_local.fallback_context_keymiss_notify,
-            baseline.read_local.fallback_context_keymiss_notify);
-        read_local.fallback_inflight_write = minus_baseline(
-            read_local.fallback_inflight_write, baseline.read_local.fallback_inflight_write);
-        read_local.fallback_arm_transient = minus_baseline(
-            read_local.fallback_arm_transient, baseline.read_local.fallback_arm_transient);
-        read_local.arm.arms = minus_baseline(
-            read_local.arm.arms, baseline.read_local.arm.arms);
-        read_local.arm.sidecars = minus_baseline(
-            read_local.arm.sidecars, baseline.read_local.arm.sidecars);
-        read_local.arm.write_ring_records = minus_baseline(
-            read_local.arm.write_ring_records, baseline.read_local.arm.write_ring_records);
-        read_local.fallback_atomic_pending = minus_baseline(
-            read_local.fallback_atomic_pending, baseline.read_local.fallback_atomic_pending);
-        read_local.fallback_missing = minus_baseline(
-            read_local.fallback_missing, baseline.read_local.fallback_missing);
-        read_local.fallback_typed = minus_baseline(
-            read_local.fallback_typed, baseline.read_local.fallback_typed);
-        read_local.fallback_expired = minus_baseline(
-            read_local.fallback_expired, baseline.read_local.fallback_expired);
-        read_local.fallback_seq_churn = minus_baseline(
-            read_local.fallback_seq_churn, baseline.read_local.fallback_seq_churn);
-        read_local.fallback_generation = minus_baseline(
-            read_local.fallback_generation, baseline.read_local.fallback_generation);
-        read_local.fallback_lane_full = minus_baseline(
-            read_local.fallback_lane_full, baseline.read_local.fallback_lane_full);
-        read_local.defer_lane_full = minus_baseline(
-            read_local.defer_lane_full, baseline.read_local.defer_lane_full);
-        read_local.defer_quota = minus_baseline(
-            read_local.defer_quota, baseline.read_local.defer_quota);
-        read_local.mget_local_hits = minus_baseline(
-            read_local.mget_local_hits, baseline.read_local.mget_local_hits);
-        read_local.mget_fallback_multi = minus_baseline(
-            read_local.mget_fallback_multi, baseline.read_local.mget_fallback_multi);
-        read_local.mget_fallback_watch = minus_baseline(
-            read_local.mget_fallback_watch, baseline.read_local.mget_fallback_watch);
-        read_local.mget_fallback_context = minus_baseline(
-            read_local.mget_fallback_context, baseline.read_local.mget_fallback_context);
-        read_local.mget_fallback_context_owner_key = minus_baseline(
-            read_local.mget_fallback_context_owner_key,
-            baseline.read_local.mget_fallback_context_owner_key);
-        read_local.mget_fallback_context_connection_state = minus_baseline(
-            read_local.mget_fallback_context_connection_state,
-            baseline.read_local.mget_fallback_context_connection_state);
-        read_local.mget_fallback_context_route = minus_baseline(
-            read_local.mget_fallback_context_route,
-            baseline.read_local.mget_fallback_context_route);
-        read_local.mget_fallback_context_keymiss_notify = minus_baseline(
-            read_local.mget_fallback_context_keymiss_notify,
-            baseline.read_local.mget_fallback_context_keymiss_notify);
-        read_local.mget_fallback_inflight_write = minus_baseline(
-            read_local.mget_fallback_inflight_write,
-            baseline.read_local.mget_fallback_inflight_write);
-        read_local.mget_fallback_arm_transient = minus_baseline(
-            read_local.mget_fallback_arm_transient,
-            baseline.read_local.mget_fallback_arm_transient);
-        read_local.mget_fallback_atomic_pending = minus_baseline(
-            read_local.mget_fallback_atomic_pending,
-            baseline.read_local.mget_fallback_atomic_pending);
-        read_local.mget_fallback_typed = minus_baseline(
-            read_local.mget_fallback_typed, baseline.read_local.mget_fallback_typed);
-        read_local.mget_fallback_expired = minus_baseline(
-            read_local.mget_fallback_expired, baseline.read_local.mget_fallback_expired);
-        read_local.mget_fallback_seq_churn = minus_baseline(
-            read_local.mget_fallback_seq_churn,
-            baseline.read_local.mget_fallback_seq_churn);
-        read_local.mget_generation_retries = minus_baseline(
-            read_local.mget_generation_retries,
-            baseline.read_local.mget_generation_retries);
-        read_local.mget_fallback_generation = minus_baseline(
-            read_local.mget_fallback_generation,
-            baseline.read_local.mget_fallback_generation);
-        read_local.mget_fallback_lane_full = minus_baseline(
-            read_local.mget_fallback_lane_full,
-            baseline.read_local.mget_fallback_lane_full);
-    }
     const uint64_t connected = g_server ? g_server->live_clients() : 0;
 
     if (info_section(op, "SERVER")) {
         const uint64_t uptime = g_started_monotonic_ns ? (now_ns() - g_started_monotonic_ns) / 1000000000ull : 0;
-        // zc-min is live: cfg() is only the boot request. Read the same synchronized value as
-        // CONFIG GET, after which a benchmark can verify a completed CONFIG SET of either arm.
-        std::string zc_min;
-        {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            for (const ConfigValue& item : g_config)
-                if (!std::strcmp(item.name, "zc-min")) { zc_min = item.value; break; }
-        }
         // process_id and tcp_port are plain facts about this process, not telemetry that could be
         // stale -- and tooling depends on them. The NIC bench harness identifies the server it just
         // booted by reading process_id out of INFO, so its absence made every NIC cell fail with an
         // opaque "boot/cell FAIL" long before any measurement was taken.
-        // read_local is the effective boot state. Actual loop entry and successful completions
-        // are separate observations: a configured but unreachable lane must be visible in INFO.
         appendf(body, "# Server\r\nredis_version:%s\r\ntomokv_version:%s\r\nredis_mode:standalone\r\n"
-                      "thread_mode:%s\r\nshards:%u\r\noverlap:%u\r\nreorder:%u\r\nread_local:%u\r\natomic:%u\r\n"
-                      "arch_bits:%zu\r\nmultiplexing_api:%s\r\nprocess_id:%lld\r\n"
+                      "arch_bits:%zu\r\nmultiplexing_api:io_uring\r\nprocess_id:%lld\r\n"
                       "tcp_port:%u\r\nuptime_in_seconds:%llu\r\nuptime_in_days:%llu\r\n",
-                kVersion, kVersion, g_server ? g_server->thread_mode_name() : "2s",
-                g_server ? g_server->nshards() : 0u,
-                g_server ? g_server->cfg().overlap : 0u,
-                g_server ? g_server->cfg().reorder : 0u,
-                g_server && g_server->read_local_enabled() ? 1u : 0u,
-                g_server && g_server->atomic_enabled() ? 1u : 0u,
-                sizeof(void*) * 8,
-                g_ring_epoll_mode ? "epoll" : "io_uring",
+                kVersion, kVersion, sizeof(void*) * 8,
                 static_cast<long long>(::getpid()),
                 static_cast<unsigned>(g_server ? g_server->cfg().port : 0),
                 static_cast<unsigned long long>(uptime),
                 static_cast<unsigned long long>(uptime / 86400));
-        appendf(body, "key_lb:%u\r\nclient_lb:%u\r\nflip_auto:%u\r\n"
-                      "flip_fingerprint_window:%u\r\nnet_io:%s\r\nhash:%s\r\nzc_min:%s\r\n"
-                      "pin_threads:%u\r\n",
-                g_server && g_server->key_lb_signals_enabled() ? 1u : 0u,
-                g_server && g_server->client_lb_signals_enabled() ? 1u : 0u,
-                g_server && g_server->flipctl_enabled() ? 1u : 0u,
-                flip_fingerprint_window(g_server && g_server->flipctl_enabled()),
-                g_ring_epoll_mode ? "epoll" : "uring",
-                g_hash_kind == HashKind::SipHash12 ? "siphash" : "mix64",
-                zc_min.c_str(), g_server && g_server->cfg().pin_threads ? 1u : 0u);
-        if (g_server) {
-            // Boot homes stay immutable through FLIP/LB. Current owners come from dispatch's
-            // authoritative acquire loads, so INFO never echoes a requested but unused map.
-            // Append each entry separately: a full 256-shard map exceeds appendf's scratch buffer.
-            body += "shard_home:";
-            for (uint32_t sid = 0; sid < g_server->nshards(); sid++)
-                appendf(body, "%s%u:%u", sid ? "," : "", sid,
-                        g_server->placement().shard_home(sid));
-            body += "\r\nshard_owners:";
-            for (uint32_t sid = 0; sid < g_server->nshards(); sid++)
-                appendf(body, "%s%u:%u", sid ? "," : "", sid,
-                        g_server->worker_of_shard(static_cast<int32_t>(sid)));
-            body += "\r\nthread_cpus:";
-            for (uint32_t tid = 0; tid < g_server->nthreads(); tid++)
-                appendf(body, "%s%u:%d", tid ? "," : "", tid,
-                        g_server->placement().thread(tid).cpu);
-            body += "\r\n";
-        }
-        // Guard the CALL, including all argument evaluation. The cold non-inlined helper owns
-        // its scratch buffers so the disabled INFO path keeps its old output without those arrays.
-        if (g_server && g_server->read_local_enabled())
-            append_read_local_thread_info(body, *g_server);
-        if (g_server && g_server->mode_schedule_stats())
-            append_mode_schedule_info(body, g_server->mode_schedule_stats(), g_server->nthreads());
-        if (g_server && g_server->thread_mode() == ThreadMode::Fused) {
-            appendf(body,
-                    "fused_threads:%u\r\nclient_threads:%u\r\nowner_threads:%u\r\n"
-                    "flip_available:0\r\nflip_unavailable_reason:threads_are_fused\r\n",
-                    g_server->nthreads(), g_server->client_serving_thread_count(),
-                    g_server->shard_owner_count());
-        } else {
-            const FlipReport flip = g_server ? g_server->flip_report() : FlipReport{};
-            appendf(body,
-                    "io_threads:%u\r\nex_threads:%u\r\nflip_target_io:%u\r\n"
-                    "flip_target_ex:%u\r\n"
-                    "flip_unit_threads:%u\r\nflip_bucket_min:%u\r\nflip_bucket_max:%u\r\n"
-                    "flip_client_min:%u\r\nflip_client_max:%u\r\n"
-                    "flip_last_transfers:%llu\r\nflip_in_progress:%u\r\n",
-                    flip.live_io, flip.live_ex, flip.target_io, flip.target_ex,
-                    flip.unit_threads, flip.bucket_min, flip.bucket_max,
-                    flip.client_min, flip.client_max,
-                    static_cast<unsigned long long>(flip.last_transfers),
-                    flip.moving ? 1u : 0u);
-        }
-    }
-    if (info_section(op, "FLIPCTL")) {
-        if (g_server && !g_server->flipctl_available()) {
-            appendf(body,
-                    "# Flipctl\r\nflipctl_state:unavailable\r\nflipctl_phase:fused\r\n"
-                    "flipctl_available:0\r\nflipctl_thread_mode:1s\r\n"
-                    "flipctl_reason:threads_are_fused\r\nflipctl_fused_threads:%u\r\n"
-                    "flipctl_client_threads:%u\r\nflipctl_owner_threads:%u\r\n",
-                    g_server->nthreads(), g_server->client_serving_thread_count(),
-                    g_server->shard_owner_count());
-        } else {
-            const FlipctlReport ctl = g_server ? g_server->flipctl_report() : FlipctlReport{};
-            appendf(body,
-                    "# Flipctl\r\nflipctl_state:%s\r\nflipctl_phase:%s\r\n"
-                    "flipctl_anchor_io:%u\r\nflipctl_anchor_ex:%u\r\n"
-                    "flipctl_anchor_rate:%.3f\r\nflipctl_signature_band:%.9f\r\n"
-                    "flipctl_rate_band:%.9f\r\nflipctl_triggers:%llu\r\n"
-                    "flipctl_boot_triggers:%llu\r\nflipctl_fingerprint_triggers:%llu\r\n"
-                    "flipctl_rate_surge_triggers:%llu\r\n"
-                    "flipctl_rate_collapse_triggers:%llu\r\n"
-                    "flipctl_surge_triggers:%llu\r\nflipctl_collapse_triggers:%llu\r\n"
-                    "flipctl_forced_triggers:%llu\r\n"
-                    "flipctl_null_maneuvers:%llu\r\nflipctl_model_holds:%llu\r\n"
-                    "flipctl_shift_confirmations:%u\r\n"
-                    "flipctl_rate_confirmations:%u\r\n"
-                    "flipctl_round_trips:%llu\r\nflipctl_model_margin:%u\r\n"
-                    "flipctl_last_trigger:%s\r\n"
-                    "flipctl_model_last_decision:%s\r\nflipctl_model_kappa:%.4f\r\n"
-                    "flipctl_model_moves:%u\r\nflipctl_model_misses:%u\r\n"
-                    "flipctl_invalidated_maneuvers:%llu\r\nflipctl_cost_holds:%llu\r\n"
-                    "flipctl_client_cost:%.2f\r\nflipctl_last_flip_lost:%.1f\r\n"
-                    "flipctl_last_flip_moved:%llu\r\nflipctl_flip_ticks:%.2f\r\n"
-                    "flipctl_refine_decision:%s\r\nflipctl_refine_steps:%u\r\n",
-                    ctl.state.c_str(), ctl.phase.c_str(), ctl.anchor_io, ctl.anchor_ex,
-                    ctl.anchor_rate, ctl.signature_band, ctl.rate_band,
-                    static_cast<unsigned long long>(ctl.triggers),
-                    static_cast<unsigned long long>(ctl.boot_triggers),
-                    static_cast<unsigned long long>(ctl.fingerprint_triggers),
-                    static_cast<unsigned long long>(ctl.rate_surge_triggers),
-                    static_cast<unsigned long long>(ctl.rate_collapse_triggers),
-                    static_cast<unsigned long long>(ctl.rate_surge_triggers),
-                    static_cast<unsigned long long>(ctl.rate_collapse_triggers),
-                    static_cast<unsigned long long>(ctl.forced_triggers),
-                    static_cast<unsigned long long>(ctl.null_maneuvers),
-                    static_cast<unsigned long long>(ctl.model_holds),
-                    ctl.shift_confirmations, ctl.rate_confirmations,
-                    static_cast<unsigned long long>(ctl.round_trips), ctl.model_margin,
-                    ctl.last_trigger.c_str(),
-                    ctl.model_last_decision.c_str(), ctl.model_kappa,
-                    ctl.model_moves, ctl.model_misses,
-                    static_cast<unsigned long long>(ctl.invalidated_maneuvers),
-                    static_cast<unsigned long long>(ctl.cost_holds),
-                    ctl.client_cost, ctl.last_flip_lost,
-                    static_cast<unsigned long long>(ctl.last_flip_moved), ctl.flip_ticks,
-                    ctl.refine_decision.c_str(), ctl.refine_steps);
-        }
     }
     if (info_section(op, "CLIENTS")) {
         appendf(body, "# Clients\r\nconnected_clients:%llu\r\nblocked_clients:%llu\r\n"
@@ -2140,11 +1542,7 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(g_server ? g_server->climon_monitors() : 0));
     }
     if (info_section(op, "MEMORY")) {
-        // used_memory follows the same accounted basis that admits/evicts writes and that MEMORY
-        // STATS uses: objects plus the stable per-key slot cost. Redis's dataset excludes keyspace
-        // table overhead, so used_memory_dataset remains the object allocation portion here.
-        const uint64_t used_memory = accounted_memory_bytes(obj_bytes, keys);
-        const uint64_t used_memory_peak = info_stats_observe_memory(used_memory);
+        const uint64_t object_peak = info_stats_observe_memory(obj_bytes);
         size_t allocated = 0, resident = 0;
 #if defined(TOMO_JEMALLOC)
         uint64_t epoch = 1; size_t epoch_size = sizeof(epoch);
@@ -2152,25 +1550,13 @@ void cmd_info(Shard&, Op& op) {
         size_t sz = sizeof(allocated); mallctl("stats.allocated", &allocated, &sz, nullptr, 0);
         sz = sizeof(resident); mallctl("stats.resident", &resident, &sz, nullptr, 0);
 #endif
-        // Armed writes recycle their retired blocks through a per-owner cache. Those bytes are
-        // allocated but hold no key, so they are reported here and deliberately left out of
-        // used_memory / used_memory_dataset / the maxmemory budget: every figure above keeps the
-        // same basis it had before the cache existed.
-        uint64_t block_cache = 0;
-        if (g_server)
-            for (uint32_t t = 0; t < g_server->nthreads(); t++)
-                block_cache += g_server->thread(t).read_local_block_cache_bytes();
         appendf(body, "# Memory\r\nused_memory:%llu\r\nused_memory_dataset:%llu\r\n"
                       "used_memory_rss:%llu\r\nused_memory_peak:%llu\r\n"
-                      "mem_allocator:%s\r\nallocator_allocated:%llu\r\nallocator_resident:%llu\r\n"
-                      "mem_block_cache:%llu\r\n",
-                static_cast<unsigned long long>(used_memory),
-                static_cast<unsigned long long>(obj_bytes),
-                static_cast<unsigned long long>(resident),
-                static_cast<unsigned long long>(used_memory_peak),
+                      "mem_allocator:%s\r\nallocator_allocated:%llu\r\nallocator_resident:%llu\r\n",
+                static_cast<unsigned long long>(obj_bytes), static_cast<unsigned long long>(obj_bytes),
+                static_cast<unsigned long long>(resident), static_cast<unsigned long long>(object_peak),
                 alloc_backend(), static_cast<unsigned long long>(allocated),
-                static_cast<unsigned long long>(resident),
-                static_cast<unsigned long long>(block_cache));
+                static_cast<unsigned long long>(resident));
     }
     if (info_section(op, "PERSISTENCE")) {
         uint64_t preimages = 0;
@@ -2184,7 +1570,6 @@ void cmd_info(Shard&, Op& op) {
                 "snapshot_preimages:%llu\r\n"
                 "snapshot_cuts_armed:%llu\r\nsnapshot_cuts_waited:%llu\r\n"
                 "snapshot_groups_drained:%llu\r\n"
-                "snapshot_cut_ticket:%llu\r\n"
                 "aof_enabled:%u\r\naof_rewrite_in_progress:%u\r\n"
                 "aof_rewrite_scheduled:%u\r\naof_last_bgrewrite_status:%s\r\n"
                 "aof_last_write_status:%s\r\naof_base_size:%llu\r\n"
@@ -2210,8 +1595,6 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(g_server ? g_server->snapshot().cuts_waited() : 0),
                 static_cast<unsigned long long>(
                     g_server ? g_server->snapshot().drained_groups() : 0),
-                static_cast<unsigned long long>(
-                    g_server ? g_server->snapshot().cut_ticket() : 0),
                 g_server && g_server->aof().configured() ? 1u : 0u,
                 g_server && g_server->aof().rewrite_in_progress() ? 1u : 0u,
                 g_server && g_server->aof().rewrite_scheduled() ? 1u : 0u,
@@ -2239,12 +1622,10 @@ void cmd_info(Shard&, Op& op) {
     if (info_section(op, "STATS")) {
         const ScriptStats scripting = script_stats();
         const FunctionStats functions = function_stats();
-        const AtomicTripwireCounts tripwire = atomic_tripwire_counts();
         const uint64_t sampled_rate = info_stats_sample_ops(sampled_ops);
         appendf(body, "# Stats\r\ntotal_connections_received:%llu\r\nrejected_connections:%llu\r\n"
                       "total_commands_processed:%llu\r\nkeyspace_hits:%llu\r\nkeyspace_misses:%llu\r\n"
-                      "expired_keys:%llu\r\nactive_expire_reap_lag_ms_max:%llu\r\n"
-                      "evicted_keys:%llu\r\ninstantaneous_ops_per_sec:%llu\r\n"
+                      "expired_keys:%llu\r\nevicted_keys:%llu\r\ninstantaneous_ops_per_sec:%llu\r\n"
                       "expired_hash_fields:%llu\r\nhash_field_expires:%llu\r\n"
                       "keyspace_rehashes:%llu\r\n"
                       "total_net_input_bytes:%llu\r\ntotal_net_output_bytes:%llu\r\n"
@@ -2263,24 +1644,12 @@ void cmd_info(Shard&, Op& op) {
                       "atomic_gauge_underflows:%llu\r\n"
                       "atomic_pending_entries:%llu\r\natomic_localfast:%llu\r\n"
                       "atomic_scan_order_holds:%llu\r\natomic_exec_order_holds:%llu\r\n"
-                      "atomic_exec_order_late:%llu\r\n"
                       "watch_reservation_waits:%llu\r\n"
                       "watch_reservation_coexist:%llu\r\n"
                       "watch_reservation_precommit_aborts:%llu\r\n"
                       "atomic_commit_windows:%llu\r\natomic_commit_holds:%llu\r\n"
                       "atomic_read_cuts_held:%llu\r\natomic_fanout_cuts:%llu\r\n"
                       "atomic_exec_read_cuts:%llu\r\n"
-                      "atomic_tripwire_plain_path_changes:%llu\r\n"
-                      "atomic_tripwire_chain_smaller_tickets:%llu\r\n"
-                      "atomic_tripwire_samekey_masked_out:%llu\r\n"
-                      "atomic_tripwire_samekey_visible_lost:%llu\r\n"
-                      "atomic_tripwire_samekey_undecided:%llu\r\n"
-                      "atomic_tripwire_samekey_undecided_le_cut:%llu\r\n"
-                      "atomic_tripwire_samekey_undecided_gt_cut:%llu\r\n"
-                      "atomic_tripwire_excluded_reader_zero:%llu\r\n"
-                      "atomic_tripwire_excluded_conn_mismatch:%llu\r\n"
-                      "atomic_tripwire_collapse_undelete:%llu\r\n"
-                      "atomic_tripwire_collapse_write_other:%llu\r\n"
                       "atomic_credit_pool:%u\r\natomic_credit_debt:%u\r\n"
                       "script_stage_owner_tasks:%llu\r\nscript_run_attempts:%llu\r\n"
                       "script_validate_owner_tasks:%llu\r\nscript_apply_owner_tasks:%llu\r\n"
@@ -2297,7 +1666,7 @@ void cmd_info(Shard&, Op& op) {
                       "pubsub_patterns:%llu\r\npubsub_home_entries:%llu\r\n"
                       "pubsub_inflight:%llu\r\npubsub_pending_commands:%llu\r\n"
                       "pubsub_blobs:%llu\r\npubsub_deliveries:%llu\r\n"
-                      "pubsub_delivery_batches:%llu\r\npubsub_forwarded_stale:%llu\r\n"
+                      "pubsub_delivery_batches:%llu\r\n"
                       "client_output_buffer_limit_disconnections:%llu\r\n"
                       "notify_events_fired:%llu\r\nnotify_events_dropped:%llu\r\n"
                       "client_scatter_requests:%llu\r\nclient_scatter_io_responses:%llu\r\n"
@@ -2318,12 +1687,10 @@ void cmd_info(Shard&, Op& op) {
                       "script_effect_writes:%llu\r\nscript_failed_after_effects:%llu\r\n"
                       "function_generation:%llu\r\nfunction_calls:%llu\r\n"
                       "function_thread_rebuilds:%llu\r\nfunction_readonly_rejections:%llu\r\n"
-                      "monitor_feed_lines:%llu\r\nmonitor_forwarded_stale:%llu\r\n"
-                      "client_pause_holds:%llu\r\n"
+                      "monitor_feed_lines:%llu\r\nclient_pause_holds:%llu\r\n"
                       "client_no_touch_ops:%llu\r\n"
                       "tracking_total_keys:%llu\r\ntracking_total_items:%llu\r\n"
                       "tracking_total_prefixes:%llu\r\ntracking_invalidations:%llu\r\n"
-                      "tracking_forwarded_stale:%llu\r\n"
                       "slowlog_batches_timed:%llu\r\nslowlog_escalations:%llu\r\n"
                       "slowlog_entries_recorded:%llu\r\nlatency_events_recorded:%llu\r\n"
                       "net_io_epoll_events:%llu\r\nnet_io_epoll_recvs:%llu\r\n"
@@ -2332,7 +1699,6 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(connections), static_cast<unsigned long long>(rejected),
                 static_cast<unsigned long long>(total_ops), static_cast<unsigned long long>(hits),
                 static_cast<unsigned long long>(misses), static_cast<unsigned long long>(expired),
-                static_cast<unsigned long long>(active_expire_reap_lag_ms_max),
                 static_cast<unsigned long long>(evicted),
                 static_cast<unsigned long long>(sampled_rate),
                 static_cast<unsigned long long>(expired_hash_fields),
@@ -2371,7 +1737,6 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(atomic_localfast),
                 static_cast<unsigned long long>(atomic_scan_holds),
                 static_cast<unsigned long long>(atomic_exec_order_holds),
-                static_cast<unsigned long long>(multi_exec_order_late()),
                 static_cast<unsigned long long>(watch_reservation_waits),
                 static_cast<unsigned long long>(watch_reservation_coexist),
                 static_cast<unsigned long long>(watch_reservation_precommit_aborts),
@@ -2385,17 +1750,6 @@ void cmd_info(Shard&, Op& op) {
                     g_server ? g_server->atomic_fanout_cuts() : 0),
                 static_cast<unsigned long long>(
                     g_server ? g_server->atomic_exec_read_cuts() : 0),
-                static_cast<unsigned long long>(tripwire.plain_path_changes),
-                static_cast<unsigned long long>(tripwire.chain_smaller_tickets),
-                static_cast<unsigned long long>(tripwire.samekey_masked_out),
-                static_cast<unsigned long long>(tripwire.samekey_visible_lost),
-                static_cast<unsigned long long>(tripwire.samekey_undecided),
-                static_cast<unsigned long long>(tripwire.samekey_undecided_le_cut),
-                static_cast<unsigned long long>(tripwire.samekey_undecided_gt_cut),
-                static_cast<unsigned long long>(tripwire.excluded_reader_zero),
-                static_cast<unsigned long long>(tripwire.excluded_conn_mismatch),
-                static_cast<unsigned long long>(tripwire.collapse_undelete),
-                static_cast<unsigned long long>(tripwire.collapse_write_other),
                 g_server ? g_server->atomic_credit_pool() : 0,
                 g_server ? g_server->atomic_credit_debt() : 0,
                 static_cast<unsigned long long>(g_server ? g_server->script_stage_owner_tasks() : 0),
@@ -2429,7 +1783,6 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(g_server ? g_server->pubsub_blobs() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->pubsub_deliveries() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->pubsub_delivery_batches() : 0),
-                static_cast<unsigned long long>(g_server ? g_server->pubsub_forwarded_stale() : 0),
                 static_cast<unsigned long long>(
                     g_server ? g_server->client_output_buffer_limit_disconnections() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->notify_events_fired() : 0),
@@ -2468,14 +1821,12 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(functions.thread_rebuilds),
                 static_cast<unsigned long long>(functions.ro_rejections),
                 static_cast<unsigned long long>(g_server ? g_server->climon_monitor_lines() : 0),
-                static_cast<unsigned long long>(g_server ? g_server->monitor_forwarded_stale() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_pause_holds() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_no_touch_ops() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_tracking_keys() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_tracking_items() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_tracking_prefixes() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->climon_invalidations() : 0),
-                static_cast<unsigned long long>(g_server ? g_server->tracking_forwarded_stale() : 0),
                 // Mechanism counters: a slowlog test that cannot see these move proves nothing.
                 static_cast<unsigned long long>(slowlog_batches_timed()),
                 static_cast<unsigned long long>(slowlog_escalations()),
@@ -2487,255 +1838,16 @@ void cmd_info(Shard&, Op& op) {
                 // reached the non-quiesced / mid-drain geometry it is there to cover.
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_segmented() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_deferred() : 0),
-                // barrier_owner_overlaps must read 0 on any production run: blocking dispatch
-                // requires an empty ROB and bars younger parsing, excluding a second owner.
-                // barrier_releases_held is the fired-mechanism proof for DEBUG BARRIER-HOLD --
-                // a barrier-ownership test that leaves it at 0 never reached its geometry and
-                // must fail, not pass.
+                // barrier_owner_overlaps must read 0 on any production run: it is the live
+                // assertion behind NOTES-BARRIER.md's reachability verdict. barrier_releases_held
+                // is the fired-mechanism proof for DEBUG BARRIER-HOLD -- a barrier-ownership test
+                // that leaves it at 0 never reached its geometry and must fail, not pass.
                 static_cast<unsigned long long>(
                     g_server ? g_server->barrier_owner_overlaps() : 0),
                 static_cast<unsigned long long>(
                     g_server ? g_server->barrier_releases_held() : 0));
-        appendf(body,
-                "flip_completed:%llu\r\nflip_refused:%llu\r\n"
-                "flip_clients_transferred:%llu\r\nflip_last_transfers:%llu\r\n"
-                "flip_conservation_checks:%llu\r\nflip_conservation_violations:%llu\r\n",
-                static_cast<unsigned long long>(g_server ? g_server->flip_completed() : 0),
-                static_cast<unsigned long long>(g_server ? g_server->flip_refused() : 0),
-                static_cast<unsigned long long>(
-                    g_server ? g_server->flip_clients_transferred() : 0),
-                static_cast<unsigned long long>(
-                    g_server ? g_server->flip_last_transfers() : 0),
-                static_cast<unsigned long long>(
-                    g_server ? g_server->flip_conservation_checks() : 0),
-                static_cast<unsigned long long>(
-                    g_server ? g_server->flip_conservation_violations() : 0));
-        appendf(body,
-                "foreign_read_unsafe_refs:%llu\r\n"
-                "foreign_read_occupied_cells:%llu\r\n"
-                "foreign_read_wildcard_cells:%llu\r\n"
-                "foreign_read_saturated_cells:%llu\r\n"
-                "foreign_read_poisoned_shards:%llu\r\n",
-                static_cast<unsigned long long>(foreign_read_unsafe_refs),
-                static_cast<unsigned long long>(foreign_read_occupied_cells),
-                static_cast<unsigned long long>(foreign_read_wildcard_cells),
-                static_cast<unsigned long long>(foreign_read_saturated_cells),
-                static_cast<unsigned long long>(foreign_read_poisoned_shards));
-        appendf(body,
-                "read_local_hits:%llu\r\n"
-                "read_local_keyspace_hits:%llu\r\n"
-                "read_local_keyspace_misses:%llu\r\n"
-                "read_local_fallbacks:%llu\r\n"
-                "read_local_fallback_multi:%llu\r\n"
-                "read_local_fallback_watch:%llu\r\n"
-                "read_local_fallback_context:%llu\r\n"
-                "read_local_fallback_context_owner_key:%llu\r\n"
-                "read_local_fallback_context_connection_state:%llu\r\n"
-                "read_local_fallback_context_route:%llu\r\n"
-                "read_local_fallback_context_keymiss_notify:%llu\r\n"
-                "read_local_fallback_inflight_write:%llu\r\n"
-                "read_local_fallback_arm_transient:%llu\r\n"
-                "read_local_arms:%llu\r\n"
-                "read_local_write_ring_sidecars:%llu\r\n"
-                "read_local_write_ring_records:%llu\r\n"
-                "read_local_fallback_atomic_pending:%llu\r\n"
-                "read_local_fallback_missing:%llu\r\n"
-                "read_local_fallback_typed:%llu\r\n"
-                "read_local_fallback_expired:%llu\r\n"
-                "read_local_fallback_seq_churn:%llu\r\n"
-                "read_local_fallback_generation:%llu\r\n"
-                "read_local_fallback_lane_full:%llu\r\n"
-                "read_local_defer_lane_full:%llu\r\n"
-                "read_local_defer_quota:%llu\r\n",
-                static_cast<unsigned long long>(read_local.hits),
-                static_cast<unsigned long long>(read_local.keyspace_hits),
-                static_cast<unsigned long long>(read_local.keyspace_misses),
-                static_cast<unsigned long long>(read_local.fallbacks()),
-                static_cast<unsigned long long>(read_local.fallback_multi),
-                static_cast<unsigned long long>(read_local.fallback_watch),
-                static_cast<unsigned long long>(read_local.fallback_context),
-                static_cast<unsigned long long>(read_local.fallback_context_owner_key),
-                static_cast<unsigned long long>(read_local.fallback_context_connection_state),
-                static_cast<unsigned long long>(read_local.fallback_context_route),
-                static_cast<unsigned long long>(read_local.fallback_context_keymiss_notify),
-                static_cast<unsigned long long>(read_local.fallback_inflight_write),
-                static_cast<unsigned long long>(read_local.fallback_arm_transient),
-                static_cast<unsigned long long>(read_local.arm.arms),
-                static_cast<unsigned long long>(read_local.arm.sidecars),
-                static_cast<unsigned long long>(read_local.arm.write_ring_records),
-                static_cast<unsigned long long>(read_local.fallback_atomic_pending),
-                static_cast<unsigned long long>(read_local.fallback_missing),
-                static_cast<unsigned long long>(read_local.fallback_typed),
-                static_cast<unsigned long long>(read_local.fallback_expired),
-                static_cast<unsigned long long>(read_local.fallback_seq_churn),
-                static_cast<unsigned long long>(read_local.fallback_generation),
-                static_cast<unsigned long long>(read_local.fallback_lane_full),
-                static_cast<unsigned long long>(read_local.defer_lane_full),
-                static_cast<unsigned long long>(read_local.defer_quota));
-        appendf(body,
-                "read_local_mget_local_hits:%llu\r\n"
-                "read_local_mget_fallbacks:%llu\r\n"
-                "read_local_mget_fallback_multi:%llu\r\n"
-                "read_local_mget_fallback_watch:%llu\r\n"
-                "read_local_mget_fallback_context:%llu\r\n"
-                "read_local_mget_fallback_context_owner_key:%llu\r\n"
-                "read_local_mget_fallback_context_connection_state:%llu\r\n"
-                "read_local_mget_fallback_context_route:%llu\r\n"
-                "read_local_mget_fallback_context_keymiss_notify:%llu\r\n"
-                "read_local_mget_fallback_inflight_write:%llu\r\n"
-                "read_local_mget_fallback_arm_transient:%llu\r\n"
-                "read_local_mget_fallback_atomic_pending:%llu\r\n"
-                "read_local_mget_fallback_typed:%llu\r\n"
-                "read_local_mget_fallback_expired:%llu\r\n"
-                "read_local_mget_fallback_seq_churn:%llu\r\n"
-                "read_local_mget_generation_retries:%llu\r\n"
-                "read_local_mget_fallback_generation:%llu\r\n"
-                "read_local_mget_fallback_lane_full:%llu\r\n",
-                static_cast<unsigned long long>(read_local.mget_local_hits),
-                static_cast<unsigned long long>(read_local.mget_fallbacks()),
-                static_cast<unsigned long long>(read_local.mget_fallback_multi),
-                static_cast<unsigned long long>(read_local.mget_fallback_watch),
-                static_cast<unsigned long long>(read_local.mget_fallback_context),
-                static_cast<unsigned long long>(read_local.mget_fallback_context_owner_key),
-                static_cast<unsigned long long>(
-                    read_local.mget_fallback_context_connection_state),
-                static_cast<unsigned long long>(read_local.mget_fallback_context_route),
-                static_cast<unsigned long long>(
-                    read_local.mget_fallback_context_keymiss_notify),
-                static_cast<unsigned long long>(read_local.mget_fallback_inflight_write),
-                static_cast<unsigned long long>(read_local.mget_fallback_arm_transient),
-                static_cast<unsigned long long>(read_local.mget_fallback_atomic_pending),
-                static_cast<unsigned long long>(read_local.mget_fallback_typed),
-                static_cast<unsigned long long>(read_local.mget_fallback_expired),
-                static_cast<unsigned long long>(read_local.mget_fallback_seq_churn),
-                static_cast<unsigned long long>(read_local.mget_generation_retries),
-                static_cast<unsigned long long>(read_local.mget_fallback_generation),
-                static_cast<unsigned long long>(read_local.mget_fallback_lane_full));
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        // Temporary experiment telemetry is lifetime-scoped (unlike Redis compatibility stats,
-        // CONFIG RESETSTAT does not rebase it) so queue/pool gauges and their traffic stay coherent.
-        const ReadLocalSetTaxStats& settax = read_local.settax;
-        const uint64_t settax_overwrite_attempts = settax.overwrite_hits +
-            settax.reject_missing + settax.reject_encoding + settax.reject_ttl +
-            settax.reject_oversize + settax.reject_size_class + settax.reject_borrowed +
-            settax.reject_sequence_saturated + settax.overwrite_maxmemory_oom;
-        appendf(body,
-                "read_local_settax_variant:%u\r\n"
-                "read_local_settax_overwrite_attempts:%llu\r\n"
-                "read_local_settax_overwrite_hits:%llu\r\n"
-                "read_local_settax_reject_missing:%llu\r\n"
-                "read_local_settax_reject_encoding:%llu\r\n"
-                "read_local_settax_reject_ttl:%llu\r\n"
-                "read_local_settax_reject_oversize:%llu\r\n"
-                "read_local_settax_reject_size_class:%llu\r\n"
-                "read_local_settax_reject_borrowed:%llu\r\n"
-                "read_local_settax_reject_sequence_saturated:%llu\r\n"
-                "read_local_settax_overwrite_maxmemory_oom:%llu\r\n",
-                static_cast<unsigned>(TOMO_READ_LOCAL_SET_TAX_VARIANT),
-                static_cast<unsigned long long>(settax_overwrite_attempts),
-                static_cast<unsigned long long>(settax.overwrite_hits),
-                static_cast<unsigned long long>(settax.reject_missing),
-                static_cast<unsigned long long>(settax.reject_encoding),
-                static_cast<unsigned long long>(settax.reject_ttl),
-                static_cast<unsigned long long>(settax.reject_oversize),
-                static_cast<unsigned long long>(settax.reject_size_class),
-                static_cast<unsigned long long>(settax.reject_borrowed),
-                static_cast<unsigned long long>(settax.reject_sequence_saturated),
-                static_cast<unsigned long long>(settax.overwrite_maxmemory_oom));
-        appendf(body,
-                "read_local_settax_init_raw_calls:%llu\r\n"
-                "read_local_settax_init_int_calls:%llu\r\n"
-                "read_local_settax_init_extern_calls:%llu\r\n"
-                "read_local_settax_init_key_bytes:%llu\r\n"
-                "read_local_settax_init_value_bytes:%llu\r\n"
-                "read_local_settax_init_cell_prepare_calls:%llu\r\n"
-                "read_local_settax_fresh_allocation_attempts:%llu\r\n"
-                "read_local_settax_accounting_add_calls:%llu\r\n"
-                "read_local_settax_accounting_sub_calls:%llu\r\n"
-                "read_local_settax_accounting_bytes:%llu\r\n"
-                "read_local_settax_slot_replacements:%llu\r\n"
-                "read_local_settax_expire_erases:%llu\r\n",
-                static_cast<unsigned long long>(settax.init_raw_calls),
-                static_cast<unsigned long long>(settax.init_int_calls),
-                static_cast<unsigned long long>(settax.init_extern_calls),
-                static_cast<unsigned long long>(settax.init_key_bytes),
-                static_cast<unsigned long long>(settax.init_value_bytes),
-                static_cast<unsigned long long>(settax.init_cell_prepare_calls),
-                static_cast<unsigned long long>(settax.fresh_allocation_attempts),
-                static_cast<unsigned long long>(settax.accounting_add_calls),
-                static_cast<unsigned long long>(settax.accounting_sub_calls),
-                static_cast<unsigned long long>(settax.accounting_bytes),
-                static_cast<unsigned long long>(settax.slot_replacements),
-                static_cast<unsigned long long>(settax.expire_erases));
-        appendf(body,
-                "read_local_settax_recycle_acquire_attempts:%llu\r\n"
-                "read_local_settax_recycle_acquire_hits:%llu\r\n"
-                "read_local_settax_recycle_acquire_ineligible:%llu\r\n"
-                "read_local_settax_recycle_acquire_empty:%llu\r\n"
-                "read_local_settax_recycle_return_attempts:%llu\r\n"
-                "read_local_settax_recycle_return_accepted:%llu\r\n"
-                "read_local_settax_recycle_return_ineligible:%llu\r\n"
-                "read_local_settax_recycle_return_limited:%llu\r\n"
-                "read_local_settax_recycle_pool_nodes:%llu\r\n"
-                "read_local_settax_recycle_pool_max_owner_nodes:%llu\r\n"
-                "read_local_settax_recycle_capacity_evals:%llu\r\n"
-                "read_local_settax_recycle_candidate_attempts:%llu\r\n"
-                "read_local_settax_recycle_reject_not_string:%llu\r\n"
-                "read_local_settax_recycle_reject_encoding:%llu\r\n"
-                "read_local_settax_recycle_reject_borrowed:%llu\r\n"
-                "read_local_settax_recycle_atomic_pool_accepts:%llu\r\n",
-                static_cast<unsigned long long>(settax.recycle_acquire_attempts),
-                static_cast<unsigned long long>(settax.recycle_acquire_hits),
-                static_cast<unsigned long long>(settax.recycle_acquire_ineligible),
-                static_cast<unsigned long long>(settax.recycle_acquire_empty),
-                static_cast<unsigned long long>(settax.recycle_return_attempts),
-                static_cast<unsigned long long>(settax.recycle_return_accepted),
-                static_cast<unsigned long long>(settax.recycle_return_ineligible),
-                static_cast<unsigned long long>(settax.recycle_return_limited),
-                static_cast<unsigned long long>(settax.recycle_pool_nodes),
-                static_cast<unsigned long long>(settax.recycle_pool_max_owner_nodes),
-                static_cast<unsigned long long>(settax.recycle_capacity_evals),
-                static_cast<unsigned long long>(settax.recycle_candidate_attempts),
-                static_cast<unsigned long long>(settax.recycle_reject_not_string),
-                static_cast<unsigned long long>(settax.recycle_reject_encoding),
-                static_cast<unsigned long long>(settax.recycle_reject_borrowed),
-                static_cast<unsigned long long>(settax.recycle_atomic_pool_accepts));
-        appendf(body,
-                "read_local_settax_qsbr_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_object_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_table_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_depth:%llu\r\n"
-                "read_local_settax_qsbr_max_owner_depth:%llu\r\n"
-                "read_local_settax_qsbr_depth_samples:%llu\r\n"
-                "read_local_settax_qsbr_depth_sum:%llu\r\n"
-                "read_local_settax_qsbr_seals:%llu\r\n"
-                "read_local_settax_qsbr_sealed_entries:%llu\r\n"
-                "read_local_settax_qsbr_grace_scans:%llu\r\n"
-                "read_local_settax_qsbr_participant_loads:%llu\r\n"
-                "read_local_settax_qsbr_zero_progress_scans:%llu\r\n"
-                "read_local_settax_qsbr_reclaims:%llu\r\n"
-                "read_local_settax_qsbr_forced_graces:%llu\r\n"
-                "read_local_settax_qsbr_forced_yields:%llu\r\n"
-                "read_local_settax_object_sequence_retries:%llu\r\n",
-                static_cast<unsigned long long>(settax.qsbr_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_object_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_table_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_depth),
-                static_cast<unsigned long long>(settax.qsbr_max_owner_depth),
-                static_cast<unsigned long long>(settax.qsbr_depth_samples),
-                static_cast<unsigned long long>(settax.qsbr_depth_sum),
-                static_cast<unsigned long long>(settax.qsbr_seals),
-                static_cast<unsigned long long>(settax.qsbr_sealed_entries),
-                static_cast<unsigned long long>(settax.qsbr_grace_scans),
-                static_cast<unsigned long long>(settax.qsbr_participant_loads),
-                static_cast<unsigned long long>(settax.qsbr_zero_progress_scans),
-                static_cast<unsigned long long>(settax.qsbr_reclaims),
-                static_cast<unsigned long long>(settax.qsbr_forced_graces),
-                static_cast<unsigned long long>(settax.qsbr_forced_yields),
-                static_cast<unsigned long long>(settax.object_sequence_retries));
-#endif
     }
-    if (info_section(op, "COMMANDSTATS", false)) {
+    if (info_section(op, "COMMANDSTATS")) {
         body += "# Commandstats\r\n";
         for (uint32_t id = 0; id < command_registry_size(); id++) {
             uint64_t calls = 0;
@@ -2754,7 +1866,7 @@ void cmd_info(Shard&, Op& op) {
         appendf(body, "db0:keys=%llu,expires=%llu\r\n",
                 static_cast<unsigned long long>(keys), static_cast<unsigned long long>(expires));
     }
-    if (g_server && info_section(op, "LB", false)) lbsignals_info_section(*g_server, body);
+    if (g_server && info_section(op, "LB")) lbsignals_info_section(*g_server, body);
     reply_verbatim(op.sink(), Slice(body.data(), body.size()), "txt", op.resp3());
 }
 
@@ -2900,12 +2012,8 @@ static const CommandSpec kTable[] = {
                           CmdFlags::Climon,                                       cmd_monitor,    0,  0, 0},
     {"COMMAND",    1, -1, CmdFlags::ConnLocal | CmdFlags::Admin,                  cmd_command,    0,  0, 0},
     {"CONFIG",     2, -1, CmdFlags::Admin | CmdFlags::ConfigRoute,                cmd_config,     0,  0, 0},
-    {"DEBUG",      2, -1, CmdFlags::Admin | CmdFlags::ConfigRoute |
-                              CmdFlags::DebugSleep,                                cmd_debug,      0,  0, 0},
-    {"FLIP",       1,  3, CmdFlags::Write | CmdFlags::Admin | CmdFlags::ConnLocal |
-                          CmdFlags::OrderedLocal | CmdFlags::NoScript | CmdFlags::NoMulti |
-                          CmdFlags::NoAsyncLoading | CmdFlags::FlipAsync,           cmd_flip,       0,  0, 0},
-    {"INFO",       1, -1, CmdFlags::ConnLocal | CmdFlags::Admin,                  cmd_info,       0,  0, 0},
+    {"DEBUG",      2, -1, CmdFlags::Admin | CmdFlags::ConfigRoute,                cmd_debug,      0,  0, 0},
+    {"INFO",       1,  2, CmdFlags::ConnLocal | CmdFlags::Admin,                  cmd_info,       0,  0, 0},
     {"SELECT",     2,  2, CmdFlags::ConnLocal,                                    cmd_select,     0,  0, 0},
         {"DBSIZE",     1,  2, CmdFlags::Admin | CmdFlags::ConfigRoute,                cmd_dbsize,     0,  0, 0},
     {"FLUSHALL",   1,  2, CmdFlags::Write | CmdFlags::Admin | CmdFlags::AllShards,cmd_flush,      0,  0, 0},
@@ -2922,41 +2030,6 @@ static const CommandSpec kTable[] = {
 };
 
 }  // namespace
-
-DebugSleepResult debug_sleep_prepare(Server& server, Client& client, Op& op,
-                                     uint64_t& delay_ms) {
-    if (op.argc() != 3 || !eq_icase(op.arg(1), "sleep"))
-        return DebugSleepResult::NotSleep;
-    if (!debug_command_allowed(server, &client)) {
-        reply_debug_command_denied(op);
-        return DebugSleepResult::Handled;
-    }
-
-    // Preserve DEBUG SLEEP's deliberately lenient Redis-compatible parse: malformed, negative,
-    // NaN and infinity all spell zero. Only a finite positive value can become a timer.
-    double seconds = 0;
-    if (!parse_double_lenient(op.arg(2), seconds)) seconds = 0;
-    if (!std::isfinite(seconds) || seconds < 0.0) seconds = 0;
-    const double cap_seconds = static_cast<double>(std::max<uint32_t>(1, server.timeout()));
-    if (seconds > cap_seconds) {
-        reply_err(op.sink(), "ERR value is not a valid float");
-        return DebugSleepResult::Handled;
-    }
-    if (seconds == 0.0) {
-        reply_ok(op.sink());
-        return DebugSleepResult::Handled;
-    }
-
-    // IoLoop deadlines are milliseconds. Round away from zero so every positive request parks at
-    // least once; the timeout-derived cap keeps this conversion far below uint64_t overflow.
-    delay_ms = static_cast<uint64_t>(std::ceil(seconds * 1000.0));
-    if (!delay_ms) delay_ms = 1;
-    return DebugSleepResult::Deferred;
-}
-
-void cmd_flip_unavailable(Shard&, Op& op) {
-    reply_err(op.sink(), "ERR FLIP is unavailable with --thread-mode 1s: threads are fused");
-}
 
 bool debug_command_allowed(const Server& server, const Client* client) {
     const DebugCommandMode mode = server.cfg().enable_debug_command;
@@ -3031,9 +2104,6 @@ bool command_parse_scan_cursor(Slice text, uint64_t& cursor) {
 }
 
 Server* command_server() { return g_server; }
-uint64_t command_proto_max_bulk_len() {
-    return g_proto_max_bulk_len.load(std::memory_order_relaxed);
-}
 ThreadCtx* command_local_thread() { return g_thread; }
 
 void command_config_snapshot(std::vector<std::pair<std::string, std::string>>& out) {
@@ -3049,8 +2119,7 @@ void command_config_resetstat() {
     // cross-thread reads INFO already performs on every call, so no new sharing is introduced.
     StatBaseline baseline;
     collect_stat_totals(baseline);
-    info_stats_reset(baseline.sampled_ops,
-                     accounted_memory_bytes(baseline.object_bytes, baseline.keys));
+    info_stats_reset(baseline.sampled_ops, baseline.object_bytes);
     std::lock_guard<std::mutex> lock(g_stat_baseline_mu);
     g_stat_baseline = baseline;
 }
@@ -3089,57 +2158,15 @@ void command_client_disconnected(Client* client) {
     g_client_meta.erase(client->id());
 }
 
-void* command_client_migration_extract(Client* client) {
-    if (!client) return nullptr;
-    auto* catalog = new (std::nothrow) ClientMigrationCatalog;
-    if (!catalog) return nullptr;
-    catalog->node = g_client_meta.extract(client->id());
-    if (catalog->node.empty()) {
-        delete catalog;
-        return nullptr;
-    }
-    return catalog;
-}
-
-bool command_client_migration_install(void* opaque) {
-    std::unique_ptr<ClientMigrationCatalog> catalog(
-        static_cast<ClientMigrationCatalog*>(opaque));
-    if (!catalog || catalog->node.empty()) return false;
-    return g_client_meta.insert(std::move(catalog->node)).inserted;
-}
-
-void command_client_migration_discard(void* opaque) {
-    delete static_cast<ClientMigrationCatalog*>(opaque);
-}
-
-bool command_client_migration_reserve(uint32_t extra) {
-    try {
-        g_client_meta.reserve(g_client_meta.size() + extra);
-        return true;
-    } catch (const std::bad_alloc&) {
-        return false;
-    }
-}
-
 // Cold process-wide directory. CLIENT UNBLOCK and CLIENT TRACKING REDIRECT need to name a
 // connection owned by ANOTHER io thread; the per-owner catalog above deliberately cannot. The
-// mutex is taken at accept/close, by those two cold commands, and by stale notification delivery
-// after migration -- never on an ordinary command or reply path.
+// mutex is taken at accept, at close, and by those two cold commands -- never on a reply path.
 std::mutex g_client_dir_mu;
-std::unordered_map<uint64_t, Client*> g_client_dir;
+std::unordered_map<uint64_t, uint32_t> g_client_dir;
 
-void command_client_directory_add(Client* client, uint32_t io) {
-    if (!client) return;
+void command_client_directory_add(uint64_t id, uint32_t io) {
     std::lock_guard<std::mutex> lock(g_client_dir_mu);
-    if (client->ifid_thread() != io) std::abort();
-    g_client_dir[client->id()] = client;
-}
-
-void command_client_directory_move(uint64_t id, uint32_t io) {
-    std::lock_guard<std::mutex> lock(g_client_dir_mu);
-    auto found = g_client_dir.find(id);
-    if (found == g_client_dir.end() || !found->second || found->second->ifid_thread() != io)
-        std::abort();
+    g_client_dir[id] = io;
 }
 
 void command_client_directory_remove(uint64_t id) {
@@ -3151,12 +2178,7 @@ bool command_client_directory_find(uint64_t id, uint32_t& io) {
     std::lock_guard<std::mutex> lock(g_client_dir_mu);
     auto found = g_client_dir.find(id);
     if (found == g_client_dir.end()) return false;
-    Client* client = found->second;
-    if (!client) return false;
-    // Do not trust a captured registry value at the correctness edge.  The acquire load is the
-    // documented single-owner publication and remains safe while the directory lock prevents
-    // concurrent close from removing and eventually freeing this pointer.
-    io = client->ifid_thread();
+    io = found->second;
     return true;
 }
 
@@ -3236,9 +2258,6 @@ bool command_client_set_info(Client* client, Slice option, Slice value) {
 }
 
 void command_client_set_no_evict(Client* client, bool enabled) {
-    // Metadata only. There is no consumer by design: Redis's NO-EVICT gates client output-buffer
-    // eviction, while TomoKV implements only key eviction. Keeping the bit lets CLIENT INFO/LIST
-    // round-trip the accepted Redis surface without falsely coupling it to FlatStore eviction.
     if (ClientMeta* meta = client_meta(client)) meta->no_evict = enabled;
 }
 

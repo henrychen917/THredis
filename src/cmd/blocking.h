@@ -44,8 +44,6 @@ void blocking_start(BlockingState* state, uint32_t tasks);
 // marker distinguishes them from real ScatterState tasks before either pointer is dereferenced.
 bool blocking_execute(Server& server, ThreadCtx& self, Ring& ring, const Task& task,
                       Shard& shard, Op& op);
-bool blocking_execute_iofused(Server& server, ThreadCtx& self, Ring& ring, const Task& task,
-                              Shard& shard, Op& op);
 BlockingSnapshotPrepare blocking_snapshot_prepare(const Task& task, Shard& shard, Op& op);
 
 // Called only behind Shard::has_blocking_waiters(), from mutations that can make a waited
@@ -66,8 +64,6 @@ void blocking_scatter_mutation_published(const Task& task, Shard& shard, Op& op)
 // IO-side connection barrier, move resume, cancellation and ordered retirement.
 bool blocking_resume_move(Server& server, ThreadCtx& self, Ring& ring, Client& client,
                           ScatterArenaPool& pool);
-bool blocking_resume_move_iofused(Server& server, ThreadCtx& self, Ring& ring, Client& client,
-                                  ScatterArenaPool& pool);
 bool blocking_cancel_client(Server& server, ThreadCtx& self, Ring& ring, Client& client);
 // CLIENT UNBLOCK: arm the reply shape the cancel is about to need. Owner-io only.
 bool blocking_request_unblock(Client& client, bool error_flavor);

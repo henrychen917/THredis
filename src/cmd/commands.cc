@@ -69,59 +69,9 @@ bool command_equal(Slice input, const char* canonical) {
     return true;
 }
 
-template <size_t N>
-bool command_name_in(const char* name, const char* const (&names)[N]) {
-    for (const char* candidate : names)
-        if (!std::strcmp(name, candidate)) return true;
-    return false;
-}
-
-// Owner scheduler class table. This runs once while copying the registry; execution reads only
-// the stamped metadata byte. Static means deliberately argv-independent: MGET is SmallMulti at
-// every arity, and a bounded LRANGE is still Long. That is the cost of constant policy lookup.
-CommandLengthClass command_length_class_for(const CommandSpec& spec, bool read_local_armed) {
-    static constexpr const char* kSmallMulti[] = {
-        "DEL", "UNLINK", "EXISTS", "TOUCH", "MGET", "MSET", "MSETNX",
-        "HMGET", "SMISMEMBER", "ZMSCORE",
-        "SMOVE", "LMOVE", "RPOPLPUSH",
-        "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX", "BLMOVE", "BRPOPLPUSH",
-    };
-    static constexpr const char* kLong[] = {
-        "GETRANGE", "SUBSTR", "SETRANGE", "BITFIELD", "BITFIELD_RO", "BITCOUNT",
-        "BITPOS", "DUMP", "RESTORE", "RESTORE-ASKING",
-        "HGETALL", "HKEYS", "HVALS", "HRANDFIELD", "HSCAN",
-        "LINDEX", "LINSERT", "LRANGE", "LREM", "LSET", "LPOS", "LTRIM",
-        "SMEMBERS", "SRANDMEMBER", "SSCAN",
-        "ZRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZRANGEBYLEX",
-        "ZREVRANGEBYLEX", "ZREVRANGE", "ZRANDMEMBER", "ZSCAN",
-        "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
-        "GEOSEARCH", "XRANGE", "XREVRANGE", "XPENDING", "XCLAIM", "XAUTOCLAIM",
-        "XTRIM", "SCAN",
-    };
-    CommandLengthClass length = CommandLengthClass::Point;
-    if (command_name_in(spec.name, kSmallMulti))
-        length = CommandLengthClass::SmallMulti;
-    else if ((spec.flags & CmdFlags::MultiShard) || command_name_in(spec.name, kLong))
-        length = CommandLengthClass::Long;
-
-    // Armed read-local raises write-side cost, most visibly because raw-string updates lose the
-    // try_overwrite path used by plain SET. Stamp that coarse boot-only cost into the existing
-    // two-bit class: Point -> SmallMulti, SmallMulti -> Long, and Long saturates at Long. The
-    // unarmed branch returns the historical assignment byte-for-byte.
-    if (read_local_armed && (spec.flags & CmdFlags::Write)) {
-        if (length == CommandLengthClass::Point)
-            length = CommandLengthClass::SmallMulti;
-        else
-            length = CommandLengthClass::Long;
-    }
-    return length;
-}
-
 }  // namespace
 
-HotCommandSpecs g_hot_command_specs;
-
-bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_armed) {
+bool command_registry_init(bool tls_enabled) {
     if (g_registry.built) return true;
     const CommandTable families[] = {
         string_command_table(), hash_command_table(), hash_ttl_command_table(),
@@ -155,13 +105,6 @@ bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_ar
         for (const CommandTable& family : families)
             for (size_t i = 0; i < family.size; i++) {
                 CommandSpec copy = family.specs[i];
-                copy.length_class =
-                    static_cast<uint8_t>(command_length_class_for(copy, read_local_armed));
-                if (fused_mode && !std::strcmp(copy.name, "FLIP")) {
-                    copy.flags &= ~CmdFlags::FlipAsync;
-                    copy.handler = cmd_flip_unavailable;
-                    copy.handler_notify = cmd_flip_unavailable;
-                }
                 const AclCommandCategoryDefinition* categories =
                     generated_acl_categories(copy.name);
                 if (!categories) {
@@ -226,12 +169,6 @@ bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_ar
     for (const CommandSpec& entry : g_registry.entries) {
         const CommandSpec* spec = &entry;
         const size_t n = std::strlen(spec->name);
-        if (!std::strcmp(spec->name, "GET")) g_hot_command_specs.get = spec;
-        else if (!std::strcmp(spec->name, "SET")) g_hot_command_specs.set = spec;
-        else if (!std::strcmp(spec->name, "DEL")) g_hot_command_specs.del = spec;
-        else if (!std::strcmp(spec->name, "MGET")) g_hot_command_specs.mget = spec;
-        else if (!std::strcmp(spec->name, "MSET")) g_hot_command_specs.mset = spec;
-        else if (!std::strcmp(spec->name, "INCR")) g_hot_command_specs.incr = spec;
         if (n == 0 || spec->min_arity < 1 ||
             (spec->max_arity >= 0 && spec->max_arity < spec->min_arity) ||
             spec->first_key < 0 || spec->key_step < 0 ||
@@ -255,21 +192,10 @@ bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_ar
         g_registry.slots[pos] = spec;
     }
     g_registry.built = true;
-    // The inline resolve in command_lookup bypasses the table for these rows, so pin the two to
-    // each other here: a renamed or dropped row fails at boot, not as a divergent wire reply.
-    static constexpr const char* kHotVerbs[] = {"GET", "SET", "DEL", "MGET", "MSET", "INCR"};
-    for (const char* verb : kHotVerbs) {
-        const Slice name(verb, static_cast<uint32_t>(std::strlen(verb)));
-        if (command_lookup(name) != command_lookup_registry(name)) {
-            std::fprintf(stderr, "hot command row '%s' disagrees with the registry\n", verb);
-            g_registry.built = false;
-            return false;
-        }
-    }
     return true;
 }
 
-const CommandSpec* command_lookup_registry(Slice name) {
+const CommandSpec* command_lookup(Slice name) {
     if (!g_registry.built || name.n == 0) return nullptr;
     size_t pos = command_hash(name.p, name.n) & g_registry.mask;
     for (size_t probes = 0; probes < g_registry.slots.size(); probes++) {
@@ -279,6 +205,11 @@ const CommandSpec* command_lookup_registry(Slice name) {
         pos = (pos + 1) & g_registry.mask;
     }
     return nullptr;
+}
+
+bool command_arity_ok(const CommandSpec& spec, uint32_t argc) {
+    return argc >= static_cast<uint32_t>(spec.min_arity) &&
+           (spec.max_arity < 0 || argc <= static_cast<uint32_t>(spec.max_arity));
 }
 
 namespace {

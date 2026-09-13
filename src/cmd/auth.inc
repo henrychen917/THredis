@@ -117,7 +117,6 @@ bool auth_dispatch_entry(IoLoop& loop, Client& client, Op& op, uint32_t consumed
     if (auth_allowed_without_credentials(op)) return false;
     client.advance_parse(consumed);
     loop.self_->note_command(op.spec->id);
-    loop.flip_fingerprint_note(*op.spec, op);
     reply_err(op.sink(), "NOAUTH Authentication required.");
     loop.finish_prebuilt(&client, op);
     return true;

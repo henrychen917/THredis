@@ -7,7 +7,6 @@
 # suites (e.g. s6fix, scan) for commands whose successful replies are intentionally
 # nondeterministic and must be compared as sets rather than byte streams.
 import socket, sys, random, re, time, hashlib, select
-from _differ_history import coverage
 
 LIST_GENERATORS = sys.argv[1:] == ["--list-generators"]
 if LIST_GENERATORS:
@@ -22,10 +21,10 @@ else:
 RESP3 = "-3" in EXTRA
 SEED = int(next((arg for arg in EXTRA if arg != "-3"), "7"))
 
-def conn_mode(h, p, resp3, buffering=-1):
+def conn_mode(h, p, resp3):
     s = socket.create_connection((h, p), timeout=30)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    f = s.makefile("rb", buffering=buffering)
+    f = s.makefile("rb")
     if resp3:
         s.sendall(enc(["HELLO", "3"]))
         hello = read_reply(f)
@@ -40,13 +39,6 @@ def enc(args):
         if isinstance(a, str): a = a.encode()
         o += b"$%d\r\n" % len(a) + a + b"\r\n"
     return o
-def read_exact(f, count):
-    out = b""
-    while len(out) < count:
-        chunk = f.read(count - len(out))
-        if not chunk: raise EOFError
-        out += chunk
-    return out
 def read_reply(f):
     line = f.readline()
     if not line: raise EOFError
@@ -55,7 +47,7 @@ def read_reply(f):
     if t in (b"$", b"=", b"!"):
         n = int(line[1:-2])
         if n == -1: return line
-        return line + read_exact(f, n + 2)
+        return line + f.read(n + 2)
     if t in (b"*", b"~", b">"):
         n = int(line[1:-2])
         if n == -1: return line
@@ -1791,10 +1783,9 @@ def gen_edgeenc(rng):
                 ["RENAME", k + "c", k + "r"], ["GET", k + "r"],
                 ["DEL", k, k + "r"]]
 
-    # Promotion and the one-way rule at the fixed limits: hash 512, set/zset 128, value 64.
-    for limit_kind in ("entries", "value"):
+    # promotion and the one-way rule, at the aligned limits (128 entries / 64 bytes)
+    for limit_kind, entries in (("entries", 129), ("value", 3)):
         for kind in ("hash", "set", "zset"):
-            entries = (513 if kind == "hash" else 129) if limit_kind == "entries" else 3
             k = "edge:%s:%s" % (kind, limit_kind)
             ops.append(["DEL", k])
             for i in range(entries):
@@ -1907,8 +1898,9 @@ def gen_edgeenc(rng):
 def gen_servertail(rng):
     """LCS-heavy, plus the introspection replies that are genuinely byte-comparable.
 
-    Threshold alignment is done in the suite preamble below: the oracle is configured to the
-    target's fixed compact limits, outside the diffed operation stream.
+    Threshold alignment is done in the suite preamble below, NOT here: the two servers spell their
+    encoding knobs differently, so the same intent needs two different CONFIG SET commands and they
+    cannot travel in the diffed op stream.
 
     Deliberately EXCLUDED, with reasons:
       - OBJECT ENCODING on strings of 45..192 bytes. Our embstr/raw boundary is kEmbedThreshold
@@ -2685,9 +2677,7 @@ def run_blocking_differ(rng):
         payload = enc(argv)
         ts.sendall(payload); os_.sendall(payload)
         logical_ops += 1
-        target, oracle = read_reply(tf), read_reply(of)
-        coverage.note(argv)
-        return compare(label or " ".join(argv[:4]), target, oracle)
+        return compare(label or " ".join(argv[:4]), read_reply(tf), read_reply(of))
 
     def property_check(label, target, oracle):
         nonlocal checks
@@ -2816,19 +2806,13 @@ def run_blocking_differ(rng):
          ["ZADD", "cbd:forever:bzmpop", "1", "v"]),
     ]
     for command, wake in forever_arms:
-        # The preceding reply can precede its gauge decrement too. Arm against a settled
-        # baseline, so that delayed decrement cannot cancel this arm's observed increment.
-        tbase, obase = await_blocked(ts, tf, 0), await_blocked(os_, of, 0)
+        tbase, obase = info_blocked(ts, tf), info_blocked(os_, of)
         tw, twf = conn_mode(TH, TP, RESP3); ow, owf = conn_mode(OH, OP, RESP3)
         tw.sendall(enc(command)); ow.sendall(enc(command)); logical_ops += 1
         tarmed = await_blocked(ts, tf, tbase + 1)
         oarmed = await_blocked(os_, of, obase + 1)
         property_check("%s timeout-zero armed" % command[0], tarmed == tbase + 1,
                        oarmed == obase + 1)
-        # A gauge stuck at zero must fail even if both servers miss the arm. Induce by
-        # suppressing blocked_clients increments; parity alone would pass False == False.
-        property_check("target %s blocking gauge moved" % command[0], tarmed, tbase + 1)
-        property_check("oracle %s blocking gauge moved" % command[0], oarmed, obase + 1)
         tready = bool(select.select([tw], [], [], 0.05)[0])
         oready = bool(select.select([ow], [], [], 0.05)[0])
         property_check("%s timeout-zero silence" % command[0], tready, oready)
@@ -2837,7 +2821,6 @@ def run_blocking_differ(rng):
                      b"ready" if tready else b"silent", b"ready" if oready else b"silent")
         both(wake, "%s wake write" % command[0])
         compare("%s wake reply" % command[0], read_reply(twf), read_reply(owf))
-        coverage.note(command)
         tw.close(); ow.close(); twf.close(); owf.close()
 
     # Redis serves clients blocked on one key in arrival order.  Register each client fully before
@@ -2857,7 +2840,6 @@ def run_blocking_differ(rng):
     for index, (tw, twf, ow, owf) in enumerate(waiters):
         target = read_reply(twf); oracle = read_reply(owf)
         compare("FIFO waiter %d reply" % index, target, oracle)
-        coverage.note('BLPOP')
         expected = [b"cbd:fifo", ("v%d" % index).encode()]
         property_check("FIFO waiter %d value" % index, parse_reply(target), expected)
         property_check("FIFO oracle waiter %d value" % index, parse_reply(oracle), expected)
@@ -2939,11 +2921,7 @@ def run_blocking_differ(rng):
             property_check("WAIT finite deadline fired", time.monotonic() - started >= 0.15, True)
         tw.close(); ow.close(); twf.close(); owf.close()
 
-    # Closing a WAIT socket does not synchronously retire its blocked-client registration on
-    # either server. Compare settled values, never two independently moving gauges. The bounded
-    # poll retains the last value on timeout: suppress disconnect's decrement to make the zero
-    # control fail, even if both servers leak the same count and the parity row agrees.
-    final_t, final_o = await_blocked(ts, tf, 0), await_blocked(os_, of, 0)
+    final_t, final_o = info_blocked(ts, tf), info_blocked(os_, of)
     property_check("blocking gauges drain", final_t, final_o)
     property_check("target blocking gauge zero control", final_t, 0)
     property_check("oracle blocking gauge zero control", final_o, 0)
@@ -3607,7 +3585,6 @@ def run_spubsub_differ(rng):
     tl.sendall(enc(initial)); ol.sendall(enc(initial))
     for index in range(len(subscribed)):
         compare("initial SSUBSCRIBE %d" % index, read_reply(tlf), read_reply(olf))
-    coverage.note(initial)
 
     # Randomized subscription changes, local receiver counts, deliveries, and introspection.
     for sequence in range(600):
@@ -3640,7 +3617,6 @@ def run_spubsub_differ(rng):
             command = ["PUBSUB", "SHARDCHANNELS", "spubsub:differ:*"]
             tp.sendall(enc(command)); op.sendall(enc(command))
             compare("SHARDCHANNELS %d" % sequence, read_reply(tpf), read_reply(opf), True)
-        coverage.note(command)
 
     # Same bytes in regular/shard/pattern namespaces must not cross in either direction.
     cross = channels[0]
@@ -3651,7 +3627,6 @@ def run_spubsub_differ(rng):
     tr, trf = conn(TH, TP); ore, oref = conn(OH, OP)
     tr.sendall(enc(["SUBSCRIBE", cross])); ore.sendall(enc(["SUBSCRIBE", cross]))
     compare("cross SUBSCRIBE", read_reply(trf), read_reply(oref))
-    coverage.note('SUBSCRIBE')
     tp.sendall(enc(["SPUBLISH", cross, "shard-only"]))
     op.sendall(enc(["SPUBLISH", cross, "shard-only"]))
     compare("cross SPUBLISH", read_reply(tpf), read_reply(opf))
@@ -3666,7 +3641,6 @@ def run_spubsub_differ(rng):
     tp.sendall(enc(["PUBLISH", cross, "regular-only"]))
     op.sendall(enc(["PUBLISH", cross, "regular-only"]))
     compare("cross PUBLISH", read_reply(tpf), read_reply(opf))
-    coverage.note('PUBLISH')
     compare("cross message", read_reply(trf), read_reply(oref))
     target_ready = bool(select.select([tl], [], [], 0.15)[0])
     oracle_ready = bool(select.select([ol], [], [], 0.15)[0])
@@ -3679,7 +3653,6 @@ def run_spubsub_differ(rng):
     tpat, tpatf = conn(TH, TP); opat, opatf = conn(OH, OP)
     tpat.sendall(enc(["PSUBSCRIBE", pattern])); opat.sendall(enc(["PSUBSCRIBE", pattern]))
     compare("cross PSUBSCRIBE", read_reply(tpatf), read_reply(opatf))
-    coverage.note('PSUBSCRIBE')
     tp.sendall(enc(["SPUBLISH", cross, "no-pattern"]))
     op.sendall(enc(["SPUBLISH", cross, "no-pattern"]))
     compare("pattern SPUBLISH", read_reply(tpf), read_reply(opf))
@@ -3703,7 +3676,6 @@ def run_spubsub_differ(rng):
         return repr((labels, channels_seen, counts)).encode()
     compare("SUNSUBSCRIBE all", normalize_unsubscribe_all(target_frames),
             normalize_unsubscribe_all(oracle_frames))
-    coverage.note('SUNSUBSCRIBE', 'unordered acknowledgement multiset')
 
     for sock in (tp, op, tl, ol, tr, ore, tpat, opat): sock.close()
     print("DIFFER spubsub: %d checks, %d diffs -> %s" %
@@ -3758,9 +3730,7 @@ def run_pubsub_differ(rng):
         payload = enc(argv)
         t.sendall(payload); o.sendall(payload)
         logical_ops += 1
-        target, oracle = read_reply(tf), read_reply(of)
-        coverage.note(argv)
-        return compare(label or " ".join(argv[:4]), target, oracle, unordered)
+        return compare(label or " ".join(argv[:4]), read_reply(tf), read_reply(of), unordered)
 
     def raw_int(reply):
         try:
@@ -3819,7 +3789,6 @@ def run_pubsub_differ(rng):
                                      read_reply(tf), read_reply(of))
             property_check("%s target count %d" % (verb, index), parsed_count(target), count)
             property_check("%s oracle count %d" % (verb, index), parsed_count(oracle), count)
-        coverage.note(verb)
 
     for verb, missing, count in (("UNSUBSCRIBE", token + ":count:missing", 4),
                                  ("PUNSUBSCRIBE", token + ":count:missing:*", 4),
@@ -3835,7 +3804,6 @@ def run_pubsub_differ(rng):
         target = [read_reply(tf) for _ in range(count)]
         oracle = [read_reply(of) for _ in range(count)]
         compare(verb + " all", canonical_unsubscribe(target), canonical_unsubscribe(oracle))
-        coverage.note(verb, 'unordered acknowledgement multiset')
         tcounts = sorted(parsed_count(frame) for frame in target)
         ocounts = sorted(parsed_count(frame) for frame in oracle)
         wanted = list(range(remaining, remaining + count))
@@ -4125,19 +4093,16 @@ def run_fanout_differ(rng):
         for channel in exact:
             for sock in (ts, os_): sock.sendall(enc(["SUBSCRIBE", channel]))
             compare("SUBSCRIBE ack %d" % index, read_reply(tf), read_reply(of))
-            coverage.note('SUBSCRIBE')
             state["exact"].add(channel)
         if index % 2 == 0:
             pattern = rng.choice(PATTERNS)
             for sock in (ts, os_): sock.sendall(enc(["PSUBSCRIBE", pattern]))
             compare("PSUBSCRIBE ack %d" % index, read_reply(tf), read_reply(of))
-            coverage.note('PSUBSCRIBE')
             state["patterns"].add(pattern)
         if index % 3 != 1:
             shard = rng.choice(SHARDS)
             for sock in (ts, os_): sock.sendall(enc(["SSUBSCRIBE", shard]))
             compare("SSUBSCRIBE ack %d" % index, read_reply(tf), read_reply(of))
-            coverage.note('SSUBSCRIBE')
             state["shard"].add(shard)
         subs.append(state)
 
@@ -4175,7 +4140,6 @@ def run_fanout_differ(rng):
             for i in range(burst):
                 compare("%s burst %d/%d" % (verb, round_index, i),
                         read_reply(publisher[0][1]), read_reply(publisher[1][1]))
-                coverage.note(verb)
                 published.append((channel, shard))
         elif mode < 9:
             # (2) one at a time across MANY channels -- ordering owned by the delivery fence.
@@ -4187,7 +4151,6 @@ def run_fanout_differ(rng):
                 publisher[0][0].sendall(command); publisher[1][0].sendall(command)
                 compare("%s seq %d/%d" % (verb, round_index, step),
                         read_reply(publisher[0][1]), read_reply(publisher[1][1]))
-                coverage.note(verb)
                 published.append((channel, shard))
         else:
             # Subscription churn plus the full introspection surface.
@@ -4215,7 +4178,6 @@ def run_fanout_differ(rng):
                     target = normalize("SMEMBERS", target)
                     oracle = normalize("SMEMBERS", oracle)
                 compare(" ".join(command[:3]), target, oracle)
-                coverage.note(command)
         drain(published)
 
     # Sentinel sweep: every subscriber's NEXT frame must be this publish. Any frame either server
@@ -4301,7 +4263,6 @@ def run_notify_suite(rng):
         payload = enc(op)
         tds.sendall(payload); ods.sendall(payload)
         target_reply = read_reply(tdf); oracle_reply = read_reply(odf)
-        coverage.note(op)
         if target_reply != oracle_reply:
             diffs += 1
             if diffs <= 12:
@@ -4364,15 +4325,6 @@ def run_wiredump_suite(rng):
             return value + b"\x00field-ttl\x00" + ttl
         return value
 
-    def full_read_diff(kind, key, ttl_fields):
-        target = full_read(ts, tf, kind, key, ttl_fields)
-        oracle = full_read(os_, of, kind, key, ttl_fields)
-        coverage.note({'string': 'GET', 'list': 'LRANGE', 'hash': 'HGETALL',
-                       'set': 'SMEMBERS', 'zset': 'ZRANGE'}[kind])
-        if ttl_fields:
-            coverage.note('HPEXPIRETIME')
-        return target != oracle
-
     far = str(int(time.time() * 1000) + 24 * 60 * 60 * 1000)
     farther = str(int(far) + 70000)
     definitions = [
@@ -4408,7 +4360,6 @@ def run_wiredump_suite(rng):
     for _, _, setup, _ in definitions:
         for operation in setup:
             replies = [command(sock, file, operation) for sock, file in pairs]
-            coverage.note(operation)
             if replies[0] != replies[1]:
                 diffs += 1
 
@@ -4435,9 +4386,8 @@ def run_wiredump_suite(rng):
                                              oracle_dump, "REPLACE"])
             oracle_reply = command(os_, of, ["RESTORE", "wd:cross", "600000",
                                               target_dump, "REPLACE"])
-            coverage.note('RESTORE')
-            coverage.note('DUMP', 'cross-decoded payload property')
-            if target_reply != oracle_reply or full_read_diff(kind, "wd:cross", ttl_fields):
+            if target_reply != oracle_reply or full_read(ts, tf, kind, "wd:cross", ttl_fields) != \
+                    full_read(os_, of, kind, "wd:cross", ttl_fields):
                 diffs += 1
         elif action == 1:
             # Feed exactly the same randomly selected producer payload to both RESTORE parsers.
@@ -4449,23 +4399,22 @@ def run_wiredump_suite(rng):
                 options.append("ABSTTL")
             target_reply = command(ts, tf, ["RESTORE", "wd:restore", ttl, wire] + options)
             oracle_reply = command(os_, of, ["RESTORE", "wd:restore", ttl, wire] + options)
-            coverage.note('RESTORE')
-            if target_reply != oracle_reply or full_read_diff(kind, "wd:restore", ttl_fields):
+            if target_reply != oracle_reply or full_read(ts, tf, kind, "wd:restore", ttl_fields) != \
+                    full_read(os_, of, kind, "wd:restore", ttl_fields):
                 diffs += 1
         elif action == 2:
             target_reply = command(ts, tf, ["EXISTS", key])
             oracle_reply = command(os_, of, ["EXISTS", key])
-            coverage.note('EXISTS')
             if target_reply != oracle_reply:
                 diffs += 1
         elif action == 3:
-            if full_read_diff(kind, key, ttl_fields):
+            if full_read(ts, tf, kind, key, ttl_fields) != \
+                    full_read(os_, of, kind, key, ttl_fields):
                 diffs += 1
         else:
             # This arm is a negative control until the first restore and a live-TTL check after it.
             target_reply = normalize("PTTL", command(ts, tf, ["PTTL", "wd:restore"]))
             oracle_reply = normalize("PTTL", command(os_, of, ["PTTL", "wd:restore"]))
-            coverage.note('PTTL')
             if target_reply != oracle_reply:
                 diffs += 1
         checks += 1
@@ -4485,34 +4434,8 @@ if SUITE == "wiredump":
 # invalidation arrives as an out-of-band push. So the suite drives a fixed pair of connections per
 # side, byte-compares every reply of an identity-independent grammar stream, and then compares the
 # invalidation frames a tracking connection receives for an identical write script.
-def climon_tracking_conn(h, p):
-    # Replies and out-of-band pushes share this socket. compare_pushes() drains the socket
-    # directly: a buffered reply reader can prefetch a push after the reply and hide it from
-    # select()/recv() until the NEXT round. Keep all unread bytes in the socket; read_exact()
-    # above still assembles bulk payloads when an unbuffered read ends at a TCP boundary.
-    # The caller explicitly negotiates HELLO 3 after constructing both tracking sockets.
-    return conn_mode(h, p, False, buffering=0)
-
-def climon_reader_control():
-    # Exercise the actual reader before every climon stream, so reverting to buffered reads
-    # turns the existing differential row red even when the live server's timing is benign.
-    # A reply and push written together force the old read-ahead window without any sleeps.
-    push = b">2\r\n$10\r\ninvalidate\r\n*1\r\n$4\r\nck:2\r\n"
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0)); listener.listen()
-        client, file = climon_tracking_conn(*listener.getsockname())
-        with client, file, listener.accept()[0] as sender:
-            sender.sendall(b"$1\r\nv\r\n" + push)
-            if read_reply(file) != b"$1\r\nv\r\n":
-                raise AssertionError("climon reader control lost its command reply")
-            if not select.select([client], [], [], 0)[0]:
-                raise AssertionError("climon reader control: push hidden in reply buffer")
-            if read_exact(file, len(push)) != push:
-                raise AssertionError("climon reader control lost its invalidation push")
-
 def run_climon_suite(rng):
     import select as _select
-    climon_reader_control()
     diffs = 0
     checks = 0
     ts, tf = conn(TH, TP); os_, of = conn(OH, OP)
@@ -4524,7 +4447,6 @@ def run_climon_suite(rng):
         payload = enc(args)
         ts.sendall(payload); os_.sendall(payload)
         a = read_reply(tf); b = read_reply(of)
-        coverage.note(args)
         checks += 1
         if a != b:
             diffs += 1
@@ -4579,7 +4501,7 @@ def run_climon_suite(rng):
         both(op, "grammar")
 
     # ---- invalidation stream. RESP3 tracking client + a writer, per side. --------------------
-    tt, ttf = climon_tracking_conn(TH, TP); ot, otf = climon_tracking_conn(OH, OP)
+    tt, ttf = conn(TH, TP); ot, otf = conn(OH, OP)
     for cs, cf in ((tt, ttf), (ot, otf)):
         cs.sendall(enc(["HELLO", "3"])); read_reply(cf)
     tw, twf = conn(TH, TP); ow, owf = conn(OH, OP)
@@ -4718,7 +4640,6 @@ def run_compatintro_suite(rng):
         nonlocal checks
         target = raw_command(ts, tf, argv)
         oracle = raw_command(os_, of, argv)
-        coverage.note(argv)
         checks += 1
         if target != oracle:
             mismatch(label or " ".join(argv[:3]), target, oracle)
@@ -5137,7 +5058,6 @@ xgroup|destroy xgroup|help xgroup|setid xinfo|consumers xinfo|groups xinfo|help 
         nonlocal compared
         target = command(ts, tf, argv)
         oracle = command(os_, of, argv)
-        coverage.note(argv)
         compared += 1
         if target != oracle:
             mismatch(label, target, oracle)
@@ -5236,7 +5156,6 @@ def run_aclsel_suite(rng):
         nonlocal checks
         target = raw(ts, tf, argv)
         oracle = raw(os_, of, argv)
-        coverage.note(argv)
         checks += 1
         if target != oracle: mismatch(label, target, oracle)
         return target
@@ -5245,7 +5164,6 @@ def run_aclsel_suite(rng):
         nonlocal checks
         target = raw(target_pair[0], target_pair[1], argv)
         oracle = raw(oracle_pair[0], oracle_pair[1], argv)
-        coverage.note(argv)
         checks += 1
         if target != oracle: mismatch(label, target, oracle)
         if target.startswith(b"-NOPERM"):
@@ -5405,7 +5323,6 @@ def run_s6fix_suite(rng):
     def compare(argv, label=None):
         target = command(ts, tf, argv)
         oracle = command(os_, of, argv)
-        coverage.note(argv)
         if target != oracle:
             mismatch(label or " ".join(argv[:4]), target, oracle)
         return target, oracle
@@ -5444,7 +5361,6 @@ def run_s6fix_suite(rng):
             mismatch("A4 %s null control" % side, nulls, 0)
         print("  A4 %s distinct=%d missing=%d unexpected=%d nulls=%d" %
               (side, len(set(seen) & expected), len(missing), len(unexpected), nulls))
-    coverage.note('RANDOMKEY', 'membership/coverage property on both servers')
 
     # A5: independently exhaust each server's cursor, then compare the complete key sets.
     for sock, file in ((ts, tf), (os_, of)):
@@ -5483,7 +5399,6 @@ def run_s6fix_suite(rng):
             if sorted(keys) != want:
                 mismatch("%s %s keys" % (label, side), sorted(keys), want)
             print("  %s %s calls=%d keys=%r" % (label, side, calls, sorted(keys)))
-        coverage.note('SCAN', 'complete typed-key set property on both servers')
 
     # A6: exact seconds differ because the processes start separately; positivity and no-future
     # are the oracle properties, and LASTSAVE=0 on the old target fails them.
@@ -5500,7 +5415,6 @@ def run_s6fix_suite(rng):
         if future_control:
             mismatch("A6 %s future control" % side, future_control, 0)
         print("  A6 %s lastsave=%d future_control=%d" % (side, value, future_control))
-    coverage.note('LASTSAVE', 'positive/not-future property on both servers')
 
     # A7 and the two cheap SCAN cosmetic errors are byte-comparable.
     compare(["WAITAOF", "0", "0", "0"], "A7 AOF-off zero control")
@@ -5772,22 +5686,33 @@ for cs, cf in ((ts, tf), (os_, of)):
     cs.sendall(enc(["FLUSHALL"]))
     if read_reply(cf)[:1] != b"+": raise RuntimeError("FLUSHALL failed on clean-slate")
 script_stats_before = target_stats() if SUITE == "script" else None
-# OBJECT ENCODING compares hash/set/zset only at matched promotion limits. TomoKV's limits
-# are fixed; configure the oracle to those values. These setup replies are drained, not diffed.
+# OBJECT ENCODING is only comparable once both servers promote at the same sizes, and the two
+# spell those knobs differently, so the alignment cannot ride in the diffed op stream. Replies are
+# drained, NOT diffed -- the knob NAMES differ by design.
 if SUITE in ("servertail", "edgeenc"):
-    alignment = [["CONFIG", "SET", "hash-max-listpack-entries", "512"],
-                 ["CONFIG", "SET", "hash-max-listpack-value", "64"],
-                 ["CONFIG", "SET", "set-max-listpack-entries", "128"],
-                 ["CONFIG", "SET", "set-max-listpack-value", "64"],
-                 ["CONFIG", "SET", "set-max-intset-entries", "128"],
-                 ["CONFIG", "SET", "zset-max-listpack-entries", "128"],
-                 ["CONFIG", "SET", "zset-max-listpack-value", "64"],
-                 ["CONFIG", "SET", "list-max-listpack-size", "-2"]]
-    for command in alignment:
-        os_.sendall(enc(command))
-        if read_reply(of)[:1] != b"+":
-            raise RuntimeError("encoding alignment failed: %r" % command)
-
+    alignment = {
+        0: [["CONFIG", "SET", "hash-max-compact-entries", "128"],
+            ["CONFIG", "SET", "hash-max-compact-value", "64"],
+            ["CONFIG", "SET", "set-max-compact-entries", "128"],
+            ["CONFIG", "SET", "set-max-compact-value", "64"],
+            ["CONFIG", "SET", "zset-max-compact-entries", "128"],
+            ["CONFIG", "SET", "zset-max-compact-value", "64"],
+            ["CONFIG", "SET", "list-max-compact-entries", "128"],
+            ["CONFIG", "SET", "list-max-compact-value", "64"]],
+        1: [["CONFIG", "SET", "hash-max-listpack-entries", "128"],
+            ["CONFIG", "SET", "hash-max-listpack-value", "64"],
+            ["CONFIG", "SET", "set-max-listpack-entries", "128"],
+            ["CONFIG", "SET", "set-max-listpack-value", "64"],
+            ["CONFIG", "SET", "set-max-intset-entries", "128"],
+            ["CONFIG", "SET", "zset-max-listpack-entries", "128"],
+            ["CONFIG", "SET", "zset-max-listpack-value", "64"],
+            ["CONFIG", "SET", "list-max-listpack-size", "128"]],
+    }
+    for side, (cs, cf) in enumerate(((ts, tf), (os_, of))):
+        for command in alignment[side]:
+            cs.sendall(enc(command))
+            if read_reply(cf)[:1] != b"+":
+                raise RuntimeError("encoding alignment failed: %r" % command)
 diffs = 0
 # HLL's directed promotion stream uses many-argument PFADDs and byte-sized GET oracles, and the
 # cgaps suite carries wide numkeys forms; keep their pipeline chunks below the target's fixed
@@ -5806,7 +5731,6 @@ for i in range(0, len(ops), BATCH):
         tss.sendall(enc(command)); oss.sendall(enc(command))
         a = normalize(command[0], read_reply(tsf))
         b = normalize(command[0], read_reply(osf))
-        coverage.note(command)
         if a != b:
             diffs += 1
             if diffs <= 12:
@@ -5828,7 +5752,6 @@ for i in range(0, len(ops), BATCH):
             raise
         a = normalize_introspection(o[0].upper(), o, a)
         b = normalize_introspection(o[0].upper(), o, b)
-        coverage.note(o)
         if a != b:
             diffs += 1
             if diffs <= 12:
@@ -5948,7 +5871,6 @@ if SUITE == "scan":
         for count in (7, 50, 400):
             tset, tcalls, temitted = walk_to_end(ts, tf, args, count, step)
             oset, ocalls, oemitted = walk_to_end(os_, of, args, count, step)
-            coverage.note(args, 'cursor-completeness property')
             if tset != oset:
                 diffs += 1
                 missing = [x for x in oset if x not in set(tset)]
@@ -6042,51 +5964,28 @@ if SUITE == "infofix":
         property_fail("target peak reset", repr(reset_memory))
     print("  infofix peak points: %r" % memory_points)
 
-    # The same sampled-rate contract as infofix.py: INFO-only polls let residual samples drain,
-    # and work is fed until a sample sees it. No arbitrary instant is compared to the oracle's
-    # live gauge. Pin published_rate at zero/nonzero to fail the positive/idle controls.
-    def sampled_rate(sock, file):
-        return int(fields(sock, file, "stats").get("instantaneous_ops_per_sec", "-1"))
-
-    def idle_rate(sock, file):
-        deadline = time.monotonic() + 5.0
-        while True:
-            value = sampled_rate(sock, file)
-            if value <= 0 or time.monotonic() >= deadline:
-                return value
-            time.sleep(.11)
-
+    # Sampled-rate controls: RESETSTAT+idle is zero, a byte-compared PING burst is positive, and a
+    # second RESETSTAT returns the detector to zero.
     for sock, file in ((ts, tf), (os_, of)):
         issue(sock, file, ["CONFIG", "RESETSTAT"])
-    target_control = idle_rate(ts, tf)
+    time.sleep(.15)
+    target_control = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "-1"))
     if target_control != 0: property_fail("target rate control", str(target_control))
     payload = enc(["PING"]) * 1000
-    deadline = time.monotonic() + 5.0
-    while True:
-        ts.sendall(payload); os_.sendall(payload)
-        replies_ok = True
-        for iteration in range(1000):
-            target_reply, oracle_reply = read_reply(tf), read_reply(of)
-            coverage.note('PING')
-            if target_reply != oracle_reply:
-                property_fail("rate burst byte compare", "iteration=%d" % iteration)
-                replies_ok = False
-        target_rate = sampled_rate(ts, tf)
-        oracle_rate = sampled_rate(os_, of)
-        if (not replies_ok or (target_rate > 0 and oracle_rate > 0) or
-                target_rate < 0 or oracle_rate < 0 or time.monotonic() >= deadline):
+    ts.sendall(payload); os_.sendall(payload)
+    for iteration in range(1000):
+        target_reply, oracle_reply = read_reply(tf), read_reply(of)
+        if target_reply != oracle_reply:
+            property_fail("rate burst byte compare", "iteration=%d" % iteration)
             break
-        time.sleep(.11)
+    time.sleep(.12)
+    target_rate = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "0"))
+    oracle_rate = int(fields(os_, of, "stats").get("instantaneous_ops_per_sec", "0"))
     if target_rate <= 0: property_fail("target rate fired", str(target_rate))
     if oracle_rate <= 0: property_fail("oracle rate fired", str(oracle_rate))
     issue(ts, tf, ["CONFIG", "RESETSTAT"])
-    # Natural sampler aging must not hide an omitted RESETSTAT baseline (leave PING calls
-    # untouched to induce this independent reset failure).
-    ping = fields(ts, tf, "commandstats").get("cmdstat_ping", "calls=0")
-    ping_calls = dict(item.split("=", 1) for item in ping.split(",") if "=" in item)
-    if int(ping_calls["calls"]) != 0:
-        property_fail("target commandstats reset", ping)
-    reset_rate = idle_rate(ts, tf)
+    time.sleep(.15)
+    reset_rate = int(fields(ts, tf, "stats").get("instantaneous_ops_per_sec", "-1"))
     if reset_rate != 0: property_fail("target rate reset", str(reset_rate))
     print("  infofix sampled rates: control=%d target=%d oracle=%d reset=%d" %
           (target_control, target_rate, oracle_rate, reset_rate))

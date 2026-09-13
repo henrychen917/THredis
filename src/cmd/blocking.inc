@@ -383,10 +383,6 @@ BlockingProbe blocking_probe_key(Shard& shard, BlockingState& state,
     KvObj* object = shard.notify_carrier()
         ? shard.store_find<true>(key.hash, blocking_key_slice(key))
         : shard.store().find(key.hash, blocking_key_slice(key));
-    // Redis's stream probe path uses lookupKeyRead (and LOOKUP_NOEFFECTS when waking a waiter),
-    // both of which feed the public hit/miss counters. List/zset blocking probes are write lookups.
-    if (state.kind == BlockingKind::Xread || state.kind == BlockingKind::Xreadgroup)
-        shard.note_keyspace_read(object);
     if (!object) {
         if (state.kind == BlockingKind::Xread && key.cursor_latest && !key.cursor_resolved) {
             key.cursor = {};
@@ -476,24 +472,6 @@ bool blocking_pick(const BlockingState& state, uint32_t& selected, bool& wrong_t
     return false;
 }
 
-template <bool IofusedPrivateQueue>
-uint32_t blocking_task_free_slots(ThreadCtx& owner, uint32_t producer) {
-    if constexpr (IofusedPrivateQueue)
-        return owner.iofused_task_free_slots(producer);
-    else
-        return owner.task_free_slots(producer);
-}
-
-template <bool IofusedPrivateQueue>
-bool blocking_post_task_quiet(ThreadCtx& owner, uint32_t producer, const Task& task,
-                              LoopSignals& signals) {
-    if constexpr (IofusedPrivateQueue)
-        return owner.post_iofused_task_quiet(producer, task, signals);
-    else
-        return owner.post_task_quiet(producer, task, signals);
-}
-
-template <bool IofusedPrivateQueue>
 bool blocking_post_groups(BlockingState& state, ThreadCtx& self, Ring& ring,
                           BlockingPhase phase) {
     uint32_t needed[kMaxThreads] = {};
@@ -505,8 +483,7 @@ bool blocking_post_groups(BlockingState& state, ThreadCtx& self, Ring& ring,
     }
     for (uint32_t i = 0; i < nparticipants; i++) {
         const uint32_t owner = participants[i];
-        if (blocking_task_free_slots<IofusedPrivateQueue>(
-                state.server->thread(owner), self.id()) < needed[owner]) return false;
+        if (state.server->thread(owner).task_free_slots(self.id()) < needed[owner]) return false;
     }
 
     state.pending.store(static_cast<uint32_t>(state.groups.size()), std::memory_order_relaxed);
@@ -518,8 +495,7 @@ bool blocking_post_groups(BlockingState& state, ThreadCtx& self, Ring& ring,
         ThreadCtx& owner = state.server->thread(owner_id);
         const Task task{state.client, state.op_id, group.shard,
                         reinterpret_cast<ScatterState*>(&state)};
-        if (!blocking_post_task_quiet<IofusedPrivateQueue>(
-                owner, self.id(), task, self.sig())) std::abort();
+        if (!owner.post_task_quiet(self.id(), task, self.sig())) std::abort();
     }
     for (uint32_t i = 0; i < nparticipants; i++) {
         ThreadCtx& owner = state.server->thread(participants[i]);
@@ -528,16 +504,14 @@ bool blocking_post_groups(BlockingState& state, ThreadCtx& self, Ring& ring,
     return true;
 }
 
-template <bool IofusedPrivateQueue>
 bool blocking_post_selected(BlockingState& state, ThreadCtx& self, Ring& ring) {
     const int32_t shard = state.keys[state.selected].shard;
     ThreadCtx& owner = state.server->thread(state.server->worker_of_shard(shard));
-    if (blocking_task_free_slots<IofusedPrivateQueue>(owner, self.id()) == 0) return false;
+    if (owner.task_free_slots(self.id()) == 0) return false;
     state.active_tasks.fetch_add(1, std::memory_order_relaxed);
     state.phase.store(BlockingPhase::Claimed, std::memory_order_release);
     const Task task{state.client, state.op_id, shard, reinterpret_cast<ScatterState*>(&state)};
-    if (!blocking_post_task_quiet<IofusedPrivateQueue>(
-            owner, self.id(), task, self.sig())) std::abort();
+    if (!owner.post_task_quiet(self.id(), task, self.sig())) std::abort();
     owner.flush_task_notify(self.id(), ring, self.sig());
     return true;
 }
@@ -598,20 +572,15 @@ bool blocking_run_direct(BlockingState& state, Shard& shard, ThreadCtx& self, Ri
     }
     bool plain_active = false;
     if (shard.store().atomic_needs_version(key.hash, key_slice)) {
-        const uint64_t snapshot = state.server->atomic_snapshot();
-        const uint64_t cleanup_cutoff = state.server->atomic_snapshot();
-        shard.store().atomic_promote_key(
-            key.hash, key_slice, state.server->atomic_read_floor(), cleanup_cutoff);
-        if (shard.store().atomic_needs_version(key.hash, key_slice)) {
-            const WorkError prepared = begin_plain_version(
-                *state.server, shard, key_slice, key.hash, snapshot, state.client->id());
-            if (prepared != WorkError::None) {
-                reply_work_error(op, prepared);
-                blocking_publish_completion(state, self, ring);
-                return true;
-            }
-            plain_active = true;
+        const WorkError prepared = begin_plain_version(
+            *state.server, shard, key_slice, key.hash, state.server->atomic_snapshot(),
+            state.client->id());
+        if (prepared != WorkError::None) {
+            reply_work_error(op, prepared);
+            blocking_publish_completion(state, self, ring);
+            return true;
         }
+        plain_active = true;
     }
     std::vector<std::string> members;
     std::vector<double> scores;
@@ -654,7 +623,6 @@ bool blocking_run_direct(BlockingState& state, Shard& shard, ThreadCtx& self, Ri
     return true;
 }
 
-template <bool IofusedPrivateQueue>
 bool blocking_dispatch_selected(BlockingState& state, Shard& shard, ThreadCtx& self, Ring& ring) {
     if (blocking_is_move(state.kind) || state.kind == BlockingKind::Xread) {
         blocking_request_move(state, self, ring);
@@ -663,11 +631,10 @@ bool blocking_dispatch_selected(BlockingState& state, Shard& shard, ThreadCtx& s
     if (state.keys[state.selected].shard == shard.id()) {
         if (blocking_run_direct(state, shard, self, ring)) return true;
         state.phase.store(BlockingPhase::NeedRegister, std::memory_order_release);
-        return blocking_post_groups<IofusedPrivateQueue>(
-            state, self, ring, BlockingPhase::Registering);
+        return blocking_post_groups(state, self, ring, BlockingPhase::Registering);
     }
     state.phase.store(BlockingPhase::NeedSelected, std::memory_order_release);
-    return blocking_post_selected<IofusedPrivateQueue>(state, self, ring);
+    return blocking_post_selected(state, self, ring);
 }
 
 class BlockingRegistry {
@@ -863,7 +830,6 @@ void blocking_reset_probes(BlockingState& state) {
     state.candidate.store(UINT32_MAX, std::memory_order_relaxed);
 }
 
-template <bool IofusedPrivateQueue>
 bool blocking_finish_probe(BlockingState& state, Shard& shard, ThreadCtx& self, Ring& ring) {
     if (state.cancel_requested.load(std::memory_order_acquire)) {
         state.phase.store(BlockingPhase::Cancelled, std::memory_order_release);
@@ -882,18 +848,16 @@ bool blocking_finish_probe(BlockingState& state, Shard& shard, ThreadCtx& self, 
         if (missing_group) { blocking_finish_missing_group(state, self, ring); return true; }
         if (oom) { blocking_finish_oom(state, self, ring); return true; }
         state.selected = selected;
-        return blocking_dispatch_selected<IofusedPrivateQueue>(state, shard, self, ring);
+        return blocking_dispatch_selected(state, shard, self, ring);
     }
     blocking_reset_probes(state);
     BlockingPhase expected = BlockingPhase::Probe;
     if (!state.phase.compare_exchange_strong(
             expected, BlockingPhase::NeedRegister, std::memory_order_acq_rel,
             std::memory_order_acquire)) return true;
-    return blocking_post_groups<IofusedPrivateQueue>(
-        state, self, ring, BlockingPhase::Registering);
+    return blocking_post_groups(state, self, ring, BlockingPhase::Registering);
 }
 
-template <bool IofusedPrivateQueue>
 bool blocking_finish_registration(BlockingState& state, Shard& shard,
                                   ThreadCtx& self, Ring& ring) {
     if (state.cancel_requested.load(std::memory_order_acquire)) {
@@ -935,7 +899,7 @@ bool blocking_finish_registration(BlockingState& state, Shard& shard,
                 expected, BlockingPhase::Claimed, std::memory_order_acq_rel,
                 std::memory_order_acquire)) return true;
         state.selected = selected;
-        return blocking_dispatch_selected<IofusedPrivateQueue>(state, shard, self, ring);
+        return blocking_dispatch_selected(state, shard, self, ring);
     }
     BlockingPhase expected = BlockingPhase::Registering;
     if (!state.phase.compare_exchange_strong(
@@ -1026,9 +990,8 @@ void blocking_start(BlockingState* state, uint32_t tasks) {
     state->phase.store(BlockingPhase::Probe, std::memory_order_release);
 }
 
-template <bool IofusedPrivateQueue>
-bool blocking_execute_impl(Server&, ThreadCtx& self, Ring& ring, const Task& task,
-                           Shard& shard, Op& op) {
+bool blocking_execute(Server&, ThreadCtx& self, Ring& ring, const Task& task,
+                      Shard& shard, Op& op) {
     const bool notify = (op.spec->flags & CmdFlags::NotifySelected) != 0;
     NotifyExecutionScope notify_scope(shard, op, notify);
     BlockingState& state = *op.blocking_state();
@@ -1043,13 +1006,12 @@ bool blocking_execute_impl(Server&, ThreadCtx& self, Ring& ring, const Task& tas
         return true;
     }
     if (phase == BlockingPhase::NeedRegister) {
-        if (!blocking_post_groups<IofusedPrivateQueue>(
-                state, self, ring, BlockingPhase::Registering)) return false;
+        if (!blocking_post_groups(state, self, ring, BlockingPhase::Registering)) return false;
         blocking_task_done(state, self, ring);
         return true;
     }
     if (phase == BlockingPhase::NeedSelected) {
-        if (!blocking_post_selected<IofusedPrivateQueue>(state, self, ring)) return false;
+        if (!blocking_post_selected(state, self, ring)) return false;
         blocking_task_done(state, self, ring);
         return true;
     }
@@ -1060,8 +1022,7 @@ bool blocking_execute_impl(Server&, ThreadCtx& self, Ring& ring, const Task& tas
         } else if (!blocking_run_direct(state, shard, self, ring)) {
             blocking_reset_probes(state);
             state.phase.store(BlockingPhase::NeedRegister, std::memory_order_release);
-            complete = blocking_post_groups<IofusedPrivateQueue>(
-                state, self, ring, BlockingPhase::Registering);
+            complete = blocking_post_groups(state, self, ring, BlockingPhase::Registering);
         }
         if (!complete) return false;
         blocking_task_done(state, self, ring);
@@ -1074,7 +1035,7 @@ bool blocking_execute_impl(Server&, ThreadCtx& self, Ring& ring, const Task& tas
         for (uint32_t index : group->keys)
             state.keys[index].probe = blocking_probe_key(shard, state, state.keys[index]);
         if (state.pending.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-            !blocking_finish_probe<IofusedPrivateQueue>(state, shard, self, ring)) return false;
+            !blocking_finish_probe(state, shard, self, ring)) return false;
         blocking_task_done(state, self, ring);
         return true;
     }
@@ -1098,23 +1059,12 @@ bool blocking_execute_impl(Server&, ThreadCtx& self, Ring& ring, const Task& tas
         }
         if (state.phase.load(std::memory_order_acquire) == BlockingPhase::Registering &&
             state.pending.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
-            !blocking_finish_registration<IofusedPrivateQueue>(
-                state, shard, self, ring)) return false;
+            !blocking_finish_registration(state, shard, self, ring)) return false;
         blocking_task_done(state, self, ring);
         return true;
     }
     blocking_task_done(state, self, ring);
     return true;
-}
-
-bool blocking_execute(Server& server, ThreadCtx& self, Ring& ring, const Task& task,
-                      Shard& shard, Op& op) {
-    return blocking_execute_impl<false>(server, self, ring, task, shard, op);
-}
-
-bool blocking_execute_iofused(Server& server, ThreadCtx& self, Ring& ring, const Task& task,
-                              Shard& shard, Op& op) {
-    return blocking_execute_impl<true>(server, self, ring, task, shard, op);
 }
 
 BlockingSnapshotPrepare blocking_snapshot_prepare(const Task& task, Shard& shard, Op& op) {
@@ -1211,9 +1161,8 @@ void blocking_scatter_mutation_published(const Task& task, Shard& shard, Op& op)
     }
 }
 
-template <bool IofusedPrivateQueue>
-bool blocking_resume_move_impl(Server& server, ThreadCtx& self, Ring& ring, Client& client,
-                               ScatterArenaPool& pool) {
+bool blocking_resume_move(Server& server, ThreadCtx& self, Ring& ring, Client& client,
+                          ScatterArenaPool& pool) {
     if (!client.blocked()) return false;
     for (uint64_t id = client.rob().flush_id(), end = client.rob().dispatch_id(); id != end; id++) {
         Op& op = client.rob().at(id);
@@ -1246,9 +1195,8 @@ bool blocking_resume_move_impl(Server& server, ThreadCtx& self, Ring& ring, Clie
         }
         for (uint32_t i = 0; i < nparticipants; i++) {
             const uint32_t owner = participants[i];
-            if (blocking_task_free_slots<IofusedPrivateQueue>(
-                    server.thread(owner), self.id()) < needed[owner]) {
-                xshard_abandon_unpublished(dispatch.state, pool, self.id());
+            if (server.thread(owner).task_free_slots(self.id()) < needed[owner]) {
+                xshard_destroy(dispatch.state, pool, self.id());
                 return false;
             }
         }
@@ -1261,24 +1209,13 @@ bool blocking_resume_move_impl(Server& server, ThreadCtx& self, Ring& ring, Clie
             const int32_t sid = xshard_dispatch_shard(dispatch, i);
             ThreadCtx& owner = server.thread(server.worker_of_shard(sid));
             const Task task{&client, id, sid, dispatch.state};
-            if (!blocking_post_task_quiet<IofusedPrivateQueue>(
-                    owner, self.id(), task, self.sig())) std::abort();
+            if (!owner.post_task_quiet(self.id(), task, self.sig())) std::abort();
         }
         for (uint32_t i = 0; i < nparticipants; i++)
             server.thread(participants[i]).flush_task_notify(self.id(), ring, self.sig());
         return true;
     }
     return false;
-}
-
-bool blocking_resume_move(Server& server, ThreadCtx& self, Ring& ring, Client& client,
-                          ScatterArenaPool& pool) {
-    return blocking_resume_move_impl<false>(server, self, ring, client, pool);
-}
-
-bool blocking_resume_move_iofused(Server& server, ThreadCtx& self, Ring& ring, Client& client,
-                                  ScatterArenaPool& pool) {
-    return blocking_resume_move_impl<true>(server, self, ring, client, pool);
 }
 
 bool blocking_cancel_client(Server& server, ThreadCtx& self, Ring& ring, Client& client) {
@@ -1331,9 +1268,7 @@ void blocking_retire(Server& server, Client& client, Op& op, ThreadCtx& thread) 
     // One predicted-false relaxed load on an already-cold path. A command that completed with
     // real data keeps its reply; only the byte-less cancel shape is filled in here.
     const uint8_t unblock = state->unblock_reply.load(std::memory_order_acquire);
-    // replied(), not a raw byte test: a coded reply IS a reply, and reading it as "no reply"
-    // would append the UNBLOCKED/timeout error behind it and put two replies on the wire.
-    if (__builtin_expect(unblock != 0, false) && !op.replied()) {
+    if (__builtin_expect(unblock != 0, false) && op.reply.empty() && op.direct_len == 0) {
         if (unblock == 2) reply_err(op.sink(), "UNBLOCKED client unblocked via CLIENT UNBLOCK");
         else blocking_reply_timeout(op, state->kind);
     }
@@ -1348,7 +1283,7 @@ void blocking_retire(Server& server, Client& client, Op& op, ThreadCtx& thread) 
     // rob.in_flight() != 0, and the barrier this dispatch then takes stops the parse pass, so a
     // blocking op is provably ALONE in its ROB and no second owner can exist here. Nothing near
     // this line said so, and a relaxed guard or a seventh owner would have made it a live
-    // ordering defect of exactly the class t-storeorder fixed.
+    // ordering defect of exactly the class t-storeorder fixed. NOTES-BARRIER.md has the audit.
     //
     // Note the alternative -- clear only at ROB quiescence -- cannot be spelled here: Rob::drain
     // hands each op to this callback while flush_ is still at that op and stores the advanced

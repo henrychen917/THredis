@@ -930,7 +930,7 @@ bool verify_dump_payload(Op& op, Slice envelope, Slice& encoded) {
 
 template <bool kNotify>
 void cmd_dump_impl(Shard& shard, Op& op) {
-    KvObj* object = shard.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* object = shard.store_find<kNotify>(op.hash, op.key());
     // Protocol-selected null: reply_nil is the RESP2-only spelling and left DUMP answering "$-1"
     // on a RESP3 connection where every other miss answers "_".
     if (!object) { reply_null(op.sink(), op.resp3()); return; }

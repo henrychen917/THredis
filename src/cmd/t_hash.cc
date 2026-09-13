@@ -743,9 +743,7 @@ bool externalize_hash(Shard& shard, Op& op, KvObj*& object) {
     }
     value->compact_payload_bytes = hash_compact_payload(source);
     value->random_state = hash_random_state(source);
-    KvObj* replacement = kvobj_new_hash(object->key(), value,
-                                        shard.store().deadline(op.hash, object),
-                                        object->has_ttl_slot());
+    KvObj* replacement = kvobj_new_hash(object->key(), value, object->expire_at_ms());
     if (!replacement) {
         delete value;
         reply_err(op.sink(), "ERR out of memory");
@@ -810,9 +808,7 @@ const HashFieldTtl* hash_ttls_of(const KvObj* object) {
 // keeps every handler below unchanged: after this returns, all remaining fields are live.
 template <bool kNotify>
 inline bool hash_lookup(Shard& shard, Op& op, KvObj*& object) {
-    object = (op.spec->flags & CmdFlags::Readonly)
-        ? shard.store_find_read<kNotify>(op.hash, op.key())
-        : shard.store_find<kNotify>(op.hash, op.key());
+    object = shard.store_find<kNotify>(op.hash, op.key());
     if (!obj_type_check(object, Type::Hash, op.sink())) return false;
     if (__builtin_expect(shard.store().field_expire_count() != 0, false) && object)
         object = hash_ttl_on_access(shard, op, object, kNotify);

@@ -4,7 +4,6 @@
 // exposes only opaque state and the narrow IO/executor hooks needed by the single-TU core.
 #pragma once
 
-#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -44,10 +43,8 @@ void multi_mark_queue_error(Client& client);
 // transaction dispatch and lifetime machinery in multi.inc preserves the layout of the ordinary
 // parse/dispatch and retirement paths.
 bool multi_dispatch_entry(IoLoop& loop, Client& client, Op& op, uint32_t consumed);
-bool multi_dispatch_entry_iofused(IoLoop& loop, Client& client, Op& op, uint32_t consumed);
 void multi_retire_entry(IoLoop& loop, Client& client, Op& op);
 uint32_t multi_owner_pass_entry(IoLoop& loop);
-uint32_t multi_owner_pass_entry_iofused(IoLoop& loop);
 uint32_t multi_owner_reap_entry(IoLoop& loop);
 void multi_close_entry(IoLoop& loop, Client& client);
 void multi_shutdown_entry(IoLoop& loop);
@@ -60,18 +57,6 @@ void multi_abandon_unpublished(MultiExecState* state);
 
 // Low-bit tagging reuses Task::scatter without changing the 32-byte queue item.
 bool multi_task_tagged(const Task& task);
-// Does `group_epoch` belong to this fragment's OWN logical unit? The transaction's plain per-key
-// installs publish through its own epoch word; every cross-shard command lowered inside the same
-// EXEC keeps its own ScatterState and publishes through that one. A caller asking "is there an
-// undecided record here that is not mine" has to accept both, or a transaction holds against its
-// own child.
-bool multi_task_owns_epoch(const Task& task, const void* group_epoch);
-// INFO atomic_exec_order_late: times an EXEC write reached its install with an undecided record
-// from another logical unit of the same connection still on this owner -- the ordering violation
-// the dispatch-time park in ExLoop::execute() exists to make impossible. It is a BUG counter and
-// must read zero; it is separate from atomic_exec_order_holds precisely so that "the hold fired"
-// and "the hold fired too late" cannot be confused for one another.
-uint64_t multi_exec_order_late();
 Task multi_make_task(Client* client, uint64_t op_id, int32_t shard, MultiExecState* state);
 MultiTaskResult multi_execute_task(Server& server, const Task& task, Shard& shard,
                                    uint32_t owner_thread_id, uint32_t owner_domain,

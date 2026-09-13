@@ -11,7 +11,6 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,17 +20,6 @@ namespace tomo {
 
 class Shard;
 class Op;
-
-// Static executor scheduling cost. This is deliberately coarse: the policy needs a cheap verb
-// class, not a runtime estimate from argv or clocks. Point includes GET and unarmed SET; the armed
-// registry promotes writes by one saturated class. SmallMulti is the simple fanout/vector family;
-// Long covers combining, range, scan, and other whole-value work.
-enum class CommandLengthClass : uint8_t {
-    Point = 0,
-    SmallMulti = 1,
-    Long = 2,
-    Count = 3,
-};
 
 struct CmdFlags {
     static constexpr uint32_t Write     = 1u << 0;   // mutates the keyspace
@@ -95,22 +83,6 @@ struct CmdFlags {
     // slot unfinished and completes it from a cold deadline list.  Commands without this bit do
     // not enter that machinery; the test lives inside the already-cold ConnLocal branch.
     static constexpr uint32_t DeferredLocal = 1u << 21;
-    // Administrative execution constraints inherited from the shipped fork's FLIP row. They are
-    // named flags (rather than command-name checks) so scripts/MULTI/loading keep one policy gate.
-    static constexpr uint32_t NoScript = 1u << 22;
-    static constexpr uint32_t NoMulti = 1u << 23;
-    static constexpr uint32_t NoAsyncLoading = 1u << 24;
-    // FLIP publishes an unfinished connection-local ROB slot and is completed by IoLoop's staged
-    // coordinator. No other command enters that control path.
-    static constexpr uint32_t FlipAsync = 1u << 25;
-    // Exact hot-decode class for the fused parsing-thread read lane. The flag is deliberately
-    // narrower than Readonly: it admits only plain GET and MGET, then applies the remaining
-    // connection/store gates to every routed key before either command enters the lane.
-    static constexpr uint32_t ReadLocalEligible = 1u << 26;
-    // DEBUG SLEEP alone publishes a connection-local unfinished ROB slot and completes it from
-    // IoLoop's cold timer list. This bit does not make DEBUG generally deferred: all other DEBUG
-    // subcommands retain their synchronous control-plane path.
-    static constexpr uint32_t DebugSleep = 1u << 27;
 };
 
 using CmdHandler = void (*)(Shard&, Op&);
@@ -126,8 +98,6 @@ struct CommandSpec {
     int32_t     min_arity;
     int32_t     max_arity;
     uint32_t    flags;
-    // Boot-stamped scheduler metadata in the existing alignment hole before handler.
-    uint8_t     length_class = 0;
     CmdHandler  handler;
 
     // Key range within argv: [first_key, last_key] stepping by key_step.
@@ -149,8 +119,7 @@ struct CommandSpec {
                           int16_t last_key_, int16_t key_step_,
                           CmdHandler handler_notify_ = nullptr)
         : name(name_), min_arity(min_arity_), max_arity(max_arity_), flags(flags_),
-          length_class(0), handler(handler_), first_key(first_key_), last_key(last_key_),
-          key_step(key_step_),
+          handler(handler_), first_key(first_key_), last_key(last_key_), key_step(key_step_),
           handler_notify(handler_notify_ ? handler_notify_ :
                          (handler_ == cmd_xshard_only ? cmd_xshard_only_notify : handler_)) {}
 };
@@ -158,15 +127,6 @@ struct CommandSpec {
 // 48 = the ACL audit's measured 40 plus the notify v2 handler_notify tail pointer. Registry rows
 // are cold read-only data; the lock exists to catch accidental growth, not to forbid deliberate.
 static_assert(sizeof(CommandSpec) == 48);
-
-inline CommandLengthClass command_length_class(const CommandSpec& spec) {
-    return static_cast<CommandLengthClass>(spec.length_class);
-}
-
-inline bool command_is_read_local_mget(const CommandSpec& spec) {
-    constexpr uint32_t kMgetClass = CmdFlags::ReadLocalEligible | CmdFlags::MultiShard;
-    return (spec.flags & kMgetClass) == kMgetClass;
-}
 
 struct CommandTable {
     const CommandSpec* specs;
@@ -228,78 +188,9 @@ CommandTable pfdebug_command_table();
 
 // Built once before threads start. Lookup hashes the uppercase-normalized bytes into an open-
 // addressed table; the load factor is capped at 1/2 so ordinary command names land in one probe.
-bool command_registry_init(bool tls_enabled, bool fused_mode = false,
-                           bool read_local_armed = false);
-
-// Clean registry rows for the verbs command_lookup resolves inline. command_registry_init stamps
-// them from the same rows the hash table indexes and re-checks the two against each other; they
-// stay null before that, so a pre-init lookup is still "unknown", exactly as the hash probe says.
-// Read on every dispatch and written only at boot, so it owns its cache line: no .bss neighbour
-// that is written at runtime can false-share the GET pointer load.
-struct alignas(64) HotCommandSpecs {
-    const CommandSpec* get  = nullptr;
-    const CommandSpec* set  = nullptr;
-    const CommandSpec* del  = nullptr;
-    const CommandSpec* mget = nullptr;
-    const CommandSpec* mset = nullptr;
-    const CommandSpec* incr = nullptr;
-};
-extern HotCommandSpecs g_hot_command_specs;
-
-// The cold entry: open-addressed probe of the uppercase-normalized name. Callers use
-// command_lookup below, which reaches this only for a name the inline resolve did not claim.
-const CommandSpec* command_lookup_registry(Slice name);
-
-// Little-endian packed verb key with every byte OR 0x20. For an ASCII letter, OR 0x20 has exactly
-// its two spellings as preimages ('G' 0x47 and 'g' 0x67 both give 0x67) and nothing else, and the
-// length is matched first, so key equality against a canonical verb is byte-exact case-insensitive
-// equality — the relation command_lookup_registry's ascii_upper compare implements — and no other
-// byte string, binary or otherwise, can alias a hot verb. A 3-byte key carries 0x20 in its top byte.
-inline constexpr uint32_t command_verb_key(char a, char b, char c, char d = ' ') {
-    return (static_cast<uint32_t>(static_cast<uint8_t>(a)) |
-            (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
-            (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
-            (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24)) | 0x20202020u;
-}
-
-// Command lookup. GET/SET/DEL and MGET/MSET/INCR resolve here, in registers, from the length the
-// parser already established: no call, no frame, no canary, no stack round-trip. Every other verb,
-// every other length, and the pre-init state take the out-of-line probe. The 3-byte key is built
-// from an in-bounds 16-bit load plus one byte rather than a 3-byte memcpy: GCC lowers that memcpy
-// to two narrow stack stores and a wider reload, which forces a frame and a store-forwarding stall
-// on every GET.
-// Always inlined so the parse loop never depends on the unit-growth heuristics (see the t_string.o
-// inliner note in the Makefile).
-__attribute__((always_inline)) inline const CommandSpec* command_lookup(Slice name) {
-    if (name.n == 3) {
-        uint16_t lo;
-        std::memcpy(&lo, name.p, 2);    // one 16-bit load plus one byte: both inside the name
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        lo = __builtin_bswap16(lo);
-#endif
-        const uint32_t key =
-            (static_cast<uint32_t>(lo) |
-             (static_cast<uint32_t>(static_cast<uint8_t>(name.p[2])) << 16)) | 0x20202020u;
-        if (key == command_verb_key('G', 'E', 'T')) return g_hot_command_specs.get;
-        if (key == command_verb_key('S', 'E', 'T')) return g_hot_command_specs.set;
-        if (key == command_verb_key('D', 'E', 'L')) return g_hot_command_specs.del;
-    } else if (name.n == 4) {
-        uint32_t key;
-        std::memcpy(&key, name.p, 4);   // one 32-bit load, never widened past the name
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-        key = __builtin_bswap32(key);
-#endif
-        key |= 0x20202020u;
-        if (key == command_verb_key('M', 'G', 'E', 'T')) return g_hot_command_specs.mget;
-        if (key == command_verb_key('M', 'S', 'E', 'T')) return g_hot_command_specs.mset;
-        if (key == command_verb_key('I', 'N', 'C', 'R')) return g_hot_command_specs.incr;
-    }
-    return command_lookup_registry(name);
-}
-inline bool command_arity_ok(const CommandSpec& spec, uint32_t argc) {
-    return argc >= static_cast<uint32_t>(spec.min_arity) &&
-           (spec.max_arity < 0 || argc <= static_cast<uint32_t>(spec.max_arity));
-}
+bool command_registry_init(bool tls_enabled);
+const CommandSpec* command_lookup(Slice name);
+bool command_arity_ok(const CommandSpec& spec, uint32_t argc);
 uint32_t command_registry_size();
 const CommandSpec* command_registry_at(uint32_t id);
 uint64_t command_acl_category_mask(const CommandSpec& spec);
@@ -319,7 +210,6 @@ void cmd_bitfield_notify(Shard&, Op&);
 void cmd_bitfield_ro(Shard&, Op&);
 void cmd_bitfield_ro_notify(Shard&, Op&);
 class Server;
-void cmd_flip_unavailable(Shard&, Op&);
 class Client;
 class ThreadCtx;
 struct Op;
@@ -337,12 +227,6 @@ void command_set_local_context(Client* client, ThreadCtx* thread);
 void command_client_connected(Client* client, const char* addr, const char* laddr,
                               bool unix_socket, uint64_t now_ms);
 void command_client_disconnected(Client* client);
-// Runtime IO-owner handoff moves the thread-local CLIENT catalog as an extracted map node. The
-// opaque handle owns that node between source and destination; no metadata field is reconstructed.
-void* command_client_migration_extract(Client* client);
-bool command_client_migration_install(void* catalog);
-void command_client_migration_discard(void* catalog);
-bool command_client_migration_reserve(uint32_t extra);
 void command_client_set_subscriptions(Client* client, uint32_t channels, uint32_t patterns,
                                       uint32_t shard_channels);
 std::string command_client_info_line(const Client& client, uint64_t now_ms);
@@ -351,8 +235,6 @@ bool command_client_filter_match(const Client& client, const PubSubEvent& event,
 bool command_client_set_name(Client* client, Slice name);
 std::string command_client_name(const Client* client);
 bool command_client_set_info(Client* client, Slice option, Slice value);
-// Compatibility metadata only: reported by CLIENT INFO/LIST, not enforced. Redis applies this to
-// client output-buffer eviction, a mechanism TomoKV does not implement.
 void command_client_set_no_evict(Client* client, bool enabled);
 void command_client_set_no_touch(Client* client, bool enabled);
 // MONITOR feed lines and CLIENT INFO share the owner-catalog peer address.
@@ -362,12 +244,9 @@ void command_client_set_tracking_view(Client* client, bool on, int64_t redirect)
 void command_client_reset_meta(Client* client);
 // CLIENT subcommand arity error, shared by climon.cc and tracking.cc.
 void climon_wrong_args(Op& op, const char* subcommand);
-// Process-wide id -> live Client directory. The pointer is read only under the directory mutex and
-// only to acquire-load Client::ifid_thread(), the connection ownership edge. Besides CLIENT
-// UNBLOCK/TRACKING REDIRECT, stale notification deliveries use it after a migration has already
-// moved the old owner's local catalog node.
-void command_client_directory_add(Client* client, uint32_t io);
-void command_client_directory_move(uint64_t id, uint32_t io);
+// Process-wide id -> owning io thread directory. Written at accept/close only (cold), read only
+// by CLIENT UNBLOCK and CLIENT TRACKING REDIRECT, so no hot path pays for the mutex.
+void command_client_directory_add(uint64_t id, uint32_t io);
 void command_client_directory_remove(uint64_t id);
 bool command_client_directory_find(uint64_t id, uint32_t& io);
 
@@ -385,7 +264,6 @@ bool command_prepare_scan_route(Server& server, Op& op);
 bool command_prepare_subcmd_route(Server& server, Op& op);
 // Lets the server-tail translation unit reach the bound Server without duplicating the binding.
 Server* command_server();
-uint64_t command_proto_max_bulk_len();
 // The IO thread currently running a ConnLocal handler, for the few commands that must talk to
 // the loop itself (SHUTDOWN's ring pokes). Null outside a ConnLocal call.
 ThreadCtx* command_local_thread();

@@ -1015,9 +1015,7 @@ AddOutcome zset_add_one(CollectionRef& value, const CompactLimit& limit, double 
 
 template <bool kNotify>
 KvObj* lookup_zset(Shard& shard, Op& op) {
-    KvObj* object = (op.spec->flags & CmdFlags::Readonly)
-        ? shard.store_find_read<kNotify>(op.hash, op.key())
-        : shard.store_find<kNotify>(op.hash, op.key());
+    KvObj* object = shard.store_find<kNotify>(op.hash, op.key());
     if (!obj_type_check(object, Type::Zset, op.sink())) return reinterpret_cast<KvObj*>(-1);
     return object;
 }
@@ -1064,9 +1062,7 @@ bool externalize_zset(Shard& shard, Op& op, KvObj*& object) {
             return false;
         }
     }
-    KvObj* replacement = kvobj_new_zset(object->key(), value,
-                                        shard.store().deadline(op.hash, object),
-                                        object->has_ttl_slot());
+    KvObj* replacement = kvobj_new_zset(object->key(), value, object->expire_at_ms());
     if (!replacement) {
         delete value;
         reply_oom(op);
@@ -1428,9 +1424,10 @@ void cmd_zrem(Shard& shard, Op& op) {
     reply_int(op.sink(), static_cast<long long>(removed));
 }
 
-RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop,
-                                 const CompactItems& items) {
+RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
     RemovalResult result;
+    CompactItems items;
+    if (!items.load(value)) return result;
     const int64_t length = static_cast<int64_t>(items.entries.size());
     if (start < 0) start += length;
     if (stop < 0) stop += length;
@@ -1444,12 +1441,6 @@ RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t st
     result.count = static_cast<uint32_t>(stop - start + 1);
     if (!value.erase_range(value.compact().logical(first), end)) return {};
     return result;
-}
-
-RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
-    CompactItems items;
-    if (!items.load(value)) return {};
-    return compact_erase_rank(value, start, stop, items);
 }
 
 RemovalResult compact_erase_score(CollectionRef& value, const ScoreRange& range) {
@@ -1702,7 +1693,8 @@ void emit_rank_range(Op& op, const CollectionRef& value, int64_t start, int64_t 
 
 void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& range,
                       const RangeOptions& options) {
-    // Both encodings use the same LIMIT-offset rule; negative rank indices are separate.
+    // A negative LIMIT offset is NOT rejected here: it counts back from the end of the matched
+    // range on the expanded encoding. See zset_resolve_limit_offset in t_zset.h.
     if (score_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;
@@ -1775,7 +1767,7 @@ void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& rang
 
 void emit_lex_range(Op& op, const CollectionRef& value, const LexRange& range,
                     const RangeOptions& options) {
-    // As in emit_score_range, LIMIT offsets have the same rule in both encodings.
+    // As in emit_score_range: a negative LIMIT offset is resolved per encoding, not rejected.
     if (lex_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;
@@ -1958,7 +1950,7 @@ void cmd_zpop_generic(Shard& shard, Op& op, bool maximum) {
         const int64_t first = maximum ? static_cast<int64_t>(items.entries.size() - take) : 0;
         const int64_t last = maximum ? static_cast<int64_t>(items.entries.size() - 1)
                                      : static_cast<int64_t>(take - 1);
-        removed = compact_erase_rank(value, first, last, items);
+        removed = compact_erase_rank(value, first, last);
     } else {
         const uint64_t start_rank = maximum ? value.entries() : 1;
         ZsetNode* node = zset_expanded(value)->by_rank(start_rank);
@@ -2454,9 +2446,7 @@ bool zset_sort_promote_one(Shard& shard, uint64_t hash, Slice key) {
         if (!moved) return false;
         for (const Compact::Entry entry : CollectionRef(object).compact())
             if (!moved->append(entry.value)) { delete moved; return false; }
-        KvObj* replacement = kvobj_new_zset(object->key(), moved,
-                                            shard.store().deadline(hash, object),
-                                            object->has_ttl_slot());
+        KvObj* replacement = kvobj_new_zset(object->key(), moved, object->expire_at_ms());
         if (!replacement) { delete moved; return false; }
         replacement->set_eviction_meta(object->eviction_meta());
         if (shard.store_insert<kNotify>(hash, replacement) != FlatStore::InsertResult::Inserted) {
@@ -2478,18 +2468,12 @@ void zset_sort_promote(Shard& shard, uint64_t hash, Slice key, bool notify) {
 }
 
 ZsetOwnerResult zset_owner_read(Shard& shard, Slice key, uint64_t hash, bool notify,
-                                bool read_stats, std::vector<ZsetEntry>& entries,
-                                int64_t& expire_at_ms, bool* reserve_ttl_slot) {
+                                std::vector<ZsetEntry>& entries, int64_t& expire_at_ms) {
     entries.clear();
-    if (reserve_ttl_slot) *reserve_ttl_slot = false;
-    KvObj* object = read_stats
-        ? (notify ? shard.store_find_read<true>(hash, key)
-                  : shard.store_find_read<false>(hash, key))
-        : (notify ? shard.store_find<true>(hash, key) : shard.store().find(hash, key));
+    KvObj* object = notify ? shard.store_find<true>(hash, key) : shard.store().find(hash, key);
     if (!object) { expire_at_ms = -1; return ZsetOwnerResult::Missing; }
     if (static_cast<Type>(object->type) != Type::Zset) return ZsetOwnerResult::WrongType;
-    expire_at_ms = shard.store().deadline(hash, object);
-    if (reserve_ttl_slot) *reserve_ttl_slot = object->has_ttl_slot();
+    expire_at_ms = object->expire_at_ms();
     try {
         entries.reserve(CollectionRef(object).entries());
         if (!zset_walk(zset_value(object), [&](double score, Slice member) {
@@ -2504,8 +2488,7 @@ ZsetOwnerResult zset_owner_read(Shard& shard, Slice key, uint64_t hash, bool not
 }
 
 ZsetOwnerResult zset_owner_replace(Shard& shard, Slice key, uint64_t hash, bool notify,
-                                   const std::vector<ZsetEntry>& entries, int64_t expire_at_ms,
-                                   bool reserve_ttl_slot) {
+                                   const std::vector<ZsetEntry>& entries, int64_t expire_at_ms) {
     if (entries.empty()) {
         if (notify) shard.store_erase<true>(hash, key, FlatStore::EraseEvent::None);
         else shard.store().erase(hash, key);
@@ -2525,7 +2508,7 @@ ZsetOwnerResult zset_owner_replace(Shard& shard, Slice key, uint64_t hash, bool 
             return ZsetOwnerResult::Oom;
         }
     }
-    KvObj* object = kvobj_adopt_zset(key, value, expire_at_ms, reserve_ttl_slot);
+    KvObj* object = kvobj_adopt_zset(key, value, expire_at_ms);
     if (!object) { delete value; return ZsetOwnerResult::Oom; }
     const FlatStore::InsertResult inserted = notify
         ? shard.store_insert<true>(hash, object)

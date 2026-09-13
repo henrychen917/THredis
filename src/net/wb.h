@@ -64,44 +64,11 @@
 #include <unordered_map>
 #include "conn.h"
 #include "epoll.h"
-#include "resp.h"       // format_reply_code: the owner's half of the coded reply
 #include "tls.h"
 #include "uring.h"
 #include "../core/signal.h"
 
 namespace tomo {
-
-// THE OWNER'S HALF of the coded reply (see ReplyCode in src/exec/op.h) has TWO shapes here, and
-// the split is a performance contract, not a style choice.
-//
-// The HOT path -- an op retiring with nothing staged ahead of it -- renders straight into the fill
-// buffer's frontier through reserve_fill/commit_fill. No temporary.
-//
-// The COLD paths -- a borrowed value, or a segment queue already open -- take op_materialise_code()
-// instead, which turns the code back into bytes inside op.reply and leaves their existing
-// append_buf_segment(op.direct, op.direct_len, op.reply.data(), op.reply.size()) lines completely
-// untouched. A code implies op.reply is empty and op.direct_len is zero, so the bytes land in the
-// right order with no reordering logic at all.
-//
-// The obvious middle road -- render into a `char scratch[kReplyCodeMax]` and pass it along -- was
-// built first and MEASURED WORSE. A local array makes GCC apply -fstack-protector-strong to the
-// enclosing function, and the enclosing function here is the per-op retire lambda: it went from
-// 139-196 instructions to 237-280 and picked up two to three canary sequences, which EVERY retired
-// op paid, GETs included, for a benefit only coded replies receive. That is the whole of the split
-// GET regression. No array on this path, ever.
-
-// The coded reply's ONLY appearance in the per-op retire lambda is a call to this. Rendering it
-// inline meant inlining reserve_fill -> SmallBuf::reserve -> grow(), i.e. malloc/memcpy/free, into
-// the hottest function the io thread runs -- paid in code size and register pressure by every op,
-// including the GETs that never carry a code. Base reached its reply through an out-of-line
-// SmallBuf::append call too, so this trades like for like.
-template <bool TrackOutput>
-__attribute__((noinline)) void stage_coded_reply(Client& conn, Op& op) {
-    const uint32_t n = format_reply_code(conn.reserve_fill(kReplyCodeMax),
-                                         op.reply_code_, op.reply_ival_);
-    if constexpr (TrackOutput) conn.commit_fill(n);
-    else                       conn.fill_buf().commit_raw(n);
-}
 
 // THE LOCK BUG note above is preserved as history: WbGuard died with the multi-sender designs
 // (exwb, then 3s). In pure 2s exactly one thread -- the connection's io thread -- ever touches the
@@ -121,13 +88,11 @@ public:
     using RetireFn = void (*)(void*, Client&, Op&);
     using LimitFn = bool (*)(void*, Client&);
 
-    void bind(Ring* ring, void* release_ctx, ReleaseFn release_fn,
-              void* retire_ctx, RetireFn retire_fn,
-              const std::atomic<bool>* limit_armed,
-              void* limit_ctx, LimitFn limit_fn,
-              const uint32_t* cached_now_s, LoopSignals* tls_signals) {
-        if (!ring || !release_fn || !retire_fn || !limit_armed || !limit_fn ||
-            !cached_now_s || !tls_signals) std::abort();
+    void bind(Ring* ring, void* release_ctx = nullptr, ReleaseFn release_fn = nullptr,
+              void* retire_ctx = nullptr, RetireFn retire_fn = nullptr,
+              const std::atomic<bool>* limit_armed = nullptr,
+              void* limit_ctx = nullptr, LimitFn limit_fn = nullptr,
+              const uint32_t* cached_now_s = nullptr, LoopSignals* tls_signals = nullptr) {
         epoll_ = g_ring_epoll_mode;
         ring_ = ring;
         release_ctx_ = release_ctx;
@@ -142,10 +107,6 @@ public:
     }
 
     Ring&  ring()       { return *ring_; }
-    // Only cold, non-templated send sites consult this boot-latched fallback. Hot paths carry the
-    // pipeline-1 classifier as a template argument.
-    void set_cold_send_classification(bool enabled) { classify_cold_sends_ = enabled; }
-
 
     // ---- OUT-OF-BAND FRAMES WAITING FOR EARLIER-ISSUED REPLIES ----------------------------------
     //
@@ -186,95 +147,46 @@ public:
         return true;
     }
 
-    uint64_t deferred_output_bytes(const Client& c) const {
-        const auto found = oob_defer_.find(const_cast<Client*>(&c));
-        if (found == oob_defer_.end()) return 0;
-        uint64_t bytes = 0;
-        for (const auto& frame : found->second) bytes += frame.bytes.size();
-        return bytes;
-    }
-
-    // THE WHOLE REPLY SIDE, in one call: retire completed ops IN ORDER, stage their bytes, and
-    // write. All three belong together and all three belong to the sender -- if the io thread
-    // retired and merely handed bytes over, only the send syscall would move between modes, and
-    // an "ex-wb" measured that way would not be ex-wb. In pure 2s the sender is the connection's
-    // io thread and nobody else (the Wb-thread and EX-mode callers this comment once listed were
-    // deleted with those postures; see the head of this file), so no lock exists or is needed and
-    // the ROB stays SPSC by construction. Returns true if it did anything, so a caller can tell
-    // progress from an empty poll.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
+    // THE WHOLE REPLY SIDE, in one call, run by whichever stage owns sending for this client.
+    //
+    // Retire completed ops IN ORDER, stage their bytes, and write. All three belong together and all
+    // three belong to the sender: if the io thread retired and merely handed bytes over, only the
+    // send syscall would move between modes and an "ex-wb" measured that way would not be ex-wb.
+    //
+    // WHO MAY CALL. In Io mode, only the owning io thread -- no lock exists or is needed. In Wb mode,
+    // only the connection's dedicated sender. In EX MODE, ANYONE: the executor that just completed
+    // the head flushes it inline, and the owning io thread sweeps as the backstop -- so the whole
+    // serve (drain + stage + send) is one io-thread-local pass. The
+    // ROB stays SPSC because the lock makes "exactly one consumer at any instant" true dynamically,
+    // Retire completed ops IN ORDER, stage their bytes, and write. Owned and run only by the
+    // connection's io thread. Returns true if it did anything, so a caller can tell progress from
+    // an empty poll.
+    template <bool kEp = false>
     bool serve(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, true, ClassifySend, Coded>(c);
-        return serve_impl<false, false, kEp, true, ClassifySend, Coded>(c);
-    }
-
-    // Micro-pipeline retirement half. It drains exactly the same in-order prefix and stages the
-    // same buffers/segments as serve(), but deliberately leaves SQE construction to pump().
-    template <bool kEp = false, bool Coded = false>
-    bool prepare(Client& c, bool& submit_allowed) {
-        submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, false, false, Coded>(c, &submit_allowed);
-        return serve_impl<false, false, kEp, false, false, Coded>(c, &submit_allowed);
-    }
-
-    // Unified pipeline batches already guard a nullable Client slot before their submit half. Its
-    // bound limit callback tombstones that slot on the rare refusal, avoiding a parallel bool on
-    // every ordinary reply while leaving the established split-pipeline prepare API untouched.
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, false, false, Coded>(c);
-        return serve_impl<false, false, kEp, false, false, Coded>(c);
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
+            return serve_impl<true, false, kEp>(c);
+        return serve_impl<false, false, kEp>(c);
     }
 
     // kTLS uses the ordinary plaintext staging and send path. This separate instantiation only
     // enforces/counts the pre-existing TLS no-borrow contract; plaintext clients pay no mode test.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
+    template <bool kEp = false>
     bool serve_ktls(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, true, ClassifySend, Coded>(c);
-        return serve_impl<false, true, kEp, true, ClassifySend, Coded>(c);
-    }
-
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_ktls(Client& c, bool& submit_allowed) {
-        submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, false, false, Coded>(c, &submit_allowed);
-        return serve_impl<false, true, kEp, false, false, Coded>(c, &submit_allowed);
-    }
-
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline_ktls(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, false, false, Coded>(c);
-        return serve_impl<false, true, kEp, false, false, Coded>(c);
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
+            return serve_impl<true, true, kEp>(c);
+        return serve_impl<false, true, kEp>(c);
     }
 
     // TLS is a separate write-back variant selected by the IO owner. Plain serve()/pump() above
     // remain untouched and are the only instantiated path when tls-port is zero.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
+    template <bool kEp = false>
     bool serve_tls(Client& c, TlsConn& tls) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, true, ClassifySend, Coded>(c, tls);
-        return serve_tls_impl<false, kEp, true, ClassifySend, Coded>(c, tls);
-    }
-
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_tls(Client& c, TlsConn& tls, bool& submit_allowed) {
-        submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, false, false, Coded>(c, tls, &submit_allowed);
-        return serve_tls_impl<false, kEp, false, false, Coded>(c, tls, &submit_allowed);
-    }
-
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline_tls(Client& c, TlsConn& tls) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, false, false, Coded>(c, tls);
-        return serve_tls_impl<false, kEp, false, false, Coded>(c, tls);
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
+            return serve_tls_impl<true, kEp>(c, tls);
+        return serve_tls_impl<false, kEp>(c, tls);
     }
 
     // THE ENGINE'S ONE ESCALATION CHANNEL. Under io_uring a fatal send error is reported by
@@ -295,10 +207,7 @@ public:
     // PER-OP, and that is the point. Suppression cannot be decided per connection: a pipelined
     // `CLIENT REPLY SKIP; PING; PING` retires all three in ONE drain, and a per-connection
     // decision would swallow both PONGs. The mark is made by the io thread's armed gate before
-    // dispatch, so each op carries its own answer here. The per-connection reply mode only
-    // SELECTS this variant (climon_reply_suppressed), and the hot serve never reads the mark, so
-    // the mode must outlive every marked op: CLIENT REPLY ON and RESET leave OFF through the
-    // SkipNow drain state (climon.cc) instead of dropping to ON while marked ops are in flight.
+    // dispatch, so each op carries its own answer here.
     //
     // Special command state MUST still be surrendered through retire_fn_ even when the bytes are
     // dropped, or scatter/blocking/MULTI/notification state leaks and cross-shard groups never
@@ -307,45 +216,21 @@ public:
     // never committed.
     __attribute__((noinline, cold))
     bool serve_suppressing(Client& c) {
-        return serve_suppressing_impl(c, true);
-    }
-
-    __attribute__((noinline, cold))
-    bool prepare_suppressing(Client& c, bool& submit_allowed) {
-        submit_allowed = true;
-        return serve_suppressing_impl(c, false, &submit_allowed);
-    }
-
-private:
-    __attribute__((noinline, cold))
-    bool serve_suppressing_impl(Client& c, bool submit,
-                                bool* submit_allowed = nullptr) {
         stats_.serves++;
         Client& conn = c;
         conn.start_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
-            // A retire hook may stage THIS op's own bytes before the skip is consulted: cross-
-            // shard MGET assembly seals the fill buffer, then appends the array header, every
-            // borrowed bulk and its CRLF to the segment queue. Record the queue frontier first so
-            // a suppressed op can take exactly those back instead of leaking a partial array.
-            const uint32_t segments_before = conn.output_list_length();
-            const bool fill_was_staged = conn.has_pending_fill();
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr) {
+                if (retire_fn_) retire_fn_(retire_ctx_, conn, op);
+            }
             if (op.reply_skip()) {
-                if (op.zc_ptr && op.zc_shard >= 0) release(op.zc_shard, op.zc_ptr);
-                // Everything past the frontier is this op's reply -- except the seal, which moved
-                // OLDER fill bytes into the queue and must stay. It exists iff the fill buffer
-                // went from staged to empty across the hook; nothing else empties it mid-drain.
-                const uint32_t keep = segments_before +
-                    ((fill_was_staged && !conn.has_pending_fill()) ? 1u : 0u);
-                conn.truncate_segments(keep,
-                    [&](int32_t shard, const char* ptr) { release(shard, ptr); });
+                if (op.zc_ptr && op.zc_shard >= 0 && release_fn_)
+                    release_fn_(release_ctx_, op.zc_shard, op.zc_ptr);
                 return;
             }
             if (op.zc_ptr) {
                 conn.seal_fill_segment();
-                if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
                 conn.append_borrow_segment(op.zc_ptr, op.zc_len, op.zc_shard);
@@ -356,42 +241,28 @@ private:
             // fill frontier; this op's direct region was handed out at the same offset only if
             // nothing was staged, so committing here stays correct.
             if (conn.has_pending_segments()) {
-                if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
             } else {
-                // A coded reply is rendered straight into the fill frontier: no temporary, and a
-                // compile-time length instead of the runtime-length memcpy op.reply needed.
-                if (op.reply_code_) stage_coded_reply<true>(conn, op);
-                else if (op.direct_len) conn.commit_fill(op.direct_len);
+                if (op.direct_len) conn.commit_fill(op.direct_len);
                 if (!op.reply.empty()) conn.append_fill(op.reply.data(), op.reply.size());
             }
         });
         draining_ = nullptr;
         bool did = retired != 0;
-        did |= flush_deferred_oob(conn);
-        if (limit_fn_(limit_ctx_, c)) {
-            if (submit_allowed) *submit_allowed = false;
+        did |= flush_deferred_oob(conn, c.rob().flush_id());
+        if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
             stats_.retired += retired;
             return true;
         }
-        if (submit && !conn.nothing_to_write()) {
-            if (epoll_)
-                did |= pump<true>(c);
-            else if (classify_cold_sends_)
-                did |= pump<false, true>(c);
-            else
-                did |= pump<false>(c);
-        }
+        if (!conn.nothing_to_write()) did |= epoll_ ? pump<true>(c) : pump<false>(c);
         stats_.retired += retired;
         return did;
     }
 
-public:
-
     // Try to push whatever this client has buffered. Safe to call spuriously: if nothing is pending
     // or a send is already outstanding it does nothing. Returns true if a send was submitted.
-    template <bool kEp = false, bool ClassifySend = false>
+    template <bool kEp = false>
     bool pump(Client& c) {
       if constexpr (kEp) { return pump_epoll(c); }
       else {
@@ -403,7 +274,7 @@ public:
         const size_t legacy_total = conn.send_buf().size();
         const size_t legacy_sent  = conn.wsent();
         if (legacy_sent < legacy_total)
-            return submit_legacy<kEp, ClassifySend>(c, legacy_total, legacy_sent);
+            return submit_legacy<kEp>(c, legacy_total, legacy_sent);
 
         if (conn.has_pending_segments()) {
             bool has_borrow = false;
@@ -415,7 +286,7 @@ public:
             if (!s) return false;
             io_uring_prep_sendmsg(s, conn.fd(), conn.send_msg(), MSG_NOSIGNAL);
             s->user_data = ur_tag(UrKind::Send, &c);
-            ring_->note_send_pending<ClassifySend>();
+            ring_->note_pending();
 
             conn.set_segmented_send(true);
             conn.set_send_requested(total);
@@ -432,7 +303,7 @@ public:
 
         const size_t total = conn.send_buf().size();
         const size_t sent  = conn.wsent();
-        return sent < total ? submit_legacy<kEp, ClassifySend>(c, total, sent) : false;
+        return sent < total ? submit_legacy<kEp>(c, total, sent) : false;
       }
     }
 
@@ -473,7 +344,7 @@ public:
                 stats_.bytes_sent += static_cast<uint64_t>(n);
                 if (static_cast<uint32_t>(n) < total) stats_.short_writes++;
                 else stats_.sends_completed++;
-                c.set_last_interaction_s(*cached_now_s_);
+                if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
                 did = true;
                 continue;
             }
@@ -488,14 +359,12 @@ public:
     // Non-templated wrapper for the two cold sites that cannot carry the engine in their type:
     // close_client's TLS alert/close_notify drain, and the CLIENT REPLY suppressed serve.
     bool pump_tls_any(Client& c, TlsConn& tls) {
-        if (epoll_) return pump_tls<true>(c, tls);
-        return classify_cold_sends_ ? pump_tls<false, true>(c, tls)
-                                    : pump_tls<false>(c, tls);
+        return epoll_ ? pump_tls<true>(c, tls) : pump_tls<false>(c, tls);
     }
 
     // Engine independent except for its one ciphertext write, which submit_tls_cipher<kEp> owns.
     // The plaintext -> OpenSSL half is identical in both engines.
-    template <bool kEp = false, bool ClassifySend = false>
+    template <bool kEp = false>
     bool pump_tls(Client& c, TlsConn& tls) {
         if (c.send_inflight()) return false;
 
@@ -504,8 +373,7 @@ public:
         const char* cipher = nullptr;
         const int cipher_bytes = tls.peek_output(cipher);
         if (cipher_bytes > 0)
-            return submit_tls_cipher<kEp, ClassifySend>(
-                c, tls, cipher, static_cast<uint32_t>(cipher_bytes));
+            return submit_tls_cipher<kEp>(c, tls, cipher, static_cast<uint32_t>(cipher_bytes));
         if (!tls.connected()) return false;
 
         Client& conn = c;
@@ -557,11 +425,11 @@ public:
             } else {
                 conn.commit_write(plain_accepted);
             }
-            tls_signals_->tls_plaintext_output_bytes += plain_accepted;
+            if (tls_signals_) tls_signals_->tls_plaintext_output_bytes += plain_accepted;
         } else if (encrypted.op == TlsOp::WantWrite) {
-            tls_signals_->tls_want_write++;
+            if (tls_signals_) tls_signals_->tls_want_write++;
         } else if (encrypted.op == TlsOp::WantRead) {
-            tls_signals_->tls_want_read++;
+            if (tls_signals_) tls_signals_->tls_want_read++;
         }
         if (tls.failed()) {
             if (!tls.last_error().empty())
@@ -573,15 +441,12 @@ public:
 
         cipher = nullptr;
         const int ready = tls.peek_output(cipher);
-        if (ready > 0)
-            return submit_tls_cipher<kEp, ClassifySend>(
-                c, tls, cipher, static_cast<uint32_t>(ready));
+        if (ready > 0) return submit_tls_cipher<kEp>(c, tls, cipher, static_cast<uint32_t>(ready));
         return encrypted.op == TlsOp::Progress;
     }
 
     // Completion handler. `res` is the CQE result: bytes written, or negative errno.
     // Returns false when the connection should be torn down.
-    template <bool SubmitFollowup = true, bool ClassifySend = false>
     bool on_send_complete(Client& c, int res) {
         bool resubmit = false;
         {
@@ -608,8 +473,8 @@ public:
                     conn.commit_write(static_cast<uint32_t>(res));
                 }
                 stats_.bytes_sent += static_cast<uint64_t>(res);
-                tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
-                c.set_last_interaction_s(*cached_now_s_);
+                if (tls_signals_) tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
+                if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
                 if (static_cast<uint32_t>(res) < conn.send_requested()) stats_.short_writes++;
                 const bool drained = conn.segmented_send()
                     ? !conn.has_pending_segments()
@@ -626,12 +491,10 @@ public:
                 }
             }
         }
-        if constexpr (SubmitFollowup)
-            if (resubmit) pump<false, ClassifySend>(c);
+        if (resubmit) pump<false>(c);
         return true;
     }
 
-    template <bool SubmitFollowup = true, bool ClassifySend = false>
     bool on_tls_send_complete(Client& c, TlsConn& tls, int res) {
         c.set_send_inflight(false);
         bool resubmit = false;
@@ -668,15 +531,16 @@ public:
                 return false;
             }
             stats_.bytes_sent += cipher_sent;
-            tls_signals_->net_output_bytes += cipher_sent;
-            tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
-            c.set_last_interaction_s(*cached_now_s_);
+            if (tls_signals_) {
+                tls_signals_->net_output_bytes += cipher_sent;
+                tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+            }
+            if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
             if (cipher_sent < c.send_requested()) stats_.short_writes++;
             else stats_.sends_completed++;
             resubmit = true;
         }
-        if constexpr (SubmitFollowup)
-            if (resubmit) pump_tls<false, ClassifySend>(c, tls);
+        if (resubmit) pump_tls<false>(c, tls);
         return !tls.failed();
     }
 
@@ -686,13 +550,6 @@ public:
         oob_defer_.erase(&c);
         if (c.send_inflight()) return;
         c.release_all_segments([&](int32_t shard, const char* ptr) { release(shard, ptr); });
-    }
-
-    // Migration must neither splice nor strand a push frame. Combined with Client's empty output
-    // segments and no-send predicate, this also proves that no zero-copy value pointer remains in
-    // the kernel on behalf of this connection.
-    bool migration_ready(const Client& c) const {
-        return draining_ != &c && oob_defer_.find(const_cast<Client*>(&c)) == oob_defer_.end();
     }
 
     // Dead clients still receive their send CQE during the deferred-free window. Consume whatever
@@ -707,7 +564,7 @@ public:
                 c.commit_write(static_cast<uint32_t>(res));
             }
             stats_.bytes_sent += static_cast<uint64_t>(res);
-            tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
+            if (tls_signals_) tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
         }
         teardown(c);
     }
@@ -718,8 +575,10 @@ public:
             const uint32_t cipher_sent = static_cast<uint32_t>(res);
             if (tls.consume_output(cipher_sent)) {
                 stats_.bytes_sent += cipher_sent;
-                tls_signals_->net_output_bytes += cipher_sent;
-                tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+                if (tls_signals_) {
+                    tls_signals_->net_output_bytes += cipher_sent;
+                    tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+                }
             }
         }
         teardown(c);
@@ -743,18 +602,17 @@ public:
     Stats& stats() { return stats_; }
     const Stats& stats() const { return stats_; }
     void note_zc_suppressed_tls() {
-        tls_signals_->tls_zc_suppressed++;
+        if (tls_signals_) tls_signals_->tls_zc_suppressed++;
     }
 
 private:
     // Empty on every serve of every connection that has no subscription, tracking or monitor:
     // one predicted-true test per serve, as before. The drain has finished staging and published
     // its new flush frontier, so every append below is on a frame boundary.
-    bool flush_deferred_oob(Client& conn) {
+    bool flush_deferred_oob(Client& conn, uint64_t retired_through) {
         if (__builtin_expect(oob_defer_.empty(), true)) return false;
         auto found = oob_defer_.find(&conn);
         if (found == oob_defer_.end()) return false;
-        const uint64_t retired_through = conn.rob().flush_id();
         DeferredOobQueue& queue = found->second;
         bool flushed = false;
         while (!queue.empty() && queue.front().after <= retired_through) {
@@ -766,28 +624,12 @@ private:
         return flushed;
     }
 
-    // `Coded` IS AN ORDINARY TEMPLATE ARGUMENT, and that is the whole point of this shape. The
-    // previous version decided it at RUNTIME from a boot-latched bool, which meant serve_impl
-    // became a forwarder in front of the real body -- a new function boundary in the io thread's
-    // hot path that moved inlining and cost the split cells ~0.9% of real work (measured against a
-    // dead-pad placement control: placement alone was -0.11%..-0.30%, the binary was -0.83%..-1.48%).
-    //
-    // Every caller already knows the mode statically, so nothing had to be threaded:
-    //   flush_ready              carries `Fused` as its 3rd template parameter already, and is the
-    //                            path BOTH modes take -> passes Fused
-    //   wb_serve_natural         split-only: run_loop reaches pipeline_pass under
-    //   wb_retire_prepare        constexpr IoPipe = !Fused && Pipeline == 1  -> pass false
-    //   genthread_*              fused-only: run_loop reaches run_fused_iofused_loop
-    // With Coded=false every coded block below is deleted by `if constexpr`, so a 2s instantiation
-    // is the pre-reply-code function, not a variant of it.
-    template <bool TrackOutput, bool TlsNoBorrow, bool kEp, bool Submit, bool ClassifySend,
-              bool Coded>
-    bool serve_impl(Client& c, bool* submit_allowed = nullptr) {
+    template <bool TrackOutput, bool TlsNoBorrow, bool kEp>
+    bool serve_impl(Client& c) {
         TOMO_FORENSIC(c.n_serves.fetch_add(1, std::memory_order_relaxed));
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
-        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if constexpr (TlsNoBorrow) {
@@ -799,13 +641,14 @@ private:
             // Plain commands have no sidecar and take exactly the pre-notify zc_ptr branch. Special
             // command state, borrowed values, and armed notification batches all already use this
             // field, so their retirement hook nests behind that existing test.
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr) {
+                if (retire_fn_) retire_fn_(retire_ctx_, conn, op);
+            }
             if (op.zc_ptr) {
                 // Anything already staged is older than this op. Once sealed, every subsequent
                 // reply uses segments until the queue drains, so no fill-buffer append can jump a
                 // borrowed value that is only partially written.
                 conn.seal_fill_segment();
-                if constexpr (Coded) if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
                 if constexpr (TlsNoBorrow) {
@@ -824,25 +667,10 @@ private:
             // "copy". A reply that outgrew the region spilled to op.reply -- emit it AFTER the
             // direct part so the RESP stream stays in order.
             if (conn.has_pending_segments()) {
-                if constexpr (Coded) if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
                 if (op.direct_len) stats_.direct++;
             } else {
-                // Coded reply: render at the fill frontier, one constant-length store by the
-                // thread that owns the buffer. The whole block is deleted for Coded=false, and
-                // what remains below is the pre-reply-code text, instruction for instruction.
-                if constexpr (Coded) {
-                    if (op.reply_code_) {
-                        stage_coded_reply<TrackOutput>(conn, op);
-                        if (!op.reply.empty()) {
-                            if constexpr (TrackOutput)
-                                conn.append_fill(op.reply.data(), op.reply.size());
-                            else conn.fill_buf().append(op.reply.data(), op.reply.size());
-                        }
-                        return;
-                    }
-                }
                 if (op.direct_len) {
                     if constexpr (TrackOutput) conn.commit_fill(op.direct_len);
                     else conn.fill_buf().commit_raw(op.direct_len);
@@ -856,17 +684,15 @@ private:
         });
         draining_ = nullptr;
         bool did = retired != 0;
-        did |= flush_deferred_oob(conn);
+        did |= flush_deferred_oob(conn, c.rob().flush_id());
         if constexpr (TrackOutput) {
-            if (limit_fn_(limit_ctx_, c)) {
-                if (submit_allowed) *submit_allowed = false;
+            if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
                 stats_.retired += retired;
                 if (!retired) stats_.serves_empty++;
                 return true;
             }
         }
-        if constexpr (Submit)
-            if (!conn.nothing_to_write()) did |= pump<kEp, ClassifySend>(c);
+        if (!conn.nothing_to_write()) did |= pump<kEp>(c);
         stats_.retired += retired;
         // A serve that retires nothing: the POLLING paths (flush_ready, the backstop) finding
         // nothing, which is expected and cheap.
@@ -874,20 +700,18 @@ private:
         return did;
     }
 
-    template <bool TrackOutput, bool kEp, bool Submit, bool ClassifySend, bool Coded>
-    bool serve_tls_impl(Client& c, TlsConn& tls, bool* submit_allowed = nullptr) {
+    template <bool TrackOutput, bool kEp>
+    bool serve_tls_impl(Client& c, TlsConn& tls) {
         TOMO_FORENSIC(c.n_serves.fetch_add(1, std::memory_order_relaxed));
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
-        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if (op.no_borrow()) note_zc_suppressed_tls();
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr && retire_fn_) retire_fn_(retire_ctx_, conn, op);
             if (op.zc_ptr) {
                 conn.seal_fill_segment();
-                if constexpr (Coded) if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
                 conn.append_buf_segment(op.zc_ptr, op.zc_len);
@@ -898,25 +722,10 @@ private:
                 return;
             }
             if (conn.has_pending_segments()) {
-                if constexpr (Coded) if (op.reply_code_) op_materialise_code(op);
                 conn.append_buf_segment(op.direct, op.direct_len,
                                         op.reply.data(), op.reply.size());
                 if (op.direct_len) stats_.direct++;
             } else {
-                // Coded reply: render at the fill frontier, one constant-length store by the
-                // thread that owns the buffer. The whole block is deleted for Coded=false, and
-                // what remains below is the pre-reply-code text, instruction for instruction.
-                if constexpr (Coded) {
-                    if (op.reply_code_) {
-                        stage_coded_reply<TrackOutput>(conn, op);
-                        if (!op.reply.empty()) {
-                            if constexpr (TrackOutput)
-                                conn.append_fill(op.reply.data(), op.reply.size());
-                            else conn.fill_buf().append(op.reply.data(), op.reply.size());
-                        }
-                        return;
-                    }
-                }
                 if (op.direct_len) {
                     if constexpr (TrackOutput) conn.commit_fill(op.direct_len);
                     else conn.fill_buf().commit_raw(op.direct_len);
@@ -930,32 +739,30 @@ private:
         });
         draining_ = nullptr;
         bool did = retired != 0;
-        did |= flush_deferred_oob(conn);
+        did |= flush_deferred_oob(conn, c.rob().flush_id());
         if constexpr (TrackOutput) {
-            if (limit_fn_(limit_ctx_, c)) {
-                if (submit_allowed) *submit_allowed = false;
+            if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
                 stats_.retired += retired;
                 if (!retired) stats_.serves_empty++;
                 return true;
             }
         }
-        if constexpr (Submit)
-            if (!conn.nothing_to_write() || tls.output_pending())
-                did |= pump_tls<kEp, ClassifySend>(c, tls);
+        if (!conn.nothing_to_write() || tls.output_pending()) did |= pump_tls<kEp>(c, tls);
         stats_.retired += retired;
         if (!retired) stats_.serves_empty++;
         return did;
     }
-    template <bool kEp, bool ClassifySend = false>
+    template <bool kEp>
     bool submit_legacy(Client& c, size_t total, size_t sent) {
       if constexpr (kEp) { bool did = false; (void)write_legacy_epoll(c, total, sent, did); return did; }
       else {
-        const size_t request = std::min<size_t>(total - sent, kMaxSendBytes);
+        static constexpr size_t kMaxSendBytes = 0x7ffff000u;
+        const size_t request = std::min(total - sent, kMaxSendBytes);
         io_uring_sqe* s = ring_->sqe();
         if (!s) return false;
         io_uring_prep_send(s, c.fd(), c.send_buf().data() + sent, request, MSG_NOSIGNAL);
         s->user_data = ur_tag(UrKind::Send, &c);
-        ring_->note_send_pending<ClassifySend>();
+        ring_->note_pending();
 
         c.set_segmented_send(false);
         c.set_send_requested(static_cast<uint32_t>(request));
@@ -968,7 +775,8 @@ private:
     // One legacy-buffer write. `did` is only raised when bytes actually moved; the bool return says
     // "keep going" so the caller's loop can distinguish a short write (retry) from a stop.
     bool write_legacy_epoll(Client& c, size_t total, size_t sent, bool& did) {
-        const size_t request = std::min<size_t>(total - sent, kMaxSendBytes);
+        static constexpr size_t kMaxSendBytes = 0x7ffff000u;
+        const size_t request = std::min(total - sent, kMaxSendBytes);
         c.set_segmented_send(false);
         c.set_send_requested(static_cast<uint32_t>(request));
         stats_.sends_submitted++;
@@ -979,7 +787,7 @@ private:
         stats_.bytes_sent += static_cast<uint64_t>(n);
         if (static_cast<size_t>(n) < request) stats_.short_writes++;
         else if (c.write_drained()) stats_.sends_completed++;
-        c.set_last_interaction_s(*cached_now_s_);
+        if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
         did = true;
         return true;
     }
@@ -999,7 +807,7 @@ private:
         send_failed_ = true;
     }
 
-    template <bool kEp, bool ClassifySend = false>
+    template <bool kEp>
     bool submit_tls_cipher(Client& c, TlsConn& tls, const char* cipher, uint32_t bytes) {
       if constexpr (kEp) {
         // Drain every record OpenSSL has already produced in one call. Recursing back through
@@ -1015,8 +823,8 @@ private:
             const uint32_t sent = static_cast<uint32_t>(n);
             if (!tls.consume_output(sent)) { send_failed_ = true; return did; }
             stats_.bytes_sent += sent;
-            tls_signals_->tls_ciphertext_output_bytes += sent;
-            c.set_last_interaction_s(*cached_now_s_);
+            if (tls_signals_) tls_signals_->tls_ciphertext_output_bytes += sent;
+            if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
             did = true;
             if (sent < remaining) stats_.short_writes++;
             else stats_.sends_completed++;
@@ -1032,7 +840,7 @@ private:
         if (!s) return false;
         io_uring_prep_send(s, c.fd(), cipher, bytes, MSG_NOSIGNAL);
         s->user_data = ur_tag(UrKind::TlsSend, &c);
-        ring_->note_send_pending<ClassifySend>();
+        ring_->note_pending();
         c.set_send_requested(bytes);
         c.set_send_inflight(true);
         stats_.sends_submitted++;
@@ -1042,7 +850,7 @@ private:
 
     void release(int32_t shard, const char* ptr) {
         stats_.zc_releases++;
-        release_fn_(release_ctx_, shard, ptr);
+        if (release_fn_) release_fn_(release_ctx_, shard, ptr);
     }
 
     inline static constexpr char kCrlf[2] = {'\r', '\n'};
@@ -1059,7 +867,6 @@ private:
     // Engine, for the cold non-templated entry points only. The hot send path never reads it.
     bool   epoll_ = false;
     bool   send_failed_ = false;
-    bool   classify_cold_sends_ = false;
     // The connection whose retire drain is running right now, or null. defer_oob() uses it to make
     // parking unconditional across the partial-reply staging window.
     const Client* draining_ = nullptr;

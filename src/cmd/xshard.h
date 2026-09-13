@@ -26,18 +26,15 @@ struct ScatterDispatch;
 enum class XshardStringStoreResult : uint8_t { Stored, Oom, InsertFailed, Maxmemory };
 XshardStringStoreResult xshard_store_string(Shard& shard, Slice key, uint64_t hash, Slice value,
                                             int64_t expire_at_ms = -1,
-                                            bool integer_encode = true,
-                                            bool reserve_ttl_slot = false);
+                                            bool integer_encode = true);
 XshardStringStoreResult xshard_store_string_notify(Shard& shard, Slice key, uint64_t hash,
                                                    Slice value, int64_t expire_at_ms = -1,
-                                                   bool integer_encode = true,
-                                                   bool reserve_ttl_slot = false);
+                                                   bool integer_encode = true);
 KvObj* xshard_make_string(Slice key, Slice value, int64_t expire_at_ms = -1,
-                          bool integer_encode = true, bool reserve_ttl_slot = false);
+                          bool integer_encode = true);
 KvObj* xshard_make_atomic_string(Shard& shard, Slice key, Slice value,
                                  int64_t expire_at_ms = -1,
-                                 bool integer_encode = true,
-                                 bool reserve_ttl_slot = false);
+                                 bool integer_encode = true);
 
 // Multi-key pops choose a key after their first-hop probes, then ask that key's live owner to do
 // the mutation.  Keeping these helpers in the type lanes preserves their cursor/encoding rules and
@@ -71,7 +68,7 @@ XshardElementResult xshard_insert_set_element(Shard& shard, Slice key, uint64_t 
 
 enum class ScatterPrepare : uint8_t { NotScatter, Ready, Backpressure, Error };
 enum class ScatterTaskResult : uint8_t { Complete, Retry };
-enum class ScatterFinish : uint8_t { Waiting, Retry, CommitQueued, Final };
+enum class ScatterFinish : uint8_t { Waiting, Retry, Final };
 
 // ONE PUBLISHED READ CUT, whoever holds it.  A read that resolves its fragments on several owners
 // needs the versions its cut names to survive until the last fragment has answered, and the only
@@ -151,9 +148,6 @@ ScatterPrepare xshard_prepare(Server& server, Op& op, ScatterArenaPool& pool,
                               Client* origin_client = nullptr);
 int32_t xshard_dispatch_shard(const ScatterDispatch& dispatch, uint32_t index);
 void xshard_destroy(ScatterState* state, ScatterArenaPool& pool, uint32_t owner_io);
-// Prepared states may already carry pre-counted owner lifetime pins. A caller that proves no task
-// was published must abandon through this arm so those phantom pins cannot enter deferred teardown.
-void xshard_abandon_unpublished(ScatterState* state, ScatterArenaPool& pool, uint32_t owner_io);
 
 // Called by the connection-owning IO thread immediately before the ROB slot is staged.  It builds
 // final RESP bytes/segments, transfers every gathered borrow to the connection segment queue, and
@@ -177,18 +171,9 @@ FlatStore::SnapshotWriteResult xshard_snapshot_prepare(const Task& task, Shard& 
 // Executes one bounded owner pass.  KEYS may return Retry; all other tasks complete in one pass.
 ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
                                  uint32_t owner_thread_id);
-// Visits the hashes represented by one completed owner task. Weighted placement calls this only
-// on the sampled path, keeping ScatterState's private grouping layout out of ExLoop.
-void xshard_visit_task_hashes(const Task& task, void* context,
-                              void (*visit)(void*, uint64_t));
 void xshard_watch_finish(const Task& task, Shard& shard, Op& op,
                          ScatterTaskResult result);
 bool xshard_task_should_defer(Server& server, Shard& shard, const Task& task, Op& op);
-// DEBUG-only #77 probe. Fragment entry latches per-key atomic_needs_version answers in process-
-// cold state; xshard_execute consumes them immediately before the actual lookups.
-void xshard_tripwire_fragment_begin(const Task& task, Shard& shard, Op& op);
-void xshard_tripwire_fragment_execute(const Task& task, Shard& shard, Op& op,
-                                      bool plain_path, uint64_t cut);
 bool xshard_tasks_share_key(const Task& older, Op& older_op,
                             const Task& younger, Op& younger_op, int32_t shard_id);
 // True for a scatter task whose group names no keys (KEYS, exact DBSIZE, FLUSHDB/FLUSHALL): it
@@ -197,31 +182,16 @@ bool xshard_tasks_share_key(const Task& older, Op& older_op,
 // older same-connection task on the same shard.
 bool xshard_task_is_whole_owner(const Task& task);
 
-// Counts a completed owner and, for the last owner, either serializes the final reply, queues the
-// completed group for this executor pass's commit batch, or publishes a fully-preflighted second
-// hop. Final means the caller must publish OpState::Done and notify IO; CommitQueued means the
-// caller must append the task to the allocation-free executor-local batch and leave the Op issued.
+// Counts a completed owner and, for the last owner, either serializes the final reply or publishes
+// a fully-preflighted second hop.  Final means the caller must publish OpState::Done and notify IO.
 ScatterFinish xshard_complete(Server& server, ThreadCtx& self, Ring& ring,
                               const Task& task, Op& op);
-ScatterFinish xshard_complete_iofused(Server& server, ThreadCtx& self, Ring& ring,
-                                      const Task& task, Op& op);
-void xshard_queue_commit(Server& server, ThreadCtx& self, const Task& task);
-using XshardCommitNotify = void (*)(void*, Client*);
-void xshard_flush_commits(Server& server, ThreadCtx& self, Ring& ring,
-                          void* notify_context, XshardCommitNotify notify);
 
 // Ordinary one-key operations only enter this path when their key already has an MVCC record.
 // Reads bind the current committed cut; writes first install a deep-cloned, freshly-ticketed
 // version so collection handlers may continue mutating in place without touching a predecessor.
-struct PlainForeignReadScope {
-    struct Key { uint64_t hash; Slice key; };
-    std::vector<Key> keys;
-    bool active = false;
-    bool poisoned = false;
-};
-bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_conn_id,
-                          PlainForeignReadScope& foreign_scope);
-void xshard_plain_finish(Shard& shard, PlainForeignReadScope& foreign_scope);
+bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_conn_id);
+void xshard_plain_finish(Shard& shard);
 uint32_t xshard_cleanup_shard(Server& server, Shard& shard, uint32_t budget = 8);
 uint32_t xshard_cleanup_shard_at(Shard& shard, uint64_t floor, uint64_t cleanup_cutoff,
                                  uint32_t budget = 8);

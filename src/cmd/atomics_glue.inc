@@ -9,9 +9,9 @@ namespace {
 
 WorkError begin_plain_version(Server& server, Shard& shard, Slice key, uint64_t hash,
                               uint64_t snapshot, uint64_t origin_conn_id) {
-    // Cleanup is owner-pass work: every caller has already made the pass's single promotion
-    // attempt before asking individual keys whether they still need a version.
     FlatStore& store = shard.store();
+    const uint64_t cleanup_cutoff = server.atomic_snapshot();
+    store.atomic_promote_key(hash, key, server.atomic_read_floor(), cleanup_cutoff);
     const bool had_record = store.atomic_has_record(hash, key);
     // A key reserved by a staged cross-owner script carries no MVCC record of its own, so the
     // record test alone sent this write down the untracked physical path -- it mutated the value
@@ -24,8 +24,7 @@ WorkError begin_plain_version(Server& server, Shard& shard, Slice key, uint64_t 
     }
     if (script_forced) server.note_script_forced_write();
 
-    // Writers must clone the newest committed version, even while an unrelated reservation
-    // holds the safe read watermark behind a completed foreign write.
+    if (snapshot == UINT64_MAX) snapshot = server.atomic_snapshot();
     store.atomic_set_read_context(snapshot, origin_conn_id);
     KvObj* visible = store.find(hash, key);
     KvObj* clone = nullptr;
@@ -35,8 +34,15 @@ WorkError begin_plain_version(Server& server, Shard& shard, Slice key, uint64_t 
             store.atomic_clear_read_epoch();
             return WorkError::Oom;
         }
-        const SnapshotHookStatus loaded = load_object_image(
-            key, image, shard.type_limits(), clone);
+        const SnapshotTypeHooks& hooks = snapshot_type_hooks(image.type);
+        const Slice payload(reinterpret_cast<const char*>(image.payload.data()),
+                            static_cast<uint32_t>(image.payload.size()));
+        if (!hooks.load) {
+            store.atomic_clear_read_epoch();
+            return WorkError::Corrupt;
+        }
+        const SnapshotHookStatus loaded = hooks.load(key, image.encoding, image.expire_at_ms,
+                                                     payload, shard.type_limits(), clone);
         if (loaded != SnapshotHookStatus::Ok || !clone) {
             store.atomic_clear_read_epoch();
             return loaded == SnapshotHookStatus::Oom ? WorkError::Oom : WorkError::Corrupt;
@@ -44,7 +50,7 @@ WorkError begin_plain_version(Server& server, Shard& shard, Slice key, uint64_t 
     }
 
     void* prepared = nullptr;
-    if (!store.atomic_prepare_plain(key, hash, origin_conn_id, prepared) ||
+    if (!store.atomic_prepare_plain(key, origin_conn_id, prepared) ||
         !store.atomic_prepare_capacity(1) || !store.atomic_admit(key, clone)) {
         if (prepared) store.atomic_discard_plain(prepared);
         if (clone) kvobj_free(clone);
@@ -88,23 +94,28 @@ ScatterTaskResult execute_atomic_direct_rename(const Task& task, Shard& shard, O
     destination.expire_at_ms = source->expire_at_ms();
     KvObj* clone = nullptr;
     if (destination.type == Type::String) {
-        KvObjRawReadBuffer raw;
         clone = source->is_int()
             ? kvobj_new_int(op.arg(destination_key.arg), source->int_value(),
-                            destination.expire_at_ms, source->has_ttl_slot())
-            : xshard_make_string(op.arg(destination_key.arg),
-                                 kvobj_string_value(source, raw),
-                                 destination.expire_at_ms, false,
-                                 source->has_ttl_slot());
+                            destination.expire_at_ms)
+            : xshard_make_string(op.arg(destination_key.arg), source->str_value(),
+                                 destination.expire_at_ms, false);
     } else {
         if (!serialize_object(source, destination)) {
             group.error = WorkError::Oom;
         } else {
-            const SnapshotHookStatus loaded = load_object_image(
-                op.arg(destination_key.arg), destination, shard.type_limits(), clone);
-            if (loaded != SnapshotHookStatus::Ok || !clone)
-                group.error = loaded == SnapshotHookStatus::Oom
-                    ? WorkError::Oom : WorkError::Corrupt;
+            const SnapshotTypeHooks& hooks = snapshot_type_hooks(destination.type);
+            const Slice payload(reinterpret_cast<const char*>(destination.payload.data()),
+                                static_cast<uint32_t>(destination.payload.size()));
+            if (!hooks.load) {
+                group.error = WorkError::Corrupt;
+            } else {
+                const SnapshotHookStatus loaded = hooks.load(
+                    op.arg(destination_key.arg), destination.encoding,
+                    destination.expire_at_ms, payload, shard.type_limits(), clone);
+                if (loaded != SnapshotHookStatus::Ok || !clone)
+                    group.error = loaded == SnapshotHookStatus::Oom
+                        ? WorkError::Oom : WorkError::Corrupt;
+            }
         }
     }
     if (!clone || group.error != WorkError::None) {
@@ -126,22 +137,6 @@ ScatterTaskResult execute_atomic_apply(const Task& task, Shard& shard, Op& op,
     ShardGroup& group = *group_for(state, shard.id());
     FlatStore& store = shard.store();
 
-    if (state.kind == Kind::Script && !state.aborted.load(std::memory_order_acquire)) {
-        // Validation and UNPIN are separate waves. Keep the write intents until this owner
-        // turn and validate again before any exchange; plain RMWs remain free to run between
-        // waves, but cannot make a saved script image overwrite their completed write.
-        for (uint32_t i = 0; i < group.count; i++) {
-            const uint32_t pos = state.key_order[group.begin + i];
-            const KeyRef& key = state.keys[pos];
-            if ((state.status[pos] & 1u) &&
-                store.atomic_script_changed(key.hash, op.arg(key.arg), state.script_cut)) {
-                state.script_conflict.store(true, std::memory_order_release);
-                state.aborted.store(true, std::memory_order_release);
-                return ScatterTaskResult::Complete;
-            }
-        }
-    }
-
     // The phase-one destination observation is sufficient for computing an unconditional image.
     // NX decisions are different: their precondition must still hold at the owner immediately
     // before installation. The owner cannot interleave another task between this validation and
@@ -162,11 +157,13 @@ ScatterTaskResult execute_atomic_apply(const Task& task, Shard& shard, Op& op,
             if (store.atomic_has_record(key.hash, op.arg(key.arg))) {
                 // A foreign undecided value is deliberately invisible to ordinary reads. For an
                 // NX validator it is a reservation: let its group decide, then re-run validation.
-                // One hash probe of both tables answers "is there a physical candidate"; the
-                // previous full for_each walk of the shard ran on every Retry of this arm and
-                // stalled the owner for the whole table while the foreign group was undecided.
-                if (store.atomic_has_physical(key.hash, op.arg(key.arg)))
-                    return ScatterTaskResult::Retry;
+                // Raw table iteration is reached only on this uncommon collision arm and avoids
+                // adding a query to the frozen MVCC engine.
+                bool physical_candidate = false;
+                store.for_each([&](KvObj* object) {
+                    physical_candidate |= object->key() == op.arg(key.arg);
+                });
+                if (physical_candidate) return ScatterTaskResult::Retry;
             }
         }
     }
@@ -192,8 +189,17 @@ ScatterTaskResult execute_atomic_apply(const Task& task, Shard& shard, Op& op,
         if (key.stable_object) continue;
         KvObj* value = nullptr;
         if (image.present) {
-            const SnapshotHookStatus loaded = load_object_image(
-                key_slice, image, shard.type_limits(), value);
+            const SnapshotTypeHooks& hooks = snapshot_type_hooks(image.type);
+            const Slice payload(reinterpret_cast<const char*>(image.payload.data()),
+                                static_cast<uint32_t>(image.payload.size()));
+            if (!hooks.load) {
+                group.error = WorkError::Corrupt;
+                state.aborted.store(true, std::memory_order_release);
+                return ScatterTaskResult::Complete;
+            }
+            const SnapshotHookStatus loaded = hooks.load(
+                key_slice, image.encoding, image.expire_at_ms, payload,
+                shard.type_limits(), value);
             if (loaded != SnapshotHookStatus::Ok || !value) {
                 group.error = loaded == SnapshotHookStatus::Oom
                     ? WorkError::Oom : WorkError::Corrupt;
@@ -271,7 +277,9 @@ ScatterTaskResult execute_atomic_apply(const Task& task, Shard& shard, Op& op,
     }
     store.atomic_finish_group_install(parked_bytes, installed_bytes);
     store.atomic_publish_group(pending_entry);
-    note_owner_record_install(state, *owner_refs);
+    if (*owner_refs == 0)
+        state.record_refs.fetch_add(1, std::memory_order_release);
+    (*owner_refs)++;
     return ScatterTaskResult::Complete;
 }
 
@@ -308,34 +316,60 @@ inline Slice op_routed_key(const Op& op) {
 }
 
 template <typename Fn>
-bool with_touched_keys(Op& op, Fn&& fn) {
+void for_each_touched_key(Op& op, Fn&& fn) {
+    if (op.spec->flags & CmdFlags::ScriptRoute) {
+        uint32_t first = 0, count = 0;
+        if (!command_script_key_range(op, first, count)) return;
+        for (uint32_t i = 0; i < count; i++) {
+            const Slice key = op.arg(first + i);
+            fn(FlatStore::hash_key(key), key);
+        }
+        return;
+    }
     Kind kind;
     if (!classify(op, kind)) {
-        const uint32_t count = op.argc() > 1 ? 1 : 0;
-        fn(count, [&](uint32_t) {
-            return std::pair<uint64_t, Slice>{op.hash, op_routed_key(op)};
-        });
-        return true;
+        if (op.argc() > 1) fn(op.hash, op_routed_key(op));
+        return;
     }
-    XshardKeyPlan keys;
-    if (!classify_keys(op, kind, keys)) return false;
-    const uint32_t count = key_count_for(keys);
-    fn(count, [&](uint32_t i) {
-        const uint32_t arg = key_arg_for(keys, i);
-        const Slice key = op.arg(arg);
-        return std::pair<uint64_t, Slice>{FlatStore::hash_key(key), key};
-    });
-    return true;
-}
-
-template <typename Fn>
-bool for_each_touched_key(Op& op, Fn&& fn) {
-    return with_touched_keys(op, [&](uint32_t count, auto&& key_at) {
-        for (uint32_t i = 0; i < count; i++) {
-            const auto [hash, key] = key_at(i);
-            fn(hash, key);
+    uint32_t sinter_count = 0;
+    uint32_t mpop_count = 0;
+    bool sort_store = false;
+    uint32_t sort_store_arg = 0;
+    uint32_t zset_count = 0;
+    GeoRoute geo_route;
+    if (kind == Kind::Sintercard) {
+        uint64_t parsed = 0;
+        if (parse_u64(op.arg(1), parsed) && parsed <= UINT32_MAX)
+            sinter_count = static_cast<uint32_t>(parsed);
+    } else if (kind == Kind::Lmpop || kind == Kind::Zmpop) {
+        int64_t parsed = 0;
+        if (parse_i64(op.arg(1), parsed) && parsed > 0 && parsed <= UINT32_MAX)
+            mpop_count = static_cast<uint32_t>(parsed);
+    } else if (kind == Kind::Sort) {
+        SortOptions options;
+        if (parse_sort_options(op, options)) {
+            sort_store = options.store;
+            sort_store_arg = options.store_arg;
         }
-    });
+    } else if (is_any_zsetop(kind)) {
+        uint64_t limit = 0;
+        std::vector<double> weights;
+        ZAggregate aggregate = ZAggregate::Sum;
+        bool withscores = false;
+        if (!parse_zset_operation(op, kind, zset_count, weights, aggregate, withscores, limit))
+            return;
+    } else if (is_geo_kind(kind)) {
+        if (!geo_prepare_route(op, geo_route)) return;
+    }
+    const uint32_t count = key_count_for(kind, op, sinter_count, mpop_count, sort_store, 0,
+                                         zset_count, geo_route.store);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t arg = key_arg_for(kind, i, sinter_count, sort_store_arg, 0,
+                                         geo_route.store, geo_route.source_arg,
+                                         geo_route.destination_arg);
+        const Slice key = op.arg(arg);
+        fn(FlatStore::hash_key(key), key);
+    }
 }
 
 uint64_t snapshot_exclusive_floor(uint64_t snapshot) {
@@ -507,13 +541,64 @@ uint32_t ScatterArenaPool::reap_deferred() {
 }
 
 FlatStore::SnapshotWriteResult xshard_local_snapshot_prepare(Op& op, Shard& shard) {
+    if (op.spec->flags & CmdFlags::ScriptRoute) {
+        uint32_t first = 0, count = 0;
+        if (!command_script_key_range(op, first, count))
+            return FlatStore::SnapshotWriteResult::Error;
+        while (op.zc_len < count) {
+            const Slice key = op.arg(first + op.zc_len);
+            const auto result = shard.store().snapshot_prepare_write(
+                FlatStore::hash_key(key), key);
+            if (result != FlatStore::SnapshotWriteResult::Ready) return result;
+            op.zc_len++;
+        }
+        return FlatStore::SnapshotWriteResult::Ready;
+    }
     Kind kind;
     if (!classify(op, kind)) return FlatStore::SnapshotWriteResult::Ready;
-    XshardKeyPlan keys;
-    if (!classify_keys(op, kind, keys)) return FlatStore::SnapshotWriteResult::Error;
-    const uint32_t count = key_count_for(keys, true);
+    uint32_t count = 0;
+    uint32_t mpop_count = 0;
+    bool pop_edge = false;
+    uint64_t pop_count = 1;
+    SortOptions sort_options;
+    GeoRoute geo_route;
+    if (kind == Kind::Lmpop || kind == Kind::Zmpop) {
+        if (!parse_mpop(op, kind, mpop_count, pop_edge, pop_count))
+            return FlatStore::SnapshotWriteResult::Error;
+    }
+    if (kind == Kind::Sort) {
+        if (!parse_sort_options(op, sort_options))
+            return FlatStore::SnapshotWriteResult::Error;
+        if (!sort_options.store) return FlatStore::SnapshotWriteResult::Ready;
+    }
+    if (is_geo_kind(kind)) {
+        if (!geo_prepare_route(op, geo_route)) return FlatStore::SnapshotWriteResult::Error;
+        if (!geo_route.store) return FlatStore::SnapshotWriteResult::Ready;
+    }
+    auto arg_at = [&](uint32_t i) -> uint32_t {
+        if (kind == Kind::Mset || kind == Kind::Msetnx) return 1 + i * 2;
+        if (kind == Kind::Bitop) return 2;
+        if (kind == Kind::Copy) return 2;
+        if (is_store_setop(kind) || is_store_zsetop(kind)) return 1;
+        if (is_geo_kind(kind)) return geo_route.destination_arg;
+        if (kind == Kind::Lmpop || kind == Kind::Zmpop) return 2 + i;
+        if (kind == Kind::Zrangestore) return 1;
+        if (kind == Kind::Sort) return sort_options.store_arg;
+        return 1 + i;
+    };
+    if (kind == Kind::Mset || kind == Kind::Msetnx) count = (op.argc() - 1) / 2;
+    else if (kind == Kind::Del || kind == Kind::Unlink) count = op.argc() - 1;
+    else if (kind == Kind::Copy || is_store_setop(kind) || is_store_zsetop(kind) ||
+             kind == Kind::Bitop) count = 1;
+    else if (is_geo_kind(kind)) count = 1;
+    else if (kind == Kind::Lmpop || kind == Kind::Zmpop) count = mpop_count;
+    else if (kind == Kind::Zrangestore || kind == Kind::Sort) count = 1;
+    else if (kind == Kind::Rename || kind == Kind::Renamenx || kind == Kind::Smove ||
+             kind == Kind::Lmove || kind == Kind::Rpoplpush) count = 2;
+    else return FlatStore::SnapshotWriteResult::Ready;
+
     while (op.zc_len < count) {
-        const uint32_t arg = key_arg_for(keys, op.zc_len, true);
+        const uint32_t arg = arg_at(op.zc_len);
         const Slice key = op.arg(arg);
         const uint64_t hash = arg == 1 ? op.hash : FlatStore::hash_key(key);
         const auto result = shard.store().snapshot_prepare_write(hash, key);
@@ -569,31 +654,10 @@ FlatStore::SnapshotWriteResult xshard_snapshot_prepare(const Task& task, Shard& 
 }
 
 bool xshard_task_should_defer(Server& server, Shard& shard, const Task& task, Op& op) {
+    (void)server;
     if (!task.client) return false;
-    // A tagged MULTI fragment carries a MultiExecState; the scatter reads below would be garbage.
-    // Its program order is enforced by has_parked_predecessor alone, and its own-undecided
-    // handling lives in the transaction engine -- deferring it here on misread state parked one
-    // fragment forever while its sibling spun at the command barrier.
-    if (multi_task_tagged(task)) return false;
     if (task.scatter) {
         ScatterState& state = *task.scatter;
-        // TEST HOOK (DEBUG ATOMIC-OFF-HOP-DELAY): the lead owner publishes its mutation wave while
-        // every other participating owner parks here. Returning true feeds the task back through
-        // atomic_deferred_, so the executor remains available to run the readers that observe the
-        // deliberately widened physical tear. The state word is zero unless prepare classified a
-        // non-atomic cross-owner mutation; GET/SET and read/probe waves never reach this branch.
-        if (__builtin_expect(state.debug_hop_deadline != 0, false) &&
-            xshard_owner_mutation_phase(state, op) &&
-            server.worker_of_shard(shard.id()) != state.debug_hop_lead_owner &&
-            now_ns() < state.debug_hop_deadline)
-            return true;
-        // TEST HOOK (DEBUG ATOMIC-CONDITIONAL-DEFER): park, do not stall, the atomic-OFF
-        // destination check. Both contenders' destination tasks then reach this deferred queue
-        // before either newly posted phase-two task can install its result.
-        if (__builtin_expect(state.debug_conditional_deadline != 0, false) &&
-            state.phase == 1 && task.shard == state.keys[1].shard &&
-            now_ns() < state.debug_conditional_deadline)
-            return true;
         // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER): park every fragment but the lead one until the
         // deadline. A park, not a stall -- the owner returns to its queue, so the transaction this
         // widened window exists to race is free to execute and publish its ticket in the middle of
@@ -674,15 +738,6 @@ namespace {
 
 template <typename Fn>
 bool for_each_task_key(const Task& task, Op& op, int32_t shard_id, Fn&& fn) {
-    // A tagged MULTI child carries a MultiExecState, not a ScatterState -- reading scatter fields
-    // through that pointer is garbage. For program-order overlap a transaction fragment counts as
-    // touching every key on ITS OWN shard (the zero-key whole-owner rule below, with the same
-    // own-shard scoping that avoided the walker livelock): a younger fragment must defer behind
-    // any parked older same-connection task there, and a parked fragment holds younger ones.
-    // This blindness was the seed-19 EXISTS divergence: an EXEC child ran past its own
-    // connection's older cross-shard DEL parked in atomic_deferred_ and read the pre-DEL world.
-    if (multi_task_tagged(task))
-        return (task.shard >= 0 ? task.shard : op.shard) == shard_id;
     if (task.scatter) {
         ScatterState& state = *task.scatter;
         // WHOLE-OWNER COMMANDS NAME NO KEYS, AND THAT IS THE POINT. KEYS, exact DBSIZE and
@@ -732,62 +787,7 @@ bool for_each_task_key(const Task& task, Op& op, int32_t shard_id, Fn&& fn) {
 }  // namespace
 
 bool xshard_task_is_whole_owner(const Task& task) {
-    return task.scatter != nullptr && !multi_task_tagged(task) &&
-           task.scatter->key_count == 0;
-}
-
-namespace {
-
-uint64_t tripwire_scatter_slot(const ScatterState& state, const Shard& shard, uint32_t pos) {
-    return (static_cast<uint64_t>(state.phase) << 56) |
-           (static_cast<uint64_t>(static_cast<uint32_t>(shard.id())) << 32) | pos;
-}
-
-bool tripwire_scatter_read_phase(const ScatterState& state) {
-    if (!state.key_count || state.runtime_loading || state.kind == Kind::Script) return false;
-    if (state.atomic_write) return false;
-    if ((state.atomic_apply || state.atomic_pop || state.two_hop) && state.phase == 2) return false;
-    return !sort_deref_gathering(state);
-}
-
-}  // namespace
-
-void xshard_tripwire_fragment_begin(const Task& task, Shard& shard, Op& op) {
-    if (!atomic_tripwire_enabled() || !task.scatter || multi_task_tagged(task)) return;
-    ScatterState& state = *task.scatter;
-    if (!tripwire_scatter_read_phase(state)) return;
-    ShardGroup* group = group_for(state, shard.id());
-    if (!group) return;
-    const uint64_t cut = state.atomic_pop && state.phase == 1 &&
-                         state.pop_retry_snapshot != UINT64_MAX
-        ? state.pop_retry_snapshot : state.snapshot;
-    for (uint32_t i = 0; i < group->count; i++) {
-        const uint32_t pos = state.key_order[group->begin + i];
-        const KeyRef& key = state.keys[pos];
-        const Slice bytes = op.arg(key.arg);
-        atomic_tripwire_plain_begin(
-            &state, &state, tripwire_scatter_slot(state, shard, pos), key.hash, cut,
-            shard.store().atomic_tripwire_ticket(key.hash, bytes),
-            shard.store().atomic_needs_version(key.hash, bytes));
-    }
-}
-
-void xshard_tripwire_fragment_execute(const Task& task, Shard& shard, Op& op,
-                                      bool plain_path, uint64_t cut) {
-    if (!atomic_tripwire_enabled() || !task.scatter || multi_task_tagged(task)) return;
-    ScatterState& state = *task.scatter;
-    if (!tripwire_scatter_read_phase(state)) return;
-    ShardGroup* group = group_for(state, shard.id());
-    if (!group) return;
-    for (uint32_t i = 0; i < group->count; i++) {
-        const uint32_t pos = state.key_order[group->begin + i];
-        const KeyRef& key = state.keys[pos];
-        const Slice bytes = op.arg(key.arg);
-        atomic_tripwire_plain_execution(
-            &state, &state, tripwire_scatter_slot(state, shard, pos), key.hash, cut,
-            shard.store().atomic_tripwire_ticket(key.hash, bytes),
-            shard.store().atomic_needs_version(key.hash, bytes), plain_path);
-    }
+    return task.scatter != nullptr && task.scatter->key_count == 0;
 }
 
 bool xshard_tasks_share_key(const Task& older, Op& older_op,
@@ -817,39 +817,8 @@ uint64_t plain_read_cut(Server& server, const Op& op, uint64_t now) {
     return cut;
 }
 
-bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_conn_id,
-                          PlainForeignReadScope& foreign_scope) {
+bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_conn_id) {
     FlatStore& store = shard.store();
-    const bool scoped_foreign_write = store.read_local_enabled() &&
-        (op.spec->flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)) &&
-        (op.local_xshard() || (op.spec->flags & CmdFlags::ScriptRoute));
-    if (scoped_foreign_write) {
-        bool allocation_failed = false;
-        const bool enumerated = for_each_touched_key(op, [&](uint64_t hash, Slice key) {
-            if (allocation_failed) return;
-            try { foreign_scope.keys.push_back({hash, key}); }
-            catch (const std::bad_alloc&) { allocation_failed = true; }
-        });
-        foreign_scope.active = true;
-        if (!enumerated || allocation_failed) {
-            // Optional safety metadata must never make an otherwise-valid write fail. A write whose
-            // complete key set cannot be retained runs under the fixed-size shard poison instead;
-            // if MVCC records below independently require exact keys, their established preparation
-            // may still reject the handler for its own parse/allocation failure.
-            foreign_scope.keys.clear();
-            foreign_scope.poisoned = true;
-            store.foreign_read_unenumerable_open();
-            // The shared route parsers install their precise syntax/OOM reply before returning
-            // false. Do not run the handler a second time over that reply. A failure only in this
-            // optional retained vector has no reply and safely continues under the poison.
-            if (!enumerated) return false;
-        } else {
-            store.foreign_read_scope_open_span(
-                static_cast<uint32_t>(foreign_scope.keys.size()), [&](uint32_t index) {
-                    return foreign_scope.keys[index].hash;
-                });
-        }
-    }
     if (!store.atomic_has_records()) return true;
     const uint32_t read_stall = server.debug_atomic_read_delay();
     if (__builtin_expect(read_stall != 0, false) &&
@@ -861,8 +830,9 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
         struct RecordedKey { uint64_t hash; Slice key; };
         std::vector<RecordedKey> recorded;
         bool allocation_failed = false;
-        const auto inspect_key = [&](uint64_t hash, Slice key) {
+        for_each_touched_key(op, [&](uint64_t hash, Slice key) {
             if (allocation_failed) return;
+            store.atomic_promote_key(hash, key, floor, cleanup_cutoff);
             if (!store.atomic_needs_version(hash, key)) return;
             if (!store.atomic_has_record(hash, key) &&
                 (op.spec->flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)))
@@ -871,27 +841,7 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
                 if (prior.hash == hash && prior.key == key) return;
             try { recorded.push_back(RecordedKey{hash, key}); }
             catch (const std::bad_alloc&) { allocation_failed = true; }
-        };
-        bool enumerated = true;
-        if (foreign_scope.active && !foreign_scope.poisoned) {
-            store.atomic_promote_keys(
-                static_cast<uint32_t>(foreign_scope.keys.size()), floor, cleanup_cutoff,
-                [&](uint32_t index) {
-                    const PlainForeignReadScope::Key& key = foreign_scope.keys[index];
-                    return std::pair<uint64_t, Slice>{key.hash, key.key};
-                });
-            for (const PlainForeignReadScope::Key& key : foreign_scope.keys)
-                inspect_key(key.hash, key.key);
-        } else {
-            enumerated = with_touched_keys(op, [&](uint32_t count, auto&& key_at) {
-                store.atomic_promote_keys(count, floor, cleanup_cutoff, key_at);
-                for (uint32_t i = 0; i < count; i++) {
-                    const auto [hash, key] = key_at(i);
-                    inspect_key(hash, key);
-                }
-            });
-        }
-        if (!enumerated) return false;
+        });
         if (allocation_failed) { set_oom(op); return false; }
         if (recorded.empty()) return true;
 
@@ -900,7 +850,7 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
                 plain_read_cut(server, op, cleanup_cutoff), origin_conn_id);
             return true;
         }
-        const uint64_t snapshot = UINT64_MAX;
+        const uint64_t snapshot = server.atomic_snapshot();
 
         struct PreparedLocal {
             RecordedKey key;
@@ -923,16 +873,23 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
                     failure = WorkError::Oom;
                     break;
                 }
-                const SnapshotHookStatus loaded = load_object_image(
-                    item.key, image, shard.type_limits(), next.clone);
+                const SnapshotTypeHooks& hooks = snapshot_type_hooks(image.type);
+                const Slice payload(reinterpret_cast<const char*>(image.payload.data()),
+                                    static_cast<uint32_t>(image.payload.size()));
+                if (!hooks.load) {
+                    failure = WorkError::Corrupt;
+                    break;
+                }
+                const SnapshotHookStatus loaded = hooks.load(
+                    item.key, image.encoding, image.expire_at_ms, payload,
+                    shard.type_limits(), next.clone);
                 if (loaded != SnapshotHookStatus::Ok || !next.clone) {
                     failure = loaded == SnapshotHookStatus::Oom
                         ? WorkError::Oom : WorkError::Corrupt;
                     break;
                 }
             }
-            if (!store.atomic_prepare_plain(
-                    item.key, item.hash, origin_conn_id, next.entry)) {
+            if (!store.atomic_prepare_plain(item.key, origin_conn_id, next.entry)) {
                 if (next.clone) kvobj_free(next.clone);
                 failure = WorkError::Oom;
                 break;
@@ -988,7 +945,7 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
             plain_read_cut(server, op, cleanup_cutoff), origin_conn_id);
         return true;
     }
-    const uint64_t snapshot = UINT64_MAX;
+    const uint64_t snapshot = server.atomic_snapshot();
     const WorkError result = begin_plain_version(
         server, shard, routed, op.hash, snapshot, origin_conn_id);
     if (result == WorkError::None) return true;
@@ -996,19 +953,8 @@ bool xshard_plain_prepare(Server& server, Shard& shard, Op& op, uint64_t origin_
     return false;
 }
 
-void xshard_plain_finish(Shard& shard, PlainForeignReadScope& foreign_scope) {
+void xshard_plain_finish(Shard& shard) {
     shard.store().atomic_finish_plain();
-    FlatStore& store = shard.store();
-    if (!foreign_scope.active) return;
-    if (foreign_scope.poisoned) {
-        store.foreign_read_unenumerable_close();
-    } else {
-        store.foreign_read_scope_close_span(
-            static_cast<uint32_t>(foreign_scope.keys.size()), [&](uint32_t index) {
-                return foreign_scope.keys[index].hash;
-            });
-    }
-    foreign_scope.active = false;
 }
 
 uint32_t xshard_cleanup_shard(Server& server, Shard& shard, uint32_t budget) {

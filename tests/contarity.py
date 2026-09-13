@@ -3,18 +3,15 @@
 
 Usage: tests/contarity.py HOST PORT
 
-Boot requirement: at least two shard-OWNING threads and `--enable-debug-command yes`. The standard
+Boot requirement: at least two executor threads and `--enable-debug-command yes`. The standard
 gate geometry is `--shards 16 --ratio 6:2`. DEBUG SHARD resolves every candidate on this boot's
-random hash seed; DEBUG LBSIGNALS supplies the live shard-to-owner map (its `shard` rows, which
-are correct in --thread-mode 1s too, where no thread carries the `ex` label). The battery refuses
-to run unless it finds a key owned by a thread different from shard 0's owner, because pinning
+random hash seed; DEBUG LBSIGNALS supplies the live shard-to-executor map. The battery refuses to
+run unless it finds a key owned by an executor different from shard 0's executor, because pinning
 every SubcmdRoute child to the same owner as HELP is the routing regression this test must expose.
 """
 
 import socket
 import sys
-
-import _lib
 
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
@@ -120,16 +117,23 @@ def expect(connection, label, command, wanted):
 
 
 def topology(connection):
-    """Owners from the DEBUG LBSIGNALS shard rows -- 1s-safe (the `ex` label is absent there)."""
-    topo = _lib.topology(connection)
-    executors = set(topo.owners)
-    if len(executors) < 2:
+    raw = connection.command("DEBUG", "LBSIGNALS")
+    if isinstance(raw, RespError) or not isinstance(raw, bytes):
         raise AssertionError(
-            "contarity needs two shard-owning threads; this boot (thread-mode %s) has %d: %r"
-            % (topo.mode, len(executors), sorted(executors)))
-    if 0 not in topo.shard_owner:
+            "DEBUG LBSIGNALS unavailable; boot with --enable-debug-command yes: %r" % raw)
+    executors = set()
+    shard_owner = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == b"thread" and fields[2] == b"ex":
+            executors.add(int(fields[1]))
+        elif len(fields) >= 3 and fields[0] == b"shard":
+            shard_owner[int(fields[1])] = int(fields[2])
+    if len(executors) < 2:
+        raise AssertionError("contarity needs at least two executor threads; found %r" % executors)
+    if 0 not in shard_owner:
         raise AssertionError("DEBUG LBSIGNALS did not report shard 0")
-    return executors, topo.shard_owner
+    return executors, shard_owner
 
 
 def cross_owner_key(connection, shard_owner):

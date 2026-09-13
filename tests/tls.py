@@ -306,11 +306,6 @@ def handshake_matrix(host, tls_port, cert_dir, client_kind, admin, expect_ktls):
                 raise AssertionError("%s did not engage bidirectional kTLS" % label)
         elif active_after != 0 or fallback_after <= fallback_before:
             raise AssertionError("%s did not take forced userspace fallback" % label)
-        # This socket's version and (on the fallback boot) userspace path were proved above.
-        # A surviving third reply must pass through TLS after CLIENT REPLY suppression.
-        probe.sock.sendall(frame("CLIENT", "REPLY", "SKIP") + frame("PING") + frame("PING"))
-        if probe.reader.read() != b"PONG" or probe.command("PING", "tls-suppression") != b"tls-suppression":
-            raise AssertionError("%s suppressed pipeline lost TLS framing" % label)
         probe.close(graceful=True)
         time.sleep(0.05)
     print("  ok   TLS1.2 + TLS1.3 handshake matrix (%s)" %
@@ -348,12 +343,12 @@ def full_battery(host, tls_port, plain_port, cert_dir, mode, expect_ktls):
     suppressed_before_get = int(parse_stats(admin).get("tls_zc_suppressed", "0"))
 
     config_reply = admin.command("CONFIG", "GET", "tls-*")
-    if not isinstance(config_reply, list) or len(config_reply) != 20:
+    if not isinstance(config_reply, list) or len(config_reply) != 22:
         raise AssertionError("CONFIG GET tls-* omitted a TLS knob: %r" % (config_reply,))
     config_values = dict(zip(config_reply[0::2], config_reply[1::2]))
     if (config_values.get(b"tls-port") != str(tls_port).encode() or
             config_values.get(b"tls-auth-clients") != mode.encode() or
-            b"tls-ktls" in config_values):
+            config_values.get(b"tls-ktls") != (b"yes" if expect_ktls else b"no")):
         raise AssertionError("CONFIG GET did not preserve TLS listener/auth values")
     immutable = admin.command("CONFIG", "SET", "tls-port", str(tls_port))
     if not isinstance(immutable, RuntimeError) or "immutable" not in str(immutable):

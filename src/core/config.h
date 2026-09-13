@@ -9,11 +9,10 @@
 //
 // COMPILE-TIME tunables live elsewhere on purpose (changing them is a rebuild + re-validation,
 // not an operational act). The complete list, so nothing hides:
-//   kRobWindow        64      net/rob.h       max in-flight ops per connection (ROB size);
-//                                             the read-local write ring is sized FROM it
+//   kRobWindow        64      net/conn.h      max in-flight ops per connection (ROB size)
 //   kEmbedThreshold   192     store/kvobj.h   value bytes embedded in the key's block
-//   ValueSlot::kInline 1024   cmd/scatter_engine.inc  gather slot capacity; pairs with zc-min as
-//                                             the unified copy-vs-borrow cutover (min of the two)
+//   ValueSlot::kInline 1024   cmd/xshard.cc   gather slot capacity; pairs with zc-min as the
+//                                             unified copy-vs-borrow cutover (min of the two)
 //   kCommonBytes      16KiB   cmd/xshard.h    pooled scatter arena block size
 //   sizeof(Op)==336, sizeof(Client)==1984     footprint locks (static_assert, do not move)
 
@@ -29,11 +28,9 @@
 #include <utility>
 #include <vector>
 
-#include "../base/slice.h"       // Slice (notify flag parsing)
-#include "../cmd/notify.h"       // parse_notify_flags
 #include "../store/eviction.h"   // MaxmemoryPolicy + parse_maxmemory_policy
 #include "../store/typeval.h"    // TypeLimits (compact-encoding limits)
-#include "../store/flatstore.h"  // HashKind + g_hash_kind (the only symbols needed from it)
+#include "../store/flatstore.h"  // HashKind + g_hash_kind
 
 namespace tomo {
 
@@ -213,88 +210,31 @@ inline std::string cfg_client_output_buffer_limit_string(const ClientOutputBuffe
 enum class DebugCommandMode : uint8_t { No = 0, Yes = 1, Local = 2 };
 enum class AppendFsyncPolicy : uint8_t { Always = 0, Everysec = 1, No = 2 };
 // One boot-latched persistence engine governs both AOF and snapshot file data/sync operations.
-// Uring is native; epoll networking derives the syscall persistence engine (there is no ring).
+// Uring is the native default; normal exists as the syscall-path control and compatibility lane.
 enum class PersistIoEngine : uint8_t { Normal = 0, Uring = 1 };
 // One boot-latched NETWORK event engine for every io thread. Uring is the native default and the
 // only path with measured numbers behind it; epoll exists so the same binary runs where io_uring is
-// unavailable or unwanted. This boot-only choice also selects the persistence engine.
+// unavailable or unwanted. Deliberately spelled like --persist-io: same shape of decision (which
+// kernel interface carries our IO), same boot-only latching, same enum grammar.
 enum class NetIoEngine : uint8_t { Uring = 0, Epoll = 1 };
-// Boot-latched loop architecture. 2s retains dedicated network and executor threads; 1s gives
-// every selected physical thread both loop objects. Split/fused remain compatibility spellings.
-enum class ThreadMode : uint8_t { Split = 0, Fused = 1 };
 enum class TlsAuthClients : uint8_t { Yes = 0, No = 1, Optional = 2 };
-
-// Public encoding settings retain Redis's full numeric range; the shard's existing uint32
-// limits saturate at the maximum representable collection/element size. No hot layout grows.
-// Keep names, aliases and parsing here so boot, CONFIG SET/GET and REWRITE cannot drift.
-struct EncodingConfig {
-    enum Key : uint32_t { HashEntries, HashValue, ListSize, SetEntries, SetValue,
-                          ZsetEntries, ZsetValue, Count };
-    struct Setting { const char* name; const char* alias; bool memory; };
-    static constexpr Setting settings[Count] = {
-        {"hash-max-listpack-entries", "hash-max-ziplist-entries", false},
-        {"hash-max-listpack-value", "hash-max-ziplist-value", true},
-        {"list-max-listpack-size", "list-max-ziplist-size", false},
-        {"set-max-listpack-entries", nullptr, false},
-        {"set-max-listpack-value", nullptr, false},
-        {"zset-max-listpack-entries", "zset-max-ziplist-entries", false},
-        {"zset-max-listpack-value", "zset-max-ziplist-value", true},
-    };
-    int64_t values[Count] = {512, 64, -2, 128, 64, 128, 64};
-
-    static int find(Slice name) {
-        for (uint32_t i = 0; i < Count; i++)
-            if (name.eq_icase(settings[i].name) ||
-                (settings[i].alias && name.eq_icase(settings[i].alias))) return i;
-        return -1;
-    }
-    static bool parse(uint32_t key, Slice input, int64_t& out);
-    static void apply(TypeLimits& limits, uint32_t key, int64_t value) {
-        if (key == ListSize) {
-            limits.list = list_compact_limit(static_cast<int32_t>(value));
-            return;
-        }
-        const uint32_t bound = value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value);
-        switch (key) {
-            case HashEntries: limits.hash.max_entries = bound; break;
-            case HashValue: limits.hash.max_value = bound; break;
-            case SetEntries: limits.set.max_entries = bound; break;
-            case SetValue: limits.set.max_value = bound; break;
-            case ZsetEntries: limits.zset.max_entries = bound; break;
-            case ZsetValue: limits.zset.max_value = bound; break;
-            default: break;
-        }
-    }
-    TypeLimits type_limits() const {
-        TypeLimits limits;
-        for (uint32_t i = 0; i < Count; i++) apply(limits, i, values[i]);
-        return limits;
-    }
-};
 
 struct Config {
     // ---- placement (boot-only) -------------------------------------------------------------
+    const char* node_cpus   = nullptr;   // operator-declared topology; null = self-discover
     const char* place       = nullptr;   // complete role@cpu list; null = --ratio / default
-    // Whole-server role counts for even placement (--ratio); zero = unset, split mode only.
+    // Whole-server role counts for even placement (--ratio). All zero = unset. Unlike the per-node
+    // fields above these express any global shape, and they are what a flip controller would vary.
     uint32_t even_ifid      = 0;
     uint32_t even_ex        = 0;
-    const char* shard_home  = nullptr;   // optional complete shard:executor_tid topology
-    // Resolve before persistence recovery and shard allocation: eight migration units per EX.
-    static constexpr uint32_t kShardsAuto = UINT32_MAX;
-    uint32_t shards         = kShardsAuto;
-    bool     pin_threads    = true;     // relative to the process's allowed CPU set
-
-    // Independently swept boot latches. Each off arm allocates none of its signals/windows;
-    // the shared controller exists only if either is on. Numeric policy stays derived.
-    uint32_t key_lb = 1;
-    uint32_t client_lb = 1;
-
-    // ---- automatic role split (boot-latched) -----------------------------------------------
-    // Ships dark. The controller alone arms the owner-local sampled fingerprint writer;
-    // its measured sampling policy is internal to flipctl.h. Off and 1s
-    // dispatch pay one predicted branch per op and no fingerprint store. Trigger bands learn
-    // from the anchor's own quiet jitter; no separate controller tuning knobs remain.
-    uint32_t flip_auto = 0;
+    const char* shard_home  = nullptr;   // optional complete shard:ex_tid map
+    // Shards should outnumber workers: a shard is the unit of migration, so more shards gives the
+    // LB finer granularity. Too many and each one's working set stops being worth its own table.
+    uint32_t shards         = 16;
+    // Pinning is relative to the process's ALLOWED cpu set, so taskset confines both the process and
+    // its topology grouping — that property is what lets independent benchmark lanes share one box,
+    // and its absence was a real bug (threads silently floated instead of erroring).
+    bool     pin_threads    = true;
 
     // ---- network (boot-only) ---------------------------------------------------------------
     uint16_t port           = 6379;
@@ -305,9 +245,6 @@ struct Config {
     uint32_t tcp_keepalive  = 300;       // live for newly accepted TCP clients, 0 = off
     uint32_t tcp_backlog    = 511;       // boot-only, passed directly to listen(2)
     NetIoEngine net_io      = NetIoEngine::Uring;  // boot-only: which network event engine io runs
-    // Boot-only amortization schedule: 0=off, 1=on. Split overlaps IO writeback;
-    // fused selects the gated three-way schedule, including when read-local is armed.
-    uint32_t overlap = 0;
     ClientOutputBufferLimits client_output_buffer_limits;
 
     // ---- security / test commands ----------------------------------------------------------
@@ -322,14 +259,13 @@ struct Config {
     // ---- persistence (dir/dbfilename are boot-only) ----------------------------------------
     const char* dir         = ".";
     const char* dbfilename  = "dump.tomo";
+    const char* load_path   = nullptr;   // boot-only: load a dump before serving
     // Redis's default periodic snapshot policy. An empty vector is `save ""` and arms no
     // mutation observers or cron work.
     std::vector<SaveClause> save{{3600, 1}, {300, 100}, {60, 10000}};
     bool appendonly = false;
     AppendFsyncPolicy appendfsync = AppendFsyncPolicy::Everysec;
-    ThreadMode thread_mode = ThreadMode::Split;
-    // Boot-only local-read lane; its internal winners are fixed.
-    uint32_t read_local = 0;            // boot-only 0|1; GET/MGET lane in 1s or shard-less 2s IO
+    PersistIoEngine persist_io = PersistIoEngine::Uring;
     const char* appendfilename = "appendonly.aof";
     const char* appenddirname = "appendonlydir";
     uint32_t auto_aof_rewrite_percentage = 100;
@@ -351,20 +287,48 @@ struct Config {
     uint64_t maxmemory      = 0;         // bytes; zero removes all eviction-path work.
     MaxmemoryPolicy maxmemory_policy = MaxmemoryPolicy::NoEviction;
     uint32_t maxmemory_samples = 5;
-    // ---- atomics (live via CONFIG SET) -----------------------------------------------------
-    uint32_t atomic = 0;               // 0 = fully off, no allocation; epoch-MVCC multi-key lane
-    // The in-flight credit window is always min(16 * resolved shards, 1024), derived at boot.
+    // LRU bucket = (1 << lru_clock_shift) seconds; 5 clock bits give 32 buckets, so the window
+    // before ages alias is 32 << shift seconds. Default 8 = 256s buckets / ~2h16m window: zero
+    // header bytes and right for cache-realistic timescales. Shrink it (e.g. 6 = 64s / ~34min)
+    // for fast-shifting working sets; for real cache duty allkeys-lfu discriminates with no clock
+    // at all and is the recommended default.               (boot-only)
+    uint32_t lru_clock_shift = 8;
 
-    // ---- scripting / collection encodings -------------------------------------------------
-    // The Lua instruction bound is fixed in scripting.cc; unused interpreters allocate nothing.
-    EncodingConfig encodings;           // Redis listpack controls, live via CONFIG SET
+    // ---- atomics (both live via CONFIG SET) --------------------------------------------------
+    uint32_t atomic          = 0;        // epoch-MVCC atomic multi-key lane (MSET/MSETNX/DEL/
+                                         // UNLINK write groups; MGET/EXISTS/TOUCH snapshot reads).
+                                         // 0 = fully off: no allocation, plain paths byte-identical.
+    // In-flight atomic write groups; 0 = unlimited; -1 (the default) = AUTO, resolved at boot to
+    // min(16 * shards, 1024). Measured three-point law (2026-08-26, MSET-8 p32 ks=100k): the
+    // optimum is 256 at 8c/16sh, 1024 at 32c/64sh AND 64c/128sh; larger windows flood the
+    // per-shard pending scans (8c at 1024 collapses 40x), unlimited loses ~25% at 32c+ and the
+    // default-256 left 2.3x on the table at 64c (796k -> 2.74M). A memory/backpressure valve,
+    // not an ordering device -- tickets are drawn at the publish, so no frontier exists.
+    static constexpr uint32_t kAtomicWindowAuto = UINT32_MAX;
+    uint32_t atomic_window   = kAtomicWindowAuto;
+    // ---- scripting -----------------------------------------------------------------------------
+    // Lua VM instructions an EVAL/FCALL activation may retire before it is aborted with BUSY.
+    // Scripts run inside one shard-owner task, so an unbounded script would park that owner's
+    // whole queue; this is the bound that makes SCRIPT KILL structurally unnecessary. Rounded up
+    // to the 1000-instruction hook interval. 0 = unlimited (opt out; an owner can then stall).
+    // Boot-only, and deliberately tomo-named: Redis's lua-time-limit/busy-reply-threshold is a
+    // wall-clock BUSY-reply threshold for a script that keeps running, which is a different
+    // mechanism, so borrowing the name would borrow the wrong semantics.
+    uint64_t script_instruction_limit = 100000;
+    // Cross-owner script sidecars. -1 selects the boot-time auto value, 0 disables the facility
+    // and allocates no workbench/intent state. These are TomoKV-specific because Redis has no
+    // equivalent scatter engine knobs.
+    int64_t script_crossshard_max_bytes = -1;
+    int64_t script_crossshard_workbench_bytes = -1;
+    int64_t script_crossshard_conflict_retries = -1;
+    int64_t script_crossshard_cut_slots = -1;
+
+    TypeLimits type_limits;              // 8 compact-encoding limits, all live via CONFIG SET
     StreamLimits stream_limits;          // macro-node roll-over budgets, live via CONFIG SET
 
-    // Empty flag string = notifications off.
+    // Cold feature tail: never shift a pre-existing Config field because several boot-latched
+    // values are loaded directly in executor code. Empty flag string = notifications off.
     uint32_t notify_events = 0;
-    // Boot-only latency reordering across connections in an executor batch; connection order is
-    // preserved. 0 keeps FIFO and allocates nothing. Same alignment hole as the former ex_sched.
-    uint32_t reorder = 0;
 
     // CLIENT TRACKING's bounded per-key remembering table (redis knob name and semantics:
     // tracking-table-max-keys, default 1000000, 0 = unlimited). The bound is applied per io
@@ -384,6 +348,7 @@ struct Config {
     const char* tls_ciphers = nullptr;
     const char* tls_ciphersuites = nullptr;
     bool tls_prefer_server_ciphers = false;
+    bool tls_ktls = true;                 // tomo-only: try kernel TLS, silently fall back
 
     // SLOWLOG + LATENCY. Redis knob names, grammar and semantics exactly:
     //   slowlog-log-slower-than  microseconds; -1 disables the log entirely, 0 logs everything
@@ -395,24 +360,13 @@ struct Config {
     int64_t  slowlog_log_slower_than = 10000;
     uint64_t slowlog_max_len = 128;
     uint32_t latency_monitor_threshold = 0;
+
     // The conf file this process booted from, retained purely so CONFIG REWRITE has a destination.
-    // It is set from the optional first argv path in main, before parse_config_args runs.
-    // Null means "started without a config file", which is exactly the
+    // It is set by the argv pre-scan in main, NOT by parse_config_args -- `--conf` is consumed
+    // before the parser runs. Null means "started without a config file", which is exactly the
     // condition CONFIG REWRITE reports as an error.
     const char* conf_path = nullptr;
-    // The knob collapse leaves 80 bytes spare; retain the project's 624-byte layout lock.
-    uint8_t layout_reserved[80]{};
 };
-static_assert(sizeof(Config) == 624, "Config footprint changed; update the documented accounting");
-
-inline constexpr uint32_t cfg_default_shards(uint32_t executors) {
-    return executors >= 32 ? 256 : 8 * executors;
-}
-
-// epoll owns no io_uring ring; preserve its existing syscall persistence dependency.
-inline PersistIoEngine persistence_engine(const Config& cfg) {
-    return cfg.net_io == NetIoEngine::Epoll ? PersistIoEngine::Normal : PersistIoEngine::Uring;
-}
 
 // ---- tiny local parsers (const char* flavors; the Slice flavors in the .cc files are separate) --
 
@@ -442,7 +396,7 @@ inline bool cfg_parse_u64(const char* s, uint64_t& out) {
 }
 
 // Signed flavor. The tree had no signed scalar parser until slowlog-log-slower-than, whose redis
-// grammar accepts a real -1.
+// grammar accepts a real -1 rather than the unsigned sentinel --atomic-window uses.
 inline bool cfg_parse_i64(const char* s, int64_t& out) {
     if (!s || !*s) return false;
     const bool negative = *s == '-';
@@ -458,36 +412,11 @@ inline bool cfg_parse_i64(const char* s, int64_t& out) {
     const uint64_t limit = negative ? (uint64_t{1} << 63) : (uint64_t{1} << 63) - 1;
     if (v > limit) return false;
     // INT64_MIN has no positive counterpart. Avoid negating it: even rejected values such as
-    // INT64_MIN must not execute undefined behavior.
+    // `--script-crossshard-max-bytes -9223372036854775808` must not execute undefined behavior.
     out = negative ? (v == (uint64_t{1} << 63) ? std::numeric_limits<int64_t>::min()
                                                 : -static_cast<int64_t>(v))
                    : static_cast<int64_t>(v);
     return true;
-}
-
-inline bool EncodingConfig::parse(uint32_t key, Slice input, int64_t& out) {
-    if (key >= Count) return false;
-    if (settings[key].memory) {
-        uint64_t bytes = 0;
-        // Redis memtoull also accepts a bare unit (and the empty string) as zero.
-        // Preserve that grammar here without broadening unrelated TomoKV controls.
-        if (!input.n || cfg_memory_suffix(input.p, input.n, "b") ||
-            cfg_memory_suffix(input.p, input.n, "k") ||
-            cfg_memory_suffix(input.p, input.n, "kb") ||
-            cfg_memory_suffix(input.p, input.n, "m") ||
-            cfg_memory_suffix(input.p, input.n, "mb") ||
-            cfg_memory_suffix(input.p, input.n, "g") ||
-            cfg_memory_suffix(input.p, input.n, "gb")) bytes = 0;
-        else if (!cfg_parse_memory(input.p, input.n, bytes)) return false;
-        if (bytes > static_cast<uint64_t>(LONG_MAX)) return false;
-        out = static_cast<int64_t>(bytes);
-        return true;
-    }
-    // Redis string2ll: canonical decimal only, unlike the older TomoKV signed parser.
-    if (!input.n || input.p[0] == '+') return false;
-    const std::string text(input.p, input.n);
-    if (!cfg_parse_i64(text.c_str(), out) || std::to_string(out) != text) return false;
-    return key == ListSize ? out >= INT_MIN && out <= INT_MAX : out >= 0 && out <= LONG_MAX;
 }
 
 // Cross-source state: --ratio and --place are mutually exclusive WITHIN a source; across sources
@@ -509,18 +438,6 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
     for (int i = 0; i < argc; i++) {
         auto next = [&](const char* d) { return (i + 1 < argc) ? args[++i] : d; };
         const char* a = args[i];
-        const int encoding = !std::strncmp(a, "--", 2)
-            ? EncodingConfig::find(Slice(a + 2, std::strlen(a + 2))) : -1;
-        if (encoding >= 0) {
-            const char* value = next(nullptr);
-            int64_t parsed = 0;
-            if (!value || !EncodingConfig::parse(encoding, Slice(value, std::strlen(value)), parsed)) {
-                std::fprintf(stderr, "%s has an invalid encoding limit\n", a);
-                return kConfigError;
-            }
-            cfg.encodings.values[encoding] = parsed;
-            continue;
-        }
         if      (!std::strcmp(a, "--port")) {
             uint32_t value = 0;
             if (!cfg_parse_u32(next(nullptr), value) || value > UINT16_MAX) {
@@ -561,6 +478,15 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             else if (cfg_eq_icase(value, "no")) cfg.tls_prefer_server_ciphers = false;
             else {
                 std::fprintf(stderr, "--tls-prefer-server-ciphers wants yes or no\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--tls-ktls")) {
+            const char* value = next(nullptr);
+            if (cfg_eq_icase(value, "yes")) cfg.tls_ktls = true;
+            else if (cfg_eq_icase(value, "no")) cfg.tls_ktls = false;
+            else {
+                std::fprintf(stderr, "--tls-ktls wants yes or no\n");
                 return kConfigError;
             }
         }
@@ -607,13 +533,14 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             std::vector<const char*> values;
             values.reserve(words.size());
             for (const std::string& word : words) values.push_back(word.c_str());
-            // The parser stages internally and commits only on success; no outer copy needed.
+            ClientOutputBufferLimits scratch = cfg.client_output_buffer_limits;
             const char* error = nullptr;
             if (!cfg_parse_client_output_buffer_limit(values.data(), values.size(),
-                                                       cfg.client_output_buffer_limits, error)) {
+                                                       scratch, error)) {
                 std::fprintf(stderr, "--client-output-buffer-limit: %s\n", error);
                 return kConfigError;
             }
+            cfg.client_output_buffer_limits = scratch;
             i = end - 1;
         }
         else if (!std::strcmp(a, "--requirepass")) cfg.requirepass = next("");
@@ -693,30 +620,6 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                 return kConfigError;
             }
         }
-        else if (!std::strcmp(a, "--thread-mode")) {
-            const char* value = next(nullptr);
-            if (value && (!std::strcmp(value, "2s") || !std::strcmp(value, "split")))
-                cfg.thread_mode = ThreadMode::Split;
-            else if (value && (!std::strcmp(value, "1s") || !std::strcmp(value, "fused")))
-                cfg.thread_mode = ThreadMode::Fused;
-            else {
-                std::fprintf(stderr,
-                             "--thread-mode wants 2s or 1s (split/fused are aliases)\n");
-                return kConfigError;
-            }
-        }
-        else if (!std::strcmp(a, "--overlap")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.overlap) || cfg.overlap > 1) {
-                std::fprintf(stderr, "--overlap wants 0 or 1\n");
-                return kConfigError;
-            }
-        }
-        else if (!std::strcmp(a, "--read-local")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.read_local) || cfg.read_local > 1) {
-                std::fprintf(stderr, "--read-local wants 0 or 1\n");
-                return kConfigError;
-            }
-        }
         // WHOLE-SERVER role counts, evenly spread across L3 domains by the server itself.
         // This is the runtime replacement for authoring --place strings offline, and the knob a
         // flip controller will drive: counts in, placement out, no per-node arithmetic.
@@ -736,39 +639,14 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             }
             cfg.even_ifid = a2; cfg.even_ex = b;
         }
-        else if (!std::strcmp(a, "--shards")) {
-            // Same grammar as every other numeric knob (a bare atoi accepted "16x" as 16 and
-            // turned "abc"/"-5" into a misleading range message from validate_config).
-            const char* value = next(nullptr);
-            if (value && !std::strcmp(value, "-1")) cfg.shards = Config::kShardsAuto;
-            else if (!cfg_parse_u32(value, cfg.shards) || cfg.shards == 0 || cfg.shards > 256) {
-                std::fprintf(stderr, "--shards wants -1 (auto) or 1..256\n");
+        else if (!std::strcmp(a, "--shards"))     cfg.shards = static_cast<uint32_t>(std::atoi(next("16")));
+        else if (!std::strcmp(a, "--lru-clock-shift")) {
+            uint64_t shift = 0;
+            if (!cfg_parse_u64(next(nullptr), shift) || shift > 16) {
+                std::fprintf(stderr, "--lru-clock-shift wants 0..16 (bucket = 1<<N seconds)\n");
                 return kConfigError;
             }
-        }
-        else if (!std::strcmp(a, "--reorder")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.reorder) || cfg.reorder > 1) {
-                std::fprintf(stderr, "--reorder wants 0 or 1\n");
-                return kConfigError;
-            }
-        }
-        else if (!std::strcmp(a, "--key-lb")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.key_lb) || cfg.key_lb > 1) {
-                std::fprintf(stderr, "--key-lb wants 0 or 1\n");
-                return kConfigError;
-            }
-        }
-        else if (!std::strcmp(a, "--client-lb")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.client_lb) || cfg.client_lb > 1) {
-                std::fprintf(stderr, "--client-lb wants 0 or 1\n");
-                return kConfigError;
-            }
-        }
-        else if (!std::strcmp(a, "--flip-auto")) {
-            if (!cfg_parse_u32(next(nullptr), cfg.flip_auto) || cfg.flip_auto > 1) {
-                std::fprintf(stderr, "--flip-auto wants 0 or 1\n");
-                return kConfigError;
-            }
+            cfg.lru_clock_shift = static_cast<uint32_t>(shift);
         }
         else if (!std::strcmp(a, "--maxmemory")) {
             if (!cfg_parse_memory(next(nullptr), cfg.maxmemory)) {
@@ -856,6 +734,7 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
         }
         else if (!std::strcmp(a, "--dir"))        cfg.dir = next(".");
         else if (!std::strcmp(a, "--dbfilename")) cfg.dbfilename = next("dump.tomo");
+        else if (!std::strcmp(a, "--load"))       cfg.load_path = next("");
         else if (!std::strcmp(a, "--appendonly")) {
             const char* value = next(nullptr);
             if (cfg_eq_icase(value, "yes")) cfg.appendonly = true;
@@ -872,6 +751,15 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             else if (cfg_eq_icase(value, "no")) cfg.appendfsync = AppendFsyncPolicy::No;
             else {
                 std::fprintf(stderr, "--appendfsync wants always, everysec or no\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--persist-io")) {
+            const char* value = next(nullptr);
+            if (cfg_eq_icase(value, "normal")) cfg.persist_io = PersistIoEngine::Normal;
+            else if (cfg_eq_icase(value, "uring")) cfg.persist_io = PersistIoEngine::Uring;
+            else {
+                std::fprintf(stderr, "--persist-io wants normal or uring\n");
                 return kConfigError;
             }
         }
@@ -914,6 +802,30 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                 return kConfigError;
             }
         }
+        else if (!std::strcmp(a, "--hash-max-compact-entries")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.hash.max_entries)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--hash-max-compact-value")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.hash.max_value)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--list-max-compact-entries")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.list.max_entries)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--list-max-compact-value")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.list.max_value)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--set-max-compact-entries")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.set.max_entries)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--set-max-compact-value")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.set.max_value)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--zset-max-compact-entries")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.zset.max_entries)) return kConfigError;
+        }
+        else if (!std::strcmp(a, "--zset-max-compact-value")) {
+            if (!cfg_parse_u32(next(nullptr), cfg.type_limits.zset.max_value)) return kConfigError;
+        }
         else if (!std::strcmp(a, "--stream-node-max-bytes")) {
             if (!cfg_parse_u32(next(nullptr), cfg.stream_limits.node_max_bytes)) return kConfigError;
         }
@@ -933,6 +845,48 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                 return kConfigError;
             }
         }
+        else if (!std::strcmp(a, "--atomic-window")) {
+            const char* v = next(nullptr);
+            if (v && !std::strcmp(v, "-1")) cfg.atomic_window = Config::kAtomicWindowAuto;
+            else if (!cfg_parse_u32(v, cfg.atomic_window)) {
+                std::fprintf(stderr, "--atomic-window wants a uint32, 0 = unlimited, -1 = auto\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--script-instruction-limit")) {
+            if (!cfg_parse_u64(next(nullptr), cfg.script_instruction_limit)) {
+                std::fprintf(stderr, "--script-instruction-limit wants a uint64, 0 = unlimited\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--script-crossshard-max-bytes")) {
+            if (!cfg_parse_i64(next(nullptr), cfg.script_crossshard_max_bytes) ||
+                cfg.script_crossshard_max_bytes < -1) {
+                std::fprintf(stderr, "--script-crossshard-max-bytes wants -1, 0, or a positive byte count\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--script-crossshard-workbench-bytes")) {
+            if (!cfg_parse_i64(next(nullptr), cfg.script_crossshard_workbench_bytes) ||
+                cfg.script_crossshard_workbench_bytes < -1) {
+                std::fprintf(stderr, "--script-crossshard-workbench-bytes wants -1, 0, or a positive byte count\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--script-crossshard-conflict-retries")) {
+            if (!cfg_parse_i64(next(nullptr), cfg.script_crossshard_conflict_retries) ||
+                cfg.script_crossshard_conflict_retries < -1) {
+                std::fprintf(stderr, "--script-crossshard-conflict-retries wants -1, 0, or a positive count\n");
+                return kConfigError;
+            }
+        }
+        else if (!std::strcmp(a, "--script-crossshard-cut-slots")) {
+            if (!cfg_parse_i64(next(nullptr), cfg.script_crossshard_cut_slots) ||
+                cfg.script_crossshard_cut_slots < -1) {
+                std::fprintf(stderr, "--script-crossshard-cut-slots wants -1, 0, or a positive count\n");
+                return kConfigError;
+            }
+        }
         else if (!std::strcmp(a, "--shard-home")) cfg.shard_home = next("");
         else if (!std::strcmp(a, "--no-pin"))     cfg.pin_threads = false;
         else if (!std::strcmp(a, "--hash")) {
@@ -940,6 +894,14 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             if      (!std::strcmp(h, "mix64"))   g_hash_kind = HashKind::Mix64Seeded;
             else if (!std::strcmp(h, "siphash")) g_hash_kind = HashKind::SipHash12;
             else { std::fprintf(stderr, "--hash must be mix64 | siphash\n"); return kConfigError; }
+        }
+        else if (!std::strcmp(a, "--l3-domains")) {
+            // Operator-declared topology: comma-separated per-domain cpu lists, '-' for ranges,
+            // '+' to glue disjoint ranges into one domain. "--l3-domains 0-3,4-7" = two declared
+            // domains on one CCX -- a shape discovery would never produce, which is the point.
+            // (Renamed from --node-cpus 2026-08-25: "nodes" as a server structure died with the
+            // fork; this declares L3 LOCALITY DOMAINS for placement spread, nothing more.)
+            cfg.node_cpus = next("");
         }
         else if (!std::strcmp(a, "--place")) {
             if (st.ratio_source == source) {
@@ -951,38 +913,35 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
             cfg.place = next("");
         }
         else if (!std::strcmp(a, "--help")) {
-            std::printf("usage: %s [conf-file] [--port N] [--bind A] [--unixsocket PATH]\n"
+            std::printf("usage: %s [conf-file] [--conf FILE] [--port N] [--bind A] [--unixsocket PATH]\n"
                         "       [--shards N] [--zc-min N] [--no-pin]\n"
                         "  conf file: `name value` per line, # comments; same names as the flags\n"
                         "  without the leading --; `pin no` spells --no-pin. CLI flags override the\n"
                         "  file. See tomokv.conf in the repo root for the annotated full set.\n"
-                        "  threading: --thread-mode 2s|1s --overlap 0|1 --read-local 0|1 (defaults 2s, 0, 0)\n"
-                        "             (split/fused are mode aliases)\n"
-                        "    --overlap 1                 2s: IO-overlapped writeback; 1s: all overlap (uring)\n"
-                        "    --reorder 0|1 (default 0)   cross-connection reordering in an executor batch for latency; per-connection order always preserved\n"
-                        "  placement (default derived from allowed CPUs):\n"
-                        "    --ratio io:ex               global counts, split mode only\n"
-                        "    --place role@cpu,...        explicit CPUs; roles are ifid, ex\n"
-                        "    --shards -1|N               default auto: min(8*executors, 256)\n"
-                        "    --shard-home shard:tid,...  complete shard-to-executor map; allows empty fillers\n"
-                        "  load balancing: --key-lb 0|1 --client-lb 0|1 (both default 1)\n"
-                        "  flip controller: --flip-auto 0|1\n"
-                        "    --zc-min N                  zero-copy replies at >= N bytes (0=off)\n"
-                        "  cache: --maxmemory BYTES --maxmemory-policy POLICY\n"
+                        "  placement (pure 2s; default = even io/ex split over all allowed cpus):\n"
+                        "    --ratio io:ex               GLOBAL counts, spread evenly over L3 domains\n"
+                        "    --place role@cpu,...        explicit per-thread; roles are ifid, ex\n"
+                        "    --l3-domains LIST           declared L3 topology, ranges joined by +\n"
+                        "    --shard-home shard:tid,...  complete shard-to-executor map\n"
+                        "    --zc-min N                  zero-copy GET replies for values >= N (0=off)\n"
+                        "  cache: --maxmemory BYTES --maxmemory-policy POLICY (allkeys-lfu\n"
+                        "         recommended for cache duty) --lru-clock-shift N (bucket=1<<N s)\n"
                         "         --maxmemory-samples N (1..64, default 5)\n"
                         "  limits: --maxclients N --timeout SECONDS --tcp-keepalive SECONDS\n"
                         "          --tcp-backlog N --client-output-buffer-limit CLASS HARD SOFT SECONDS ...\n"
-                        "  network engine: --net-io uring|epoll (boot-only; default uring)\n"
+                        "  network engine: --net-io uring|epoll (boot-only; default uring;\n"
+                        "          epoll implies --persist-io normal)\n"
                         "  TLS: --tls-port N --tls-cert-file PATH --tls-key-file PATH\n"
                         "       --tls-ca-cert-file PATH --tls-ca-cert-dir PATH\n"
                         "       --tls-auth-clients yes|no|optional --tls-protocols LIST\n"
                         "       --tls-ciphers LIST --tls-ciphersuites LIST\n"
-                        "       --tls-prefer-server-ciphers yes|no\n"
+                        "       --tls-prefer-server-ciphers yes|no --tls-ktls yes|no\n"
                         "  notifications: --notify-keyspace-events FLAGS (default empty/off)\n"
                         "  client-side caching: --tracking-table-max-keys N "
                         "(default 1000000, 0=unlimited)\n"
-                        "  persistence: --dir PATH --dbfilename NAME\n"
+                        "  persistence: --dir PATH --dbfilename NAME --load PATH\n"
                         "    --save SECONDS CHANGES (repeatable; --save \"\" disables)\n"
+                        "    --persist-io normal|uring (boot-only; default uring; AOF + snapshot)\n"
                         "    --appendonly yes|no --appendfsync always|everysec|no\n"
                         "    --appendfilename NAME --appenddirname NAME\n"
                         "    --auto-aof-rewrite-percentage N --auto-aof-rewrite-min-size BYTES\n"
@@ -995,14 +954,14 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                         "  observability: --slowlog-log-slower-than US (default 10000; -1 off)\n"
                         "            --slowlog-max-len N (default 128)\n"
                         "            --latency-monitor-threshold MS (default 0 = off)\n"
-                        "  atomics: --atomic 0|1 (default 0)\n"
-                        "  encodings: --hash-max-listpack-entries N --hash-max-listpack-value BYTES\n"
-                        "    --list-max-listpack-size N (-1..-5: 4..64 KiB; >=0: entry count; default -2)\n"
-                        "    --set-max-listpack-entries N --set-max-listpack-value N\n"
-                        "    --zset-max-listpack-entries N --zset-max-listpack-value BYTES\n"
+                        "  atomics: --atomic 0|1 --atomic-window N (default 256; 0=unlimited)\n"
+                        "  scripting: --script-instruction-limit N (default 100000; 0=unlimited)\n"
+                        "    --script-crossshard-max-bytes N --script-crossshard-workbench-bytes N\n"
+                        "    --script-crossshard-conflict-retries N --script-crossshard-cut-slots N\n"
+                        "  compact encodings: --{hash,list,set,zset}-max-compact-{entries,value} N\n"
                         "  streams: --stream-node-max-bytes N --stream-node-max-entries N\n"
                         "  misc: --hash mix64|siphash\n"
-                        "  (--mode/--wb/--nodes died with 3s, 2026-08)\n",
+                        "  (pure 2s is the only server; --mode/--wb/--nodes died with 3s, 2026-08)\n",
                         prog);
             return kConfigHelp;
         }
@@ -1016,39 +975,6 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
 
 // Post-parse validation shared by every source combination. Call once, after all token streams.
 inline int validate_config(const Config& cfg) {
-    if (cfg.key_lb > 1 || cfg.client_lb > 1) {
-        std::fprintf(stderr, "--key-lb and --client-lb want 0 or 1\n");
-        return kConfigError;
-    }
-    if (cfg.shard_home && !*cfg.shard_home) {
-        std::fprintf(stderr, "--shard-home must contain shard:thread pairs\n");
-        return kConfigError;
-    }
-    if (cfg.reorder > 1) {
-        std::fprintf(stderr, "--reorder wants 0 or 1\n");
-        return kConfigError;
-    }
-    if (cfg.overlap > 1) {
-        std::fprintf(stderr, "--overlap wants 0 or 1\n");
-        return kConfigError;
-    }
-    if (cfg.thread_mode == ThreadMode::Fused && cfg.overlap != 0 &&
-        cfg.net_io != NetIoEngine::Uring) {
-        std::fprintf(stderr,
-                     "--thread-mode 1s with --overlap %u requires --net-io uring for its single submit boundary\n",
-                     cfg.overlap);
-        return kConfigError;
-    }
-    if (cfg.thread_mode == ThreadMode::Fused && (cfg.even_ifid || cfg.even_ex)) {
-        std::fprintf(stderr,
-                     "--ratio is unavailable with --thread-mode 1s: every thread handles networking and execution\n");
-        return kConfigError;
-    }
-    if (cfg.thread_mode == ThreadMode::Fused && cfg.flip_auto) {
-        std::fprintf(stderr,
-                     "--flip-auto is unavailable with --thread-mode 1s\n");
-        return kConfigError;
-    }
     if (cfg.databases != 1) {
         std::fprintf(stderr, "databases must be 1: this server owns one keyspace\n");
         return kConfigError;
@@ -1083,7 +1009,7 @@ inline int validate_config(const Config& cfg) {
         std::fprintf(stderr, "Configuring Redis with users defined in redis.conf and at the same setting an ACL file path is invalid. This setup is very likely to lead to configuration errors and security holes, please define either an ACL file or declare users directly in your redis.conf, but not both.\n");
         return kConfigError;
     }
-    if (cfg.shards != Config::kShardsAuto && (cfg.shards == 0 || cfg.shards > 256)) {
+    if (cfg.shards == 0 || cfg.shards > 256) {
         std::fprintf(stderr, "shards must be between 1 and 256\n");
         return kConfigError;
     }

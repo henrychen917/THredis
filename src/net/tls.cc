@@ -137,12 +137,12 @@ std::unique_ptr<TlsContext> TlsContext::create(const Config& cfg, std::string& e
     std::unique_ptr<TlsContext> out(new TlsContext(raw));
 
     SSL_CTX_set_options(raw, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION |
-                             SSL_OP_ENABLE_KTLS);
+                             (cfg.tls_ktls ? SSL_OP_ENABLE_KTLS : 0));
     if (cfg.tls_prefer_server_ciphers)
         SSL_CTX_set_options(raw, SSL_OP_CIPHER_SERVER_PREFERENCE);
     SSL_CTX_set_session_cache_mode(raw, SSL_SESS_CACHE_OFF);
     SSL_CTX_set_dh_auto(raw, 1);
-    SSL_CTX_set_keylog_callback(raw, TlsConn::keylog_callback);
+    if (cfg.tls_ktls) SSL_CTX_set_keylog_callback(raw, TlsConn::keylog_callback);
 
     if (!configure_protocols(raw, cfg.tls_protocols, error)) return nullptr;
     // Prefer the kernel/AES-NI-fast choices by default. Explicit Redis cipher knobs replace these

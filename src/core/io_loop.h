@@ -1,32 +1,37 @@
-// io_loop.h — accepts, receives, parses, routes, publishes, retires, and sends for its clients.
-// In fused mode the same physical thread also executes its owned shards; split mode hands tasks
-// to executor threads. Reply retirement and sending stay with the connection's IO owner.
+// io_loop.h — the IO stage. Accepts, receives, parses, routes, publishes, retires, and (in Io mode)
+// sends.
+//
+// EVERY CROSS-THREAD SIGNAL HERE IS A Channel, and every measurement is a LoopSignals field, so this
+// loop is comparable with the EX and WB loops through one interface. See signal.h.
 //
 //   out  task_in of the shard's owner        a parsed op to execute
-//   in   ready mask / client_in             completed ops to retire and send
+//   in   client_in from workers              "you have completed ops to retire"
+//
+// WHAT MOVES BETWEEN MODES, AND WHAT DOES NOT. The ROB is ALWAYS drained by the IO thread that owns
+// the connection, in every mode. Only the send syscall moves. Letting a second thread retire from
+// the ROB would make dispatch_id/flush_id a cross-thread pair for no measured benefit. So this is
+// NOT a byte-for-byte reproduction of the fork's ex-wb, which had the executor build and send its
+// own contiguous ready prefix without returning to IO — said here so no result from that mode is
+// misread as a verdict on that design.
 #pragma once
-#include <array>
 #include <deque>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
 #include <memory>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "server.h"
-#include "iopipe_pipeline.h"
 #include "signal.h"
-#include "ex_loop.h"
-#include "genthread_pipeline.h"
 #include "../net/conn.h"
 #include "../net/resp.h"
 #include "../net/uring.h"
@@ -34,7 +39,6 @@
 #include "../net/wb.h"
 #include "../net/tls.h"
 #include "../cmd/command.h"
-#include "../cmd/debug_sleep.h"
 #include "../cmd/slowlog.h"
 #include "../cmd/blocking.h"
 #include "../cmd/auth.h"
@@ -50,19 +54,18 @@ namespace tomo {
 
 inline constexpr uint32_t kRecvChunk = 16 * 1024;
 
-// IO and EX responsibilities compose on one physical thread in fused mode:
+// THE FIVE LOOPS. Each mode composes threads from five specialised loop shapes, distinguished by
+// what the thread OWNS while serving (pure 2s, owner ruling 2026-08-24):
 //
 //   io    IoLoop    recv+parse+retire+send; owns the whole client
 //   ex    ExLoop    execute+notify; never sends
 
 class IoLoop {
-    friend struct CoreConcurrencyTest;
 public:
     WbEngine& engine() { return wb_; }
     uint32_t reap_atomic_deferred() {
         return scatter_pool_.reap_deferred() + multi_owner_reap_entry(*this);
     }
-
     // ONE LISTENING SOCKET PER IO THREAD, via SO_REUSEPORT.
     //
     // Sharing a single listen fd across io threads does NOT distribute connections: every thread
@@ -76,30 +79,37 @@ public:
     // process; two SERVER PROCESSES sharing a port is the failure mode that once faked data loss,
     // so a boot must still verify nothing else holds the port.
     bool init(Server* srv, ThreadCtx* self, const char* addr, uint16_t port,
-              int unix_listen_fd = -1, const TlsContext* tls_context = nullptr,
-              bool dormant = false) {
+              int unix_listen_fd = -1, const TlsContext* tls_context = nullptr) {
         srv_ = srv; self_ = self;
-        (void)addr;
-        configured_port_ = port;
+        self_->set_wb_engine(&wb_);
+        if (port) {
+            listen_fd_ = make_reuseport_listener(addr, port, srv_->cfg().tcp_backlog);
+            if (listen_fd_ < 0) return false;
+        }
         tls_context_ = tls_context;
+        if (tls_context_) {
+            tls_listen_fd_ = make_reuseport_listener(addr, srv_->cfg().tls_port,
+                                                      srv_->cfg().tcp_backlog, true);
+            if (tls_listen_fd_ < 0) return false;
+        }
         unix_listen_fd_ = unix_listen_fd;
         epoll_ = srv_->cfg().net_io == NetIoEngine::Epoll;
-        targeted_ifid_ = srv_->cfg().thread_mode == ThreadMode::Fused &&
-                         srv_->cfg().overlap != 0;
-        age_sample_rate_cached_ = srv_->effective_age_sample_rate();
-        age_signals_armed_ = age_sample_rate_cached_ != 0;
-        client_lb_signal_armed_ = srv_->client_lb_signals_enabled();
-        lb_controller_armed_ = srv_->lb_controller_enabled();
         if (!ring_.init(4096)) return false;
+        self_->set_ring(&ring_);
         if (epoll_ && !init_epoll()) return false;
+        if (srv_->aof().configured()) {
+            std::string error;
+            if (!srv_->aof().bind_writer(*self_, ring_, error)) {
+                std::fprintf(stderr, "AOF writer init failed: %s\n", error.c_str());
+                return false;
+            }
+        }
         wb_.bind(&ring_, this, [](void* ctx, int32_t shard, const char* ptr) {
             static_cast<IoLoop*>(ctx)->queue_borrow_release(shard, ptr);
         }, this, [](void* ctx, Client& client, Op& op) {
             auto* loop = static_cast<IoLoop*>(ctx);
-            const bool was_blocked = client.blocked();
             NotifyBatch* notifications = nullptr;
             if (op.has_scatter_state()) {
-                loop->climon_flush_completed(op);
                 notifications = notify_take_batch(op);
                 xshard_retire(*loop->srv_, *loop->self_, loop->ring_, client, op,
                     loop->scatter_pool_, loop->self_->id(), loop,
@@ -119,24 +129,10 @@ public:
             }
             if (__builtin_expect(notifications != nullptr, false))
                 notify_retire_batch_entry(*loop, notifications, client.id());
-            if (was_blocked && !client.blocked()) {
-                // A blocking wait is timeout-exempt, so its parked duration cannot become the
-                // idle age the first cron pass sees after retirement. The socket send refresh is
-                // too late: cron runs later in this same IO pass, before its CQE can arrive.
-                client.set_last_interaction_s(loop->cached_now_s_);
-                // One-shot test synchronizer: make that vulnerable retirement -> cron ordering
-                // deterministic. Production never arms it, and the blocking path is already cold.
-                if (loop->srv_->debug_blocking_timeout_reap_take())
-                    loop->client_cron_beat_ms_ = 0;
-            }
         }, srv_->client_obuf_armed_ptr(), this, [](void* ctx, Client& client) {
             return static_cast<IoLoop*>(ctx)->client_obuf_check(&client, true);
         }, &cached_now_s_, &self_->sig());
-        wb_.set_cold_send_classification(
-            srv_->cfg().thread_mode == ThreadMode::Fused &&
-            srv_->cfg().overlap != 0);
-        initialized_ = true;
-        return dormant || activate();
+        return true;
     }
 
     ~IoLoop() {
@@ -169,198 +165,24 @@ public:
         return fd;
     }
 
+    // Linux does not provide TCP-style SO_REUSEPORT distribution for filesystem AF_UNIX paths:
+    // the pathname is a unique bind key. One listener is therefore armed by one IO thread, which
+    // round-robins accepted Client handles through the existing per-producer client channels.
+    static int make_unix_listener(const char* path, uint32_t backlog = 511) {
+        sockaddr_un sa{};
+        if (!path || !*path || std::strlen(path) >= sizeof(sa.sun_path)) return -1;
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        sa.sun_family = AF_UNIX;
+        std::memcpy(sa.sun_path, path, std::strlen(path) + 1);
+        if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0 ||
+            ::listen(fd, static_cast<int>(backlog)) != 0) {
+            ::close(fd); return -1;
+        }
+        return fd;
+    }
+
     Ring& ring() { return ring_; }
-
-    // Boot-only listener transfer. Persistence loading and IoLoop allocation/init can therefore
-    // complete before the AF_UNIX pathname starts accepting. The caller retains fd ownership on
-    // failure and releases it only after this method succeeds.
-    bool attach_listener(int fd) {
-        if (fd < 0 || !initialized_ || active_role_ || prepared_role_ || unix_listen_fd_ >= 0)
-            return false;
-        unix_listen_fd_ = fd;
-        return true;
-    }
-
-    // Epoll can allocate kernel registration state. Reserve the actual destination registration
-    // while the source still owns the connection; destination readiness events are owner-checked
-    // and ignored until commit. io_uring has no per-fd destination registration to reserve.
-    bool prepare_client_registration(Client* client) {
-        return !epoll_ || ep_.add(client->fd(), EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
-                                  ur_tag(UrKind::Recv, client));
-    }
-    void cancel_client_registration(Client* client) {
-        if (epoll_ && !ep_.del(client->fd())) std::abort();
-    }
-
-    bool activate() {
-        if (!initialized_) return false;
-        if (active_role_) {
-            self_->set_ring(&ring_);
-            self_->set_wb_engine(&wb_);
-            return true;
-        }
-        if (!prepare_activation()) return false;
-        accept_quiescing_ = false;
-        accept_cancel_submitted_ = tls_accept_cancel_submitted_ = false;
-        self_->set_ring(&ring_);
-        self_->set_wb_engine(&wb_);
-        iopipe_depth_gate_.reset(self_->sig().ops);
-        active_role_ = true;
-        return true;
-    }
-
-    // Prepare every fallible role-tenure resource while the thread is still an EX owner and no
-    // connection or bucket ownership edge has occurred. ExLoop invokes this through ThreadCtx's
-    // type-erased role hook on the physical thread that owns this IoLoop.
-    bool prepare_activation() {
-        if (!initialized_) return false;
-        if (prepared_role_) return true;
-        auto fail = [&]() {
-            if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
-            if (tls_listen_fd_ >= 0) { ::close(tls_listen_fd_); tls_listen_fd_ = -1; }
-            prepared_role_ = false;
-            return false;
-        };
-        accept_generation_++;
-        if (configured_port_ && listen_fd_ < 0) {
-            listen_fd_ = make_reuseport_listener(
-                srv_->cfg().bind_addr, configured_port_, srv_->cfg().tcp_backlog);
-            if (listen_fd_ < 0) return fail();
-        }
-        if (tls_context_ && tls_listen_fd_ < 0) {
-            tls_listen_fd_ = make_reuseport_listener(
-                srv_->cfg().bind_addr, srv_->cfg().tls_port, srv_->cfg().tcp_backlog, true);
-            if (tls_listen_fd_ < 0) return fail();
-        }
-        if (epoll_ && !register_epoll_listeners()) return fail();
-        if (srv_->aof().configured() && !aof_bound_) {
-            std::string error;
-            if (!srv_->aof().bind_writer(*self_, ring_, error)) {
-                std::fprintf(stderr, "AOF writer init failed: %s\n", error.c_str());
-                return fail();
-            }
-            aof_bound_ = true;
-        }
-        prepared_role_ = true;
-        return true;
-    }
-
-    void cancel_prepared_activation() {
-        if (active_role_ || !prepared_role_) return;
-        if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
-        if (tls_listen_fd_ >= 0) { ::close(tls_listen_fd_); tls_listen_fd_ = -1; }
-        accept_generation_++;
-        prepared_role_ = false;
-    }
-
-    void deactivate() {
-        if (!active_role_) return;
-        if (!self_->clients().empty() || !client_migrations_.empty()) std::abort();
-        // Channel homes are members of the live IO set. A thread leaving that set retires its
-        // owner-local indexes here; every new/surviving IO rebuilds the next epoch in RoleReady.
-        pubsub_clear_home_indexes();
-        // The UNIX listener is pinned to its boot IO and that thread is never a conversion
-        // candidate. TCP/TLS SO_REUSEPORT listeners are per-role-tenure resources.
-        if (unix_listen_fd_ >= 0) std::abort();
-        if (listen_fd_ >= 0) { ::close(listen_fd_); listen_fd_ = -1; }
-        if (tls_listen_fd_ >= 0) { ::close(tls_listen_fd_); tls_listen_fd_ = -1; }
-        accept_generation_++; // makes any late multishot CQE recognisably stale
-        accept_cancel_submitted_ = tls_accept_cancel_submitted_ = false;
-        active_role_ = false;
-        prepared_role_ = false;
-    }
-
-    // Called only on this loop's physical thread by the migration control lane. The public split
-    // keeps preflight (no state change) distinct from request (source remains owner until an async
-    // recv cancellation has acknowledged that the old ring released Client*).
-    bool client_transfer_ready(Client* client, uint32_t destination, std::string& error) const {
-        if (!client || destination >= srv_->nthreads() || destination == self_->id()) {
-            error = "invalid client transfer owner";
-            return false;
-        }
-        if (client->ifid_thread() != self_->id() || client->dead() || client->closing()) {
-            error = "connection is not live on the source IO thread";
-            return false;
-        }
-        if (client_pipeline_referenced(client)) {
-            error = "connection is held by a generalized-thread pipeline batch";
-            return false;
-        }
-        uint32_t directory_owner = UINT32_MAX;
-        if (!command_client_directory_find(client->id(), directory_owner) ||
-            directory_owner != self_->id()) {
-            error = "connection directory is not owned by the source IO thread";
-            return false;
-        }
-        if (client->is_tls()) {
-            error = "TLS connection has owner-local engine state";
-            return false;
-        }
-        if (!client->migration_protocol_idle()) {
-            error = "connection ROB, reply, borrow, or owner-local protocol state is busy";
-            return false;
-        }
-        if (!wb_.migration_ready(*client)) {
-            error = "connection has a deferred out-of-band frame";
-            return false;
-        }
-        if (!climon_migration_ready(client)) {
-            error = "connection has transient CLIENT/MONITOR/TRACKING state";
-            return false;
-        }
-        if (!client_executor_quiesced(client) || !client->migration_protocol_idle()) {
-            error = "connection has an unfinished executor completion";
-            return false;
-        }
-        return true;
-    }
-
-    bool prepare_client_transfer_capacity(uint32_t incoming) {
-        try {
-            self_->clients().reserve(self_->clients().size() + incoming);
-            active_.v.reserve(active_.v.size() + incoming);
-            pubsub_local_.reserve(pubsub_local_.size() + incoming);
-            climon_conn_.reserve(climon_conn_.size() + incoming);
-        } catch (const std::bad_alloc&) {
-            return false;
-        }
-        return self_->reserve_wb_slots(incoming) && command_client_migration_reserve(incoming);
-    }
-
-    bool request_client_transfer(Client* client, uint32_t destination, std::string& error) {
-        return epoll_ ? request_client_transfer_impl<true>(client, destination, false, error)
-                      : request_client_transfer_impl<false>(client, destination, false, error);
-    }
-
-    bool prepare_client_transfer(Client* client, uint32_t destination, std::string& error) {
-        return epoll_ ? request_client_transfer_impl<true>(client, destination, true, error)
-                      : request_client_transfer_impl<false>(client, destination, true, error);
-    }
-
-    bool reserve_client_transfer_state(uint32_t count) {
-        try {
-            client_migrations_.reserve(client_migrations_.size() + count);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    bool client_transfers_idle() const { return client_migrations_.empty(); }
-    bool client_transfers_prepared() const {
-        for (const auto& migration : client_migrations_)
-            if (!migration.prepared) return false;
-        return true;
-    }
-    void commit_prepared_client_transfers() {
-        if (epoll_) commit_prepared_client_transfers_impl<true>();
-        else        commit_prepared_client_transfers_impl<false>();
-    }
-    void cancel_prepared_client_transfers() {
-        if (epoll_) cancel_prepared_client_transfers_impl<true>();
-        else        cancel_prepared_client_transfers_impl<false>();
-    }
-    uint64_t client_transfer_failures() const { return client_transfer_failures_; }
 
     // ---- epoll engine: registration -----------------------------------------------------------
     // Everything that will ever be waited on is registered ONCE here. Listeners are
@@ -370,15 +192,6 @@ public:
     // see net/epoll.h. The doorbell eventfd is level-triggered and drained explicitly.
     bool init_epoll() {
         if (!ep_.init()) return false;
-        // The cross-thread doorbell exists for the lifetime of the physical thread. Role-tenure
-        // listeners are added by activate() and removed by close() in deactivate().
-        if (ring_.wake_fd() < 0) return false;
-        if (!ep_.add(ring_.wake_fd(), EPOLLIN, ur_tag(UrKind::Wake, nullptr))) return false;
-        return ring_.shutdown_fd() < 0 ||
-               ep_.add(ring_.shutdown_fd(), EPOLLIN, ur_tag(UrKind::Shutdown, nullptr));
-    }
-
-    bool register_epoll_listeners() {
         auto add_listener = [&](int fd, UrKind kind) {
             if (fd < 0) return true;
             if (!set_nonblocking(fd)) return false;
@@ -387,7 +200,10 @@ public:
         if (!add_listener(listen_fd_, UrKind::Accept)) return false;
         if (!add_listener(tls_listen_fd_, UrKind::TlsAccept)) return false;
         if (!add_listener(unix_listen_fd_, UrKind::UnixAccept)) return false;
-        return true;
+        // The cross-thread doorbell. Without this in the set, an executor that completes work while
+        // this thread is parked in epoll_wait cannot reach it, and the reply waits out the timeout.
+        if (ring_.wake_fd() < 0) return false;
+        return ep_.add(ring_.wake_fd(), EPOLLIN, ur_tag(UrKind::Wake, nullptr));
     }
 
     // THE ENGINE DECISION, MADE ONCE, HERE. It joins the two shape decisions this loop already
@@ -399,90 +215,30 @@ public:
     // one pointer chosen off a per-batch flag, zero per-operation branching) applied at the loop
     // level instead of the handler level -- the engine is a property of the whole loop, so the
     // choice belongs at its outermost frame.
-    template <uint8_t Pipeline>
-    void run_split() {
+    void run() {
         const bool has_unix = unix_listen_fd_ >= 0 ||
                               (srv_->cfg().unixsocket && *srv_->cfg().unixsocket);
         if (epoll_) {
             if (tls_context_) {
-                if (has_unix) run_loop<true, true, true, false, Pipeline>();
-                else run_loop<false, true, true, false, Pipeline>();
+                if (has_unix) run_loop<true, true, true>();
+                else run_loop<false, true, true>();
             } else {
-                if (has_unix) run_loop<true, false, true, false, Pipeline>();
-                else run_loop<false, false, true, false, Pipeline>();
+                if (has_unix) run_loop<true, false, true>();
+                else run_loop<false, false, true>();
             }
             return;
         }
         if (tls_context_) {
-            if (has_unix) run_loop<true, true, false, false, Pipeline>();
-            else run_loop<false, true, false, false, Pipeline>();
+            if (has_unix) run_loop<true, true, false>();
+            else run_loop<false, true, false>();
         } else {
-            if (has_unix) run_loop<true, false, false, false, Pipeline>();
-            else run_loop<false, false, false, false, Pipeline>();
+            if (has_unix) run_loop<true, false, false>();
+            else run_loop<false, false, false>();
         }
     }
-
-    void run() {
-        if (srv_->cfg().overlap == 1) run_split<1>();
-        else                                  run_split<0>();
-    }
-
-    void bind_fused_executor(FusedExLoop* executor) {
-        fused_executor_ = executor;
-    }
-
-    template <bool TargetedIfid>
-    void fused_executor_completion(Client* client) {
-        if (!client || client->dead()) return;
-        enqueue_serve(client);
-        mark_active_known<TargetedIfid>(client);
-    }
-
-    void run_fused();
-    void run_split_read_local();
 
 private:
-    friend struct NetcmdRegression;
-    void refresh_age_sampling() {
-        const uint32_t wanted = srv_->effective_age_sample_rate();
-        if (wanted == age_sample_rate_cached_) return;
-        age_sample_rate_cached_ = wanted;
-        age_signals_armed_ = wanted != 0;
-        self_->sig().configure_age_sampling(wanted);
-        if (!wanted) {
-            rob_head_ages_.clear();
-            rob_head_ages_.rehash(0);
-        }
-    }
-
-    enum class DispatchResult : uint8_t {
-        Progress,
-        NeedInput,
-        Error,
-        Closed,
-    };
-
-    struct WbPipelineBatch {
-        std::array<Client*, kGenthreadPipelineWbBatchConns> clients{};
-        uint32_t count = 0;
-    };
-
-    struct ClientMigration {
-        Client* client = nullptr;
-        uint32_t destination = 0;
-        bool cancel_submitted = false;
-        bool hold_for_commit = false;
-        bool prepared = false;
-        bool destination_registered = false;
-        int source_backup_fd = -1;
-        void* catalog = nullptr;
-        void* routing = nullptr;
-    };
-
     friend bool multi_dispatch_entry(IoLoop&, Client&, Op&, uint32_t);
-    friend bool multi_dispatch_entry_iofused(IoLoop&, Client&, Op&, uint32_t);
-    template <bool IofusedPrivateQueue>
-    friend bool multi_dispatch_entry_impl(IoLoop&, Client&, Op&, uint32_t);
     friend bool auth_dispatch_entry(IoLoop&, Client&, Op&, uint32_t);
     friend bool acl_dispatch_entry(IoLoop&, Client&, Op&, uint32_t, uint8_t);
     friend bool acl_finish_dispatch_denial(IoLoop&, Client&, Op&, uint32_t,
@@ -491,59 +247,43 @@ private:
     friend void acl_broadcast_user_change(IoLoop&, uint32_t, const AclPerm*, bool);
     friend void multi_retire_entry(IoLoop&, Client&, Op&);
     friend uint32_t multi_owner_pass_entry(IoLoop&);
-    friend uint32_t multi_owner_pass_entry_iofused(IoLoop&);
-    template <bool IofusedPrivateQueue>
-    friend uint32_t multi_owner_pass_entry_impl(IoLoop&);
     friend uint32_t multi_owner_reap_entry(IoLoop&);
     friend void multi_close_entry(IoLoop&, Client&);
     friend void multi_shutdown_entry(IoLoop&);
     friend void notify_retire_batch_entry(IoLoop&, NotifyBatch*, uint64_t);
 #include "pubsub.inc"
 
-    template <bool HasUnix, bool HasTls, bool kEp, bool Fused = false,
-              uint8_t Pipeline = 0, bool SplitLocal = false>
+    template <bool HasUnix, bool HasTls, bool kEp>
     void run_loop() {
-        static_assert(Pipeline <= 1);
-        if constexpr (Fused && Pipeline == 1 && !SplitLocal) {
-            // Fused overlap uses the occupancy-gated schedule on the fixed producer lanes.
-            run_fused_iofused_loop<HasUnix, HasTls, kEp, true>();
-            return;
-        }
-        static_assert(!SplitLocal || Fused);
-        constexpr bool IoPipe = (!Fused || SplitLocal) && Pipeline == 1;
-        if constexpr (Fused) {
-            if (srv_->read_local_enabled()) {
-                // A split EX tenure is permanently parked: it never probes the local lane.
-                // Resume BEFORE sampling the epoch, as at the existing network-wait boundary.
-                if (ThreadCtx::read_local_publication_parked(self_->read_local_publication()))
-                    self_->resume_read_local_tick();
-                self_->publish_read_local_tick(srv_->read_local_epoch());
-                self_->set_read_local_lane_active(true);
-            }
-        }
         if constexpr (!kEp) {
             if (listen_fd_ >= 0) arm_accept(UrKind::Accept);
             if constexpr (HasTls) arm_accept(UrKind::TlsAccept);
             if constexpr (HasUnix) if (unix_listen_fd_ >= 0) arm_accept(UrKind::UnixAccept);
         }
         LoopSignals& sig = self_->sig();
-        while (!self_->stop_flag().load(std::memory_order_relaxed) &&
-               self_->role() == Role::Ifid) {
+        while (!self_->stop_flag().load(std::memory_order_relaxed)) {
             refresh_notify_config();
             // ONE relaxed load per io batch. Per-batch checks are free; this is what buys the
             // per-operation hooks their zero-cost-when-off property.
             if (__builtin_expect(srv_->climon_armed() != climon_armed_cached_, false))
                 climon_refresh_armed();
-            const bool pause_armed = climon_pause_armed();
-            const bool client_cron_armed = !srv_->flip_dispatch_paused() &&
-                                           srv_->client_cron_armed();
-            const bool client_lb_signal_armed = client_lb_signal_armed_;
-            const bool lb_controller_armed = lb_controller_armed_;
-            // Placement's dense role vectors are mutated only under FLIP's global dispatch
-            // barrier. Do not consult them from an IO pass while that cold transaction is live.
-            const bool save_cron_armed = !srv_->flip_dispatch_paused() &&
-                                         srv_->save_cron_writer(self_->id());
-            const bool client_cron_newly_armed = client_cron_armed && !client_cron_was_armed_;
+            // A live CLIENT PAUSE is the only lane feature that needs a clock of its own; the
+            // deadline is checked once per batch, never per operation.
+            if (__builtin_expect(climon_pause_armed(), false)) {
+                cached_now_ms_ = now_ns() / 1000000ull;
+                cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
+                if (cached_now_ms_ >= climon_pause_deadline_ms_) climon_release_pause();
+            }
+            const bool client_cron_armed = srv_->client_cron_armed();
+            const bool save_cron_armed = srv_->save_cron_writer(self_->id());
+            if (__builtin_expect(client_cron_armed || save_cron_armed, false)) {
+                cached_now_ms_ = now_ns() / 1000000ull;
+                cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
+                if (client_cron_armed && !client_cron_was_armed_) {
+                    for (Client* c : self_->clients()) c->set_last_interaction_s(cached_now_s_);
+                    client_cron_beat_ms_ = cached_now_ms_;
+                }
+            }
             if (!client_cron_armed && __builtin_expect(client_cron_was_armed_, false)) {
                 // Turning the last client cron consumer off also retires output accounting once.
                 // The disabled write-back specialization then has no per-serve cleanup branch.
@@ -551,42 +291,13 @@ private:
             }
             client_cron_was_armed_ = client_cron_armed;
             sig.iterations++;
+            self_->sample_depth();
             reap_dead();               // free clients dead for a full iteration -- see close_client
             scatter_pool_.reap_deferred();
 
             uint32_t did = 0;
-            bool submitted = false;
-            bool natural_order = false;
-            if constexpr (IoPipe)
-                natural_order = iopipe_depth_gate_.loop_boundary(sig.ops);
             {
                 Span busy(sig.busy_ns);
-                // The work-span clock is already sampled once for this pass. Reuse that cut for
-                // every monotonic millisecond consumer instead of issuing separate clock_gettime
-                // reads for pause, cron and WAIT. A pass is microseconds; their public granularity
-                // is milliseconds or seconds.
-                bool pass_time_cached = pause_armed || client_cron_armed || save_cron_armed ||
-                                        client_lb_signal_armed || lb_controller_armed ||
-                                        !deferred_timers_.empty();
-                if (__builtin_expect(pass_time_cached, true)) {
-                    cached_now_ms_ = busy.start_ns() / 1000000ull;
-                    cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
-                }
-                if (__builtin_expect(pause_armed &&
-                                     cached_now_ms_ >= climon_pause_deadline_ms_, false))
-                    climon_release_pause();
-                if (client_cron_newly_armed) {
-                    for (Client* c : self_->clients()) c->set_last_interaction_s(cached_now_s_);
-                    client_cron_beat_ms_ = cached_now_ms_;
-                }
-                if (self_->sample_depth(busy.start_ns() / 1000)) {
-                    // CLOCK_THREAD_CPUTIME_ID can require a real syscall. cpu_ns is diagnostic
-                    // only (the placement controller deliberately uses busy/idle), so sample it
-                    // on the existing 100us signal beat instead of every hot pass.
-                    sig.cpu_ns = thread_cpu_ns();
-                    refresh_age_sampling();
-                    if (age_signals_armed_) sample_rob_head_age(sig.cached_now_us);
-                }
                 // A dropped accept re-arm means the server stops taking connections entirely, so it
                 // is retried every pass until it lands.
                 if constexpr (!kEp) {
@@ -595,18 +306,10 @@ private:
                     if constexpr (HasUnix)
                         if (unix_accept_pending_) arm_accept(UrKind::UnixAccept);
                 }
-                if constexpr (!IoPipe) {
-                    // In epoll mode this drains the doorbell mailbox instead of a CQ ring; the tag
-                    // stream, and therefore this switch, is identical. See uring.h.
-                    did += ring_.for_each_cqe(
-                        [&](io_uring_cqe* cqe) {
-                            on_cqe<HasTls, kEp, Fused, Pipeline>(cqe);
-                        });
-                    if constexpr (kEp)
-                        did += epoll_pass<HasUnix, HasTls, Fused, Pipeline>(0);
-                }
-                did += service_client_migrations<kEp>();
-                did += drain_client_transfers<kEp>();
+                // In epoll mode this drains the doorbell mailbox instead of a CQ ring; the tag
+                // stream, and therefore this switch, is identical. See uring.h.
+                did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe<HasTls, kEp>(cqe); });
+                if constexpr (kEp) did += epoll_pass<HasUnix, HasTls>(0);
                 did += scatter_pool_.refresh_snapshot_floor(*srv_, self_->id());
                 if constexpr (HasUnix) did += flush_handoffs();
                 did += multi_owner_pass_entry(*this);
@@ -614,47 +317,14 @@ private:
                     did += srv_->aof().writer_pass(*self_, ring_);
                 if (srv_->snapshot().writer_is(self_->id()))
                     did += srv_->snapshot().writer_pass(*self_, ring_);
-                if (__builtin_expect(!deferred_timers_.empty(), false)) {
-                    // CQ processing above may have created the first timer after the prologue.
-                    if (!pass_time_cached) {
-                        cached_now_ms_ = busy.start_ns() / 1000000ull;
-                        cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
-                        pass_time_cached = true;
-                    }
-                    did += deferred_timer_pass(cached_now_ms_);
+                if (__builtin_expect(!deferred_waits_.empty(), false)) {
+                    cached_now_ms_ = now_ns() / 1000000ull;
+                    cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
+                    did += deferred_wait_pass(cached_now_ms_);
                 }
                 did += flush_borrow_releases();
-                if constexpr (IoPipe) {
-                    if (__builtin_expect(!routing_forward_.empty(), false))
-                        client_routing_cleanup_pass();
-                    did += pipeline_pass<HasUnix, HasTls, kEp, SplitLocal>(
-                        false, natural_order, submitted);
-                } else if constexpr (Fused) {
-                    if (__builtin_expect(!routing_forward_.empty(), false))
-                        client_routing_cleanup_pass();
-                    did += flush_ready<HasTls, kEp, true, HasUnix>();
-                } else {
-                    did += collect_retire_work<HasUnix, kEp>();
-                    if (__builtin_expect(!routing_forward_.empty(), false))
-                        client_routing_cleanup_pass();
-                    did += flush_ready<HasTls, kEp>();
-                }
-                did += flip_control_pass<kEp>();
-                if (__builtin_expect(client_lb_signal_armed &&
-                                     cached_now_ms_ >= lb_client_signal_beat_ms_, false)) {
-                    did += lb_client_signal_pass();
-                    lb_client_signal_beat_ms_ = cached_now_ms_ + 1000;
-                }
-                did += lb_control_pass();
-                if (__builtin_expect(lb_controller_armed &&
-                                     cached_now_ms_ >= lb_controller_beat_ms_, false)) {
-                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->lb_tick_ms();
-                    if (srv_->lb_cron_writer(self_->id()) &&
-                        srv_->lb_controller_tick(self_->id(), cached_now_ms_))
-                        lb_schedule_wake_all();
-                    did++;
-                }
-                did += lb_wake_all_pass();
+                did += collect_retire_work<HasUnix, kEp>();
+                did += flush_ready<HasTls, kEp>();
                 if (__builtin_expect(client_cron_armed &&
                                      cached_now_ms_ >= client_cron_beat_ms_, false)) {
                     did += client_cron_pass();
@@ -666,83 +336,33 @@ private:
                     save_cron_beat_ms_ = cached_now_ms_ + 1000;
                 }
             }
+            sig.cpu_ns = thread_cpu_ns();
+
             // Flush prepared SQEs before looping. Recv re-arms and cross-ring wakes are
             // PREPARED during the work section but only reach the kernel on submit; taking
             // the busy path without submitting strands them in the SQ forever, and the peer
             // that is waiting on that wake never runs.
-            if (did) {
-                if constexpr (IoPipe) {
-                    if (!submitted || ring_.sq_ready()) ring_.submit_and_reap();
-                } else {
-                    ring_.submit_and_reap();
-                }
-                continue;
-            }
+            if (did) { ring_.submit_and_reap(); continue; }
 
             // Nothing to do: declare intent to block, re-check (a producer may have pushed between
             // the last drain and the flag being set), then wait.
             // Mask-independent sweep before parking. The mask is a hint for the hot path; it must
             // not be the only thing that can find queued work, or one lost bit wedges a connection
             // forever. Runs only when this thread has already concluded it has nothing to do.
-            uint32_t sweep_work = 0;
-            if constexpr (IoPipe)
-                sweep_work = pipeline_sweep<HasUnix, HasTls, kEp, SplitLocal>(
-                    natural_order, submitted);
-            else
-                sweep_work = sweep<HasUnix, HasTls, kEp, Fused>();
-            if (sweep_work) {
-                if constexpr (IoPipe) {
-                    if (!submitted || ring_.sq_ready()) ring_.submit_and_reap();
-                } else {
-                    ring_.submit_and_reap();
-                }
-                continue;
-            }
+            if (sweep<HasUnix, HasTls, kEp>()) { ring_.submit_and_reap(); continue; }
 
             Span idle(sig.idle_ns);
-            if constexpr (Fused) {
-                if (__builtin_expect(srv_->read_local_enabled(), false))
-                    self_->publish_read_local_parked(srv_->read_local_epoch());
-            }
             self_->arm_blocked();
             if constexpr (kEp) {
                 // The park. Same 50ms ceiling as the ring wait, and for the same reason: the stop
                 // flag is only re-read at the top of the loop, so an unbounded block would make
                 // shutdown depend on a connection arriving.
-                if constexpr (Fused) {
-                    if (!self_->any_fused_inbound())
-                        epoll_pass<HasUnix, HasTls, !SplitLocal, Pipeline>(50);
-                } else if (!self_->any_io_inbound()) {
-                    epoll_pass<HasUnix, HasTls, false, Pipeline>(50);
-                }
+                if (!self_->any_io_inbound()) epoll_pass<HasUnix, HasTls>(50);
             } else {
-                if constexpr (Fused) {
-                    if (!self_->any_fused_inbound()) ring_.submit_and_wait(1);
-                    else                            ring_.submit_and_reap();
-                } else {
-                    if (!self_->any_io_inbound()) ring_.submit_and_wait(1);
-                    else                         ring_.submit_and_reap();
-                }
-            }
-            if constexpr (Fused) {
-                // Become active conservatively before sampling the epoch. With the retirement RMW
-                // and grace scan in the same seq-cst order, a reclaimer either sees this old tick
-                // and waits or completed while we were parked; the epoch sample then acquires that
-                // unlink before any later foreign slot probe.
-                if (__builtin_expect(srv_->read_local_enabled(), false)) {
-                    self_->resume_read_local_tick();
-                    self_->publish_read_local_tick(srv_->read_local_epoch());
-                }
+                if (!self_->any_io_inbound()) ring_.submit_and_wait(1);
+                else                       ring_.submit_and_reap();
             }
             self_->clear_blocked();
-        }
-        if constexpr (Fused) {
-            // The read loop is over for this tenure. Teardown may take longer than another
-            // owner's bounded retire queue can tolerate, but it performs no foreign store probe.
-            if (srv_->read_local_enabled()) {
-                self_->set_read_local_lane_active(false);
-                self_->publish_read_local_parked(srv_->read_local_epoch());
-            }
         }
         // A close requested by the last pass's read/send path has no later flush_ready to drain it,
         // and an undrained entry would show up as a live connection in the shutdown accounting.
@@ -763,214 +383,8 @@ private:
         reap_dead();
     }
 
-    // The iofused family is a private boot-time instantiation. Neither arm owns streams' unpublished
-    // IFID reservations, A/D executor contexts, residual-age gates, or buffered retirement state.
-    // The retained ThreeWay=false body is the former overlap 1 for source comparison only.
-    // Fused overlap 1 now selects ThreeWay=true (formerly 2), with the same measured
-    // SEND-immediate / four-non-SEND N2 handling.
-    template <bool HasUnix, bool HasTls, bool kEp, bool ThreeWay>
-    void run_fused_iofused_loop() {
-        if (srv_->read_local_enabled()) {
-            if (ThreadCtx::read_local_publication_parked(self_->read_local_publication()))
-                self_->resume_read_local_tick();
-            self_->publish_read_local_tick(srv_->read_local_epoch());
-            self_->set_read_local_lane_active(true);
-        }
-        if constexpr (!kEp) {
-            if (listen_fd_ >= 0) arm_accept(UrKind::Accept);
-            if constexpr (HasTls) arm_accept(UrKind::TlsAccept);
-            if constexpr (HasUnix)
-                if (unix_listen_fd_ >= 0) arm_accept(UrKind::UnixAccept);
-        }
-        LoopSignals& sig = self_->sig();
-        WbPipelineBatch wb_batch;
-        uint32_t non_send_rotations = 0;
-        bool three_way_gate_open = false;
-
-        while (!self_->stop_flag().load(std::memory_order_relaxed) &&
-               self_->role() == Role::Ifid) {
-            refresh_notify_config();
-            if (__builtin_expect(srv_->climon_armed() != climon_armed_cached_, false))
-                climon_refresh_armed();
-            const bool pause_armed = climon_pause_armed();
-            const bool client_cron_armed = !srv_->flip_dispatch_paused() &&
-                                           srv_->client_cron_armed();
-            const bool client_lb_signal_armed = client_lb_signal_armed_;
-            const bool lb_controller_armed = lb_controller_armed_;
-            const bool save_cron_armed = !srv_->flip_dispatch_paused() &&
-                                         srv_->save_cron_writer(self_->id());
-            const bool client_cron_newly_armed =
-                client_cron_armed && !client_cron_was_armed_;
-            if (!client_cron_armed && __builtin_expect(client_cron_was_armed_, false))
-                for (Client* c : self_->clients()) c->stop_obuf_tracking();
-            client_cron_was_armed_ = client_cron_armed;
-            sig.iterations++;
-            reap_dead();
-            scatter_pool_.reap_deferred();
-
-            uint32_t did = 0;
-            {
-                Span busy(sig.busy_ns);
-                bool pass_time_cached = pause_armed || client_cron_armed || save_cron_armed ||
-                                        client_lb_signal_armed || lb_controller_armed ||
-                                        !deferred_timers_.empty();
-                if (__builtin_expect(pass_time_cached, true)) {
-                    cached_now_ms_ = busy.start_ns() / 1000000ull;
-                    cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
-                }
-                if (__builtin_expect(pause_armed &&
-                                     cached_now_ms_ >= climon_pause_deadline_ms_, false))
-                    climon_release_pause();
-                if (client_cron_newly_armed) {
-                    for (Client* c : self_->clients())
-                        c->set_last_interaction_s(cached_now_s_);
-                    client_cron_beat_ms_ = cached_now_ms_;
-                }
-                if (self_->sample_depth(busy.start_ns() / 1000)) {
-                    sig.cpu_ns = thread_cpu_ns();
-                    refresh_age_sampling();
-                    if (age_signals_armed_) sample_rob_head_age(sig.cached_now_us);
-                }
-                if constexpr (!kEp) {
-                    if (accept_pending_) arm_accept(UrKind::Accept);
-                    if constexpr (HasTls)
-                        if (tls_accept_pending_) arm_accept(UrKind::TlsAccept);
-                    if constexpr (HasUnix)
-                        if (unix_accept_pending_) arm_accept(UrKind::UnixAccept);
-                }
-                did += service_client_migrations<kEp>();
-                did += drain_client_transfers<kEp>();
-                did += scatter_pool_.refresh_snapshot_floor(*srv_, self_->id());
-                if constexpr (HasUnix) did += flush_handoffs();
-                did += multi_owner_pass_entry_iofused(*this);
-                if (srv_->aof().writer_is(self_->id()))
-                    did += srv_->aof().writer_pass(*self_, ring_);
-                if (srv_->snapshot().writer_is(self_->id()))
-                    did += srv_->snapshot().writer_pass(*self_, ring_);
-                if (__builtin_expect(!deferred_timers_.empty(), false)) {
-                    if (!pass_time_cached) {
-                        cached_now_ms_ = busy.start_ns() / 1000000ull;
-                        cached_now_s_ = static_cast<uint32_t>(cached_now_ms_ / 1000);
-                        pass_time_cached = true;
-                    }
-                    did += deferred_timer_pass(cached_now_ms_);
-                }
-                did += flush_borrow_releases();
-                if (__builtin_expect(!routing_forward_.empty(), false))
-                    client_routing_cleanup_pass();
-
-                // N0 is the rotation's only completion harvest. Receive parsing and SEND follow-up
-                // remain in the explicit IFID/WB body below.
-                did += ring_.for_each_cqe([&](io_uring_cqe* cqe) {
-                    on_cqe<HasTls, kEp, true, 1>(cqe);
-                });
-                if constexpr (kEp)
-                    did += epoll_pass<HasUnix, HasTls, true, 1>(0);
-                if constexpr (ThreeWay)
-                    did += genthread_three_way_pass<HasUnix, HasTls, kEp>(
-                        wb_batch, three_way_gate_open);
-                else
-                    did += genthread_iofused_pass<HasUnix, HasTls, kEp>(wb_batch);
-
-                did += flip_control_pass<kEp>();
-                if (__builtin_expect(client_lb_signal_armed &&
-                                     cached_now_ms_ >= lb_client_signal_beat_ms_, false)) {
-                    did += lb_client_signal_pass();
-                    lb_client_signal_beat_ms_ = cached_now_ms_ + 1000;
-                }
-                did += lb_control_pass();
-                if (__builtin_expect(lb_controller_armed &&
-                                     cached_now_ms_ >= lb_controller_beat_ms_, false)) {
-                    lb_controller_beat_ms_ = cached_now_ms_ + srv_->lb_tick_ms();
-                    if (srv_->lb_cron_writer(self_->id()) &&
-                        srv_->lb_controller_tick(self_->id(), cached_now_ms_))
-                        lb_schedule_wake_all();
-                    did++;
-                }
-                did += lb_wake_all_pass();
-                if (__builtin_expect(client_cron_armed &&
-                                     cached_now_ms_ >= client_cron_beat_ms_, false)) {
-                    did += client_cron_pass();
-                    client_cron_beat_ms_ = cached_now_ms_ + 100;
-                }
-                if (__builtin_expect(save_cron_armed &&
-                                     cached_now_ms_ >= save_cron_beat_ms_, false)) {
-                    did += srv_->save_cron_pass(*self_, ring_);
-                    save_cron_beat_ms_ = cached_now_ms_ + 1000;
-                }
-            }
-
-            if (ring_.take_sq_full_submit()) non_send_rotations = 0;
-            if (ring_.send_pending()) {
-                ring_.submit_and_reap<true>();
-                non_send_rotations = 0;
-                continue;
-            }
-            if (did) {
-                if (++non_send_rotations >= kGenthreadIoFusedCoalesceRotations) {
-                    ring_.submit_and_reap<true>();
-                    non_send_rotations = 0;
-                }
-                continue;
-            }
-
-            if constexpr (ThreeWay) three_way_gate_open = false;
-            const uint32_t sweep_work =
-                genthread_iofused_sweep<HasUnix, HasTls, kEp>();
-            if (sweep_work) {
-                if (ring_.take_sq_full_submit()) non_send_rotations = 0;
-                if (ring_.send_pending() ||
-                    ++non_send_rotations >= kGenthreadIoFusedCoalesceRotations) {
-                    ring_.submit_and_reap<true>();
-                    non_send_rotations = 0;
-                }
-                continue;
-            }
-
-            Span idle(sig.idle_ns);
-            // All local captures were consumed by the pass/sweep above. An idle fused thread
-            // must stop holding back another owner's bounded retire ring, just as in overlap 0.
-            if (__builtin_expect(srv_->read_local_enabled(), false))
-                self_->publish_read_local_parked(srv_->read_local_epoch());
-            self_->arm_blocked();
-            if constexpr (kEp) {
-                if (!self_->any_fused_inbound())
-                    epoll_pass<HasUnix, HasTls, true, 1>(50);
-            } else {
-                if (!self_->any_fused_inbound()) ring_.submit_and_wait<true>(1);
-                else                            ring_.submit_and_reap<true>();
-            }
-            non_send_rotations = 0;
-            // Clear the parked bit BEFORE sampling the epoch, in the same seq-cst order as
-            // the grace scan. The next pass may then capture foreign objects safely.
-            if (__builtin_expect(srv_->read_local_enabled(), false)) {
-                self_->resume_read_local_tick();
-                self_->publish_read_local_tick(srv_->read_local_epoch());
-            }
-            self_->clear_blocked();
-        }
-
-        if (srv_->read_local_enabled()) {
-            self_->set_read_local_lane_active(false);
-            self_->publish_read_local_parked(srv_->read_local_epoch());
-        }
-        if constexpr (kEp) {
-            while (!epoll_closes_.empty()) {
-                Client* victim = epoll_closes_.back();
-                epoll_closes_.pop_back();
-                epoll_close_now(victim);
-            }
-        }
-        clear_ifid_queue();
-        if (srv_->aof().writer_is(self_->id()))
-            srv_->aof().writer_shutdown(*self_, ring_);
-        reap_dead();
-        reap_dead();
-    }
-
     // ---- submission -----------------------------------------------------------------------------
     void arm_accept(UrKind kind) {
-        if (self_->role() != Role::Ifid || accept_quiescing_) return;
         const bool unix_socket = kind == UrKind::UnixAccept;
         const bool tls_socket = kind == UrKind::TlsAccept;
         io_uring_sqe* s = ring_.sqe();
@@ -987,10 +401,8 @@ private:
         const int listener = unix_socket ? unix_listen_fd_ :
                              tls_socket ? tls_listen_fd_ : listen_fd_;
         io_uring_prep_multishot_accept(s, listener, nullptr, nullptr, 0);
-        s->user_data = ur_tag(
-            kind, reinterpret_cast<void*>(static_cast<uintptr_t>(accept_generation_)));
+        s->user_data = ur_tag(kind, nullptr);
         ring_.note_pending();
-        accept_armed_ref(kind) = true;
         if (unix_socket) unix_accept_pending_ = false;
         else if (tls_socket) tls_accept_pending_ = false;
         else accept_pending_ = false;
@@ -1007,14 +419,13 @@ private:
     // a connection while it is true.
     template <bool kEp>
     void arm_recv(Client* c) {
-        if (c->recv_armed() || c->closing() || find_client_migration(c)) return;
+        if (c->recv_armed() || c->closing()) return;
         if constexpr (kEp) { epoll_recv(c); return; }
         size_t avail = 0;
         // may_grow ONLY at quiescence: realloc moves the buffer that every in-flight argv Slice
         // points into. See Conn::read_space.
-        const bool may_grow = c->rob().quiesced();
         char* dst = c->read_space(
-            kRecvChunk, avail, may_grow, proto_max_bulk_len_);
+            kRecvChunk, avail, c->rob().quiesced(), proto_max_bulk_len_);
         if (!dst) return;                      // no usable space yet: let the ROB drain first
         io_uring_sqe* s = ring_.sqe();
         if (!s) { self_->sig().sqe_starved++; return; }   // retried from flush_ready next pass
@@ -1033,8 +444,7 @@ private:
     void epoll_recv(Client* c) {
         for (;;) {
             size_t avail = 0;
-            char* dst = c->read_space(kRecvChunk, avail, c->rob().quiesced(),
-                                      proto_max_bulk_len_);
+            char* dst = c->read_space(kRecvChunk, avail, c->rob().quiesced());
             if (!dst) return;              // no usable space: stay un-armed so a later pass retries
             const ssize_t n = ::recv(c->fd(), dst, avail, MSG_DONTWAIT);
             if (n > 0) {
@@ -1052,7 +462,7 @@ private:
         }
     }
 
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     void arm_tls_recv(Client* c) {
         if (c->recv_armed() || c->closing()) return;
         TlsConn* tls = tls_engine(c);
@@ -1060,7 +470,7 @@ private:
         // Any engine output is submitted before another socket read. This is the memory-BIO
         // flush-before-read rule that prevents WANT_READ from hiding a required write.
         if (tls->output_pending()) {
-            (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+            (void)wb_.pump_tls<kEp>(*c, *tls);
             if (tls->output_pending()) return;
         }
         // Ciphertext or decrypted plaintext already inside the engine must be drained before a
@@ -1075,7 +485,7 @@ private:
             const ssize_t n = ::recv(c->fd(), dst, static_cast<size_t>(avail), MSG_DONTWAIT);
             if (n > 0) {
                 self_->sig().epoll_recvs++;
-                on_tls_recv<kEp, Fused, Pipeline>(c, static_cast<int>(n));
+                on_tls_recv<kEp>(c, static_cast<int>(n));
                 return;
             }
             tls->abandon_input();
@@ -1138,7 +548,7 @@ private:
     // it from here, mid-event-array, would mean a Client is freed while a later epoll_event in the
     // same batch still names it. Second, keeping every state transition in one place is what makes
     // "epoll changes only how the thread waits" true rather than aspirational.
-    template <bool HasUnix, bool HasTls, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool HasUnix, bool HasTls>
     uint32_t epoll_pass(int timeout_ms) {
         const int n = ep_.wait(timeout_ms);
         if (n <= 0) return 0;
@@ -1147,15 +557,12 @@ private:
         for (int i = 0; i < n; i++) {
             const epoll_event& ev = ep_.event(i);
             switch (ur_kind(ev.data.u64)) {
-                case UrKind::Accept:
-                    work += epoll_accept<true, Fused, Pipeline>(UrKind::Accept); break;
+                case UrKind::Accept: work += epoll_accept<true>(UrKind::Accept); break;
                 case UrKind::TlsAccept:
-                    if constexpr (HasTls)
-                        work += epoll_accept<true, Fused, Pipeline>(UrKind::TlsAccept);
+                    if constexpr (HasTls) work += epoll_accept<true>(UrKind::TlsAccept);
                     break;
                 case UrKind::UnixAccept:
-                    if constexpr (HasUnix)
-                        work += epoll_accept<true, Fused, Pipeline>(UrKind::UnixAccept);
+                    if constexpr (HasUnix) work += epoll_accept<true>(UrKind::UnixAccept);
                     break;
                 case UrKind::Wake:
                     // The doorbell. Draining it here rather than at the park keeps the level-
@@ -1174,18 +581,9 @@ private:
                     self_->sig().wakes_recv++;
                     work++;
                     break;
-                case UrKind::Shutdown:
-                    // Sticky and shared: never drain it, or this loop could steal the terminal
-                    // edge from another ring/epoll set. The signal handler published stop first.
-                    work++;
-                    break;
                 case UrKind::Recv: {
                     Client* c = ur_ptr<Client>(ev.data.u64);
-                    // During FLIP preflight the fd may already be registered here while source
-                    // ownership is still live. Do not touch even a flag until the owner edge.
-                    if (!c || c->ifid_thread() != self_->id() || c->dead() ||
-                        c->wb_slot() == Client::kWbMigrationInstalling ||
-                        find_client_migration(c)) break;
+                    if (!c || c->dead()) break;
                     // EPOLLERR/EPOLLHUP are folded into the read side on purpose: the recv that
                     // follows returns 0 or the real errno, and close_client is then reached through
                     // the one path that already knows how to tear a connection down.
@@ -1206,7 +604,7 @@ private:
                             c->set_recv_armed(false);
                         }
                     }
-                    mark_active_known<Fused && Pipeline != 0>(c);
+                    mark_active(c);
                     work++;
                     break;
                 }
@@ -1217,7 +615,7 @@ private:
     }
 
     // ---- completions ----------------------------------------------------------------------------
-    template <bool kEp, bool ImmediateProgress = true, bool ClassifySend = false>
+    template <bool kEp>
     void on_plain_send_cqe(io_uring_cqe* cqe) {
         Client* c = ur_ptr<Client>(cqe->user_data);
         if (c->dead()) {
@@ -1225,15 +623,10 @@ private:
             wb_.on_dead_send_complete(*c, cqe->res);
             return;
         }
-        if (!wb_.on_send_complete<ImmediateProgress, ClassifySend>(*c, cqe->res))
-            close_client(c);
-        else if constexpr (!ImmediateProgress) {
-            if (!c->nothing_to_write()) enqueue_serve(c);
-            enqueue_ifid(c);
-        }
+        if (!wb_.on_send_complete(*c, cqe->res)) close_client(c);
     }
 
-    template <bool kEp, bool ImmediateProgress = true, bool ClassifySend = false>
+    template <bool kEp>
     void on_tls_send_cqe(io_uring_cqe* cqe) {
         Client* c = ur_ptr<Client>(cqe->user_data);
         TlsConn* tls = tls_engine(c);
@@ -1242,39 +635,21 @@ private:
             wb_.on_dead_tls_send_complete(*c, *tls, cqe->res);
             return;
         }
-        if (!wb_.on_tls_send_complete<ImmediateProgress, ClassifySend>(
-                *c, *tls, cqe->res)) close_client(c);
-        else {
-            if constexpr (!ImmediateProgress)
-                if (!c->nothing_to_write() || tls->output_pending()) enqueue_serve(c);
-            mark_active_known<!ImmediateProgress>(c);
-        }
+        if (!wb_.on_tls_send_complete(*c, *tls, cqe->res)) close_client(c);
+        else mark_active(c);
     }
 
-    template <bool HasTls, bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool HasTls, bool kEp>
     void on_cqe(io_uring_cqe* cqe) {
-        constexpr bool ImmediateSendProgress = !(Fused && Pipeline != 0);
         if constexpr (!HasTls) {
             // Keep the tls-port=0 completion dispatch byte-for-byte shaped like the base switch.
             switch (ur_kind(cqe->user_data)) {
-                case UrKind::Accept:
-                    on_accept<kEp, Fused, Pipeline>(cqe, UrKind::Accept); break;
-                case UrKind::UnixAccept:
-                    on_accept<kEp, Fused, Pipeline>(cqe, UrKind::UnixAccept); break;
-                case UrKind::Recv:
-                    on_recv<false, kEp, Fused, Pipeline>(
-                        ur_ptr<Client>(cqe->user_data), cqe->res);
-                    break;
-                case UrKind::Send:
-                    on_plain_send_cqe<kEp, ImmediateSendProgress,
-                                      Fused && Pipeline == 1>(cqe); break;
+                case UrKind::Accept: on_accept<kEp>(cqe, UrKind::Accept); break;
+                case UrKind::UnixAccept: on_accept<kEp>(cqe, UrKind::UnixAccept); break;
+                case UrKind::Recv: on_recv<false, kEp>(ur_ptr<Client>(cqe->user_data), cqe->res); break;
+                case UrKind::Send: on_plain_send_cqe<kEp>(cqe); break;
                 case UrKind::Wake: self_->sig().wakes_recv++; break;
-                case UrKind::Shutdown: break;
-                case UrKind::SnapshotStart:
-                    if constexpr (Fused)
-                        fused_executor_->fused_snapshot_start(
-                            ur_ptr<SnapshotManager>(cqe->user_data));
-                    break;
+                case UrKind::SnapshotStart: break;
                 case UrKind::AofIo:
                     srv_->aof().on_io_complete(*self_, ring_, ur_ptr<void>(cqe->user_data),
                                                cqe->res); break;
@@ -1282,46 +657,27 @@ private:
                     srv_->snapshot().on_io_complete(*self_, ring_, ur_ptr<void>(cqe->user_data),
                                                     cqe->res); break;
                 case UrKind::Close: break;
-                case UrKind::MigrateCancel: break;
                 case UrKind::TlsReadPoll: break;
                 case UrKind::TlsWritePoll: break;
                 default: break;
             }
         } else {
             switch (ur_kind(cqe->user_data)) {
-                case UrKind::Accept:
-                    on_accept<kEp, Fused, Pipeline>(cqe, UrKind::Accept); break;
-                case UrKind::TlsAccept:
-                    on_accept<kEp, Fused, Pipeline>(cqe, UrKind::TlsAccept); break;
-                case UrKind::UnixAccept:
-                    on_accept<kEp, Fused, Pipeline>(cqe, UrKind::UnixAccept); break;
-                case UrKind::Recv:
-                    on_recv<true, kEp, Fused, Pipeline>(
-                        ur_ptr<Client>(cqe->user_data), cqe->res);
-                    break;
-                case UrKind::TlsRecv:
-                    on_tls_recv<kEp, Fused, Pipeline>(
-                        ur_ptr<Client>(cqe->user_data), cqe->res);
-                    break;
-                case UrKind::Send:
-                    on_plain_send_cqe<kEp, ImmediateSendProgress,
-                                      Fused && Pipeline == 1>(cqe); break;
-                case UrKind::TlsSend:
-                    on_tls_send_cqe<kEp, ImmediateSendProgress,
-                                    Fused && Pipeline == 1>(cqe); break;
+                case UrKind::Accept: on_accept<kEp>(cqe, UrKind::Accept); break;
+                case UrKind::TlsAccept: on_accept<kEp>(cqe, UrKind::TlsAccept); break;
+                case UrKind::UnixAccept: on_accept<kEp>(cqe, UrKind::UnixAccept); break;
+                case UrKind::Recv: on_recv<true, kEp>(ur_ptr<Client>(cqe->user_data), cqe->res); break;
+                case UrKind::TlsRecv: on_tls_recv<kEp>(ur_ptr<Client>(cqe->user_data), cqe->res); break;
+                case UrKind::Send: on_plain_send_cqe<kEp>(cqe); break;
+                case UrKind::TlsSend: on_tls_send_cqe<kEp>(cqe); break;
                 case UrKind::TlsReadPoll:
-                    on_tls_socket_poll<kEp, Fused, Pipeline>(
-                        ur_ptr<Client>(cqe->user_data), cqe->res, TlsOp::WantRead); break;
+                    on_tls_socket_poll<kEp>(ur_ptr<Client>(cqe->user_data), cqe->res,
+                                       TlsOp::WantRead); break;
                 case UrKind::TlsWritePoll:
-                    on_tls_socket_poll<kEp, Fused, Pipeline>(
-                        ur_ptr<Client>(cqe->user_data), cqe->res, TlsOp::WantWrite); break;
+                    on_tls_socket_poll<kEp>(ur_ptr<Client>(cqe->user_data), cqe->res,
+                                       TlsOp::WantWrite); break;
                 case UrKind::Wake: self_->sig().wakes_recv++; break;
-                case UrKind::Shutdown: break;
-                case UrKind::SnapshotStart:
-                    if constexpr (Fused)
-                        fused_executor_->fused_snapshot_start(
-                            ur_ptr<SnapshotManager>(cqe->user_data));
-                    break;
+                case UrKind::SnapshotStart: break;
                 case UrKind::AofIo:
                     srv_->aof().on_io_complete(*self_, ring_, ur_ptr<void>(cqe->user_data),
                                                cqe->res); break;
@@ -1329,99 +685,35 @@ private:
                     srv_->snapshot().on_io_complete(*self_, ring_, ur_ptr<void>(cqe->user_data),
                                                     cqe->res); break;
                 case UrKind::Close: break;
-                case UrKind::MigrateCancel: break;
             }
         }
     }
 
     void rearm_accept(io_uring_cqe* cqe, UrKind kind) {
         if (!(cqe->flags & IORING_CQE_F_MORE)) {
-            accept_armed_ref(kind) = false;
             self_->sig().accept_rearm++;
             arm_accept(kind);
         }
     }
 
-    bool& accept_armed_ref(UrKind kind) {
-        if (kind == UrKind::UnixAccept) return unix_accept_armed_;
-        if (kind == UrKind::TlsAccept) return tls_accept_armed_;
-        return accept_armed_;
-    }
-
-    bool accepts_quiesced() const {
-        return epoll_ || (!accept_armed_ && !tls_accept_armed_ && !unix_accept_armed_);
-    }
-
-    void quiesce_accepts_for_conversion() {
-        // UNIX owns a unique pathname and its boot owner is never selected for conversion.
-        if (unix_listen_fd_ >= 0) std::abort();
-        if (!accept_quiescing_) {
-            accept_quiescing_ = true;
-            accept_cancel_generation_ = accept_generation_;
-            accept_generation_++; // every completion from the old tenure is now recognisably stale
-            accept_pending_ = tls_accept_pending_ = false;
-        }
-        if (epoll_) return; // registration stays armed and is immediately reusable on rollback
-        auto cancel = [&](UrKind kind, bool armed, bool& submitted) {
-            if (!armed || submitted) return;
-            io_uring_sqe* sqe = ring_.sqe();
-            if (!sqe) { self_->sig().sqe_starved++; return; }
-            io_uring_prep_cancel64(
-                sqe, ur_tag(kind, reinterpret_cast<void*>(
-                                      static_cast<uintptr_t>(accept_cancel_generation_))), 0);
-            sqe->user_data = ur_tag(UrKind::MigrateCancel, nullptr);
-            ring_.note_pending();
-            submitted = true;
-        };
-        cancel(UrKind::Accept, accept_armed_, accept_cancel_submitted_);
-        cancel(UrKind::TlsAccept, tls_accept_armed_, tls_accept_cancel_submitted_);
-    }
-
-    bool restore_accepts_after_rollback() {
-        if (accept_quiescing_) {
-            if (!accepts_quiesced()) return false;
-            accept_quiescing_ = false;
-            accept_cancel_submitted_ = tls_accept_cancel_submitted_ = false;
-        }
-        if (epoll_) return true; // tenure registrations were deliberately left installed
-        if (listen_fd_ >= 0 && !accept_armed_) arm_accept(UrKind::Accept);
-        if (tls_listen_fd_ >= 0 && !tls_accept_armed_) arm_accept(UrKind::TlsAccept);
-        // Do not publish the old shape as restored while SQ starvation still leaves one of its
-        // listeners unarmed. arm_accept records a pending retry, so the next pass makes progress.
-        return (listen_fd_ < 0 || accept_armed_) &&
-               (tls_listen_fd_ < 0 || tls_accept_armed_);
-    }
-
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     void on_accept(io_uring_cqe* cqe, UrKind kind) {
-        const uint64_t generation = reinterpret_cast<uintptr_t>(ur_ptr<void>(cqe->user_data));
-        if (generation != accept_generation_ || self_->role() != Role::Ifid) {
-            if (cqe->res >= 0) ::close(cqe->res);
-            if (!(cqe->flags & IORING_CQE_F_MORE)) accept_armed_ref(kind) = false;
-            return;
-        }
         if (cqe->res < 0) {
             // Do not swallow this silently: a failing accept with no trace is indistinguishable from
             // a hung server, which is exactly how the 1024-connection failure presented.
             self_->sig().accept_err++;
-            rearm_accept(cqe, kind);
+            arm_accept(kind);
             return;
         }
-        if (srv_->flip_dispatch_paused()) {
-            ::close(cqe->res);
-            rearm_accept(cqe, kind);
-            return;
-        }
-        admit_fd<kEp, Fused, Pipeline>(cqe->res, kind);
+        admit_fd<kEp>(cqe->res, kind);
         rearm_accept(cqe, kind);
     }
 
     // Epoll's accept: the listener only told us there is a backlog, so drain it. Level-triggered
     // registration means an unfinished drain is re-reported rather than lost, but draining to
     // EAGAIN here keeps one epoll_wait per burst instead of one per connection.
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     uint32_t epoll_accept(UrKind kind) {
-        if (srv_->flip_dispatch_paused()) return 0;
         const int listener = kind == UrKind::UnixAccept ? unix_listen_fd_ :
                              kind == UrKind::TlsAccept ? tls_listen_fd_ : listen_fd_;
         if (listener < 0) return 0;
@@ -1434,16 +726,15 @@ private:
                 return taken;
             }
             taken++;
-            admit_fd<kEp, Fused, Pipeline>(fd, kind);
+            admit_fd<kEp>(fd, kind);
         }
     }
 
     // Everything an accepted fd goes through before it becomes a served connection. Shared by both
     // engines verbatim: maxclients, protected mode, Client allocation, TLS attachment, unix
     // round-robin handoff. Only the way the fd ARRIVED differs, which is the whole engine boundary.
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     void admit_fd(int fd, UrKind kind) {
-        if (srv_->flip_dispatch_paused()) { ::close(fd); return; }
         const bool unix_socket = kind == UrKind::UnixAccept;
         const bool tls_socket = kind == UrKind::TlsAccept;
         self_->sig().accepts++;
@@ -1479,12 +770,6 @@ private:
             self_->sig().accept_err++;
             return;
         }
-        // NOTHING READ-LOCAL IS ALLOCATED HERE ANY MORE. The RYOW write-ring
-        // sidecar used to be built at accept for every connection on an armed boot, so a pure-read
-        // or idle connection carried 1216 bytes (a 1280-byte jemalloc class) it could never use.
-        // It is now built on the first write of a connection a local read has ARMED, from that
-        // connection's own IO thread; an allocation failure there falls back to the unarmed
-        // contract instead of rejecting a connection that is already established.
         if (tls_socket && !attach_tls(c)) {
             delete c;
             ::close(fd);
@@ -1499,12 +784,12 @@ private:
             const auto& ios = srv_->placement().ifid_threads();
             const uint32_t target = ios[unix_rr_++ % ios.size()];
             c->set_ifid_thread(target);
-            if (target == self_->id()) adopt_client<kEp, Fused, Pipeline>(c, true);
+            if (target == self_->id()) adopt_client<kEp>(c, true);
             else if (!srv_->thread(target).post_client(self_->id(), c, ring_, self_->sig()))
                 pending_handoffs_.push_back(c);
         } else {
             c->set_ifid_thread(self_->id());
-            adopt_client<kEp, Fused, Pipeline>(c, false, tls_socket);
+            adopt_client<kEp>(c, false, tls_socket);
         }
     }
 
@@ -1545,7 +830,7 @@ private:
             auto conn = std::make_unique<TlsConn>();
             std::string error;
             if (!conn->init(*tls_context_, srv_->cfg().tls_auth_clients, c->fd(),
-                            true, error)) {
+                            srv_->cfg().tls_ktls, error)) {
                 std::fprintf(stderr, "TLS connection init failed: %s\n", error.c_str());
                 return false;
             }
@@ -1580,714 +865,20 @@ private:
         self_->sig().tls_connections_freed++;
     }
 
-    ClientMigration* find_client_migration(const Client* client) {
-        for (ClientMigration& migration : client_migrations_)
-            if (migration.client == client) return &migration;
-        return nullptr;
-    }
-    const ClientMigration* find_client_migration(const Client* client) const {
-        for (const ClientMigration& migration : client_migrations_)
-            if (migration.client == client) return &migration;
-        return nullptr;
-    }
-
-    void erase_client_migration(const Client* client) {
-        for (size_t i = 0; i < client_migrations_.size(); i++) {
-            if (client_migrations_[i].client != client) continue;
-            client_migrations_[i] = client_migrations_.back();
-            client_migrations_.pop_back();
-            return;
-        }
-        std::abort();
-    }
-
     template <bool kEp>
-    void cancel_client_transfer(Client* client) {
-        ClientMigration* migration = find_client_migration(client);
-        if (!migration) std::abort();
-        if constexpr (kEp) {
-            if (migration->destination_registered) {
-                srv_->thread(migration->destination).cancel_client_registration(client);
-                migration->destination_registered = false;
-            }
-            if (migration->source_backup_fd < 0) std::abort();
-            const int original = client->replace_fd(migration->source_backup_fd);
-            migration->source_backup_fd = -1;
-            ::close(original); // destination registration was removed above
-        }
-        if (migration->catalog) {
-            if (!command_client_migration_install(migration->catalog)) std::abort();
-            migration->catalog = nullptr;
-        }
-        if (migration->routing) {
-            client_routing_discard(migration->routing);
-            migration->routing = nullptr;
-        }
-        const uint64_t client_id = client->id();
-        erase_client_migration(client);
-        srv_->lb_client_move_cancelled(client_id);
-        client_transfer_failures_++;
-        mark_active(client);
-        arm_recv<kEp>(client);
-    }
-
-    template <bool kEp>
-    bool request_client_transfer_impl(Client* client, uint32_t destination,
-                                      bool hold_for_commit, std::string& error) {
-        if (!client_transfer_ready(client, destination, error)) return false;
-        if (srv_->thread(destination).role() != Role::Ifid &&
-            !(srv_->flip_stage() != FlipStage::Idle &&
-              srv_->flip_final_role(destination) == Role::Ifid)) {
-            error = "destination thread is not a current or prepared IO owner";
-            return false;
-        }
-        if (find_client_migration(client)) {
-            error = "connection transfer is already active";
-            return false;
-        }
-        if (!srv_->thread(destination).client_transfer_free_slots(self_->id())) {
-            error = "destination connection-transfer inbox is full";
-            return false;
-        }
-        try {
-            client_migrations_.push_back(
-                ClientMigration{client, destination, false, hold_for_commit,
-                                false, false, -1, nullptr, nullptr});
-        } catch (const std::bad_alloc&) {
-            error = "could not allocate connection-transfer state";
-            return false;
-        }
-        try {
-            // Node storage is prepared separately below; this reserves enough buckets for every
-            // migration already admitted on this source, so commit insertion cannot rehash.
-            routing_forward_.reserve(routing_forward_.size() + client_migrations_.size());
-        } catch (const std::bad_alloc&) {
-            client_migrations_.pop_back();
-            error = "could not allocate connection-routing forwarding state";
-            return false;
-        }
-
-        if (client->in_active()) {
-            client->set_in_active(false);
-            active_.erase(client);
-        }
-        discard_ifid(client);
-        if constexpr (kEp) {
-            // Reserve BOTH possible outcomes before removing the original source interest. The
-            // duplicate is already registered on source: rollback adopts that fd without ADD.
-            ClientMigration* migration = find_client_migration(client);
-            const int backup = ::fcntl(client->fd(), F_DUPFD_CLOEXEC, 0);
-            if (backup < 0 ||
-                !ep_.add(backup, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
-                         ur_tag(UrKind::Recv, client))) {
-                if (backup >= 0) ::close(backup);
-                erase_client_migration(client);
-                mark_active(client);
-                error = "could not reserve source epoll rollback registration";
-                return false;
-            }
-            migration->source_backup_fd = backup;
-            if (!srv_->thread(destination).prepare_client_registration(client)) {
-                if (!ep_.del(backup)) std::abort();
-                ::close(backup);
-                erase_client_migration(client);
-                mark_active(client);
-                error = "could not reserve destination epoll registration";
-                return false;
-            }
-            migration->destination_registered = true;
-            if (!ep_.del(client->fd())) {
-                srv_->thread(destination).cancel_client_registration(client);
-                if (!ep_.del(backup)) std::abort();
-                ::close(backup);
-                erase_client_migration(client);
-                mark_active(client);
-                error = "could not detach original source epoll registration";
-                return false;
-            }
-            client->set_recv_armed(false); // epoll held no buffer pointer; the old edge is discarded
-            return finish_client_transfer<kEp>(client);
-        }
-        return service_client_migrations<kEp>() != 0 || find_client_migration(client) != nullptr;
-    }
-
-    template <bool kEp>
-    bool finish_client_transfer(Client* client) {
-        ClientMigration* migration = find_client_migration(client);
-        if (!migration || client->recv_armed()) return false;
-        if (migration->prepared) return true;
-        const uint32_t destination = migration->destination;
-        ThreadCtx& target = srv_->thread(destination);
-        if (!target.client_transfer_free_slots(self_->id())) return false;
-
-        std::string error;
-        if (!client_transfer_ready(client, destination, error)) {
-            cancel_client_transfer<kEp>(client);
-            return false;
-        }
-        if (!client_routing_prepare(*migration, error)) {
-            cancel_client_transfer<kEp>(client);
-            return false;
-        }
-        migration->catalog = command_client_migration_extract(client);
-        if (!migration->catalog) {
-            cancel_client_transfer<kEp>(client);
-            return false;
-        }
-        if (migration->hold_for_commit) {
-            migration->prepared = true;
-            return true;
-        }
-
-        return commit_client_transfer<kEp>(client);
-    }
-
-    template <bool kEp>
-    bool commit_client_transfer(Client* client) {
-        ClientMigration* migration = find_client_migration(client);
-        if (!migration || !migration->catalog || client->recv_armed()) return false;
-        const uint32_t destination = migration->destination;
-        const bool flip_transfer = migration->hold_for_commit;
-        ThreadCtx& target = srv_->thread(destination);
-        if (!target.client_transfer_free_slots(self_->id())) std::abort();
-        if constexpr (kEp) {
-            if (!migration->destination_registered || migration->source_backup_fd < 0)
-                std::abort();
-            ::close(migration->source_backup_fd); // removes the reserved source registration
-            migration->source_backup_fd = -1;
-        }
-        void* const catalog = migration->catalog;
-        void* const routing = migration->routing;
-        std::vector<PubSubEvent*> rebind_events;
-        client_routing_commit_extract(*migration, rebind_events);
-
-        // Everything below was reserved or validated above. The owner store is deliberately last
-        // among source touches. A failed transport push after the capacity check is an invariant
-        // failure: attempting rollback would make ownership ambiguous.
-        const uint64_t client_id = client->id();
-        self_->release_wb_slot(client->wb_slot());
-        // Destination epoll readiness may arrive as soon as the owner store publishes. This
-        // sentinel keeps those events inert until the pre-reserved client/catalog/WB install.
-        client->set_wb_slot(Client::kWbMigrationInstalling);
-        if (!self_->remove_client(client)) std::abort();
-
-        const ClientTransfer transfer{client, catalog, routing, self_->id()};
-        // Last source-side touch before the owner store, so the moved connection's cold arm
-        // counters land on the thread that will actually be doing the arming from here on.
-        client->rob().set_read_local_arm_stats(target.read_local_arm_stats_or_null());
-        client_work_fences_.erase(client);
-        client->set_ifid_thread(destination); // THE single connection ownership edge
-        command_client_directory_move(client_id, destination);
-        if (!target.post_client_transfer(self_->id(), transfer, ring_, self_->sig())) std::abort();
-        // These ModifyRequests were allocated while source still owned the connection. Posting
-        // after the owner edge lets every channel home resolve the live destination. The receiver
-        // drains its transfer inbox before pub/sub events, so a newly routed delivery cannot beat
-        // installation of the moved local catalog.
-        for (PubSubEvent* event : rebind_events) {
-            srv_->pubsub_event_created();
-            pubsub_post(event->target_io, event);
-        }
-        if (flip_transfer) srv_->flip_note_client_transferred(client_id, destination);
-        erase_client_migration(client);       // pointer comparison only; source never dereferences
-        srv_->lb_client_move_committed(client_id, self_->id(), destination);
-        return true;
-    }
-
-    template <bool kEp>
-    void commit_prepared_client_transfers_impl() {
-        while (!client_migrations_.empty()) {
-            ClientMigration& migration = client_migrations_.back();
-            if (!migration.prepared || !commit_client_transfer<kEp>(migration.client)) std::abort();
-        }
-    }
-
-    template <bool kEp>
-    void cancel_prepared_client_transfers_impl() {
-        while (!client_migrations_.empty())
-            cancel_client_transfer<kEp>(client_migrations_.back().client);
-    }
-
-    template <bool kEp>
-    uint32_t service_client_migrations() {
-        uint32_t work = 0;
-        // finish_client_transfer erases by swap, so an index advances only when its entry remains.
-        for (size_t i = 0; i < client_migrations_.size();) {
-            ClientMigration& migration = client_migrations_[i];
-            Client* client = migration.client;
-            if (!client->recv_armed()) {
-                const size_t before = client_migrations_.size();
-                (void)finish_client_transfer<kEp>(client);
-                if (client_migrations_.size() != before) { work++; continue; }
-                i++;
-                continue;
-            }
-            if constexpr (!kEp) {
-                if (!migration.cancel_submitted) {
-                    io_uring_sqe* sqe = ring_.sqe();
-                    if (!sqe) { self_->sig().sqe_starved++; i++; continue; }
-                    io_uring_prep_cancel64(sqe, ur_tag(UrKind::Recv, client), 0);
-                    sqe->user_data = ur_tag(UrKind::MigrateCancel, client);
-                    ring_.note_pending();
-                    migration.cancel_submitted = true;
-                    work++;
-                }
-            }
-            i++;
-        }
-        return work;
-    }
-
-    template <bool kEp>
-    uint32_t drain_client_transfers(bool unmasked = false) {
-        auto take = [&](const ClientTransfer& transfer) {
-            Client* client = transfer.client;
-            if (!client || client->ifid_thread() != self_->id()) std::abort();
-            if (!command_client_migration_install(transfer.catalog)) std::abort();
-            if (!client_routing_install(transfer.routing, client, transfer.source)) std::abort();
-            try {
-                self_->add_client(client);
-            } catch (...) {
-                std::abort();
-            }
-            client->set_wb_slot(self_->assign_wb_slot(client));
-            // Epoll's actual registration was installed during reversible preflight. io_uring
-            // needs no registration; arm_recv below retries harmless SQ starvation.
-            mark_active(client);
-            arm_recv<kEp>(client);
-        };
-        return unmasked ? self_->drain_client_transfers_unmasked(take)
-                        : self_->drain_client_transfers(take);
-    }
-
-    bool flip_io_drained() const {
-        if (!pending_serve_.empty() || !pending_ifid_.empty() || !pending_releases_.empty() ||
-            !pending_handoffs_.empty() || !deferred_timers_.empty() ||
-            !client_migrations_.empty() || !epoll_closes_.empty() ||
-            !dead_next_.empty() || !dead_ready_.empty() ||
-            !multi_deferred_.empty() || !pending_multi_cleanups_.empty() ||
-            !pubsub_notification_chains_.empty() || !io_pipelines_quiesced() ||
-            !self_->io_inbound_quiesced() ||
-            srv_->pubsub_inflight() != 0 || srv_->pubsub_pending() != 0)
-            return false;
-        for (Client* client : self_->clients()) {
-            const bool coordinator_op = self_->id() == srv_->flip_coordinator() &&
-                client == flip_client_ && flip_epoch_local_ == srv_->flip_epoch();
-            if (coordinator_op) {
-                if (client->rob().in_flight() != 1 || client->send_inflight() ||
-                    client->serve_pending() || !client->nothing_to_write() ||
-                    !wb_.migration_ready(*client)) return false;
-            } else if (!client->flip_drain_idle() || !wb_.migration_ready(*client)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool flip_candidate_clients_ready(std::string& error) const {
-        const uint32_t planned = srv_->flip_source_clients(self_->id());
-        for (uint32_t ordinal = 0; ordinal < planned; ordinal++) {
-            Client* client = srv_->flip_client_at(self_->id(), ordinal);
-            if (!client || client == flip_client_ || client->ifid_thread() != self_->id()) {
-                error = "the weighted FLIP connection set changed after planning";
-                return false;
-            }
-            std::string refused;
-            if (!client_transfer_ready(
-                    client, srv_->flip_client_destination(self_->id(), ordinal), refused)) {
-                error = refused.empty() ? "a weighted FLIP connection is not transferable" : refused;
-                return false;
-            }
-        }
-        return true;
-    }
-
-    void flip_wake_all() {
-        for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
-            if (tid == self_->id()) continue;
-            Ring* target = srv_->thread(tid).ring();
-            if (!target) continue;
-            if (ring_.msg_to(*target, ur_tag(UrKind::Wake, nullptr))) self_->sig().wakes_sent++;
-            else self_->sig().sqe_starved++;
-        }
-    }
-
-    void lb_schedule_wake_all() { lb_wake_cursor_ = 0; }
-
-    uint32_t lb_wake_all_pass() {
-        if (lb_wake_cursor_ == UINT32_MAX) return 0;
-        while (lb_wake_cursor_ < srv_->nthreads()) {
-            const uint32_t tid = lb_wake_cursor_++;
-            if (tid == self_->id()) continue;
-            Ring* target = srv_->thread(tid).ring();
-            if (!target) continue;
-            if (ring_.msg_to(*target, ur_tag(UrKind::Wake, nullptr))) {
-                self_->sig().wakes_sent++;
-                continue;
-            }
-            self_->sig().sqe_starved++;
-            lb_wake_cursor_--; // retry this exact target after the pending SQEs are submitted
-            return 1;
-        }
-        lb_wake_cursor_ = UINT32_MAX;
-        return 1;
-    }
-
-    void flip_publish_stage(FlipStage stage) {
-        srv_->flip_set_stage(stage);
-        flip_wake_all();
-    }
-
-    void finish_flip_command(const char* error = nullptr) {
-        // An automatic FLIP is issued by the main monitor and deliberately owns no client ROB
-        // slot. Manual FLIP retains the exact asynchronous completion path below.
-        if (!flip_client_) return;
-        if (flip_epoch_local_ != srv_->flip_epoch()) std::abort();
-        Op& op = flip_client_->rob().at(flip_op_id_);
-        if (error) reply_err(op.sink(), error);
-        else       reply_ok(op.sink());
-        op.state.store(OpState::Done, std::memory_order_release);
-        enqueue_serve(flip_client_);
-        mark_active(flip_client_);
-        flip_client_ = nullptr;
-        flip_op_id_ = 0;
-    }
-
-    void flip_enter_rollback(const std::string& error) {
-        srv_->flip_note_failure(error);
-        if (srv_->flip_stage() != FlipStage::Rollback)
-            flip_publish_stage(FlipStage::Rollback);
-    }
-
-    uint32_t lb_control_pass() {
-        if (!lb_controller_armed_) return 0;
-        const LbStage stage = srv_->lb_stage();
-        if (stage != LbStage::ClientDrain) lb_client_wake_pending_ = false;
-        if (stage == LbStage::Idle || stage == LbStage::ClientMoving) return 0;
-        if (stage == LbStage::IoDrain) {
-            // This control tail is outside dispatch: all owner samples taken by this IO
-            // have either been posted (including quiet batches) or abandoned for reparse.
-            if (!srv_->lb_acked(self_->id())) {
-                srv_->lb_ack(self_->id());
-                lb_schedule_wake_all();
-            }
-            if (self_->id() == srv_->lb_coordinator()) {
-                if (srv_->lb_begin_ex_drain()) {
-                    lb_schedule_wake_all();
-                    return 1;
-                }
-                if (srv_->lb_timed_out()) {
-                    srv_->lb_stage_timed_out();
-                    lb_schedule_wake_all();
-                    return 1;
-                }
-            }
-            return 0;
-        }
-        if (stage == LbStage::ExDrain) {
-            if (self_->id() == srv_->lb_coordinator()) {
-                if (srv_->lb_all_ex_acked()) {
-                    (void)srv_->lb_commit_shard_plan(cached_now_ms_);
-                    lb_schedule_wake_all();
-                    return 1;
-                } else if (srv_->lb_timed_out()) {
-                    srv_->lb_stage_timed_out();
-                    lb_schedule_wake_all();
-                    return 1;
-                }
-            }
-            return 0;
-        }
-
-        const LbClientMove move = srv_->lb_client_move();
-        auto wake_source = [&]() {
-            Ring* source = srv_->thread(move.source).ring();
-            if (source && ring_.msg_to(*source, ur_tag(UrKind::Wake, nullptr))) {
-                self_->sig().wakes_sent++;
-                lb_client_wake_pending_ = false;
-            } else {
-                self_->sig().sqe_starved++;
-            }
-            return 1u;
-        };
-        if (lb_client_wake_pending_) return wake_source();
-        uint32_t work = 0;
-        if (move.destination == self_->id() && !srv_->lb_acked(self_->id())) {
-            if (!prepare_client_transfer_capacity(1)) {
-                srv_->lb_refuse_client_request();
-                lb_schedule_wake_all();
-                return 1;
-            }
-            srv_->lb_ack(self_->id());
-            lb_client_wake_pending_ = true;
-            work += wake_source();
-        }
-        if (move.source == self_->id() && srv_->lb_stage() == LbStage::ClientDrain &&
-            srv_->lb_acked(move.destination)) {
-            Client* selected = nullptr;
-            for (Client* client : self_->clients())
-                if (client->id() == move.id) { selected = client; break; }
-            if (!selected || selected->ifid_thread() != self_->id()) {
-                srv_->lb_refuse_client_request();
-                lb_schedule_wake_all();
-                return 1;
-            }
-            std::string error;
-            if (client_transfer_ready(selected, move.destination, error)) {
-                if (!srv_->lb_client_move_started(move.id, cached_now_ms_)) return 1;
-                const bool started = request_client_transfer(selected, move.destination, error);
-                if (!started) srv_->lb_client_move_cancelled(move.id);
-                lb_schedule_wake_all();
-                return 1;
-            }
-            if (selected->is_tls() || selected->multi_session() != nullptr ||
-                selected->blocked()) {
-                srv_->lb_refuse_client_request();
-                lb_schedule_wake_all();
-                return 1;
-            }
-        }
-        if (self_->id() == srv_->lb_coordinator() && srv_->lb_timed_out()) {
-            srv_->lb_stage_timed_out();
-            lb_schedule_wake_all();
-            return 1;
-        }
-        return work;
-    }
-
-    void flip_commit_roles_and_evacuate_shards() {
-        // The exact final owner of every physical shard was chosen and reserved before CLIENT
-        // COMMIT. A future EX may receive into its dormant shard vector while dispatch is paused;
-        // this avoids a staging owner and makes every changed shard cross exactly one owner edge.
-        for (uint32_t sid = 0; sid < srv_->nshards(); sid++) {
-            const uint32_t source = srv_->worker_of_shard(static_cast<int32_t>(sid));
-            const uint32_t destination = srv_->flip_shard_destination(sid);
-            if (source == destination) continue;
-            if (!srv_->transfer_shard_quiesced(static_cast<int32_t>(sid), source, destination))
-                std::abort();
-            srv_->flip_note_bucket_transferred();
-        }
-
-        for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
-            const Role target = srv_->flip_candidate_target(tid);
-            if (target == Role::Idle) continue;
-            if (srv_->thread(tid).role() == target) continue; // peer changed with its SMT unit
-            srv_->flip_change_role(tid, target); // direct old->new store; no Idle ownership hole
-            if (Ring* peer = srv_->thread(tid).ring())
-                (void)ring_.msg_to(*peer, ur_tag(UrKind::Wake, nullptr));
-        }
-        flip_publish_stage(FlipStage::RoleReady);
-    }
-
-    template <bool kEp>
-    uint32_t flip_control_pass() {
-        const FlipStage stage = srv_->flip_stage();
-        if (stage == FlipStage::Idle) return 0;
-
-        if (stage == FlipStage::IoDrain && !srv_->flip_acked(self_->id(), stage) &&
-            flip_io_drained()) {
-            srv_->flip_ack(self_->id(), stage);
-        } else if (stage == FlipStage::IoPrepare &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            if (!prepare_client_transfer_capacity(srv_->flip_incoming_clients(self_->id())))
-                srv_->flip_note_failure("ERR FLIP could not reserve destination connection state");
-            srv_->flip_ack(self_->id(), stage);
-        } else if (stage == FlipStage::ClientPrepare &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            const bool converting_to_ex =
-                srv_->flip_candidate_target(self_->id()) == Role::Ex;
-            if (converting_to_ex) quiesce_accepts_for_conversion();
-            const uint32_t planned = srv_->flip_source_clients(self_->id());
-            if (planned &&
-                flip_prepare_epoch_ != srv_->flip_epoch()) {
-                std::string ready_error;
-                if (!flip_candidate_clients_ready(ready_error)) {
-                    // A saturated pipelined connection is momentarily busy at ANY instant, so a
-                    // one-shot readiness snapshot let a single in-flight reply veto the whole
-                    // flip -- under 512-conn p16 load FLIP was refused essentially always, while
-                    // 8-conn tests sailed through. Dispatch is already held for this stage, so
-                    // busy connections drain within milliseconds: leave the epoch unclaimed and
-                    // retry every loop pass, and only convert not-ready into failure when the
-                    // flip's own 5s deadline expires (a genuinely stuck connection still fails).
-                    if (srv_->flip_timed_out()) {
-                        flip_prepare_epoch_ = srv_->flip_epoch();
-                        srv_->flip_note_failure(
-                            "ERR FLIP cannot quiesce a connection: " + ready_error);
-                    }
-                } else {
-                    flip_prepare_epoch_ = srv_->flip_epoch();
-                    if (!reserve_client_transfer_state(planned)) {
-                        srv_->flip_note_failure(
-                            "ERR FLIP could not reserve source connection state");
-                    } else {
-                        for (uint32_t ordinal = 0; ordinal < planned; ordinal++) {
-                            Client* client = srv_->flip_client_at(self_->id(), ordinal);
-                            if (!client) std::abort();
-                            std::string error;
-                            if (!prepare_client_transfer(
-                                    client, srv_->flip_client_destination(self_->id(), ordinal),
-                                    error)) {
-                                srv_->flip_note_failure(
-                                    "ERR FLIP could not detach a connection: " + error);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            const bool accepts_ready = !converting_to_ex || accepts_quiesced();
-            // While the quiesce retry above has not yet claimed the epoch, no prepare has run and
-            // client_transfers_prepared() is vacuously true over an empty migration list -- the
-            // mismatch test below would misread "still draining" as "set changed" and kill the
-            // flip on its first not-ready iteration. Judge outcomes only after the prepare
-            // actually ran for THIS flip epoch.
-            const bool prepared_this_epoch =
-                planned == 0 || flip_prepare_epoch_ == srv_->flip_epoch();
-            if (prepared_this_epoch && client_transfers_prepared() &&
-                client_migrations_.size() == planned && accepts_ready)
-                srv_->flip_ack(self_->id(), stage);
-            else if (prepared_this_epoch && client_transfers_prepared() &&
-                     client_migrations_.size() != planned)
-                srv_->flip_note_failure(
-                    "ERR FLIP source connection set changed during reversible preflight");
-        } else if (stage == FlipStage::ClientCommit &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            if (srv_->flip_source_clients(self_->id()))
-                commit_prepared_client_transfers_impl<kEp>();
-            srv_->flip_ack(self_->id(), stage);
-        } else if (stage == FlipStage::ClientInstall &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            const bool converting_to_ex =
-                srv_->flip_candidate_target(self_->id()) == Role::Ex;
-            // EX is frozen now, so this second full IO drain is the transit barrier for notify,
-            // pub/sub, tracking, and client-scatter messages which were posted just after a peer's
-            // earlier IoDrain acknowledgement. The global event count prevents every consumer
-            // from acknowledging while a payload is still between queues. Only a converting IO
-            // closes its listener; surviving IO rings deliberately retain their armed accepts.
-            if (flip_io_drained() && self_->client_transfers_quiesced() &&
-                (!converting_to_ex || accepts_quiesced()))
-                srv_->flip_ack(self_->id(), stage);
-        } else if (stage == FlipStage::RoleReady &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            if (flip_pubsub_rehome_epoch_ != srv_->flip_epoch()) {
-                flip_pubsub_rehome_epoch_ = srv_->flip_epoch();
-                pubsub_rehome_local(flip_pubsub_rehome_epoch_);
-            }
-            if (self_->client_transfers_quiesced() &&
-                self_->client_count() == srv_->flip_client_quota(self_->id()) &&
-                srv_->pubsub_inflight() == 0)
-                srv_->flip_ack(self_->id(), stage);
-        } else if (stage == FlipStage::Rollback &&
-                   !srv_->flip_acked(self_->id(), stage)) {
-            const bool converting_to_ex =
-                srv_->flip_candidate_target(self_->id()) == Role::Ex;
-            if (converting_to_ex && accept_quiescing_ && !accepts_quiesced())
-                quiesce_accepts_for_conversion();
-            if (client_transfers_prepared() &&
-                (!converting_to_ex || !accept_quiescing_ || accepts_quiesced())) {
-                cancel_prepared_client_transfers_impl<kEp>();
-                if (converting_to_ex && !restore_accepts_after_rollback()) return 1;
-                srv_->flip_ack(self_->id(), stage);
-            }
-        }
-
-        if (self_->id() != srv_->flip_coordinator()) return 1;
-
-        std::string failure;
-        if (stage < FlipStage::ClientCommit && stage != FlipStage::Rollback &&
-            srv_->flip_timed_out())
-            srv_->flip_note_failure("ERR FLIP timed out before the ownership commit");
-        const bool failed = srv_->flip_failed(failure);
-        if (failed && stage < FlipStage::ClientCommit && stage != FlipStage::Rollback) {
-            flip_enter_rollback(failure);
-            return 1;
-        }
-
-        switch (stage) {
-            case FlipStage::IoDrain:
-                if (srv_->flip_all_role_acked(Role::Ifid, stage)) {
-                    if (!srv_->flip_build_client_plan(flip_client_, failure))
-                        flip_enter_rollback(failure);
-                    else
-                        flip_publish_stage(FlipStage::IoPrepare);
-                }
-                break;
-            case FlipStage::IoPrepare: {
-                bool ex_io_prepared = true;
-                for (uint32_t tid = 0; tid < srv_->nthreads(); tid++)
-                    if (srv_->flip_candidate_target(tid) == Role::Ifid &&
-                        !srv_->flip_acked(tid, stage)) ex_io_prepared = false;
-                if (srv_->flip_all_role_acked(Role::Ifid, stage) && ex_io_prepared)
-                    flip_publish_stage(FlipStage::ExDrain);
-                break;
-            }
-            case FlipStage::ExDrain:
-                if (srv_->flip_all_role_acked(Role::Ex, stage)) {
-                    if (!srv_->flip_reserve_shard_plan(failure))
-                        flip_enter_rollback(failure);
-                    else
-                        flip_publish_stage(FlipStage::ClientPrepare);
-                }
-                break;
-            case FlipStage::ClientPrepare:
-                if (srv_->flip_all_role_acked(Role::Ifid, stage))
-                    flip_publish_stage(FlipStage::ClientCommit);
-                break;
-            case FlipStage::ClientCommit:
-                if (srv_->flip_all_role_acked(Role::Ifid, stage))
-                    flip_publish_stage(FlipStage::ClientInstall);
-                break;
-            case FlipStage::ClientInstall:
-                if (srv_->flip_all_role_acked(Role::Ifid, stage))
-                    flip_commit_roles_and_evacuate_shards();
-                break;
-            case FlipStage::RoleReady: {
-                bool ready = true;
-                for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
-                    const Role target = srv_->flip_candidate_target(tid);
-                    if (target != Role::Idle && srv_->thread(tid).ready_role() != target)
-                        ready = false;
-                }
-                if (ready) {
-                    if (srv_->flip_all_role_acked(Role::Ifid, stage)) {
-                        flip_publish_stage(FlipStage::ShardCommit);
-                        flip_publish_stage(FlipStage::ExInstall);
-                    }
-                }
-                break;
-            }
-            case FlipStage::ExInstall:
-                if (srv_->flip_all_role_acked(Role::Ex, stage)) {
-                    srv_->flip_complete_active();
-                    finish_flip_command();
-                }
-                break;
-            case FlipStage::Rollback:
-                if (srv_->flip_all_role_acked(Role::Ifid, stage) &&
-                    srv_->flip_all_role_acked(Role::Ex, stage)) {
-                    srv_->flip_refuse_active();
-                    finish_flip_command(failure.empty() ? "ERR FLIP refused" : failure.c_str());
-                }
-                break;
-            default: break;
-        }
-        flip_wake_all();
-        return 1;
-    }
-
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
     void adopt_client(Client* c, bool unix_socket, bool tls_socket = false) {
-        // ARMED ONCE FOR THIS OWNERSHIP TENURE. Both directions are edge triggered. Normal teardown
-        // still lets ::close() deregister; migration alone pre-registers destination + rollback
-        // interests and removes the old tenure's original registration around the owner edge.
-        // Registration belongs here rather than at accept because an AF_UNIX connection can be
-        // accepted by one IO thread and owned by another.
+        // ARMED ONCE, HERE, FOR LIFE, IN THE OWNING THREAD'S SET. Both directions, edge triggered;
+        // ::close() is the only deregistration. Registration belongs here rather than at accept
+        // because an AF_UNIX connection is accepted by one io thread and OWNED by another -- the
+        // round-robin handoff below -- and an fd sitting in the accepting thread's epoll set would
+        // deliver every one of its events to a thread that must not touch it.
         if constexpr (kEp) {
             if (!set_nonblocking(c->fd()) ||
                 !ep_.add(c->fd(), EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
                          ur_tag(UrKind::Recv, c))) {
                 std::fprintf(stderr, "epoll registration failed for client fd %d\n", c->fd());
                 self_->sig().accept_err++;
-                self_->add_client(c);
+                self_->clients().push_back(c);
                 c->set_wb_slot(self_->assign_wb_slot(c));
                 close_client(c);
                 return;
@@ -2310,13 +901,9 @@ private:
         c->set_last_interaction_s(cached_now_s_ ? cached_now_s_
                                                 : static_cast<uint32_t>(now_ns() / 1000000000ull));
         c->set_ifid_thread(self_->id());
-        // The armed lane's cold counters belong to whichever thread owns the connection; this is
-        // the one place ownership is taken (accept, AF_UNIX handoff, and migration rollback all
-        // arrive here), and the migration edge re-points it for the destination.
-        c->rob().set_read_local_arm_stats(self_->read_local_arm_stats_or_null());
         // The ready-mask slot is assigned immediately: WE are the sender, for life.
         c->set_wb_slot(self_->assign_wb_slot(c));
-        self_->add_client(c);
+        self_->clients().push_back(c);
         const std::string addr = socket_address(c->fd(), unix_socket, true);
         const std::string laddr = socket_address(c->fd(), unix_socket, false);
         const uint64_t accepted_ms = cached_now_ms_ ? cached_now_ms_ : now_ns() / 1000000ull;
@@ -2325,18 +912,17 @@ private:
         if (tls_socket) {
             TlsConn* tls = tls_slot_conn(c);
             if (tls && tls->fd_handshake()) {
-                (void)drive_tls<kEp, Fused, Pipeline>(c);
+                (void)drive_tls<kEp>(c);
                 if (!c->closing() && tls->ktls()) arm_recv<kEp>(c);
-                else if (!c->closing() && tls->memory_userspace())
-                    arm_tls_recv<kEp, Fused, Pipeline>(c);
+                else if (!c->closing() && tls->memory_userspace()) arm_tls_recv<kEp>(c);
             } else {
-                arm_tls_recv<kEp, Fused, Pipeline>(c);
+                arm_tls_recv<kEp>(c);
             }
         } else arm_recv<kEp>(c);
         // Reachability, not optimism: if that arm starved for an SQE, nothing else names this
         // conn -- it would sit accepted and silent forever (audit finding). The active set's
         // phase-1 re-arms it until the recv lands; one wasted visit if the arm succeeded.
-        mark_active_known<Fused && Pipeline != 0>(c);
+        mark_active(c);
     }
 
     uint32_t flush_handoffs() {
@@ -2351,24 +937,10 @@ private:
         return sent;
     }
 
-    template <bool HasTls, bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool HasTls, bool kEp>
     void on_recv(Client* c, int res) {
         c->set_recv_armed(false);       // the kernel has released its pointer
         if (res > 0) self_->sig().net_input_bytes += static_cast<uint64_t>(res);
-        if (find_client_migration(c)) {
-            // The original Recv CQE, not the cancel CQE, is the old-ring pointer fence. Preserve
-            // bytes which won the race with cancellation but do not parse them on the losing owner.
-            if (res > 0) {
-                c->commit_read(static_cast<size_t>(res));
-                (void)finish_client_transfer<kEp>(c);
-            } else if (res == -ECANCELED) {
-                (void)finish_client_transfer<kEp>(c);
-            } else {
-                cancel_client_transfer<kEp>(c);
-                close_client(c);
-            }
-            return;
-        }
         // A send error can close the fd while this recv is still owned by io_uring. The Client stays
         // alive until this CQE arrives, but it is a corpse: positive bytes must not resurrect it by
         // parsing and dispatching new Tasks after the teardown quiescence fence.
@@ -2376,22 +948,18 @@ private:
         if (res <= 0) { close_client(c); return; }
         c->commit_read(static_cast<size_t>(res));
         c->set_last_interaction_s(cached_now_s_);
-        if constexpr (Pipeline == 0) {
-            if constexpr (HasTls) {
-                if (c->is_tls())
-                    parse_and_dispatch<true, Fused ? kGenthreadIfidBatchOps : 0>(c);
-                else
-                    parse_and_dispatch<false, Fused ? kGenthreadIfidBatchOps : 0>(c);
-            } else {
-                parse_and_dispatch<false, Fused ? kGenthreadIfidBatchOps : 0>(c);
-            }
+        if constexpr (HasTls) {
+            if (c->is_tls()) parse_and_dispatch<true>(c);
+            else parse_and_dispatch<false>(c);
+        } else {
+            parse_and_dispatch<false>(c);
         }
         // Deliberately NOT re-armed here. flush_ready() re-arms AFTER it may have reset the read
         // buffer; arming first would leave the kernel holding a pointer that the reset then moves.
-        mark_active_known<Fused && Pipeline != 0>(c);
+        mark_active(c);
     }
 
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     bool drive_tls(Client* c) {
         TlsConn* tls = tls_slot_conn(c);
         if (!tls) return false;
@@ -2422,7 +990,7 @@ private:
         }
 
         if (tls->socket_userspace() && tls->has_pinned_plain()) {
-            (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+            (void)wb_.pump_tls<kEp>(*c, *tls);
             if (tls->has_pinned_plain()) {
                 arm_tls_socket_poll<kEp>(c, tls->wanted());
                 return true;
@@ -2430,7 +998,7 @@ private:
         }
 
         if (tls->output_pending() || c->send_inflight()) {
-            (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+            (void)wb_.pump_tls<kEp>(*c, *tls);
             return !tls->failed();
         }
 
@@ -2442,8 +1010,7 @@ private:
                 self_->sig().tls_handshakes_completed++;
                 self_->sig().tls_ktls_fallback++;
             }
-            (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(
-                *c, *tls);  // alerts and handshake flights are flushed first
+            (void)wb_.pump_tls<kEp>(*c, *tls);  // alerts and handshake flights are flushed first
             if (result == TlsOp::Error || result == TlsOp::GracefulEof) {
                 self_->sig().tls_handshakes_failed++;
                 if (!tls->last_error().empty())
@@ -2456,12 +1023,11 @@ private:
             if (!tls->connected() || tls->output_pending() || c->send_inflight()) return true;
         }
 
-        [[maybe_unused]] bool decrypted = false;
+        bool decrypted = false;
         while (tls->connected()) {
             size_t avail = 0;
-            bool may_grow = c->rob().quiesced();
             char* dst = c->read_space(
-                kRecvChunk, avail, may_grow, proto_max_bulk_len_);
+                kRecvChunk, avail, c->rob().quiesced(), proto_max_bulk_len_);
             if (!dst) break;
             const TlsIoResult result = tls->read_plain(dst, avail);
             if (result.op == TlsOp::Progress) {
@@ -2470,10 +1036,7 @@ private:
                 c->commit_read(result.bytes);
                 self_->sig().tls_plaintext_input_bytes += result.bytes;
                 decrypted = true;
-                if (tls->output_pending()) {
-                    (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
-                    break;
-                }
+                if (tls->output_pending()) { (void)wb_.pump_tls<kEp>(*c, *tls); break; }
                 continue;
             }
             if (result.op == TlsOp::WantRead) {
@@ -2483,10 +1046,10 @@ private:
             else if (result.op == TlsOp::WantWrite) {
                 self_->sig().tls_want_write++;
                 if (tls->socket_userspace()) arm_tls_socket_poll<kEp>(c, result.op);
-                else (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+                else (void)wb_.pump_tls<kEp>(*c, *tls);
             } else if (result.op == TlsOp::GracefulEof) {
                 (void)tls->shutdown();
-                (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+                (void)wb_.pump_tls<kEp>(*c, *tls);
                 close_client(c, tls->output_pending() || c->send_inflight());
                 return false;
             } else {
@@ -2494,20 +1057,17 @@ private:
                     std::fprintf(stderr, "TLS client %llu: %s\n",
                                  static_cast<unsigned long long>(c->id()),
                                  tls->last_error().c_str());
-                (void)wb_.pump_tls<kEp, Fused && Pipeline == 1>(*c, *tls);
+                (void)wb_.pump_tls<kEp>(*c, *tls);
                 close_client(c, tls->output_pending() || c->send_inflight());
                 return false;
             }
             break;
         }
-        if constexpr (Pipeline == 0) {
-            if (decrypted || c->rpos() < c->rlen())
-                parse_and_dispatch<true, Fused ? kGenthreadIfidBatchOps : 0>(c);
-        }
+        if (decrypted || c->rpos() < c->rlen()) parse_and_dispatch<true>(c);
         return !tls->failed();
     }
 
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     void on_tls_socket_poll(Client* c, int res, TlsOp wanted) {
         TlsConn* tls = tls_slot_conn(c);
         if (!tls) { close_client(c); return; }
@@ -2515,11 +1075,11 @@ private:
         c->set_recv_armed(tls->any_poll_armed());
         if (c->dead()) return;
         if (c->closing() || res < 0) { close_client(c); return; }
-        (void)drive_tls<kEp, Fused, Pipeline>(c);
-        mark_active_known<Fused && Pipeline != 0>(c);
+        (void)drive_tls<kEp>(c);
+        mark_active(c);
     }
 
-    template <bool kEp, bool Fused = false, uint8_t Pipeline = 0>
+    template <bool kEp>
     void on_tls_recv(Client* c, int res) {
         c->set_recv_armed(false);
         if (res > 0) self_->sig().net_input_bytes += static_cast<uint64_t>(res);
@@ -2539,506 +1099,21 @@ private:
         }
         self_->sig().tls_ciphertext_input_bytes += static_cast<uint64_t>(res);
         c->set_last_interaction_s(cached_now_s_);
-        (void)drive_tls<kEp, Fused, Pipeline>(c);
-        mark_active_known<Fused && Pipeline != 0>(c);
-    }
-
-    static bool read_local_mget(const Op& op) {
-        return op.spec && command_is_read_local_mget(*op.spec);
-    }
-
-    static void read_local_clear_reply(Op& op) {
-        op.clear_reply();       // bytes AND the reply code
-        op.zc_ptr = nullptr;
-        op.zc_len = 0;
-        op.zc_shard = -1;
-    }
-
-    // ATTRIBUTION FOR A DEMOTED READ, on the demote path only. Arm-on-demand has two distinct
-    // reasons to hold a read back and they must not be summed into one counter: an explicit key
-    // conflict with a live write descriptor (InflightWrite, the steady state), and the ARMING
-    // TRANSIENT -- writes this connection published before any local read armed it, which no
-    // descriptor describes and which are therefore fenced wholesale until they retire. The second
-    // is per-connection and one-shot; a bench arm whose ArmTransient count keeps growing has an
-    // arming bug, which is exactly what makes reporting it separately worth a counter.
-    static ReadLocalFallbackReason read_local_write_fallback_reason(
-            const Rob<kRobWindow>& rob) {
-        return rob.read_local_arm_fence_live()
-            ? ReadLocalFallbackReason::ArmTransient
-            : ReadLocalFallbackReason::InflightWrite;
-    }
-
-    // A demotion is planned before the stateful MONITOR/tracking gate. A complete plan is not
-    // published until ACL and FLIP admit the current frame; per-producer reservations make that
-    // later commit infallible. If the existing scatter snapshot window accepts only a prefix, that
-    // prefix contains exclusively older, already-admitted reads and is committed before the
-    // current frame crosses any stateful hook; the unconsumed frame is then safe to reparse.
-    // MGET remains one ROB operation, but its cold fallback expands here through the unchanged
-    // scatter planner into one owner Task per touched shard.
-    class ReadLocalDemotionPlan {
-    private:
-        enum class ReadKind : uint8_t { Ordinary, Scatter, Error };
-
-        struct Storage {
-            uint64_t ids[kRobWindow];
-            ScatterState* scatter[kRobWindow];
-            uint16_t scatter_tasks[kRobWindow];
-            ReadKind kinds[kRobWindow];
-            ReadLocalFallbackReason reasons[kRobWindow];
-            uint32_t owners[kMaxThreads];
-            uint32_t remaining[kMaxThreads];
-        };
-
-    public:
-        ReadLocalDemotionPlan() = default;
-        ~ReadLocalDemotionPlan() { cancel(); }
-        ReadLocalDemotionPlan(const ReadLocalDemotionPlan&) = delete;
-        ReadLocalDemotionPlan& operator=(const ReadLocalDemotionPlan&) = delete;
-
-        bool prepare(IoLoop& loop, Client* client, uint64_t hash,
-                     bool require_hash_match, int32_t reserve_shard = -1,
-                     ReadLocalFallbackReason reason =
-                         ReadLocalFallbackReason::ContextOwnerKey,
-                     bool reserve_current_without_reads = false,
-                     const uint64_t* fallback_ids = nullptr,
-                     const ReadLocalFallbackReason* fallback_reasons = nullptr,
-                     uint32_t fallback_count = 0,
-                     const Op* intersect_command = nullptr,
-                     bool intersect_filter_miss = false) {
-            if (loop_ || !client) std::abort();
-            if (reason == ReadLocalFallbackReason::None) std::abort();
-            if ((fallback_ids == nullptr) != (fallback_reasons == nullptr) ||
-                (fallback_count != 0) != (fallback_ids != nullptr) ||
-                (fallback_count && intersect_command) ||
-                (intersect_filter_miss && !intersect_command)) std::abort();
-            Rob<kRobWindow>& rob = client->rob();
-            const bool reserve_current =
-                reserve_current_without_reads && reserve_shard >= 0;
-            // A caller that already walked a complete precise keyset may pass its authoritative
-            // pending-filter miss. Consume it before reloading the same filter; hit/unknown remains
-            // false and takes the unchanged exact-selection path below.
-            if (!reserve_current && !fallback_count && intersect_filter_miss) return true;
-            // Current intersect callers also passed a known hit when they reach the exact path.
-            // Unknown remains safe without this shortcut: collecting an empty set returns below.
-            if (!intersect_command && !rob.has_pending_read_local() && !reserve_current)
-                return true;
-            // Superset pre-check (ReadLocalPendingFilter, rob.h): the filter holds every key hash
-            // any still-pending local read of this connection can touch, so a miss PROVES that no
-            // pending read shares the point hash / any declared key of the exact command. The
-            // ordinary disjoint write returns here without allocating or walking anything; a hit
-            // runs the unchanged exact plan below. EX seeds are selected by id, and a reserved
-            // current op needs the plan regardless of reads, so neither consults the filter.
-            if (!reserve_current && !fallback_count && !intersect_command &&
-                require_hash_match && !rob.read_local_pending_may_touch(hash)) return true;
-            // Select on the stack; Storage is only paid for once a read is actually demoted or
-            // the current op must be reserved.
-            uint64_t ids[kRobWindow];
-            ReadLocalFallbackReason reasons[kRobWindow];
-            bool selected[kRobWindow] = {};
-            const uint32_t pending =
-                rob.collect_pending_read_local(0, false, ids, kRobWindow);
-            for (uint32_t i = 0; i < pending; i++) reasons[i] = reason;
-            bool selective = false;
-            bool any_selected = false;
-            // The key-walking modes visit every pending read, so they also recompute the exact
-            // pending-key filter and hand it back: false hits never accumulate.
-            ReadLocalPendingFilter exact;
-            bool exact_known = false;
-            if (pending && fallback_count) {
-                selective = true;
-                for (uint32_t seed = 0; seed < fallback_count; seed++) {
-                    if (fallback_reasons[seed] == ReadLocalFallbackReason::None) continue;
-                    bool found = false;
-                    for (uint32_t i = 0; i < pending; i++) {
-                        if (ids[i] != fallback_ids[seed]) continue;
-                        selected[i] = true;
-                        any_selected = true;
-                        reasons[i] = fallback_reasons[seed];
-                        found = true;
-                        break;
-                    }
-                    if (!found) std::abort();
-                }
-            } else if (pending && intersect_command) {
-                selective = true;
-                exact_known = true;
-                for (uint32_t i = 0; i < pending; i++) {
-                    selected[i] = read_local_commands_overlap_precise_keyset_collect(
-                        rob.at(ids[i]), *intersect_command, exact);
-                    any_selected |= selected[i];
-                }
-            } else if (pending && require_hash_match) {
-                selective = true;
-                exact_known = true;
-                for (uint32_t i = 0; i < pending; i++) {
-                    selected[i] = read_local_command_touches_hash_collect(
-                        rob.at(ids[i]), hash, exact);
-                    any_selected |= selected[i];
-                }
-            }
-            if (exact_known) rob.reset_read_local_pending_filter(exact);
-            if (selective && any_selected) {
-                // MGET makes key overlap a graph rather than a single hash. Close every selective
-                // parser or EX seed transitively: if a selected MGET touches an otherwise unrelated
-                // key, its older/later local read of that key must join the same owner wave too.
-                // With nothing selected the closure is the identity, so it is skipped.
-                bool changed;
-                do {
-                    changed = false;
-                    for (uint32_t i = 0; i < pending; i++) {
-                        if (selected[i]) continue;
-                        const Op& candidate = rob.at(ids[i]);
-                        for (uint32_t prior = 0; prior < pending; prior++) {
-                            if (!selected[prior] ||
-                                !read_local_commands_overlap(
-                                    candidate, rob.at(ids[prior]))) continue;
-                            selected[i] = true;
-                            reasons[i] = ReadLocalFallbackReason::ContextOwnerKey;
-                            changed = true;
-                            break;
-                        }
-                    }
-                } while (changed);
-            }
-            uint32_t count = pending;
-            if (selective) {
-                uint32_t out = 0;
-                for (uint32_t i = 0; i < pending; i++) {
-                    if (!selected[i]) continue;
-                    ids[out] = ids[i];
-                    reasons[out] = reasons[i];
-                    out++;
-                }
-                count = out;
-            }
-            if (!count && !reserve_current) return true;
-            storage_.reset(new (std::nothrow) Storage);
-            if (!storage_) return false;
-            count_ = count;
-            for (uint32_t i = 0; i < count_; i++) {
-                storage_->ids[i] = ids[i];
-                storage_->reasons[i] = reasons[i];
-            }
-
-            loop_ = &loop;
-            client_ = client;
-            for (uint32_t i = 0; i < count_; i++) {
-                storage_->kinds[i] = ReadKind::Ordinary;
-                storage_->scatter[i] = nullptr;
-                storage_->scatter_tasks[i] = 0;
-            }
-            for (uint32_t i = 0; i < count_; i++) {
-                Op& op = rob.at(storage_->ids[i]);
-                if (read_local_mget(op)) {
-                    read_local_clear_reply(op);
-                    ScatterDispatch dispatch;
-                    const ScatterPrepare prepared = xshard_prepare(
-                        *loop.srv_, op, loop.scatter_pool_, loop.self_->id(),
-                        client->id(), dispatch, false, client);
-                    if (prepared == ScatterPrepare::Backpressure) {
-                        // A local run can contain more cross-shard reads than the existing
-                        // snapshot window admits concurrently. Publish the already prepared ROB
-                        // prefix as one ordered wave and leave this op plus the exact selected
-                        // remainder tagged in the local lane. The next EX pass demotes only entries
-                        // that overlap the unfinished owner wave; parser callers reparse their
-                        // unconsumed current frame after the same prefix commit.
-                        if (i) {
-                            const uint32_t selected_count = count_;
-                            partial_begin_ = i;
-                            partial_count_ = selected_count - i;
-                            count_ = i;
-                            partial_ = true;
-                            break;
-                        }
-                        cancel();
-                        return false;
-                    }
-                    if (prepared == ScatterPrepare::Error) {
-                        storage_->kinds[i] = ReadKind::Error;
-                        continue;
-                    }
-                    if (prepared == ScatterPrepare::Ready) {
-                        storage_->kinds[i] = ReadKind::Scatter;
-                        storage_->scatter[i] = dispatch.state;
-                        storage_->scatter_tasks[i] = dispatch.nshards;
-                        for (uint32_t task = 0; task < dispatch.nshards; task++) {
-                            const int32_t shard = xshard_dispatch_shard(dispatch, task);
-                            if (shard < 0) std::abort();
-                            add_owner(loop.srv_->worker_of_shard(shard));
-                        }
-                        continue;
-                    }
-                }
-                if (op.shard < 0) std::abort();
-                add_owner(loop.srv_->worker_of_shard(op.shard));
-            }
-            if (!partial_ && reserve_shard >= 0) {
-                reserved_current_worker_ = static_cast<int32_t>(
-                    loop.srv_->worker_of_shard(reserve_shard));
-                add_owner(static_cast<uint32_t>(reserved_current_worker_));
-            }
-
-            uint32_t reserved = 0;
-            for (; reserved < nowners_; reserved++) {
-                if (!loop.srv_->thread(storage_->owners[reserved]).reserve_task_slots(
-                        loop.self_->id(), storage_->remaining[reserved]))
-                    break;
-            }
-            if (reserved != nowners_) {
-                for (uint32_t i = 0; i < reserved; i++)
-                    loop.srv_->thread(storage_->owners[i]).cancel_task_reservation(
-                        loop.self_->id(), storage_->remaining[i]);
-                discard_prepared_reads();
-                clear();
-                return false;
-            }
-            reservations_live_ = true;
-            return true;
-        }
-
-        bool active() const { return loop_ != nullptr; }
-        bool current_reserved() const { return reserved_current_worker_ >= 0; }
-        bool partial() const { return partial_; }
-        uint32_t read_count() const { return count_; }
-
-        void commit_reads() {
-            if (!loop_) return;
-            Rob<kRobWindow>& rob = client_->rob();
-            bool completed_locally = false;
-            for (uint32_t i = 0; i < count_; i++) {
-                Op& op = rob.at(storage_->ids[i]);
-                if (storage_->kinds[i] == ReadKind::Error) {
-                    rob.complete_pending_read_local(storage_->ids[i]);
-                    op.state.store(OpState::Done, std::memory_order_release);
-                    completed_locally = true;
-                    continue;
-                }
-                if (storage_->kinds[i] == ReadKind::Scatter) {
-                    ScatterState* state = storage_->scatter[i];
-                    if (!state || !storage_->scatter_tasks[i]) std::abort();
-                    ScatterDispatch dispatch;
-                    dispatch.state = state;
-                    dispatch.nshards = storage_->scatter_tasks[i];
-                    op.attach_scatter_state(state);
-                    storage_->scatter[i] = nullptr;  // the Op/IO retirement path owns it now
-                    loop_->self_->note_command(op.spec->id);
-                    for (uint32_t task = 0; task < dispatch.nshards; task++) {
-                        const int32_t shard = xshard_dispatch_shard(dispatch, task);
-                        const uint32_t worker = loop_->srv_->worker_of_shard(shard);
-                        loop_->srv_->thread(worker).post_task_reserved_quiet(
-                            loop_->self_->id(),
-                            Task{client_, storage_->ids[i], shard, state},
-                            loop_->self_->sig());
-                        consume(worker);
-                        loop_->touch_worker(worker);
-                    }
-                } else {
-                    const uint32_t worker = loop_->srv_->worker_of_shard(op.shard);
-                    loop_->srv_->thread(worker).post_task_reserved_quiet(
-                        loop_->self_->id(),
-                        Task{client_, storage_->ids[i], -1, nullptr},
-                        loop_->self_->sig());
-                    consume(worker);
-                    loop_->touch_worker(worker);
-                }
-                rob.publish_pending_read_local_to_owner(storage_->ids[i]);
-            }
-            // A partial plan's suffix is still local. Publish its exact fallback tags only after
-            // the prepared prefix is irrevocable; cancel/backpressure before commit must leave the
-            // lane untouched so a later EX pass can probe it normally.
-            for (uint32_t i = 0; i < partial_count_; i++) {
-                const uint32_t pending = partial_begin_ + i;
-                loop_->fused_executor_->preserve_local_read_fallback(
-                    client_, storage_->ids[pending], storage_->reasons[pending]);
-            }
-            if (count_) {
-                ReadLocalStats& stats = loop_->self_->read_local_stats();
-                for (uint32_t i = 0; i < count_; i++) {
-                    loop_->fused_executor_->note_local_read_demoted(
-                        rob.at(storage_->ids[i]));
-                    stats.note_fallback(
-                        storage_->reasons[i], read_local_mget(rob.at(storage_->ids[i])));
-                }
-            }
-            if (completed_locally) {
-                // Error lowering can finish an MGET locally. Overlap's targeted parser needs
-                // the same wake as ordinary local completion, including release of its fence.
-                if (loop_->targeted_ifid_)
-                    loop_->fused_executor_completion<true>(client_);
-                else
-                    loop_->fused_executor_completion<false>(client_);
-            }
-            count_ = 0;  // every prepared scatter/marker is now owned by its published Op
-            if (reserved_current_worker_ < 0) {
-                for (uint32_t i = 0; i < nowners_; i++)
-                    if (storage_->remaining[i]) std::abort();
-                clear();
-            }
-        }
-
-        void post_current(const Task& task, uint32_t worker) {
-            if (!loop_ || reserved_current_worker_ != static_cast<int32_t>(worker))
-                std::abort();
-            loop_->srv_->thread(worker).post_task_reserved_quiet(
-                loop_->self_->id(), task, loop_->self_->sig());
-            consume(worker);
-            loop_->touch_worker(worker);
-            for (uint32_t i = 0; i < nowners_; i++)
-                if (storage_->remaining[i]) std::abort();
-            clear();
-        }
-
-    private:
-        void add_owner(uint32_t worker) {
-            uint32_t at = 0;
-            while (at != nowners_ && storage_->owners[at] != worker) at++;
-            if (at == nowners_) {
-                if (nowners_ == kMaxThreads) std::abort();
-                storage_->owners[nowners_] = worker;
-                storage_->remaining[nowners_] = 0;
-                nowners_++;
-            }
-            storage_->remaining[at]++;
-        }
-
-        void consume(uint32_t worker) {
-            uint32_t at = 0;
-            while (at != nowners_ && storage_->owners[at] != worker) at++;
-            if (at == nowners_ || !storage_->remaining[at]) std::abort();
-            storage_->remaining[at]--;
-        }
-
-        void discard_prepared_reads() {
-            if (!loop_ || !client_) return;
-            Rob<kRobWindow>& rob = client_->rob();
-            for (uint32_t i = 0; i < count_; i++) {
-                Op& op = rob.at(storage_->ids[i]);
-                if (storage_->scatter[i]) {
-                    xshard_abandon_unpublished(storage_->scatter[i], loop_->scatter_pool_,
-                                               loop_->self_->id());
-                    storage_->scatter[i] = nullptr;
-                }
-                if (read_local_mget(op)) read_local_clear_reply(op);
-            }
-        }
-
-        void cancel() {
-            if (!loop_) return;
-            if (reservations_live_)
-                for (uint32_t i = 0; i < nowners_; i++)
-                    if (storage_->remaining[i])
-                        loop_->srv_->thread(storage_->owners[i]).cancel_task_reservation(
-                            loop_->self_->id(), storage_->remaining[i]);
-            discard_prepared_reads();
-            clear();
-        }
-
-        void clear() {
-            loop_ = nullptr;
-            client_ = nullptr;
-            count_ = nowners_ = 0;
-            partial_begin_ = partial_count_ = 0;
-            reserved_current_worker_ = -1;
-            reservations_live_ = false;
-            partial_ = false;
-            storage_.reset();
-        }
-
-        IoLoop* loop_ = nullptr;
-        Client* client_ = nullptr;
-        std::unique_ptr<Storage> storage_;
-        uint32_t count_ = 0;
-        uint32_t nowners_ = 0;
-        uint32_t partial_begin_ = 0;
-        uint32_t partial_count_ = 0;
-        int32_t reserved_current_worker_ = -1;
-        bool reservations_live_ = false;
-        bool partial_ = false;
-    };
-
-public:
-    bool fused_demote_local_read_batch(Client* client, const uint64_t* probed,
-                                       const ReadLocalFallbackReason* fallbacks,
-                                       uint32_t probed_count, uint32_t& demoted) {
-        ReadLocalDemotionPlan plan;
-        if (!plan.prepare(
-                *this, client, 0, false, -1,
-                ReadLocalFallbackReason::ContextOwnerKey, false,
-                probed, fallbacks, probed_count)) return false;
-        demoted = plan.read_count();
-        if (!demoted) std::abort();
-        plan.commit_reads();
-        (void)flush_ifid_posts();
-        return true;
-    }
-
-private:
-
-    struct EmptyReadLocalDemotionPlan {};
-
-    void touch_worker(uint32_t worker) {
-        if (touched_[worker]) return;
-        touched_[worker] = true;
-        touched_list_[ntouched_++] = worker;
+        (void)drive_tls<kEp>(c);
+        mark_active(c);
     }
 
     // ---- parse -> route -> publish -----------------------------------------------------------------
-    template <bool NoBorrow, uint32_t BatchOps = 0, bool IoPipe = false,
-              bool TargetedIfid = false,
-              bool SuppressOrdinaryActiveMark = false,
-              bool IofusedPrivateQueue = false, bool SplitLocal = false>
-    DispatchResult parse_and_dispatch(Client* c) {
-        // Split readers and fused overlap need the same ROB hazards, MGET fence,
-        // admission, and demotion protocol as the baseline fused reader.
-        static constexpr bool Fused = SplitLocal || IofusedPrivateQueue || (
-            BatchOps == kGenthreadIfidBatchOps &&
-            !IoPipe && !TargetedIfid && !SuppressOrdinaryActiveMark);
-        [[maybe_unused]] const bool read_local_enabled =
-            Fused && __builtin_expect(srv_->read_local_enabled(), false);
+    template <bool NoBorrow>
+    void parse_and_dispatch(Client* c) {
         Client& conn = *c;
         Rob<kRobWindow>& rob = c->rob();
         LoopSignals& sig = self_->sig();
-        const uint32_t pass_rpos = conn.rpos();
-        const char* const pass_rbuf = conn.rbuf();
-        const uint32_t pass_rlen = conn.rlen();
-        const uint32_t self_id = self_->id();
-        auto task_free_slots = [&](ThreadCtx& owner) {
-            if constexpr (IofusedPrivateQueue) {
-                return owner.iofused_task_free_slots(self_id);
-            } else {
-                return owner.task_free_slots(self_id);
-            }
-        };
-        auto post_task_quiet = [&](ThreadCtx& owner, const Task& task) {
-            if constexpr (IofusedPrivateQueue) {
-                return owner.post_iofused_task_quiet(self_id, task, sig);
-            } else {
-                return owner.post_task_quiet(self_id, task, sig);
-            }
-        };
-        auto post_tasks_quiet = [&](ThreadCtx& owner, const Task* tasks, uint32_t count) {
-            if constexpr (IofusedPrivateQueue) {
-                return owner.post_iofused_tasks_quiet(self_id, tasks, count, sig);
-            } else {
-                return owner.post_tasks_quiet(self_id, tasks, count, sig);
-            }
-        };
-        DispatchResult result = DispatchResult::Progress;
         bool head_candidate = true;   // only the pass's FIRST dispatch can be the direct head
         const uint8_t security_flags = srv_->security_flags();
         const bool auth_required = (security_flags & Server::kSecurityAuth) != 0;
         const bool acl_active = (security_flags & Server::kSecurityAcl) != 0;
         const bool notify_armed = notify_armed_;
-        const uint64_t pass_max_bulk_len = proto_max_bulk_len_;
-        const bool default_bulk_limit = pass_max_bulk_len == 512ull * 1024 * 1024;
-        // IoDrain waits for this whole parse/post pass before opening ExDrain. A task whose
-        // owner was sampled here therefore reaches that owner before it can acknowledge.
-        const bool lb_pause_this_pass = lb_controller_armed_ &&
-            srv_->lb_should_pause(self_id, c->id());
-        if (__builtin_expect(lb_pause_this_pass, false)) {
-            flip_fingerprint_finish_pass();
-            return result;
-        }
         // ONE epoch for the whole parse pass, not one per op. Monotonicity needs the stamps to be
         // non-decreasing along the connection, not distinct: every op this pass parses may share
         // the pass's cut, and the next pass's cut is >= this one because the sequence only moves
@@ -3049,71 +1124,11 @@ private:
         // shared-clean line, the sequence load never happens, and the per-op test is never taken.
         const bool atomic_tracking = srv_->atomic_tracking_active();
         const uint64_t pass_read_cut = atomic_tracking ? srv_->atomic_snapshot() : 0;
-        uint64_t batch_start_ops = 0;
-        [[maybe_unused]] bool read_local_batch = false;
-        // LANE ADMISSION: how many lane slots (pending local reads) this connection may
-        // hold during this pass. UINT32_MAX unless the thread's local-read lane is under pressure,
-        // in which case it is the lane divided among the active connections
-        // (ExLoop::read_local_lane_quota). The pressure byte is tested FIRST and on its own,
-        // because active_.size() would otherwise be evaluated eagerly on every pass and active_
-        // lives on an IoLoop cache line this pass never otherwise touches -- see
-        // read_local_lane_under_pressure(). Steady state: one byte test per pass on a line the pass
-        // already owns; the per-op compare below is a popcount against a register.
-        [[maybe_unused]] uint32_t read_local_quota = UINT32_MAX;
-        if constexpr (Fused)
-            if (read_local_enabled &&
-                __builtin_expect(fused_executor_->read_local_lane_under_pressure(), false))
-                read_local_quota = fused_executor_->read_local_lane_quota(active_.size());
-        if constexpr (BatchOps != 0) batch_start_ops = sig.ops;
-        [[maybe_unused]] uint64_t batch_dispatch_start = 0;
-        if constexpr (IoPipe) batch_dispatch_start = rob.dispatch_id();
+
         for (;;) {
-            if constexpr (IoPipe)
-                if (rob.dispatch_id() - batch_dispatch_start >=
-                    kIoPipeIfidBatchOpsPerClient) break;
-            if constexpr (BatchOps != 0)
-                if (sig.ops - batch_start_ops >= BatchOps) break;
-            // The coordinator's own connection already holds the unfinished FLIP head. Do not
-            // parse behind it. Other connections may still parse the FLIP report/control command
-            // below so live-vs-target remains observable while the dispatch barrier is active.
-            if (__builtin_expect(srv_->flip_dispatch_paused() && c == flip_client_, false)) break;
-            if (c->scatter_barrier() || c->parse_backpressure()) break;
-            if constexpr (Fused)
-                if (read_local_enabled && rob.local_mget_fence_pending()) break;
-            Op* op;
-            if constexpr (Fused) {
-                op = read_local_enabled
-                    ? rob.acquire_read_local(conn.op_route_flags())
-                    : rob.acquire<!IofusedPrivateQueue>(conn.op_route_flags());
-                // Preserve the old unarmed overlap parser's byte replies. acquire_read_local
-                // above uses the existing coded fused arm; overlap WB already handles codes.
-            } else {
-                op = rob.acquire<false>(conn.op_route_flags());   // 2s keeps the byte path
-            }
+            if (c->scatter_barrier() || c->atomic_backpressure()) break;
+            Op* op = rob.acquire(conn.op_route_flags());
             if (!op) break;                    // window full: backpressure; let replies drain first
-            using DemotionPlan = std::conditional_t<
-                Fused, ReadLocalDemotionPlan, EmptyReadLocalDemotionPlan>;
-            [[maybe_unused]] DemotionPlan read_local_demotion;
-            [[maybe_unused]] bool read_local_owner_conflict = false;
-            [[maybe_unused]] ReadLocalFallbackReason read_local_owner_conflict_reason =
-                ReadLocalFallbackReason::None;
-            [[maybe_unused]] ReadLocalFallbackReason read_local_fallback_reason =
-                ReadLocalFallbackReason::None;
-            [[maybe_unused]] bool extend_read_local_batch = false;
-            [[maybe_unused]] bool read_local_mget_candidate = false;
-            [[maybe_unused]] bool read_local_write_hazard = false;
-            [[maybe_unused]] bool read_local_eligible_decided = false;
-            [[maybe_unused]] bool read_local_eligible = false;
-            [[maybe_unused]] bool read_local_commit_at_ordinary = false;
-            [[maybe_unused]] bool read_local_commit_before_lowering = false;
-            [[maybe_unused]] bool read_local_point_prehashed = false;
-            // Keys a local read hands to Rob::mark_current_read_local: every MGET key hashed by
-            // the eligibility walk below (no second hashing pass). A point read reports exactly
-            // one hash and reaches mark_current_read_local_hash() without building a summary.
-            [[maybe_unused]] ReadLocalPendingFilter read_local_pending_keys{};
-            // Owner-task demand this read would need if demoted: GET one, MGET its touched-shard
-            // bound. Computed once here; the lane room gate and the lane append both consume it.
-            [[maybe_unused]] uint32_t read_local_lane_demand = 1;
             uint32_t pos = conn.rpos();
             const char* err = nullptr;
             op->rbuf_off = pos;
@@ -3124,37 +1139,21 @@ private:
             ParseResult pr;
             if (__builtin_expect(security_check, false)) {
                 pr = resp_parse_limited(
-                    pass_rbuf, pass_rlen, pos, *op, &err, 10, 16384);
-            } else if (__builtin_expect(default_bulk_limit, true)) {
-                pr = resp_parse(pass_rbuf, pass_rlen, pos, *op, &err);
+                    conn.rbuf(), conn.rlen(), pos, *op, &err, 10, 16384);
+            } else if (__builtin_expect(
+                           proto_max_bulk_len_ == 512ull * 1024 * 1024, true)) {
+                pr = resp_parse(conn.rbuf(), conn.rlen(), pos, *op, &err);
             } else {
-                pr = resp_parse_limited(pass_rbuf, pass_rlen, pos, *op, &err,
-                                        1024 * 1024, pass_max_bulk_len);
+                pr = resp_parse_limited(conn.rbuf(), conn.rlen(), pos, *op, &err,
+                                        1024 * 1024, proto_max_bulk_len_);
             }
             security_check |= acl_active;
 
-            if (pr == ParseResult::Empty) {
-                conn.advance_parse(pos - conn.rpos());
-                continue;
-            }
-            if (pr == ParseResult::Incomplete) {
-                if (pass_rlen == UINT32_MAX) {
-                    finish_locally(c, *op, "ERR command exceeds receive buffer limit");
-                    conn.advance_parse(pass_rlen - conn.rpos());
-                    c->mark_closing();
-                    result = DispatchResult::Error;
-                    break;
-                }
-                // No complete frame was consumed in this pass. The buffered tail is deliberately
-                // left in place; only a new recv/readability completion may make it actionable.
-                if (conn.rpos() == pass_rpos) result = DispatchResult::NeedInput;
-                break;
-            }
+            if (pr == ParseResult::Incomplete) break;
             if (pr == ParseResult::Error) {
                 finish_locally(c, *op, err ? err : "ERR protocol error");
-                conn.advance_parse(pass_rlen - conn.rpos());
+                conn.advance_parse(conn.rlen() - conn.rpos());
                 c->mark_closing();
-                result = DispatchResult::Error;
                 break;
             }
             // The parse cursor is deliberately NOT advanced here. It advances only once this op is
@@ -3224,20 +1223,6 @@ private:
                 finish_prebuilt(c, *op);
                 continue;
             }
-            if constexpr (Fused) {
-                // A consecutive GET can reuse the first member's stable connection gates. Any
-                // other frame ends the run but keeps parsing; later writes demote only conflicting
-                // unresolved reads instead of turning the run into a connection-wide hold.
-                if (read_local_enabled && read_local_batch) {
-                    extend_read_local_batch =
-                        (spec->flags & CmdFlags::ReadLocalEligible) &&
-                        !command_is_read_local_mget(*spec) &&
-                        conn.multi_session() == nullptr &&
-                        rob.pending_read_local_count() < read_local_quota &&
-                        fused_executor_->local_read_lane_has_room();
-                    if (!extend_read_local_batch) read_local_batch = false;
-                }
-            }
             // THE SOLE DISABLED-STATE FEATURE DECISION on an ordinary operation. The executor
             // receives a spec whose handler pointer is already the clean or armed specialization;
             // no notification mask load reaches its execute path.
@@ -3251,421 +1236,16 @@ private:
                 spec = command_notify_variant(spec);
                 if constexpr (NoBorrow) spec = command_tls_variant(spec);
                 op->spec = spec;
+                if (__builtin_expect(climon_armed_gate(c, *op), false)) break;
             } else {
                 if constexpr (NoBorrow) spec = command_tls_variant(spec);
                 op->spec = spec;
             }
-            if constexpr (Fused) {
-                if (read_local_enabled) {
-                    constexpr uint32_t kWriteHazards =
-                        CmdFlags::Write | CmdFlags::SnapshotWrite |
-                        CmdFlags::Transaction | CmdFlags::ScriptRoute;
-                    constexpr uint32_t kNonPointRoutes =
-                        CmdFlags::AllShards | CmdFlags::RandomShard |
-                        CmdFlags::CursorShard | CmdFlags::ConfigRoute |
-                        CmdFlags::MultiShard | CmdFlags::ScriptRoute |
-                        CmdFlags::Blocking | CmdFlags::Transaction |
-                        CmdFlags::StreamRoute | CmdFlags::SubcmdRoute;
-                    constexpr uint32_t kReplaySensitiveClimon =
-                        Server::kClimonMonitor | Server::kClimonTracking |
-                        Server::kClimonReply;
-                    const bool write_hazard = (spec->flags & kWriteHazards) != 0;
-                    read_local_write_hazard = write_hazard;
-                    const bool point_route =
-                        (spec->flags & kNonPointRoutes) == 0 &&
-                        spec->first_key > 0 && spec->last_key == spec->first_key &&
-                        spec->key_step == 1;
-                    if (point_route) {
-                        op->hash = FlatStore::hash_key(
-                            op->arg(static_cast<uint32_t>(spec->first_key)));
-                        op->shard = srv_->router().shard_of(op->hash);
-                        read_local_point_prehashed = true;
-                    }
-                    auto classify_owner_conflict = [&](auto&& overlaps) {
-                        bool broad = false;
-                        const bool conflict = rob.read_local_owner_conflicts_before(
-                            rob.dispatch_id(), [&](const Op& owner) {
-                                if (!overlaps(owner)) return false;
-                                broad |= !read_local_owner_command_is_precise(owner);
-                                return true;
-                            });
-                        return !conflict ? ReadLocalFallbackReason::None
-                            : broad ? ReadLocalFallbackReason::ContextRoute
-                                    : ReadLocalFallbackReason::ContextOwnerKey;
-                    };
-                    auto owner_conflict_for_hash = [&](uint64_t hash) {
-                        return classify_owner_conflict([&](const Op& owner) {
-                            return read_local_owner_command_touches_hash(owner, hash);
-                        });
-                    };
-                    auto owner_conflict_for_command = [&]() {
-                        return classify_owner_conflict([&](const Op& owner) {
-                            return read_local_commands_overlap(*op, owner);
-                        });
-                    };
-
-                    if (write_hazard) {
-                        // Stage every historical v1 hazard before the stateful climon gate. A
-                        // syntactic one-key owner route or blind MSET keyset can be refined now
-                        // that arity is proved. Other multi-key writes remain conservative.
-                        rob.mark_current_write();
-                        const bool ordinary_point_write =
-                            point_route &&
-                            (spec->flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)) != 0 &&
-                            !(spec->flags & CmdFlags::ConnLocal);
-                        if (ordinary_point_write) {
-                            if (climon_armed_cached_ & kReplaySensitiveClimon) {
-                                read_local_owner_conflict_reason =
-                                    owner_conflict_for_hash(op->hash);
-                                read_local_owner_conflict = read_local_owner_conflict_reason !=
-                                    ReadLocalFallbackReason::None;
-                            }
-                            const bool reserve_owner_fenced_current =
-                                read_local_owner_conflict &&
-                                (climon_armed_cached_ & kReplaySensitiveClimon) != 0;
-                            // An evicting maxmemory policy makes the write conservative, but it is
-                            // still an ordinary one-owner route. Reserve that current append along
-                            // with the demoted reads so the post-climon sequence remains infallible.
-                            //
-                            // TWO DIFFERENT QUESTIONS, ONE ANSWER USED FOR BOTH UNTIL NOW.
-                            // "Which keys does this write touch" is answered by the eviction
-                            // policy alone: with eviction off, an ordinary point write touches
-                            // op->hash and nothing else, whatever the ROB's RYOW ring can hold.
-                            // "Can the ring record this hash for LATER reads to be checked
-                            // against" is a capacity question, and refine_current_write_hash
-                            // answers no once sixteen writes are already in flight. Conjoining
-                            // them made a full ring turn every further write into a demote-EVERY-
-                            // pending-read wave: at 59% writes and pipeline 32 the ring overflows
-                            // permanently and every single read on the connection is lowered to
-                            // the owner queue (measured: 164000 of 164000 reads, INFO
-                            // read_local_fallback_inflight_write). The selection below now asks
-                            // only the keys question, which is the owner's rule verbatim -- a read
-                            // is held back on explicit key conflict and on nothing else. Nothing
-                            // is weakened: require_hash_match=true is already what an unfilled
-                            // ring passes here on every ordinary point write.
-                            const bool point_write_exact =
-                                fused_executor_->read_local_point_writes_precise();
-                            // Still gated: with an evicting policy the write may touch keys it
-                            // never names, so it must stay a conservative ring generation and no
-                            // later read may be cleared against its hash alone.
-                            if (point_write_exact) {
-                                (void)rob.refine_current_write_hash(op->hash);
-                                op->mark_read_local_precise_write();
-                            }
-                            // DEMOTION-PLAN GATE. prepare() returns true
-                            // without building a plan -- loop_ stays null, so active() is false
-                            // and commit_reads() is its `if (!loop_) return;` no-op -- unless the
-                            // current append must be reserved or a still-pending local read may
-                            // overlap this write. Both predicates are single inline loads that
-                            // prepare() itself performs first; deciding them here skips the
-                            // 12-argument out-of-line call and its abort prologue on the common
-                            // disjoint / no-pending-read point write. This is the exact negation
-                            // of prepare()'s two true-early-outs for this call site (no intersect
-                            // command, no fallback seeds, no filter miss): behaviour identical,
-                            // measured -108 instr/op and -23 cyc/op on the armed SET at 1T.
-                            const bool needs_demotion_plan =
-                                (reserve_owner_fenced_current && op->shard >= 0) ||
-                                (rob.has_pending_read_local() &&
-                                 (!point_write_exact ||
-                                  rob.read_local_pending_may_touch(op->hash)));
-                            if (needs_demotion_plan &&
-                                !read_local_demotion.prepare(
-                                    *this, c, op->hash, point_write_exact, op->shard,
-                                    ReadLocalFallbackReason::InflightWrite,
-                                    reserve_owner_fenced_current))
-                                break;
-                            read_local_commit_at_ordinary = true;
-                        } else if (read_local_command_is_precise_mset(*op) &&
-                                   fused_executor_->read_local_point_writes_precise()) {
-                            const uint32_t key_count = (op->argc() - 1) / 2;
-                            bool intersect_filter_miss = false;
-                            uint64_t filter = 0;
-                            if (key_count <= ReadLocalRobState::kMaxPreciseKeysetKeys) {
-                                const bool pending_reads = rob.has_pending_read_local();
-                                bool pending_filter_hit = false;
-                                for (uint32_t arg = 1; arg < op->argc(); arg += 2) {
-                                    const uint64_t hash = FlatStore::hash_key(op->arg(arg));
-                                    filter |= ReadLocalRobState::keyset_filter(hash);
-                                    if (pending_reads && !pending_filter_hit)
-                                        pending_filter_hit =
-                                            rob.read_local_pending_may_touch(hash);
-                                }
-                                intersect_filter_miss =
-                                    !pending_reads || !pending_filter_hit;
-                            }
-                            const bool keyset_precise =
-                                rob.refine_current_write_keyset(filter, key_count);
-                            if (keyset_precise) op->mark_read_local_precise_write();
-                            if (!read_local_demotion.prepare(
-                                    *this, c, 0, false, -1,
-                                    ReadLocalFallbackReason::InflightWrite, false,
-                                    nullptr, nullptr, 0,
-                                    keyset_precise ? op : nullptr,
-                                    keyset_precise && intersect_filter_miss))
-                                break;
-                            read_local_commit_before_lowering = true;
-                        } else if (!read_local_demotion.prepare(
-                                       *this, c, 0, false, -1,
-                                       ReadLocalFallbackReason::InflightWrite)) {
-                            break;
-                        } else {
-                            read_local_commit_before_lowering = true;
-                        }
-                    } else if ((spec->flags & CmdFlags::ReadLocalEligible) != 0) {
-                        const bool mget = command_is_read_local_mget(*spec);
-                        read_local_mget_candidate = mget;
-                        // MGET owns a one-command latest-read boundary in both outcomes: local
-                        // success publishes its freshly copied vector, while demotion resolves the
-                        // whole command at this pass's pinned cut. Do not let an older local GET
-                        // from the same pass complete at a newer world and then follow it with an
-                        // MGET fallback at the older cut. Leave this frame unconsumed; after the
-                        // existing local lane resolves, reparsing samples a fresh pass cut.
-                        if (mget && rob.has_pending_read_local()) break;
-                        if (!mget && !point_route) std::abort();
-                        if (mget) {
-                            op->hash = FlatStore::hash_key(op->arg(1));
-                            op->shard = srv_->router().shard_of(op->hash);
-                            read_local_point_prehashed = true;
-                            read_local_lane_demand =
-                                std::min<uint32_t>(op->argc() - 1, srv_->nshards());
-                        }
-                        read_local_owner_conflict_reason = owner_conflict_for_command();
-                        read_local_owner_conflict = read_local_owner_conflict_reason !=
-                            ReadLocalFallbackReason::None;
-                        bool write_conflict = false;
-                        bool mget_atomic_pending = false;
-                        if (mget) {
-                            // Sample only the pending-key filter here. An open group outlives the
-                            // parse-to-execute gap, so that sample predicts the executor's answer;
-                            // the table-mutation bit is one ~200 ns exchange bracket that has
-                            // closed long before the executor reads, and sampling it on every
-                            // touched shard rejected about 11% of MGETs for nothing the executor's
-                            // own probe/validate would not have caught (mget_fallback_seq_churn).
-                            for (uint32_t arg = 1; arg < op->argc(); arg++) {
-                                const uint64_t hash = arg == 1
-                                    ? op->hash : FlatStore::hash_key(op->arg(arg));
-                                const int32_t shard = arg == 1
-                                    ? op->shard : srv_->router().shard_of(hash);
-                                read_local_pending_keys.add(hash);
-                                write_conflict |= rob.read_local_write_conflicts(
-                                    hash, read_local_command_touches_hash);
-                                mget_atomic_pending |=
-                                    srv_->shard(shard).store().foreign_read_key_unsafe(hash);
-                            }
-                        } else {
-                            write_conflict = rob.read_local_write_conflicts(
-                                op->hash, read_local_command_touches_hash);
-                        }
-                        read_local_eligible = extend_read_local_batch &&
-                            !write_conflict && !read_local_owner_conflict;
-                        if (extend_read_local_batch &&
-                            (write_conflict || read_local_owner_conflict)) {
-                            read_local_fallback_reason = write_conflict
-                                ? read_local_write_fallback_reason(rob)
-                                : read_local_owner_conflict_reason;
-                            read_local_batch = false;
-                        }
-                        if (!extend_read_local_batch) {
-                            read_local_eligible = true;
-                            if (multi_session_watch_size(conn) != 0) {
-                                read_local_fallback_reason =
-                                    ReadLocalFallbackReason::Watch;
-                                read_local_eligible = false;
-                            } else if (c->blocked() || c->subscriber_mode()) {
-                                read_local_fallback_reason =
-                                    ReadLocalFallbackReason::ContextConnectionState;
-                                read_local_eligible = false;
-                            } else if (op->has_scatter_state() ||
-                                       (spec->flags &
-                                        (CmdFlags::ScriptRoute | CmdFlags::AllShards)) ||
-                                       (!mget && (spec->flags & CmdFlags::MultiShard))) {
-                                read_local_fallback_reason =
-                                    ReadLocalFallbackReason::ContextRoute;
-                                read_local_eligible = false;
-                            } else if (write_conflict) {
-                                read_local_fallback_reason =
-                                    read_local_write_fallback_reason(rob);
-                                read_local_eligible = false;
-                            } else if (read_local_owner_conflict) {
-                                read_local_fallback_reason = read_local_owner_conflict_reason;
-                                read_local_eligible = false;
-                            } else if (mget &&
-                                       fused_executor_->read_local_keymiss_notify_armed()) {
-                                // A notify-aware owner lookup can emit keymiss. Local MGET serves
-                                // stable misses as nil, so keep the whole command on the unchanged
-                                // owner/scatter path while key-miss notifications are configured.
-                                read_local_fallback_reason =
-                                    ReadLocalFallbackReason::ContextKeymissNotify;
-                                read_local_eligible = false;
-                            } else {
-                                bool atomic_pending = mget_atomic_pending;
-                                bool seq_churn = false;
-                                if (!mget) {
-                                    const uint64_t state = srv_->shard(op->shard)
-                                                               .store()
-                                                               .read_local_state_acquire();
-                                    atomic_pending =
-                                        srv_->shard(op->shard)
-                                            .store()
-                                            .foreign_read_key_unsafe(state, op->hash);
-                                    seq_churn = !FlatStore::read_local_state_eligible(state);
-                                }
-                                if (atomic_pending) {
-                                    read_local_fallback_reason =
-                                        ReadLocalFallbackReason::AtomicPending;
-                                    read_local_eligible = false;
-                                } else if (seq_churn) {
-                                    read_local_fallback_reason =
-                                        ReadLocalFallbackReason::SeqChurn;
-                                    read_local_eligible = false;
-                                } else if (rob.pending_read_local_count() >= read_local_quota) {
-                                    // LANE ADMISSION, fair share: the lane is under
-                                    // pressure and this connection already holds its share of
-                                    // it. DEFER -- see the lane-full arm below for the shape.
-                                    // Deliberately does NOT re-arm the pressure window: a signal
-                                    // the actuator itself produces cannot police the actuator
-                                    // (measured: at the lane boundary the window fed by its own
-                                    // quota deferrals stayed armed forever and deferred 0.8% of
-                                    // reads where the lane itself refused 0.00008%). Only a real
-                                    // lane-full event arms it, so the lane proves pressure again
-                                    // every kReadLocalLanePressureRotations rotations.
-                                    self_->read_local_stats().defer_quota++;
-                                    break;
-                                } else if (!fused_executor_->local_read_lane_has_room(
-                                               read_local_lane_demand)) {
-                                    // LANE ADMISSION, lane full: DEFER, never demote.
-                                    // Nothing about this frame has been published -- the ROB
-                                    // slot is acquired but not published, no lane entry, no
-                                    // pending bit, no owner slot -- so leaving the bytes at rpos
-                                    // and ending the pass is the same shape as the MGET
-                                    // admission fence above. The pass reports Progress, so
-                                    // more_input keeps the connection in active_ and the next
-                                    // flush_ready re-parses it after this thread's own EX pass
-                                    // has drained the lane. (This arm exists only in the coarse
-                                    // Fused parser, whose IFID is that walk; pending_ifid_ is
-                                    // never consumed there, so it must not be touched here.)
-                                    // The former alternative, demoting the read to its shard
-                                    // owner as an ordinary task, was the seed of the p128 and
-                                    // 2048-connection pure-read collapse: 7/8 of those tasks
-                                    // were cross-thread, every pending owner task suppresses the
-                                    // receiving thread's lane tail-drain, its lane keeps a
-                                    // residue and fills sooner, and the demotions feed back. A
-                                    // read whose data is right here now waits one rotation
-                                    // instead. The deferral arms the pressure window, so the
-                                    // next rotation divides the lane fairly (quota arm above)
-                                    // instead of refusing whichever connections it parses last.
-                                    self_->read_local_stats().defer_lane_full++;
-                                    fused_executor_->note_local_read_lane_full();
-                                    break;
-                                }
-                            }
-                        }
-                        read_local_eligible_decided = true;
-                        if (!read_local_eligible) {
-                            if (read_local_fallback_reason ==
-                                ReadLocalFallbackReason::None) std::abort();
-                            // Keep the owner-routed read visible only to younger overlapping keys.
-                            // Disjoint reads may execute locally; ROB retirement orders replies.
-                            rob.extend_current_read_local_owner();
-                            if (mget) {
-                                // The MGET admission fence above reparses instead of reaching here
-                                // with any older pending local read, so the intersect set is empty.
-                                if (!read_local_demotion.prepare(
-                                        *this, c, 0, false, -1,
-                                        ReadLocalFallbackReason::ContextOwnerKey,
-                                        false, nullptr, nullptr, 0, op, true))
-                                    break;
-                                read_local_commit_before_lowering = true;
-                            } else {
-                                const bool reserve_owner_fenced_current =
-                                    read_local_owner_conflict &&
-                                    (climon_armed_cached_ & kReplaySensitiveClimon) != 0;
-                                if (!read_local_demotion.prepare(
-                                        *this, c, op->hash, true, op->shard,
-                                        ReadLocalFallbackReason::ContextOwnerKey,
-                                        reserve_owner_fenced_current))
-                                    break;
-                                read_local_commit_at_ordinary = true;
-                            }
-                        }
-                    } else if (!(spec->flags & CmdFlags::ConnLocal)) {
-                        read_local_owner_conflict_reason = point_route
-                            ? owner_conflict_for_hash(op->hash)
-                            : classify_owner_conflict([](const Op&) { return true; });
-                        read_local_owner_conflict = read_local_owner_conflict_reason !=
-                            ReadLocalFallbackReason::None;
-                        if (read_local_owner_conflict)
-                            rob.extend_current_read_local_owner();
-                        const bool reserve_owner_fenced_current =
-                            read_local_owner_conflict && point_route &&
-                            (climon_armed_cached_ & kReplaySensitiveClimon) != 0;
-                        if (!read_local_demotion.prepare(
-                                *this, c, point_route ? op->hash : 0,
-                                point_route, point_route ? op->shard : -1,
-                                point_route ? ReadLocalFallbackReason::ContextOwnerKey
-                                            : ReadLocalFallbackReason::ContextRoute,
-                                reserve_owner_fenced_current))
-                            break;
-                        if (point_route) read_local_commit_at_ordinary = true;
-                        else read_local_commit_before_lowering = true;
-                    }
-                }
-            }
-            if constexpr (Fused) {
-                if (read_local_enabled && read_local_demotion.active() &&
-                    read_local_demotion.partial()) {
-                    if (__builtin_expect(srv_->flip_dispatch_paused(), false) &&
-                        !(spec->flags & CmdFlags::FlipAsync)) {
-                        c->set_flip_backpressure(true);
-                        break;
-                    }
-                    // Only older, already-admitted reads are published here. The current frame is
-                    // still unconsumed, the FLIP fence above admitted publication, and it has not
-                    // crossed MONITOR/tracking or ACL, so it can be reparsed after the bounded wave
-                    // without replaying stateful hooks.
-                    read_local_demotion.commit_reads();
-                    break;
-                }
-            }
-            if (__builtin_expect(notify_armed, false) &&
-                __builtin_expect(climon_armed_gate(c, *op), false)) break;
             if (__builtin_expect(security_check, false) &&
                 acl_dispatch_entry(*this, conn, *op, consumed, security_flags)) continue;
-            if (__builtin_expect(srv_->flip_dispatch_paused(), false) &&
-                !(spec->flags & CmdFlags::FlipAsync)) {
-                // No ordinary request may create IO-local fanout or executor work after the first
-                // drain acknowledgement. Leave the frame unconsumed and unpublished: TCP framing
-                // keeps younger frames behind it without a ROB barrier, while FlipAsync commands
-                // at the head of other connections remain reachable throughout the pause.
-                c->set_flip_backpressure(true);
-                break;
-            }
-            if constexpr (Fused) {
-                // This must follow the per-frame FLIP gate above: demotion itself publishes owner
-                // Tasks. Non-point routes may touch any key, so move every unresolved local read
-                // before any of their lowering paths can publish.
-                if (read_local_enabled && read_local_commit_before_lowering) {
-                    if (read_local_demotion.active() && !read_local_write_hazard) {
-                        rob.extend_current_read_local_owner();
-                    }
-                    read_local_demotion.commit_reads();
-                }
-            }
             if (__builtin_expect((spec->flags & CmdFlags::Transaction) != 0, false) ||
                 __builtin_expect(conn.multi_session() != nullptr, false)) {
-                if constexpr (Fused) {
-                    if (read_local_enabled &&
-                        __builtin_expect((spec->flags & CmdFlags::ReadLocalEligible) &&
-                                         multi_session_active(conn), false))
-                        self_->read_local_stats().note_fallback(
-                            ReadLocalFallbackReason::Multi,
-                            command_is_read_local_mget(*spec));
-                }
-                if constexpr (IofusedPrivateQueue) {
-                    if (multi_dispatch_entry_iofused(*this, conn, *op, consumed)) continue;
-                } else {
-                    if (multi_dispatch_entry(*this, conn, *op, consumed)) continue;
-                }
+                if (multi_dispatch_entry(*this, conn, *op, consumed)) continue;
             }
             const bool config_scatter = (spec->flags & CmdFlags::ConfigRoute) &&
                                         command_config_routes_all_shards(*op);
@@ -3677,11 +1257,10 @@ private:
                 if (op->cmd_name().eq_icase("reset")) {
                     conn.advance_parse(consumed);
                     self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
-                    climon_reset_client(c, *op);
+                    climon_reset_client(c);
                     pubsub_start_reset(c, *op);
                     sig.ops++;
-                    mark_active_known<TargetedIfid>(c);
+                    mark_active(c);
                     break;
                 }
                 if (op->resp3()) goto subscriber_checks_done;
@@ -3695,7 +1274,6 @@ private:
                 if (op->cmd_name().eq_icase("ping")) {
                     conn.advance_parse(consumed);
                     self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
                     pubsub_reply_ping(*op);
                     finish_prebuilt(c, *op);
                     continue;
@@ -3703,7 +1281,6 @@ private:
                 if (!subscription_control && !op->cmd_name().eq_icase("quit")) {
                     conn.advance_parse(consumed);
                     self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
                     pubsub_reply_restricted(*op);
                     finish_prebuilt(c, *op);
                     continue;
@@ -3713,11 +1290,10 @@ subscriber_checks_done:
             if (spec->flags & CmdFlags::PubSub) {
                 conn.advance_parse(consumed);
                 self_->note_command(spec->id);
-                flip_fingerprint_note(*spec, *op);
                 const PubSubStartResult result = pubsub_start_command(c, *op);
                 if (result == PubSubStartResult::Async) {
                     sig.ops++;
-                    mark_active_known<TargetedIfid>(c);
+                    mark_active(c);
                     if (__builtin_expect(c->scatter_barrier(), false)) break;
                     continue;
                 }
@@ -3744,101 +1320,6 @@ subscriber_checks_done:
                 // retries from scratch before any lane hook fires.
                 if (__builtin_expect((spec->flags & CmdFlags::OrderedLocal) != 0, false) &&
                     rob.in_flight() != 0) break;
-                if (__builtin_expect((spec->flags & CmdFlags::FlipAsync) != 0, false) &&
-                    op->argc() == 3) {
-                    auto parse_count = [](Slice input, uint32_t& value) {
-                        if (!input.n) return false;
-                        uint64_t parsed = 0;
-                        for (uint32_t i = 0; i < input.n; i++) {
-                            if (input.p[i] < '0' || input.p[i] > '9') return false;
-                            parsed = parsed * 10 + static_cast<uint32_t>(input.p[i] - '0');
-                            if (parsed > UINT32_MAX) return false;
-                        }
-                        value = static_cast<uint32_t>(parsed);
-                        return true;
-                    };
-                    uint32_t target_io = 0, target_ex = 0;
-                    std::string error;
-                    bool started = parse_count(op->arg(1), target_io) &&
-                                   parse_count(op->arg(2), target_ex);
-                    if (!started) {
-                        error = "ERR FLIP io and ex must be unsigned integers";
-                        srv_->flip_note_refused();
-                    } else
-                        started = srv_->flip_begin(target_io, target_ex, self_id, error);
-                    conn.advance_parse(consumed);
-                    self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
-                    if (!started || srv_->flip_stage() == FlipStage::Idle) {
-                        if (started) reply_ok(op->sink());
-                        else reply_err(op->sink(), error.c_str());
-                        op->state.store(OpState::Done, std::memory_order_release);
-                        rob.publish();
-                        enqueue_serve(c);
-                        mark_active_known<TargetedIfid>(c);
-                        continue;
-                    }
-                    flip_client_ = c;
-                    flip_op_id_ = rob.dispatch_id();
-                    flip_epoch_local_ = srv_->flip_epoch();
-                    rob.publish();              // sole unfinished op on the coordinator connection
-                    mark_active_known<TargetedIfid>(c);
-                    break;
-                }
-                // DEBUG SLEEP parks only this connection. The unfinished ROB slot preserves
-                // pipeline order while this IO thread continues serving unrelated clients (and,
-                // in 1s, continues owning shards). All other DEBUG forms fall through unchanged.
-                if (__builtin_expect((spec->flags & CmdFlags::DebugSleep) != 0, false)) {
-                    if (op->argc() == 2 && op->arg(1).eq_icase("rehash-state")) {
-                        // This diagnostic reads mutable table counters. ConfigRoute normally
-                        // executes on the connection's IO thread, even though it passes shard 0
-                        // to the handler. Dispatch to the real owner instead, using the ordinary
-                        // queue/forwarding/publication path below. No read performs maintenance.
-                        op->hash = 0;
-                        op->shard = 0;
-                        goto ordinary_shard_ready;
-                    }
-                    uint64_t delay_ms = 0;
-                    const uint64_t slow_started =
-                        __builtin_expect(slowlog_armed_, false) ? now_ns() : 0;
-                    DebugSleepResult sleep =
-                        debug_sleep_prepare(*srv_, *c, *op, delay_ms);
-                    if (sleep != DebugSleepResult::NotSleep) {
-                        if (sleep == DebugSleepResult::Deferred &&
-                            deferred_timer_start(c, rob.dispatch_id(),
-                                                 DeferredTimerKind::DebugSleepOk, delay_ms,
-                                                 slow_started, slowlog_arm_)) {
-                            conn.advance_parse(consumed);
-                            self_->note_command(spec->id);
-                            flip_fingerprint_note(*spec, *op);
-                            rob.publish();
-                            c->set_blocked(true);
-                            // As with WAIT, retirement releases the barrier only after the timer's
-                            // reply has been staged and the ROB becomes quiescent.
-                            barrier_arm(c, BarrierOwner::Sleep);
-                            mark_active_known<TargetedIfid>(c);
-                            break;
-                        }
-                        if (sleep == DebugSleepResult::Deferred)
-                            reply_err(op->sink(), "ERR out of memory");
-                        if (__builtin_expect(slowlog_armed_, false)) {
-                            timespec wall{};
-                            ::clock_gettime(CLOCK_REALTIME, &wall);
-                            slowlog_record(self_id, c->id(), *op, now_ns() - slow_started,
-                                           static_cast<int64_t>(wall.tv_sec) * 1000 +
-                                               wall.tv_nsec / 1000000,
-                                           slowlog_arm_, true);
-                        }
-                        conn.advance_parse(consumed);
-                        self_->note_command(spec->id);
-                        flip_fingerprint_note(*spec, *op);
-                        op->state.store(OpState::Done, std::memory_order_release);
-                        rob.publish();
-                        enqueue_serve(c);
-                        mark_active_known<TargetedIfid>(c);
-                        continue;
-                    }
-                }
                 // An unsatisfied WAIT has no shard work, but Redis keeps the connection parked
                 // until its deadline (zero means forever). Publish an unfinished ROB slot and let
                 // this connection's IO owner complete it. MULTI does not enter this branch: its
@@ -3847,23 +1328,20 @@ subscriber_checks_done:
                     uint64_t timeout_ms = 0;
                     const WaitCommandResult wait = server_tail_prepare_wait(*op, timeout_ms);
                     if (wait == WaitCommandResult::Unsatisfied) {
-                        if (!deferred_timer_start(c, rob.dispatch_id(),
-                                                  DeferredTimerKind::WaitZero, timeout_ms, 0,
-                                                  SlowlogArm{})) {
+                        if (!deferred_wait_start(c, rob.dispatch_id(), timeout_ms)) {
                             reply_err(op->sink(), "ERR out of memory");
                         } else {
                             conn.advance_parse(consumed);
                             self_->note_command(spec->id);
-                            flip_fingerprint_note(*spec, *op);
                             rob.publish();
                             c->set_blocked(true);
                             // Released by the quiescence backstop, not here: a parked WAIT's own
-                            // completion (deferred_timer_pass) fires before its op retires, and
+                            // completion (deferred_wait_pass) fires before its op retires, and
                             // dropping the barrier there would let younger frames parse ahead of
                             // the WAIT reply's staging. Owner bit named so the release is
                             // attributable; the release site is deliberately unchanged.
                             barrier_arm(c, BarrierOwner::Wait);
-                            mark_active_known<TargetedIfid>(c);
+                            mark_active(c);
                             break;
                         }
                     } else if (wait == WaitCommandResult::Immediate) {
@@ -3873,11 +1351,10 @@ subscriber_checks_done:
                     // :0. Both retire through the ordinary local completion path below.
                     conn.advance_parse(consumed);
                     self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
                     op->state.store(OpState::Done, std::memory_order_release);
                     rob.publish();
                     enqueue_serve(c);
-                    mark_active_known<TargetedIfid>(c);
+                    mark_active(c);
                     continue;
                 }
                 // RESET clears this lane's connection state (monitor mode, tracking registration,
@@ -3885,10 +1362,9 @@ subscriber_checks_done:
                 // false flag test on a word the dispatcher already holds, on an already-cold
                 // command class -- no name comparison, and nothing on the ordinary path.
                 if (__builtin_expect((spec->flags & CmdFlags::Climon) != 0, false))
-                    climon_reset_client(c, *op);
+                    climon_reset_client(c);
                 conn.advance_parse(consumed);
                 self_->note_command(spec->id);
-                flip_fingerprint_note(*spec, *op);
                 command_set_local_context(c, self_);
                 snapshot_bind_io(self_, &ring_);
                 const bool acl_command = __builtin_expect(op->cmd_name().eq_icase("acl"), false);
@@ -3901,7 +1377,7 @@ subscriber_checks_done:
                 if (__builtin_expect(slowlog_armed_, false)) {
                     timespec wall{};
                     ::clock_gettime(CLOCK_REALTIME, &wall);
-                    slowlog_record(self_id, c->id(), *op, now_ns() - slow_started,
+                    slowlog_record(self_->id(), c->id(), *op, now_ns() - slow_started,
                                    static_cast<int64_t>(wall.tv_sec) * 1000 +
                                        wall.tv_nsec / 1000000,
                                    slowlog_arm_, true);
@@ -3911,9 +1387,8 @@ subscriber_checks_done:
                 op->state.store(OpState::Done, std::memory_order_release);
                 rob.publish();
                 enqueue_serve(c);
-                mark_active_known<TargetedIfid>(c);
-                if (c->closing()) { result = DispatchResult::Closed; break; }
-                if (acl_command) break;
+                mark_active(c);
+                if (c->closing() || acl_command) break;
                 if (__builtin_expect(climon_armed_dirty_, false)) {
                     climon_armed_dirty_ = false;
                     break;
@@ -3967,7 +1442,7 @@ subscriber_checks_done:
                 bool room = true;
                 for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
                     if (needed[tid] &&
-                        task_free_slots(srv_->thread(tid)) < needed[tid]) {
+                        srv_->thread(tid).task_free_slots(self_->id()) < needed[tid]) {
                         room = false;
                         break;
                     }
@@ -3986,14 +1461,13 @@ subscriber_checks_done:
                     ThreadCtx& owner = srv_->thread(tid);
                     const Task task{c, op_id, sid,
                                     reinterpret_cast<ScatterState*>(dispatch.state)};
-                    if (!post_task_quiet(owner, task)) std::abort();
+                    if (!owner.post_task_quiet(self_->id(), task, sig)) std::abort();
                     if (!touched_[tid]) {
                         touched_[tid] = true;
                         touched_list_[ntouched_++] = tid;
                     }
                 }
                 self_->note_command(spec->id);
-                flip_fingerprint_note(*spec, *op);
                 conn.advance_parse(consumed);
                 sig.ops++;
                 c->set_blocked(true);
@@ -4014,32 +1488,18 @@ subscriber_checks_done:
                 // means something, instead of being a number nothing was ever able to move.
                 if (__builtin_expect(srv_->debug_barrier_hold_armed(), false))
                     barrier_arm(c, BarrierOwner::Debug);
-                mark_active_known<TargetedIfid>(c);
+                mark_active(c);
                 break;
             }
 
 nonblocking_dispatch:
-            // Ordinary single-key commands never enter the scatter engine. Keep xshard_prepare's
-            // own classification guard for its other callers, but avoid paying the cross-TU call
-            // just to discover that GET/SET have none of the three scatter-routing flags.
-            if constexpr (Fused)
-                if (read_local_enabled && read_local_mget_candidate && read_local_eligible)
-                    goto ordinary_dispatch;
-            if (!(spec->flags & (CmdFlags::AllShards | CmdFlags::MultiShard |
-                                CmdFlags::ConfigRoute))) goto ordinary_dispatch;
-            {
             ScatterDispatch scatter_dispatch;
             const ScatterPrepare scatter_prepared =
-                xshard_prepare(*srv_, *op, scatter_pool_, self_id, c->id(), scatter_dispatch,
+                xshard_prepare(*srv_, *op, scatter_pool_, self_->id(), c->id(), scatter_dispatch,
                                false, c);
             if (scatter_prepared == ScatterPrepare::Error) {
                 conn.advance_parse(consumed);
                 finish_prebuilt(c, *op);
-                if constexpr (Fused)
-                    if (read_local_enabled && read_local_mget_candidate &&
-                        read_local_fallback_reason != ReadLocalFallbackReason::None)
-                        self_->read_local_stats().note_fallback(
-                            read_local_fallback_reason, true);
                 continue;
             }
             if (scatter_prepared == ScatterPrepare::Backpressure) {
@@ -4069,7 +1529,7 @@ nonblocking_dispatch:
                 // quiesces. Read-only and single-wave scatters (MGET, MSET/DEL groups, a direct
                 // RENAME) are not barriered and do not pay it -- they post every task from here.
                 if (scatter_dispatch.barrier && rob.in_flight() != 0) {
-                    xshard_abandon_unpublished(scatter_dispatch.state, scatter_pool_, self_id);
+                    xshard_destroy(scatter_dispatch.state, scatter_pool_, self_->id());
                     break;
                 }
                 // Read-only/plain scatters keep the compact V3 dispatch arm. Constructing route and
@@ -4091,7 +1551,7 @@ nonblocking_dispatch:
                     bool room = true;
                     for (uint32_t p = 0; p < nparticipants; p++) {
                         const uint32_t tid = participants[p];
-                        if (task_free_slots(srv_->thread(tid)) < needed[tid]) {
+                        if (srv_->thread(tid).task_free_slots(self_->id()) < needed[tid]) {
                             room = false;
                             break;
                         }
@@ -4099,8 +1559,7 @@ nonblocking_dispatch:
                     // Restore the zero-on-entry invariant before EVERY exit from this arm.
                     for (uint32_t p = 0; p < nparticipants; p++) needed[participants[p]] = 0;
                     if (!room) {
-                        xshard_abandon_unpublished(
-                            scatter_dispatch.state, scatter_pool_, self_id);
+                        xshard_destroy(scatter_dispatch.state, scatter_pool_, self_->id());
                         break;
                     }
                     const uint64_t op_id = rob.dispatch_id();
@@ -4111,24 +1570,18 @@ nonblocking_dispatch:
                         const uint32_t tid = srv_->worker_of_shard(sid);
                         ThreadCtx& owner = srv_->thread(tid);
                         const Task task{c, op_id, sid, scatter_dispatch.state};
-                        if (!post_task_quiet(owner, task)) std::abort();
+                        if (!owner.post_task_quiet(self_->id(), task, sig)) std::abort();
                         if (!touched_[tid]) {
                             touched_[tid] = true;
                             touched_list_[ntouched_++] = tid;
                         }
                     }
                     self_->note_command(spec->id);
-                    flip_fingerprint_note(*spec, *op);
                     conn.advance_parse(consumed);
                     sig.ops++;
-                    if constexpr (Fused)
-                        if (read_local_enabled && read_local_mget_candidate &&
-                            read_local_fallback_reason != ReadLocalFallbackReason::None)
-                            self_->read_local_stats().note_fallback(
-                                read_local_fallback_reason, true);
                     head_candidate = false;
                     if (scatter_dispatch.barrier) barrier_arm(c, BarrierOwner::Scatter);
-                    mark_active_known<TargetedIfid>(c);
+                    mark_active(c);
                     continue;
                 }
 
@@ -4147,12 +1600,12 @@ nonblocking_dispatch:
                 bool room = true;
                 for (uint32_t p = 0; p < nparticipants; p++) {
                     const uint32_t tid = participants[p];
-                    if (task_free_slots(srv_->thread(tid)) < needed[tid]) {
+                    if (srv_->thread(tid).task_free_slots(self_->id()) < needed[tid]) {
                         room = false; break;
                     }
                 }
                 if (!room) {
-                    xshard_abandon_unpublished(scatter_dispatch.state, scatter_pool_, self_id);
+                    xshard_destroy(scatter_dispatch.state, scatter_pool_, self_->id());
                     break;
                 }
                 const uint64_t op_id = rob.dispatch_id();
@@ -4182,21 +1635,19 @@ nonblocking_dispatch:
                     ThreadCtx& owner = srv_->thread(tid);
                     // Capacity was checked before any push. Publish all of this group's tasks for
                     // one executor with one queue-tail store; the parse-pass notify remains folded.
-                    if (!post_tasks_quiet(owner, posts + begin, end - begin)) std::abort();
+                    if (!owner.post_tasks_quiet(
+                            self_->id(), posts + begin, end - begin, sig)) std::abort();
                     if (!touched_[tid]) { touched_[tid] = true; touched_list_[ntouched_++] = tid; }
                 }
                 self_->note_command(spec->id); // one public command, not one count per shard task
-                flip_fingerprint_note(*spec, *op);
                 conn.advance_parse(consumed);
                 sig.ops++;
                 head_candidate = false;
                 if (scatter_dispatch.barrier) barrier_arm(c, BarrierOwner::Scatter);
-                mark_active_known<TargetedIfid>(c);
+                mark_active(c);
                 continue;
             }
-            }
 
-ordinary_dispatch:
             // The ordinary key position is registry metadata. Container children and the other
             // special routes refine it in the existing CursorShard hook below.
             if (spec->flags & CmdFlags::CursorShard) {
@@ -4218,69 +1669,10 @@ ordinary_dispatch:
                 op->hash = random;
                 op->shard = static_cast<int32_t>(chosen);
             } else {
-                if (!read_local_point_prehashed) {
-                    op->hash = FlatStore::hash_key(
-                        op->arg(static_cast<uint32_t>(spec->first_key)));
-                    op->shard = srv_->router().shard_of(op->hash);
-                }
+                op->hash  = FlatStore::hash_key(op->arg(static_cast<uint32_t>(spec->first_key)));
+                op->shard = srv_->router().shard_of(op->hash);
             }
-
-ordinary_shard_ready:
-            if constexpr (Fused) {
-                if (read_local_enabled && read_local_commit_at_ordinary) {
-                    // prepare() reserved the selected reads and this operation before any stateful
-                    // parser hook. Publish the reads first; the retained current credit makes the
-                    // ordinary owner append below infallible and preserves SPSC FIFO.
-                    if (read_local_demotion.active() && !read_local_write_hazard) {
-                        rob.extend_current_read_local_owner();
-                    }
-                    read_local_demotion.commit_reads();
-                }
-                if (read_local_enabled &&
-                    __builtin_expect(spec->flags & CmdFlags::ReadLocalEligible, false)) {
-                    if (!read_local_eligible_decided) std::abort();
-                    if (read_local_eligible) {
-                        if (head_candidate) {
-                            head_candidate = false;
-                            if (rob.in_flight() == 0 && c->nothing_to_write()) {
-                                SmallBuf<kWbufInline>& fb = c->fill_buf();
-                                op->direct = fb.data();
-                                op->direct_cap = static_cast<uint32_t>(fb.cap());
-                            }
-                        }
-                        const uint64_t op_id = rob.dispatch_id();
-                        op->mark_read_local();
-                        // Every hash read_local_command_touches_hash(*op, .) can match must enter
-                        // the pending filter here (GET: op->hash; MGET: the keys hashed above).
-                        // A point read reports exactly one, so it sets that word directly instead
-                        // of merging a summary whose other three words it had just zeroed.
-                        if (read_local_mget_candidate)
-                            rob.mark_current_read_local(op_id, read_local_pending_keys);
-                        else
-                            rob.mark_current_read_local_hash(op_id, op->hash);
-                        if (read_local_mget_candidate)
-                            rob.arm_current_local_mget_fence();
-                        rob.publish();
-                        // Room was proved by local_read_lane_has_room(read_local_lane_demand)
-                        // above for this very op (run extension at the top of the frame, run head
-                        // in the gate chain); nothing between there and here consumes lane room.
-                        fused_executor_->enqueue_local_read(c, op_id, read_local_lane_demand);
-                        conn.advance_parse(consumed);
-                        sig.ops++;
-                        flip_fingerprint_note(*spec, *op);
-                        mark_active_known<TargetedIfid>(c);
-                        read_local_batch = !read_local_mget_candidate;
-                        // Fill at most the existing fused IFID quantum; intervening ordinary frames
-                        // simply end this run. MGET holds a one-command cut fence until local
-                        // validation or irrevocable owner demotion, so stop this parse pass now.
-                        if (read_local_mget_candidate) break;
-                        continue;
-                    }
-                }
-            }
-
-            const uint32_t worker_id = srv_->worker_of_shard(op->shard);
-            ThreadCtx& worker = srv_->thread(worker_id);
+            ThreadCtx& worker = srv_->thread(srv_->worker_of_shard(op->shard));
 
             // PUBLISH BEFORE DISPATCH. The old order posted the task first and published after, which
             // left a window of two instructions in which a worker could receive the task, execute it,
@@ -4309,14 +1701,7 @@ ordinary_shard_ready:
             }
             Task t{c, rob.dispatch_id(), -1, nullptr};
             rob.publish();
-            bool posted = false;
-            if constexpr (Fused) {
-                if (read_local_enabled && read_local_demotion.current_reserved()) {
-                    read_local_demotion.post_current(t, worker_id);
-                    posted = true;
-                }
-            }
-            if (!posted && !post_task_quiet(worker, t)) {
+            if (!worker.post_task_quiet(self_->id(), t, sig)) {
                 rob.unpublish();          // a refused push must leave NO trace -- including in the ROB
                 // A REFUSED PUSH MUST LEAVE NO TRACE. Advancing the parse cursor before this point
                 // consumed the command's bytes while publishing no op, so the client waited forever
@@ -4327,116 +1712,34 @@ ordinary_shard_ready:
                 // inbox space.
                 break;
             }
-            if constexpr (Fused) {
-                // Count only after the owner task is irrevocably queued. A refused SPSC push
-                // unpublishes and reparses this frame; charging before it would double-count and
-                // could report a fallback for a retry that later takes the local lane.
-                if (read_local_enabled &&
-                    read_local_fallback_reason != ReadLocalFallbackReason::None)
-                    self_->read_local_stats().note_fallback(
-                        read_local_fallback_reason, read_local_mget_candidate);
-            }
             conn.advance_parse(consumed);
             sig.ops++;
-            flip_fingerprint_note(*spec, *op);
-            touch_worker(worker_id);
-            // Unified pipeline 1 entered with a live active client and its batch tail decides once
-            // whether input/backpressure requires another IFID visit. Repeating the same active
-            // and queue-dedupe checks for every op was pure per-op work; the other schedules retain
-            // their existing mark here.
-            if constexpr (!SuppressOrdinaryActiveMark)
-                mark_active_known<TargetedIfid>(c);
-        }
-        if constexpr (!IoPipe) {
-            // Item 2: one notify per worker per parse pass, not per op. The pushes above are already
-            // visible in the queues; this publishes the "look here" bit and pays the wake decision
-            // once. The pipelined schedule deliberately folds the same set across its whole IFID
-            // batch and publishes it at IFID.POST.
-            for (uint32_t i = 0; i < ntouched_; i++) {
-                const uint32_t wkr = touched_list_[i];
-                touched_[wkr] = false;
-                srv_->thread(wkr).flush_task_notify(self_id, ring_, sig);
+            {
+                const uint32_t wkr = static_cast<uint32_t>(srv_->worker_of_shard(op->shard));
+                if (!touched_[wkr]) { touched_[wkr] = true; touched_list_[ntouched_++] = wkr; }
             }
-            ntouched_ = 0;
+            mark_active(c);
         }
-        flip_fingerprint_finish_pass();
-        return result;
-    }
-
-    uint32_t flush_ifid_posts() {
-        LoopSignals& sig = self_->sig();
-        const uint32_t self_id = self_->id();
-        const uint32_t posted = ntouched_;
+        // Item 2: one notify per worker per parse pass, not per op. The pushes above are already
+        // visible in the queues; this publishes the "look here" bit and pays the wake decision once.
+        // The touched set is a LIST, not a scan: the first version swept all 128 thread slots per
+        // pass, which at p1 is 128 loads per op and measured -2.5% -- the batching win eaten by its
+        // own bookkeeping.
         for (uint32_t i = 0; i < ntouched_; i++) {
             const uint32_t wkr = touched_list_[i];
             touched_[wkr] = false;
-            srv_->thread(wkr).flush_task_notify(self_id, ring_, sig);
+            srv_->thread(wkr).flush_task_notify(self_->id(), ring_, sig);
         }
         ntouched_ = 0;
-        return posted;
-    }
-
-    // The per-operation gate of the SAMPLED fingerprint: one load of the
-    // writer's own word -- the line the old enabled() test already read -- and one predicted-false
-    // branch. The body below (the argv walk and its five counter stores, 63-86 instr/op when it ran
-    // on every frame) runs only inside a sampled parse pass. Dark writer (--flip-auto 0, every 1s
-    // boot): the word is never 0 and nothing else runs.
-    void flip_fingerprint_note(const CommandSpec& spec, const Op& op) {
-        if (__builtin_expect(self_->flip_fingerprint().pass_sampled(), false))
-            flip_fingerprint_note_sampled(spec, op);
-    }
-
-    // Pass end: the unsampled pass counts down; the sampled pass publishes and draws its gap. The
-    // draw is taken here, once per sampled pass, never eagerly per pass.
-    void flip_fingerprint_finish_pass() {
-        FlipFingerprintWriter& writer = self_->flip_fingerprint();
-        if (__builtin_expect(!writer.enabled(), true)) return;
-        if (writer.finish_parse_pass()) writer.arm(next_random());
-    }
-
-    __attribute__((noinline))
-    void flip_fingerprint_note_sampled(const CommandSpec& spec, const Op& op) {
-        FlipFingerprintWriter& writer = self_->flip_fingerprint();
-        uint32_t keys = 0;
-        uint32_t first = 0, last = 0, step = 1;
-        if (spec.first_key > 0 && static_cast<uint32_t>(spec.first_key) < op.argc()) {
-            first = static_cast<uint32_t>(spec.first_key);
-            last = spec.last_key < 0 ? op.argc() - 1
-                                     : std::min<uint32_t>(spec.last_key, op.argc() - 1);
-            step = spec.key_step > 0 ? static_cast<uint32_t>(spec.key_step) : 1;
-            if (last >= first) keys = (last - first) / step + 1;
-        }
-        uint64_t value_bytes = 0;
-        for (uint32_t arg = 1; arg < op.argc(); arg++) {
-            const bool key = keys && arg >= first && arg <= last && (arg - first) % step == 0;
-            if (!key) value_bytes += op.arg(arg).n;
-        }
-        FlipFingerprintClass command_class = FlipFingerprintClass::Other;
-        if (spec.flags & CmdFlags::Blocking) {
-            command_class = FlipFingerprintClass::Blocking;
-        } else if (keys > 1 && srv_->cfg().atomic &&
-                   (spec.flags & CmdFlags::MultiShard)) {
-            command_class = FlipFingerprintClass::AtomicGrouped;
-        } else if (keys > 1) {
-            command_class = spec.flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)
-                ? FlipFingerprintClass::MultiWrite : FlipFingerprintClass::MultiRead;
-        } else if (spec.flags & (CmdFlags::Write | CmdFlags::SnapshotWrite)) {
-            command_class = FlipFingerprintClass::Write;
-        } else if (spec.flags & CmdFlags::Readonly) {
-            command_class = FlipFingerprintClass::Read;
-        }
-        writer.note_command(command_class, keys, value_bytes);
     }
 
     // THE ONE DOOR ONTO THE PARSE BARRIER. Every owner parks a connection through here so the
     // overlap -- two owners holding the barrier at once -- is COUNTED rather than assumed absent.
-    // A blocking op is alone in its ROB: dispatch waits for all older ops to retire, then the
-    // barrier stops younger frames; a resumed move reuses that slot and inherits its owner bit.
-    // No external production path adds another owner while it is parked.
-    // barrier_owner_overlaps is that argument's live assertion, and a validation run that
+    // NOTES-BARRIER.md section 2 argues from the source that no production sequence produces one
+    // today; barrier_owner_overlaps is that argument's live assertion, and a validation run that
     // wants the two-owner geometry gates on it rather than trusting the prose. Cold by
-    // construction: the seven owners are EXEC, a subscribe, a blocking command, a deferred WAIT,
-    // a deferred DEBUG SLEEP, a barriered scatter and a CLIENT fan-out. GET and SET never reach it.
+    // construction: the six owners are EXEC, a subscribe, a blocking command, a deferred WAIT, a
+    // barriered scatter and a CLIENT fan-out. GET and SET never reach it.
     void barrier_arm(Client* c, BarrierOwner who) {
         if (__builtin_expect(c->scatter_barrier(), false)) srv_->note_barrier_overlap();
         c->barrier_acquire(who);
@@ -4448,8 +1751,6 @@ ordinary_shard_ready:
     }
 
     void finish_prebuilt(Client* c, Op& op) {
-        // Unknown-command and arity errors precede the ordinary armed gate.
-        if (!op.spec && (climon_armed_cached_ & Server::kClimonReply)) climon_mark_reply(c, op);
         op.state.store(OpState::Done, std::memory_order_release);
         c->rob().publish();
         enqueue_serve(c);
@@ -4485,93 +1786,20 @@ ordinary_shard_ready:
 
     void mark_active(Client* c) {
         if (c->dead()) return;               // a corpse from the deferred-free list: entry consumed, nothing to do
-        if (targeted_ifid_) enqueue_ifid(c);
         if (c->in_active()) return;          // one load, not a scan of the whole set
         c->set_in_active(true);
         active_.insert(c);
     }
 
-    template <bool TargetedIfid>
-    void mark_active_known(Client* c) {
-        if (c->dead()) return;
-        if constexpr (TargetedIfid)
-            if (!c->ifid_pending()) {
-                c->set_ifid_pending(true);
-                pending_ifid_.push_back(c);
-            }
-        if (c->in_active()) return;
-        c->set_in_active(true);
-        active_.insert(c);
-    }
-
-    void enqueue_ifid(Client* c) {
-        if (!c || c->dead() || c->ifid_pending()) return;
-        c->set_ifid_pending(true);
-        pending_ifid_.push_back(c);
-    }
-
-    void discard_ifid(Client* c) {
-        if (!c || !c->ifid_pending()) return;
-        for (auto it = pending_ifid_.begin(); it != pending_ifid_.end(); ++it) {
-            if (*it != c) continue;
-            pending_ifid_.erase(it);
-            c->set_ifid_pending(false);
-            return;
-        }
-        std::abort();
-    }
-
-    void clear_ifid_queue() {
-        while (!pending_ifid_.empty()) {
-            Client* c = pending_ifid_.front();
-            pending_ifid_.pop_front();
-            if (c) c->set_ifid_pending(false);
-        }
-    }
-
     // ---- inbound: workers telling us a client has completed ops -----------------------------------
     // Inbound from workers: "ops are Done" -- the claimed-post fallback for a conn with no
     // ready-mask slot. Either way the answer is the same: put the client back in the active set.
-    template <bool HasUnix, bool HasTls, bool kEp, bool Fused = false>
+    template <bool HasUnix, bool HasTls, bool kEp>
     uint32_t sweep() {
         uint32_t work = 0;
         if constexpr (HasUnix) work += flush_handoffs();
-        if constexpr (Fused) {
-            work += service_client_migrations<kEp>() + drain_client_transfers<kEp>(true) +
-                    flush_borrow_releases() +
-                    flush_ready<HasTls, kEp, true, HasUnix, true>();
-        } else {
-            work += service_client_migrations<kEp>() + drain_client_transfers<kEp>(true) +
-                    flush_borrow_releases() + collect_retire_work<HasUnix, kEp>(true) +
-                    flush_ready<HasTls, kEp>();
-        }
-        if (__builtin_expect(!routing_forward_.empty(), false))
-            client_routing_cleanup_pass();
-        if (srv_->snapshot().writer_is(self_->id()))
-            work += srv_->snapshot().writer_pass(*self_, ring_, true);
-        if (srv_->aof().writer_is(self_->id()))
-            work += srv_->aof().writer_pass(*self_, ring_, true);
-        return work;
-    }
-
-    template <bool HasUnix, bool HasTls, bool kEp, bool SplitLocal = false>
-    uint32_t pipeline_sweep(bool natural_order, bool& submitted) {
-        uint32_t work = 0;
-        if constexpr (HasUnix) work += flush_handoffs();
-        work += service_client_migrations<kEp>() + drain_client_transfers<kEp>(true) +
-                flush_borrow_releases();
-        // The hot rotation visits one cap-bounded IFID batch. Before parking, run enough batches
-        // to inspect the whole active set once, retaining this outer pass's selected order and the
-        // unmasked completion drain.
-        const size_t active_at_start = active_.size();
-        const size_t passes = std::max<size_t>(
-            1, (active_at_start + kIoPipeIfidBatchClients - 1) /
-                   kIoPipeIfidBatchClients);
-        for (size_t pass = 0; pass < passes; pass++)
-            work += pipeline_pass<HasUnix, HasTls, kEp, SplitLocal>(
-                true, natural_order, submitted);
-        if (__builtin_expect(!routing_forward_.empty(), false))
-            client_routing_cleanup_pass();
+        work += flush_borrow_releases() + collect_retire_work<HasUnix, kEp>(true) +
+                flush_ready<HasTls, kEp>();
         if (srv_->snapshot().writer_is(self_->id()))
             work += srv_->snapshot().writer_pass(*self_, ring_, true);
         if (srv_->aof().writer_is(self_->id()))
@@ -4596,7 +1824,7 @@ ordinary_shard_ready:
         return n;
     }
 
-    template <bool HasUnix, bool kEp, bool TargetedIfid = false>
+    template <bool HasUnix, bool kEp>
     uint32_t collect_retire_work(bool unmasked = false) {
         uint32_t pubsub_work = 0;
         auto take = [&](Client* c) {
@@ -4610,12 +1838,11 @@ ordinary_shard_ready:
             if constexpr (HasUnix)
                 if (!c->retire_queued().load(std::memory_order_acquire)) {
                     adopt_client<kEp>(c, true);
-                    if constexpr (TargetedIfid) enqueue_ifid(c);
                     return;
                 }
             c->retire_queued().store(false, std::memory_order_release);
             enqueue_serve(c);                    // a posted client is a serve request
-            mark_active_known<TargetedIfid>(c);
+            mark_active(c);
         };
         uint32_t n = unmasked ? self_->drain_clients_unmasked(take) : self_->drain_clients(take);
         // The ready-mask path: workers set one bit per completed-work burst; we map slot -> client,
@@ -4629,979 +1856,17 @@ ordinary_shard_ready:
                 const uint32_t b = static_cast<uint32_t>(__builtin_ctzll(bits));
                 bits &= bits - 1;
                 Client* c = self_->wb_slot_client(w * 64 + b);
-                if (c && !c->dead()) {
-                    enqueue_serve(c);
-                    mark_active_known<TargetedIfid>(c);
-                    n++;
-                }
+                if (c && !c->dead()) { enqueue_serve(c); mark_active(c); n++; }
             }
         }
         return n + pubsub_work;
-    }
-
-    bool client_pipeline_referenced(const Client* client) const {
-        if (client->ifid_pending()) return true;
-        if (active_wb_context_)
-            for (uint32_t i = 0; i < active_wb_context_->count; i++)
-                if (active_wb_context_->clients[i] == client) return true;
-        return false;
-    }
-
-    bool io_pipelines_quiesced() const {
-        return active_wb_context_ == nullptr;
-    }
-
-    // Targeted receive-buffer maintenance and the ordinary uncapped parser, shared by both
-    // overlapping fused schedules. Reply retirement and sends remain separate WB stages.
-    template <bool HasTls, bool kEp>
-    uint32_t genthread_ifid_batch() {
-        uint32_t work = 0;
-        backstop_pass_ = (++flush_tick_ >= kFlushBackstopEvery);
-        if (backstop_pass_) flush_tick_ = 0;
-        size_t ready_visits = pending_ifid_.size();
-
-        while (ready_visits) {
-            Client* c = pending_ifid_.front();
-            pending_ifid_.pop_front();
-            ready_visits--;
-            if (!c) continue;
-            c->set_ifid_pending(false);
-            if (c->dead() || !c->in_active()) continue;
-            Client& conn = *c;
-            DispatchResult dispatch_result = DispatchResult::Progress;
-            TlsConn* tls = nullptr;
-            if constexpr (HasTls) tls = tls_engine(c);
-            if (backstop_pass_ && !c->serve_pending()) enqueue_serve(c);
-
-            if constexpr (HasTls) {
-                if (tls) {
-                    if (!c->closing() && !c->recv_armed())
-                        (void)drive_tls<kEp, true, 1>(c);
-                    else if (tls->userspace()) {
-                        (void)wb_.pump_tls<kEp, true>(*c, *tls);
-                        if (tls->socket_userspace() && tls->has_pinned_plain())
-                            arm_tls_socket_poll<kEp>(c, tls->wanted());
-                    }
-                    tls = tls_engine(c);
-                    if constexpr (kEp)
-                        if (wb_.take_send_failure()) epoll_request_close(c);
-                }
-            }
-
-            if (c->scatter_barrier()) {
-                const bool resumed = c->blocked() && blocking_resume_move_iofused(
-                    *srv_, *self_, ring_, *c, scatter_pool_);
-                if (resumed) {
-                    enqueue_serve(c);
-                    work++;
-                }
-                if (__builtin_expect(c->barrier_held_by(BarrierOwner::Debug), false) &&
-                    !srv_->debug_barrier_hold_armed())
-                    c->barrier_release(BarrierOwner::Debug);
-                if (c->rob().quiesced())
-                    c->barrier_release_quiesced();
-            }
-            if (c->atomic_backpressure() && srv_->atomic_can_admit(self_->id()) &&
-                scatter_pool_.can_register_snapshot())
-                c->set_atomic_backpressure(false);
-            if (c->flip_backpressure() && !srv_->flip_dispatch_paused())
-                c->set_flip_backpressure(false);
-            if (c->rob().quiesced() &&
-                (kEp || !conn.recv_armed()))
-                conn.reset_rbuf_at_quiescence();
-
-            if constexpr (kEp) {
-                if (c->closing()) c->set_recv_armed(false);
-                if (!c->closing()) {
-                    if constexpr (HasTls) {
-                        if (tls) arm_tls_recv<kEp, true, 1>(c);
-                        else arm_recv<kEp>(c);
-                    } else {
-                        arm_recv<kEp>(c);
-                    }
-                    if constexpr (HasTls) if (tls) {
-                        (void)drive_tls<kEp, true, 1>(c);
-                        tls = tls_engine(c);
-                    }
-                    if (wb_.take_send_failure()) epoll_request_close(c);
-                }
-            }
-
-            if (!c->closing() && conn.rpos() < conn.rlen() && !c->scatter_barrier() &&
-                !c->parse_backpressure()) {
-                if (__builtin_expect(climon_pause_armed(), false)) {
-                    const uint32_t rpos_before = conn.rpos();
-                    if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<
-                                true, 0, false, true, true, true>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<
-                                false, 0, false, true, true, true>(c);
-                    } else {
-                        dispatch_result = parse_and_dispatch<
-                            false, 0, false, true, true, true>(c);
-                    }
-                    if (conn.rpos() != rpos_before) work++;
-                } else {
-                    if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<
-                                true, 0, false, true, true, true>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<
-                                false, 0, false, true, true, true>(c);
-                    } else {
-                        dispatch_result = parse_and_dispatch<
-                            false, 0, false, true, true, true>(c);
-                    }
-                    if (__builtin_expect(dispatch_result != DispatchResult::NeedInput, true))
-                        work++;
-                }
-            }
-
-            if constexpr (!kEp) {
-                if constexpr (HasTls) {
-                    if (tls && tls->memory_bio())
-                        arm_tls_recv<kEp, true, 1>(c);
-                    else if (!tls)
-                        arm_recv<kEp>(c);
-                } else {
-                    arm_recv<kEp>(c);
-                }
-            }
-
-            const bool stuck = (conn.rpos() < conn.rlen() && c->rob().full()) ||
-                               (!conn.recv_armed() && !c->closing());
-            const bool more_input = conn.rpos() < conn.rlen() &&
-                                    dispatch_result != DispatchResult::NeedInput;
-            const bool tls_output = tls && (tls->output_pending() || c->send_inflight());
-            const bool done = c->rob().quiesced() &&
-                              !more_input && !stuck && !c->serve_pending() &&
-                              c->nothing_to_write() && !tls_output;
-            if (c->dead() || !c->in_active()) continue;
-            if (done && !c->closing()) {
-                c->set_in_active(false);
-                active_.erase(c);
-            } else if (c->closing() && !tls_output && c->safe_to_release()) {
-                if (pubsub_disconnect_ready(c)) {
-                    c->set_in_active(false);
-                    active_.erase(c);
-                    close_client(c);
-                } else {
-                    enqueue_ifid(c);
-                }
-            } else {
-                const bool retry_without_retire =
-                    c->closing() || c->parse_backpressure() || c->scatter_barrier() ||
-                    (!c->recv_armed() && !c->closing()) ||
-                    (more_input && !c->rob().full());
-                if (retry_without_retire) enqueue_ifid(c);
-            }
-        }
-
-        if constexpr (kEp) {
-            while (!epoll_closes_.empty()) {
-                Client* victim = epoll_closes_.back();
-                epoll_closes_.pop_back();
-                epoll_close_now(victim);
-            }
-        }
-        return work;
-    }
-
-    // IOFUSED: launch the targeted WB dependency stream, use the ordinary coarse IFID pass as its
-    // filler, consume the warmed retirement batch, then run EX. The outer loop owns the sole submit
-    // boundary and applies the measured SEND-immediate / four non-SEND rotations rule.
-    template <bool HasUnix, bool HasTls, bool kEp>
-    uint32_t genthread_iofused_pass(WbPipelineBatch& batch) {
-        if (batch.count || active_wb_context_) std::abort();
-        active_wb_context_ = &batch;
-
-        uint32_t work = collect_retire_work<HasUnix, kEp, true>();
-        if (!pending_serve_.empty()) {
-            AofManager& aof = srv_->aof();
-            if (!aof_gate_target_) aof_gate_target_ = aof.posted_sequence();
-            if (!aof.reply_gate_ready(aof_gate_target_)) {
-                aof.register_send_gate_wait(self_->id());
-            } else {
-                aof_gate_target_ = 0;
-                while (batch.count < kGenthreadPipelineWbBatchConns &&
-                       !pending_serve_.empty()) {
-                    Client* client = pending_serve_.front();
-                    pending_serve_.pop_front();
-                    client->set_serve_pending(false);
-                    if (!client->dead()) {
-                        batch.clients[batch.count] = client;
-                        batch.count++;
-                    }
-                }
-            }
-        } else {
-            aof_gate_target_ = 0;
-        }
-
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(
-                    op.zc_len, kGenthreadWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kGenthreadCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
-        }
-
-        work += batch.count;
-        work += genthread_ifid_batch<HasTls, kEp>();
-        if (__builtin_expect(pubsub_pass_pending_, false)) work += pubsub_pass_flush();
-
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client*& submit_client = batch.clients[i];
-            Client* client = submit_client;
-            if (!client || client->dead()) continue;
-            if (__builtin_expect(
-                    (climon_armed_cached_ & Server::kClimonReply) != 0, false) &&
-                climon_reply_suppressed(client)) {
-                bool submit_allowed;
-                (void)climon_prepare_suppressed(client, submit_allowed);
-                if (!submit_allowed) submit_client = nullptr;
-                continue;
-            }
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(client))
-                    (void)wb_.prepare_pipeline_tls<kEp, true>(*client, *tls);
-                else if (TlsConn* slot = tls_slot_conn(client); slot && slot->ktls())
-                    (void)wb_.prepare_pipeline_ktls<kEp, true>(*client);
-                else
-                    (void)wb_.prepare_pipeline<kEp, true>(*client);
-            } else {
-                (void)wb_.prepare_pipeline<kEp, true>(*client);
-            }
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            bool retry_plain_submit = false;
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(client)) {
-                    (void)wb_.pump_tls<kEp, true>(*client, *tls);
-                    if (tls->socket_userspace() && tls->has_pinned_plain())
-                        arm_tls_socket_poll<kEp>(client, tls->wanted());
-                    if (tls->failed())
-                        close_client(client,
-                                     tls->output_pending() || client->send_inflight());
-                } else if (TlsConn* slot = tls_slot_conn(client); slot && slot->ktls()) {
-                    const bool sent = wb_.pump<kEp, true>(*client);
-                    retry_plain_submit = !kEp && !sent &&
-                        !client->send_inflight() && !client->nothing_to_write();
-                } else {
-                    const bool sent = wb_.pump<kEp, true>(*client);
-                    retry_plain_submit = !kEp && !sent &&
-                        !client->send_inflight() && !client->nothing_to_write();
-                }
-            } else {
-                const bool sent = wb_.pump<kEp, true>(*client);
-                retry_plain_submit = !kEp && !sent &&
-                    !client->send_inflight() && !client->nothing_to_write();
-            }
-            if constexpr (kEp)
-                if (wb_.take_send_failure()) epoll_close_now(client);
-            if (retry_plain_submit && !client->dead()) {
-                self_->sig().sqe_starved++;
-                enqueue_serve(client);
-            }
-            if (!client->dead() && client->in_active()) enqueue_ifid(client);
-        }
-        batch.count = 0;
-        active_wb_context_ = nullptr;
-
-        work += fused_executor_->fused_coarse_pass();
-        return work;
-    }
-
-    // FUSED OVERLAP ON (formerly 2): iofused's ready lists and whole batches, with the first EX
-    // batch split at its existing prefetch seam. The gate samples only work completed by this
-    // pass. Closed rotations use the literal coarse IFID -> EX -> WB owner order; an open rotation
-    // freezes and warms WB first, then runs IFID -> EX loads -> WB stores -> EX consumption. The WB
-    // callback is synchronous, so neither its client batch nor EX's stack task batch crosses an
-    // outer boundary.
-    template <bool HasUnix, bool HasTls, bool kEp>
-    uint32_t genthread_three_way_pass(WbPipelineBatch& batch, bool& gate_open) {
-        srv_->mode_schedule_stats(self_->id()).note_overlap(OverlapSchedule::Fused, gate_open);
-        if (batch.count || active_wb_context_) std::abort();
-        LoopSignals& sig = self_->sig();
-        uint32_t occupancy = 0;
-        auto note_ops_since = [&](uint64_t before) {
-            const uint64_t delta = sig.ops >= before ? sig.ops - before : 0;
-            occupancy = std::max<uint32_t>(
-                occupancy, static_cast<uint32_t>(std::min<uint64_t>(delta, UINT32_MAX)));
-        };
-
-        if (!gate_open) {
-            uint32_t work = 0;
-            uint64_t before = sig.ops;
-            work += genthread_ifid_batch<HasTls, kEp>();
-            note_ops_since(before);
-
-            before = sig.ops;
-            work += fused_executor_->fused_coarse_pass();
-            note_ops_since(before);
-
-            work += collect_retire_work<HasUnix, kEp, true>();
-            uint32_t wb_occupancy = 0;
-            work += genthread_wb_batch<HasTls, kEp, true>(&wb_occupancy);
-            occupancy = std::max(occupancy, wb_occupancy);
-            gate_open = occupancy >= kGenthreadThreeWayMinBatchOccupancy;
-            return work;
-        }
-
-        active_wb_context_ = &batch;
-        uint32_t work = collect_retire_work<HasUnix, kEp, true>();
-        if (!pending_serve_.empty()) {
-            AofManager& aof = srv_->aof();
-            if (!aof_gate_target_) aof_gate_target_ = aof.posted_sequence();
-            if (!aof.reply_gate_ready(aof_gate_target_)) {
-                aof.register_send_gate_wait(self_->id());
-            } else {
-                aof_gate_target_ = 0;
-                while (batch.count < kGenthreadPipelineWbBatchConns &&
-                       !pending_serve_.empty()) {
-                    Client* client = pending_serve_.front();
-                    pending_serve_.pop_front();
-                    client->set_serve_pending(false);
-                    if (!client->dead()) batch.clients[batch.count++] = client;
-                }
-            }
-        } else {
-            aof_gate_target_ = 0;
-        }
-
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(
-                    op.zc_len, kGenthreadWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kGenthreadCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
-        }
-
-        const uint32_t wb_occupancy = batch.count;
-        occupancy = std::max(occupancy, wb_occupancy);
-        work += wb_occupancy;
-        const uint64_t before_ifid = sig.ops;
-        work += genthread_ifid_batch<HasTls, kEp>();
-        note_ops_since(before_ifid);
-        if (__builtin_expect(pubsub_pass_pending_, false)) work += pubsub_pass_flush();
-
-        bool wb_filled = false;
-        auto wb_filler = [&] {
-            if (wb_filled) std::abort();
-            wb_filled = true;
-            for (uint32_t i = 0; i < batch.count; i++) {
-                Client*& submit_client = batch.clients[i];
-                Client* client = submit_client;
-                if (!client || client->dead()) continue;
-                if (__builtin_expect(
-                        (climon_armed_cached_ & Server::kClimonReply) != 0, false) &&
-                    climon_reply_suppressed(client)) {
-                    bool submit_allowed;
-                    (void)climon_prepare_suppressed(client, submit_allowed);
-                    if (!submit_allowed) submit_client = nullptr;
-                    continue;
-                }
-                if constexpr (HasTls) {
-                    if (TlsConn* tls = tls_engine(client))
-                        (void)wb_.prepare_pipeline_tls<kEp, true>(*client, *tls);
-                    else if (TlsConn* slot = tls_slot_conn(client); slot && slot->ktls())
-                        (void)wb_.prepare_pipeline_ktls<kEp, true>(*client);
-                    else
-                        (void)wb_.prepare_pipeline<kEp, true>(*client);
-                } else {
-                    (void)wb_.prepare_pipeline<kEp, true>(*client);
-                }
-            }
-            for (uint32_t i = 0; i < batch.count; i++) {
-                Client* client = batch.clients[i];
-                if (!client || client->dead()) continue;
-                bool retry_plain_submit = false;
-                if constexpr (HasTls) {
-                    if (TlsConn* tls = tls_engine(client)) {
-                        (void)wb_.pump_tls<kEp, true>(*client, *tls);
-                        if (tls->socket_userspace() && tls->has_pinned_plain())
-                            arm_tls_socket_poll<kEp>(client, tls->wanted());
-                        if (tls->failed())
-                            close_client(client,
-                                         tls->output_pending() || client->send_inflight());
-                    } else if (TlsConn* slot = tls_slot_conn(client); slot && slot->ktls()) {
-                        const bool sent = wb_.pump<kEp, true>(*client);
-                        retry_plain_submit = !kEp && !sent &&
-                            !client->send_inflight() && !client->nothing_to_write();
-                    } else {
-                        const bool sent = wb_.pump<kEp, true>(*client);
-                        retry_plain_submit = !kEp && !sent &&
-                            !client->send_inflight() && !client->nothing_to_write();
-                    }
-                } else {
-                    const bool sent = wb_.pump<kEp, true>(*client);
-                    retry_plain_submit = !kEp && !sent &&
-                        !client->send_inflight() && !client->nothing_to_write();
-                }
-                if constexpr (kEp)
-                    if (wb_.take_send_failure()) epoll_close_now(client);
-                if (retry_plain_submit && !client->dead()) {
-                    self_->sig().sqe_starved++;
-                    enqueue_serve(client);
-                }
-                if (!client->dead() && client->in_active()) enqueue_ifid(client);
-            }
-            batch.count = 0;
-            active_wb_context_ = nullptr;
-        };
-
-        const uint64_t before_ex = sig.ops;
-        work += fused_executor_->fused_three_way_pass(wb_filler);
-        note_ops_since(before_ex);
-        if (!wb_filled || batch.count || active_wb_context_) std::abort();
-
-        gate_open = occupancy >= kGenthreadThreeWayMinBatchOccupancy;
-        return work;
-    }
-
-    template <bool HasTls, bool kEp, bool ReportOccupancy = false>
-    uint32_t genthread_wb_batch(uint32_t* occupancy = nullptr) {
-        if constexpr (ReportOccupancy) {
-            if (!occupancy) std::abort();
-            *occupancy = 0;
-        }
-        uint32_t work = 0;
-        if (__builtin_expect(pubsub_pass_pending_, false)) work += pubsub_pass_flush();
-        if (!pending_serve_.empty()) {
-            AofManager& aof = srv_->aof();
-            if (!aof_gate_target_) aof_gate_target_ = aof.posted_sequence();
-            if (!aof.reply_gate_ready(aof_gate_target_)) {
-                aof.register_send_gate_wait(self_->id());
-                return work;
-            }
-            aof_gate_target_ = 0;
-        } else {
-            aof_gate_target_ = 0;
-        }
-        uint32_t served = 0;
-        while (served < kGenthreadPipelineWbBatchConns && !pending_serve_.empty()) {
-            Client* c = pending_serve_.front();
-            pending_serve_.pop_front();
-            c->set_serve_pending(false);
-            if (c->dead()) continue;
-            served++;
-            if (__builtin_expect((climon_armed_cached_ & Server::kClimonReply) != 0, false) &&
-                climon_reply_suppressed(c)) {
-                work += climon_serve_suppressed(c);
-                if constexpr (kEp)
-                    if (wb_.take_send_failure()) epoll_close_now(c);
-                continue;
-            }
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, true, true>(*c, *tls)) work++;
-                    if (tls->socket_userspace() && tls->has_pinned_plain())
-                        arm_tls_socket_poll<kEp>(c, tls->wanted());
-                    if (tls->failed())
-                        close_client(c, tls->output_pending() || c->send_inflight());
-                } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, true, true>(*c)) work++;
-                } else if (wb_.serve<kEp, true, true>(*c)) {
-                    work++;
-                }
-            } else if (wb_.serve<kEp, true, true>(*c)) {
-                work++;
-            }
-            if constexpr (kEp)
-                if (wb_.take_send_failure()) epoll_close_now(c);
-        }
-        if constexpr (ReportOccupancy) *occupancy = served;
-        return work + served;
-    }
-
-    // Idle audit shared by both overlapping fused schedules.
-    template <bool HasUnix, bool HasTls, bool kEp>
-    uint32_t genthread_iofused_sweep() {
-        uint32_t work = 0;
-        if constexpr (HasUnix) work += flush_handoffs();
-        work += service_client_migrations<kEp>() + drain_client_transfers<kEp>(true) +
-                flush_borrow_releases();
-        work += genthread_ifid_batch<HasTls, kEp>();
-        work += fused_executor_->fused_coarse_sweep();
-        work += collect_retire_work<HasUnix, kEp, true>(true) +
-                genthread_wb_batch<HasTls, kEp>();
-        if (__builtin_expect(!routing_forward_.empty(), false))
-            client_routing_cleanup_pass();
-        if (srv_->snapshot().writer_is(self_->id()))
-            work += srv_->snapshot().writer_pass(*self_, ring_, true);
-        if (srv_->aof().writer_is(self_->id()))
-            work += srv_->aof().writer_pass(*self_, ring_, true);
-        return work;
-    }
-
-    struct IfidBatch {
-        std::array<Client*, kIoPipeIfidBatchClients> clients{};
-        uint32_t count = 0;
-        void clear() { count = 0; }
-    };
-
-    struct WbBatch {
-        std::array<Client*, kIoPipeWbBatchClients> clients{};
-        std::array<bool, kIoPipeWbBatchClients> submit_allowed{};
-        uint32_t count = 0;
-        void clear() { count = 0; }
-    };
-
-    // Detach one backlog-scaled connection batch from the serve FIFO. Clearing serve_pending at
-    // detach preserves the old race contract: a completion that lands while this batch is being
-    // prepared can enqueue a fresh future visit.
-    uint32_t wb_gather(WbBatch& batch) {
-        if (batch.count) std::abort();
-        if (pending_serve_.empty()) {
-            aof_gate_target_ = 0;
-            return 0;
-        }
-
-        AofManager& aof = srv_->aof();
-        if (!aof_gate_target_) aof_gate_target_ = aof.posted_sequence();
-        if (!aof.reply_gate_ready(aof_gate_target_)) {
-            aof.register_send_gate_wait(self_->id());
-            return 0;
-        }
-        aof_gate_target_ = 0;
-
-        const size_t visits = std::min<size_t>(pending_serve_.size(),
-                                               kIoPipeWbBatchClients);
-        for (size_t i = 0; i < visits; i++) {
-            Client* client = pending_serve_.front();
-            pending_serve_.pop_front();
-            client->set_serve_pending(false);
-            if (!client->dead()) {
-                batch.clients[batch.count] = client;
-                batch.submit_allowed[batch.count] = true;
-                batch.count++;
-            }
-        }
-        return batch.count;
-    }
-
-    // WB.OBSERVE: consume completion hints, then gather the shallow pipeline's WB batch early so
-    // its state/payload prefetch can overlap IFID work.
-    template <bool HasUnix, bool kEp>
-    uint32_t wb_observe(bool unmasked, WbBatch& batch) {
-        return collect_retire_work<HasUnix, kEp>(unmasked) + wb_gather(batch);
-    }
-
-    // WB.PF pass 1 issues hints for every potentially retireable state line. Pass 2 performs the
-    // required acquire and, only for a published plain BORROW, hints the store payload. The hint
-    // neither reads nor copies payload bytes and never changes the borrow lifetime.
-    void wb_prefetch(WbBatch& batch) {
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(op.zc_len, kIoPipeWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kIoPipeCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
-        }
-    }
-
-    // IFID.RX: harvest this thread's wire completions/readiness, then select a bounded slice of the
-    // independently maintained active set. In epoll mode the same tagged callback stream comes
-    // from the doorbell mailbox before socket readiness is drained.
-    template <bool HasUnix, bool HasTls, bool kEp>
-    uint32_t ifid_rx(IfidBatch& batch) {
-        uint32_t work = ring_.for_each_cqe(
-            [&](io_uring_cqe* cqe) { on_cqe<HasTls, kEp, false, 1>(cqe); });
-        if constexpr (kEp) work += epoll_pass<HasUnix, HasTls, false, 1>(0);
-        if (batch.count) std::abort();
-        const size_t available = active_.size();
-        if (!available) { ifid_cursor_ = 0; return work; }
-        if (ifid_cursor_ >= available) ifid_cursor_ = 0;
-        const size_t visits = std::min<size_t>(available, kIoPipeIfidBatchClients);
-        for (size_t i = 0; i < visits; i++) {
-            Client* client = active_.at(ifid_cursor_);
-            if (++ifid_cursor_ == available) ifid_cursor_ = 0;
-            if (!client->dead()) batch.clients[batch.count++] = client;
-        }
-        return work;
-    }
-
-    // ---- IFID.PARSE+HASH: read-buffer maintenance, decode/hash/route, quiet publication --------
-    template <bool HasTls, bool kEp, bool SplitLocal = false>
-    uint32_t ifid_parse_hash(IfidBatch& batch) {
-        uint32_t work = 0;
-        backstop_pass_ = (++flush_tick_ >= kIoPipeWbBackstopTurns);
-        if (backstop_pass_) flush_tick_ = 0;
-
-        // The read side is one bounded batch before this rotation's retirement/send. Arming first
-        // keeps the arrival stream flowing independently of the reply backlog.
-        for (uint32_t batch_index = 0; batch_index < batch.count; batch_index++) {
-            Client* c = batch.clients[batch_index];
-            if (c->dead() || !c->in_active()) continue;
-            Client& conn = *c;
-            DispatchResult dispatch_result = DispatchResult::Progress;
-            TlsConn* tls = nullptr;
-            if constexpr (HasTls) tls = tls_engine(c);
-            if (backstop_pass_ && !c->serve_pending()) enqueue_serve(c);
-
-            if constexpr (HasTls) {
-                if (tls) {
-                    // Only the recv completion may drive inbound TLS while its BIO input frontier
-                    // is pinned. Pipeline callbacks decrypt but defer parsing to this stage.
-                    if (!c->closing() && !c->recv_armed())
-                        (void)drive_tls<kEp, false, 1>(c);
-                    else if (tls->userspace()) {
-                        (void)wb_.pump_tls<kEp>(*c, *tls);
-                        if (tls->socket_userspace() && tls->has_pinned_plain())
-                            arm_tls_socket_poll<kEp>(c, tls->wanted());
-                    }
-                    tls = tls_engine(c);
-                    if constexpr (kEp)
-                        if (wb_.take_send_failure()) epoll_request_close(c);
-                }
-            }
-
-            if (c->scatter_barrier()) {
-                if (c->blocked() &&
-                    blocking_resume_move(*srv_, *self_, ring_, *c, scatter_pool_)) {
-                    enqueue_serve(c);
-                    work++;
-                }
-                if (__builtin_expect(c->barrier_held_by(BarrierOwner::Debug), false) &&
-                    !srv_->debug_barrier_hold_armed())
-                    c->barrier_release(BarrierOwner::Debug);
-                if (c->rob().quiesced()) c->barrier_release_quiesced();
-            }
-            if (c->atomic_backpressure() && srv_->atomic_can_admit(self_->id()) &&
-                scatter_pool_.can_register_snapshot())
-                c->set_atomic_backpressure(false);
-            if (c->flip_backpressure() && !srv_->flip_dispatch_paused())
-                c->set_flip_backpressure(false);
-            if (c->rob().quiesced() && (kEp || !conn.recv_armed()))
-                conn.reset_rbuf_at_quiescence();
-
-            if constexpr (kEp) {
-                if (c->closing()) c->set_recv_armed(false);
-                if (!c->closing()) {
-                    if constexpr (HasTls) {
-                        if (tls) arm_tls_recv<kEp, false, 1>(c);
-                        else arm_recv<kEp>(c);
-                    } else {
-                        arm_recv<kEp>(c);
-                    }
-                    if constexpr (HasTls) if (tls) {
-                        (void)drive_tls<kEp, false, 1>(c);
-                        tls = tls_engine(c);
-                    }
-                    if (wb_.take_send_failure()) epoll_request_close(c);
-                }
-            }
-
-            if (!c->closing() && conn.rpos() < conn.rlen() && !c->scatter_barrier() &&
-                !c->parse_backpressure()) {
-                // The pause accounting and transport choice are the ordinary diet-era parse path;
-                // only the 64-entry ROB-publication cap and deferred IFID.POST are schedule-specific.
-                if (__builtin_expect(climon_pause_armed(), false)) {
-                    const uint32_t rpos_before = conn.rpos();
-                    if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<true, 0, true, false, false, false, SplitLocal>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, SplitLocal>(c);
-                    } else {
-                        dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, SplitLocal>(c);
-                    }
-                    if (conn.rpos() != rpos_before) work++;
-                } else {
-                    if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<true, 0, true, false, false, false, SplitLocal>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, SplitLocal>(c);
-                    } else {
-                        dispatch_result = parse_and_dispatch<false, 0, true, false, false, false, SplitLocal>(c);
-                    }
-                    if (__builtin_expect(dispatch_result != DispatchResult::NeedInput, true))
-                        work++;
-                }
-            }
-
-            if constexpr (!kEp) {
-                if constexpr (HasTls) {
-                    if (tls && tls->memory_bio()) arm_tls_recv<kEp, false, 1>(c);
-                    else if (!tls) arm_recv<kEp>(c);
-                } else {
-                    arm_recv<kEp>(c);
-                }
-            }
-
-            const bool stuck = (conn.rpos() < conn.rlen() && c->rob().full()) ||
-                               (!conn.recv_armed() && !c->closing());
-            const bool more_input = conn.rpos() < conn.rlen() &&
-                                    dispatch_result != DispatchResult::NeedInput;
-            const bool tls_output = tls && (tls->output_pending() || c->send_inflight());
-            const bool done = c->rob().quiesced() && !more_input && !stuck &&
-                              !c->serve_pending() && c->nothing_to_write() && !tls_output;
-            // Batch entries remain readable through the existing corpse grace; membership is the
-            // authoritative check before mutating the active set.
-            if (c->dead() || !c->in_active()) continue;
-            if (done && !c->closing()) {
-                c->set_in_active(false);
-                active_.erase(c);
-            } else if (c->closing() && !tls_output && c->safe_to_release()) {
-                if (pubsub_disconnect_ready(c)) {
-                    c->set_in_active(false);
-                    active_.erase(c);
-                    close_client(c);
-                }
-            }
-        }
-
-        if constexpr (kEp) {
-            while (!epoll_closes_.empty()) {
-                Client* victim = epoll_closes_.back();
-                epoll_closes_.pop_back();
-                epoll_close_now(victim);
-            }
-        }
-        // The IO role drains only its local-read lane. All writes and demotions still use
-        // the ordinary split owner inbox; publish QSBR only after every capture is consumed.
-        if constexpr (SplitLocal) work += fused_executor_->split_read_local_pass();
-        return work;
-    }
-
-    // IFID.POST: quiet queue tails are already published. Fold their notification/wake edge once
-    // per destination, then preserve the existing pub/sub parse-to-send boundary.
-    uint32_t ifid_post(IfidBatch&) {
-        uint32_t work = flush_ifid_posts();
-        if (__builtin_expect(pubsub_pass_pending_, false)) work += pubsub_pass_flush();
-        return work;
-    }
-
-    // WB.RETIRE+PREP: drain only the in-order Done prefix and construct reply buffers/iovecs. The
-    // engine methods are the ordinary serve bodies with their final pump deliberately omitted.
-    template <bool HasTls, bool kEp, bool Coded = false>
-    uint32_t wb_retire_prepare(WbBatch& batch) {
-        uint32_t work = 0;
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* c = batch.clients[i];
-            if (c->dead()) continue;
-            if (__builtin_expect((climon_armed_cached_ & Server::kClimonReply) != 0, false) &&
-                climon_reply_suppressed(c)) {
-                work += climon_prepare_suppressed(c, batch.submit_allowed[i]);
-                continue;
-            }
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.prepare_tls<kEp, Coded>(*c, *tls, batch.submit_allowed[i])) work++;
-                    if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
-                } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.prepare_ktls<kEp, Coded>(*c, batch.submit_allowed[i])) work++;
-                } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
-                    work++;
-                }
-            } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
-                work++;
-            }
-        }
-        return work;
-    }
-
-    // WB.SUBMIT+RECLAIM: form the actual sends from the warm prepared batch. Send completion
-    // reclamation stays at the next rotation's RX/CQE boundary.
-    template <bool HasTls, bool kEp>
-    uint32_t wb_submit_reclaim(WbBatch& batch, bool& submitted) {
-        uint32_t work = 0;
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* c = batch.clients[i];
-            if (c->dead() || !batch.submit_allowed[i]) continue;
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.pump_tls<kEp>(*c, *tls)) work++;
-                    if (tls->socket_userspace() && tls->has_pinned_plain())
-                        arm_tls_socket_poll<kEp>(c, tls->wanted());
-                    if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
-                } else if (wb_.pump<kEp>(*c)) {
-                    work++;
-                }
-            } else if (wb_.pump<kEp>(*c)) {
-                work++;
-            }
-            if constexpr (kEp)
-                if (wb_.take_send_failure()) epoll_close_now(c);
-        }
-        // The source schedule's early fire point is preserved. The live liburing query replaces
-        // its shadow pending counter, so the diet keeps zero work at individual SQE producers.
-        if constexpr (!kEp) {
-            if (ring_.sq_ready()) {
-                ring_.submit_and_reap();
-                submitted = true;
-            }
-        }
-        return work;
-    }
-
-    // At depth, completed IFID work already provides the latency-hiding window. Retain the plain
-    // split loop's combined retire/stage/pump order and skip the separate WB prefetch walks.
-    template <bool HasTls, bool kEp, bool Coded = false>
-    uint32_t wb_serve_natural(WbBatch& batch, bool& submitted) {
-        uint32_t work = 0;
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* c = batch.clients[i];
-            if (c->dead()) continue;
-            if (__builtin_expect((climon_armed_cached_ & Server::kClimonReply) != 0, false) &&
-                climon_reply_suppressed(c)) {
-                work += climon_serve_suppressed(c);
-                if constexpr (kEp)
-                    if (wb_.take_send_failure()) epoll_close_now(c);
-                continue;
-            }
-            if constexpr (HasTls) {
-                if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, false, Coded>(*c, *tls)) work++;
-                    if (tls->socket_userspace() && tls->has_pinned_plain())
-                        arm_tls_socket_poll<kEp>(c, tls->wanted());
-                    if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
-                } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, false, Coded>(*c)) work++;
-                } else if (wb_.serve<kEp, false, Coded>(*c)) {
-                    work++;
-                }
-            } else if (wb_.serve<kEp, false, Coded>(*c)) {
-                work++;
-            }
-            if constexpr (kEp)
-                if (wb_.take_send_failure()) epoll_close_now(c);
-        }
-        if constexpr (!kEp) {
-            if (ring_.sq_ready()) {
-                ring_.submit_and_reap();
-                submitted = true;
-            }
-        }
-        return work;
-    }
-
-    template <bool HasUnix, bool HasTls, bool kEp, bool SplitLocal = false>
-    uint32_t pipeline_pass(bool unmasked, bool natural_order, bool& submitted) {
-        srv_->mode_schedule_stats(self_->id()).note_overlap(
-            OverlapSchedule::SplitIo, !natural_order);
-        // One synchronous buffer per stream, exactly as measured. Cross-core queue publications
-        // and kernel SQEs own their data after their stage, so no ping/pong lifetime is required.
-        IfidBatch& ifid = ifid_batch_;
-        WbBatch& wb = wb_batch_;
-        if (ifid.count || wb.count) std::abort();
-        uint32_t work = 0;
-        if (natural_order) {
-            work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
-            work += collect_retire_work<HasUnix, kEp>(unmasked);
-            work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);
-            work += ifid_post(ifid);
-            work += wb_gather(wb);
-            work += wb_serve_natural<HasTls, kEp, SplitLocal>(wb, submitted);
-        } else {
-            for (const IoPipeStage stage : kIoPipeSchedule) {
-                switch (stage) {
-                    case IoPipeStage::WbObserve:
-                        work += wb_observe<HasUnix, kEp>(unmasked, wb);
-                        break;
-                    case IoPipeStage::IfidRx:
-                        work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
-                        break;
-                    case IoPipeStage::WbPrefetch:
-                        wb_prefetch(wb);
-                        break;
-                    case IoPipeStage::IfidParseHash:
-                        work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);
-                        break;
-                    case IoPipeStage::WbRetirePrepare:
-                        work += wb_retire_prepare<HasTls, kEp, SplitLocal>(wb);
-                        break;
-                    case IoPipeStage::IfidPost:
-                        work += ifid_post(ifid);
-                        break;
-                    case IoPipeStage::WbSubmitReclaim:
-                        work += wb_submit_reclaim<HasTls, kEp>(wb, submitted);
-                        break;
-                }
-            }
-        }
-        ifid.clear();
-        wb.clear();
-        return work;
     }
 
     // ---- retire -> stage bytes -> send or hand off -------------------------------------------------
     // The io thread's own work per active client. In 2-stage it also owns the reply side and calls
     // serve() here; in ex-wb and 3-stage the sender does that on its own thread and io only keeps
     // the READ side moving — reclaim the buffer once nothing points into it, and re-arm.
-    template <bool HasTls, bool kEp, bool Fused = false, bool HasUnix = false,
-              bool SweepPass = false>
+    template <bool HasTls, bool kEp>
     uint32_t flush_ready() {
         uint32_t work = 0;
         backstop_pass_ = (++flush_tick_ >= kFlushBackstopEvery);
@@ -5616,7 +1881,6 @@ ordinary_shard_ready:
         for (size_t idx = 0; idx < active_.size();) {
             Client* c = active_.at(idx);
             Client& conn = *c;
-            DispatchResult dispatch_result = DispatchResult::Progress;
             TlsConn* tls = nullptr;
             if constexpr (HasTls) tls = tls_engine(c);
             if (backstop_pass_ && !c->serve_pending()) enqueue_serve(c);
@@ -5627,7 +1891,7 @@ ordinary_shard_ready:
                     // SSL_write and opposite-direction BIO reads are proven safe while pinned,
                     // but SSL_read/SSL_accept consume the same direction and can move that
                     // frontier. Only the recv completion may drive inbound TLS while armed.
-                    if (!c->closing() && !c->recv_armed()) (void)drive_tls<kEp, Fused>(c);
+                    if (!c->closing() && !c->recv_armed()) (void)drive_tls<kEp>(c);
                     else if (tls->userspace()) {
                         (void)wb_.pump_tls<kEp>(*c, *tls);
                         if (tls->socket_userspace() && tls->has_pinned_plain())
@@ -5662,11 +1926,6 @@ ordinary_shard_ready:
             if (c->atomic_backpressure() && srv_->atomic_can_admit(self_->id()) &&
                 scatter_pool_.can_register_snapshot())
                 c->set_atomic_backpressure(false);
-            // Success, pre-commit rollback, and synchronous validation refusal all end by publishing
-            // Idle. The flag travels with a migrated Client, so this runs on whichever IO owns it
-            // after the FLIP and retries the still-unconsumed frame in the re-parse below.
-            if (c->flip_backpressure() && !srv_->flip_dispatch_paused())
-                c->set_flip_backpressure(false);
             // Under epoll the second half of this guard is vacuous and would be actively
             // harmful: recv_armed_ means "an edge is owed", not "the kernel holds a pointer into
             // this buffer" (nothing ever does under this engine), so testing it would make the
@@ -5693,15 +1952,12 @@ ordinary_shard_ready:
                 if (c->closing()) c->set_recv_armed(false);
                 if (!c->closing()) {
                     if constexpr (HasTls) {
-                        if (tls) arm_tls_recv<kEp, Fused>(c);
+                        if (tls) arm_tls_recv<kEp>(c);
                         else arm_recv<kEp>(c);
                     } else {
                         arm_recv<kEp>(c);
                     }
-                    if constexpr (HasTls) if (tls) {
-                        (void)drive_tls<kEp, Fused>(c);
-                        tls = tls_engine(c);
-                    }
+                    if constexpr (HasTls) if (tls) { (void)drive_tls<kEp>(c); tls = tls_engine(c); }
                     if (wb_.take_send_failure()) epoll_request_close(c);
                 }
             }
@@ -5711,7 +1967,7 @@ ordinary_shard_ready:
             // pipeline in ONE write would get `window` replies and then hang. Retiring frees slots,
             // which is what makes the rest parseable.
             if (!c->closing() && conn.rpos() < conn.rlen() && !c->scatter_barrier() &&
-                !c->parse_backpressure()) {
+                !c->atomic_backpressure()) {
                 // A CLIENT PAUSE hold deliberately leaves the parsed frame at rpos. Counting that
                 // as work would spin the ring at 100% until the deadline instead of parking it,
                 // so while a pause is live the pass reports progress only if the cursor moved.
@@ -5721,38 +1977,26 @@ ordinary_shard_ready:
                 if (__builtin_expect(climon_pause_armed(), false)) {
                     const uint32_t rpos_before = conn.rpos();
                     if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<
-                                true, Fused ? kGenthreadIfidBatchOps : 0>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<
-                                false, Fused ? kGenthreadIfidBatchOps : 0>(c);
+                        if (c->is_tls()) parse_and_dispatch<true>(c);
+                        else parse_and_dispatch<false>(c);
                     } else {
-                        dispatch_result = parse_and_dispatch<
-                            false, Fused ? kGenthreadIfidBatchOps : 0>(c);
+                        parse_and_dispatch<false>(c);
                     }
                     if (conn.rpos() != rpos_before) work++;
                 } else {
                     if constexpr (HasTls) {
-                        if (c->is_tls())
-                            dispatch_result = parse_and_dispatch<
-                                true, Fused ? kGenthreadIfidBatchOps : 0>(c);
-                        else
-                            dispatch_result = parse_and_dispatch<
-                                false, Fused ? kGenthreadIfidBatchOps : 0>(c);
+                        if (c->is_tls()) parse_and_dispatch<true>(c);
+                        else parse_and_dispatch<false>(c);
                     } else {
-                        dispatch_result = parse_and_dispatch<
-                            false, Fused ? kGenthreadIfidBatchOps : 0>(c);
+                        parse_and_dispatch<false>(c);
                     }
-                    if (__builtin_expect(
-                            dispatch_result != DispatchResult::NeedInput, true))
-                        work++;
+                    work++;
                 }
             }
 
             if constexpr (!kEp) {
                 if constexpr (HasTls) {
-                    if (tls && tls->memory_bio()) arm_tls_recv<kEp, Fused>(c);
+                    if (tls && tls->memory_bio()) arm_tls_recv<kEp>(c);
                     else if (!tls) arm_recv<kEp>(c);
                 } else {
                     arm_recv<kEp>(c);
@@ -5765,10 +2009,7 @@ ordinary_shard_ready:
             const bool stuck = (conn.rpos() < conn.rlen() && c->rob().full()) ||
                                (!conn.recv_armed() && !c->closing());
 
-            // NeedInput parks only the read side: the partial bytes stay buffered and a recv is
-            // already armed. Unresolved local reads never hold parsing; conflicts reroute them.
-            const bool more_input = conn.rpos() < conn.rlen() &&
-                                    dispatch_result != DispatchResult::NeedInput;
+            const bool more_input = conn.rpos() < conn.rlen();
             const bool tls_output = tls && (tls->output_pending() || c->send_inflight());
             const bool done = c->rob().quiesced() && !more_input && !stuck &&
                               !c->serve_pending() && c->nothing_to_write() && !tls_output;
@@ -5800,14 +2041,6 @@ ordinary_shard_ready:
             }
         }
 
-        // The fused loop rotates whole streams: finish the bounded IFID phase above, execute one
-        // batch, collect its local self-lane completions, then enter the existing write-back phase.
-        if constexpr (Fused) {
-            work += SweepPass ? fused_executor_->fused_baseline_sweep()
-                              : fused_executor_->fused_baseline_pass();
-            work += collect_retire_work<HasUnix, kEp>(SweepPass);
-        }
-
         // PUB/SUB PASS BOUNDARY -- between parsing and serving, on purpose. Everything this pass
         // parsed is resolved and appended to its subscribers' buffers HERE, so PHASE 2 sends one
         // coalesced write per subscriber instead of one per message. Off/unarmed servers pay one
@@ -5831,8 +2064,7 @@ ordinary_shard_ready:
             aof_gate_target_ = 0;
         }
         uint32_t served = 0;
-        constexpr uint32_t serve_budget = Fused ? kGenthreadWbBatchConns : kServeBudget;
-        while (served < serve_budget && !pending_serve_.empty()) {
+        while (served < kServeBudget && !pending_serve_.empty()) {
             Client* c = pending_serve_.front();
             pending_serve_.pop_front();
             c->set_serve_pending(false);
@@ -5851,16 +2083,16 @@ ordinary_shard_ready:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, false, Fused>(*c, *tls)) work++;
+                    if (wb_.serve_tls<kEp>(*c, *tls)) work++;
                     if (tls->socket_userspace() && tls->has_pinned_plain())
                         arm_tls_socket_poll<kEp>(c, tls->wanted());
                     if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, false, Fused>(*c)) work++;
-                } else if (wb_.serve<kEp, false, Fused>(*c)) {
+                    if (wb_.serve_ktls<kEp>(*c)) work++;
+                } else if (wb_.serve<kEp>(*c)) {
                     work++;
                 }
-            } else if (wb_.serve<kEp, false, Fused>(*c)) {
+            } else if (wb_.serve<kEp>(*c)) {
                 work++;
             }
             // A synchronous send has no CQE to report a fatal errno through, so the engine latches
@@ -5878,99 +2110,32 @@ ordinary_shard_ready:
         pending_serve_.push_back(c);
     }
 
-    // IO owns both ROB frontiers, so this 100us signal beat can maintain head_since without a
-    // Client field or a per-operation hook. The active set bounds the walk to connections already
-    // carrying work. Entries not seen in this beat are erased, which also makes client teardown and
-    // pointer reuse harmless without touching either lifecycle hot path.
-    void sample_rob_head_age(uint64_t now_us) {
-        LoopSignals& sig = self_->sig();
-        if (++rob_age_generation_ == 0) {
-            rob_head_ages_.clear();
-            rob_age_generation_ = 1;
-        }
-        uint64_t oldest_us = 0;
-        bool observed = false;
-        for (size_t i = 0; i < active_.size(); i++) {
-            Client* client = active_.at(i);
-            if (!client || client->dead()) continue;
-            const uint64_t head = client->rob().flush_id();
-            if (head == client->rob().dispatch_id()) continue;
-            auto [it, inserted] = rob_head_ages_.try_emplace(client);
-            RobHeadAge& age = it->second;
-            if (inserted || age.head_id != head) {
-                age.head_id = head;
-                age.head_since_us = now_us;
-            }
-            age.seen_generation = rob_age_generation_;
-            oldest_us = std::max(oldest_us, now_us - age.head_since_us);
-            observed = true;
-        }
-        for (auto it = rob_head_ages_.begin(); it != rob_head_ages_.end();) {
-            if (it->second.seen_generation != rob_age_generation_)
-                it = rob_head_ages_.erase(it);
-            else
-                ++it;
-        }
-        if (observed) sig.observe_oldest_age(oldest_us);
-        else          sig.clear_oldest_age();
-    }
-
-    enum class DeferredTimerKind : uint8_t { WaitZero, DebugSleepOk };
-    struct DeferredTimer {
-        Client* client = nullptr;
-        uint64_t op_id = 0;
-        uint64_t deadline_ms = 0;  // zero is WAIT's wait-forever spelling
-        uint64_t slow_started_ns = 0;
-        SlowlogArm slowlog_arm{};
-        DeferredTimerKind kind = DeferredTimerKind::WaitZero;
-    };
-
-    bool deferred_timer_start(Client* client, uint64_t op_id, DeferredTimerKind kind,
-                              uint64_t delay_ms, uint64_t slow_started_ns,
-                              const SlowlogArm& slowlog_arm) {
-        const uint64_t now_ms = now_ns() / 1000000ull;
-        const uint64_t deadline_ms = !delay_ms ? 0
-            : delay_ms > UINT64_MAX - now_ms ? UINT64_MAX
-                                             : now_ms + delay_ms;
-        try {
-            deferred_timers_.push_back(
-                DeferredTimer{client, op_id, deadline_ms, slow_started_ns, slowlog_arm, kind});
-        }
+    bool deferred_wait_start(Client* client, uint64_t op_id, uint64_t timeout_ms) {
+        const uint64_t deadline_ms = timeout_ms
+            ? now_ns() / 1000000ull + timeout_ms
+            : 0;
+        try { deferred_waits_.push_back(DeferredWait{client, op_id, deadline_ms}); }
         catch (const std::bad_alloc&) { return false; }
         srv_->blocking_client_parked();
         return true;
     }
 
-    uint32_t deferred_timer_pass(uint64_t now_ms) {
+    uint32_t deferred_wait_pass(uint64_t now_ms) {
         uint32_t completed = 0;
-        for (size_t i = 0; i < deferred_timers_.size();) {
-            const DeferredTimer timer = deferred_timers_[i];
-            if (!timer.deadline_ms || now_ms < timer.deadline_ms) {
+        for (size_t i = 0; i < deferred_waits_.size();) {
+            const DeferredWait wait = deferred_waits_[i];
+            if (!wait.deadline_ms || now_ms < wait.deadline_ms) {
                 i++;
                 continue;
             }
-            Client* client = timer.client;
-            Op& op = client->rob().at(timer.op_id);
-            if (timer.kind == DeferredTimerKind::WaitZero) {
-                reply_int(op.sink(), 0);
-            } else {
-                reply_ok(op.sink());
-                if (timer.slowlog_arm.armed()) {
-                    timespec wall{};
-                    ::clock_gettime(CLOCK_REALTIME, &wall);
-                    slowlog_record(self_->id(), client->id(), op,
-                                   now_ns() - timer.slow_started_ns,
-                                   static_cast<int64_t>(wall.tv_sec) * 1000 +
-                                       wall.tv_nsec / 1000000,
-                                   timer.slowlog_arm, true);
-                }
-            }
+            Client* client = wait.client;
+            Op& op = client->rob().at(wait.op_id);
+            reply_int(op.sink(), 0);
             op.state.store(OpState::Done, std::memory_order_release);
             client->set_blocked(false);
-            client->set_last_interaction_s(cached_now_s_);
             srv_->blocking_client_unparked();
-            deferred_timers_[i] = deferred_timers_.back();
-            deferred_timers_.pop_back();
+            deferred_waits_[i] = deferred_waits_.back();
+            deferred_waits_.pop_back();
             enqueue_serve(client);
             mark_active(client);
             completed++;
@@ -5978,19 +2143,19 @@ ordinary_shard_ready:
         return completed;
     }
 
-    bool deferred_timer_cancel(Client* client) {
+    bool deferred_wait_cancel(Client* client) {
         bool cancelled = false;
-        for (size_t i = 0; i < deferred_timers_.size();) {
-            const DeferredTimer timer = deferred_timers_[i];
-            if (timer.client != client) {
+        for (size_t i = 0; i < deferred_waits_.size();) {
+            const DeferredWait wait = deferred_waits_[i];
+            if (wait.client != client) {
                 i++;
                 continue;
             }
-            Op& op = client->rob().at(timer.op_id);
+            Op& op = client->rob().at(wait.op_id);
             op.state.store(OpState::Done, std::memory_order_release);
             srv_->blocking_client_unparked();
-            deferred_timers_[i] = deferred_timers_.back();
-            deferred_timers_.pop_back();
+            deferred_waits_[i] = deferred_waits_.back();
+            deferred_waits_.pop_back();
             cancelled = true;
         }
         if (cancelled) client->set_blocked(false);
@@ -6004,15 +2169,9 @@ ordinary_shard_ready:
             return false;
         }
         c->start_obuf_tracking();
-        const ClientLimitsConfigSnapshot limits = srv_->client_limits_snapshot(self_->id());
+        const ClientLimitsConfigSnapshot limits = srv_->client_limits_snapshot();
         const ClientBufferLimit& limit = c->subscriber_mode() ? limits.pubsub : limits.normal;
-        if (!limit.hard_bytes && !limit.soft_bytes) {
-            c->set_obuf_soft_since_s(0);
-            return false;
-        }
-        uint64_t used = c->obuf_bytes() + wb_.deferred_output_bytes(*c);
-        const auto pending = pubsub_pending_.find(c->id());
-        if (pending != pubsub_pending_.end()) used += pending->second.deferred.size();
+        const uint64_t used = c->obuf_bytes();
         bool over = limit.hard_bytes && used >= limit.hard_bytes;
         if (!over && limit.soft_bytes && used >= limit.soft_bytes) {
             if (!c->obuf_soft_since_s()) c->set_obuf_soft_since_s(cached_now_s_);
@@ -6032,16 +2191,6 @@ ordinary_shard_ready:
                 "Client id=%llu closed for overcoming of output buffer limits.\n",
                 static_cast<unsigned long long>(c->id()));
         close_client(c);
-        // Unified W1 has already retired/staged this client but must not let W2 submit the bytes
-        // which crossed the hard limit. Its batch already has a nullable-client guard, so encode
-        // this rare refusal there and keep the ordinary prepare path free of a parallel bool.
-        // close_client runs first while the active context still fences the Client lifetime.
-        if (active_wb_context_)
-            for (uint32_t i = 0; i < active_wb_context_->count; i++)
-                if (active_wb_context_->clients[i] == c) {
-                    active_wb_context_->clients[i] = nullptr;
-                    break;
-                }
         return true;
     }
 
@@ -6075,23 +2224,9 @@ ordinary_shard_ready:
         return work;
     }
 
-    uint32_t lb_client_signal_pass() {
-        lb_client_observations_.clear();
-        if (lb_client_observations_.capacity() < self_->clients().size())
-            lb_client_observations_.reserve(self_->clients().size());
-        for (Client* client : self_->clients()) {
-            if (client->dead()) continue;
-            lb_client_observations_.push_back({client->id(), client->rob().dispatch_id(),
-                                               client->rob().in_flight()});
-        }
-        srv_->lb_publish_client_observations(self_->id(), lb_client_observations_);
-        return static_cast<uint32_t>(lb_client_observations_.size());
-    }
-
     void refresh_notify_config() {
         LiveConfigSnapshot snapshot;
-        if (!srv_->live_config_snapshot_if_changed(
-                self_->id(), notify_config_version_, snapshot)) return;
+        if (!srv_->live_config_snapshot_if_changed(notify_config_version_, snapshot)) return;
         notify_config_armed_ = snapshot.notify_events != 0;
         save_config_armed_ = snapshot.save_armed;
         notify_armed_ = notify_config_armed_ || save_config_armed_ ||
@@ -6102,12 +2237,6 @@ ordinary_shard_ready:
         slowlog_arm_.slowlog_us = snapshot.slowlog_log_slower_than;
         slowlog_arm_.latency_ms = snapshot.latency_monitor_threshold;
         slowlog_armed_ = slowlog_arm_.armed();
-        if (srv_->read_local_enabled()) {
-            fused_executor_->set_read_local_point_writes_precise(
-                snapshot.maxmemory == 0 || snapshot.policy == MaxmemoryPolicy::NoEviction);
-            fused_executor_->set_read_local_keymiss_notify(
-                (snapshot.notify_events & NOTIFY_KEY_MISS) != 0);
-        }
         notify_config_version_ = snapshot.version;
     }
 
@@ -6120,7 +2249,7 @@ ordinary_shard_ready:
         if (c->dead()) return;
         if (!c->closing()) {
             c->mark_closing();
-            if (deferred_timer_cancel(c)) enqueue_serve(c);
+            if (deferred_wait_cancel(c)) enqueue_serve(c);
             if (c->blocked() && blocking_cancel_client(*srv_, *self_, ring_, *c))
                 enqueue_serve(c);
             TlsConn* slot_tls = tls_slot_conn(c);
@@ -6160,14 +2289,14 @@ ordinary_shard_ready:
         if (!pubsub_disconnect_ready(c)) { mark_active(c); return; }
         c->set_in_active(false);
         active_.erase(c);
-        (void)self_->remove_client(c);
+        auto& v = self_->clients();
+        for (size_t i = 0; i < v.size(); i++)
+            if (v[i] == c) { v[i] = v.back(); v.pop_back(); break; }
         // THE RETRY IS THE LOAD-BEARING PART of this wait: the client left the active set when it
         // went quiet, so nothing revisits it unless mark_active puts it back -- returning without
         // doing so leaked the entire client (~137KB) per disconnect once. Only a quiesced,
         // claim-free conn may release its slot and die.
-        if (!c->safe_to_release() || !client_executor_quiesced(c) ||
-            !c->safe_to_release()) { mark_active(c); return; }
-        client_work_fences_.erase(c);
+        if (!c->safe_to_release()) { mark_active(c); return; }
         climon_untrack_client(c);
         command_client_disconnected(c);
         self_->release_wb_slot(c->wb_slot());
@@ -6175,7 +2304,6 @@ ordinary_shard_ready:
         wb_.teardown(*c);
         ::close(c->fd());
         srv_->client_released();
-        srv_->lb_forget_client(c->id());
         // NOT delete. An ex-side claimed post may still sit un-consumed in our inbound channels
         // naming this client. Every such entry was pushed BEFORE this point, and channels are FIFO
         // with their mask bits set -- so ONE full
@@ -6183,34 +2311,6 @@ ordinary_shard_ready:
         // free it at the top of the one after; the drain lambda skips dead clients.
         c->mark_dead();
         dead_next_.push_back(c);
-    }
-
-    // Called only after the connection is ROB-quiescent and no longer dispatching. The
-    // acquire on Done precedes this snapshot, so every executor that could still hold
-    // this Client published its odd scope before we sample. Wait for EACH such scope
-    // to end, without requiring all executors to be idle at the same instant.
-    bool client_executor_quiesced(Client* client) const {
-        try {
-            auto [it, inserted] = client_work_fences_.try_emplace(client);
-            ClientWorkFence& fence = it->second;
-            const uint64_t dispatch = client->rob().dispatch_id();
-            if (inserted || fence.dispatch != dispatch) {
-                fence.dispatch = dispatch;
-                for (uint32_t tid = 0; tid < srv_->nthreads(); tid++)
-                    fence.epochs[tid] = srv_->client_work_epoch(tid);
-            }
-            bool ready = true;
-            for (uint32_t tid = 0; tid < srv_->nthreads(); tid++) {
-                // This IO's synchronous fused stack cannot run concurrently with teardown;
-                // its existing pipeline/serve fences cover retained local handles.
-                if (tid == self_->id() || !(fence.epochs[tid] & 1)) continue;
-                if (srv_->client_work_epoch(tid) == fence.epochs[tid]) ready = false;
-                else fence.epochs[tid] = 0;
-            }
-            return ready;
-        } catch (const std::bad_alloc&) {
-            return false; // Keep the Client and retry; allocation failure cannot waive lifetime.
-        }
     }
 
     // Free everything that has been dead for a full iteration. Called once per loop pass, BEFORE
@@ -6225,8 +2325,7 @@ ordinary_shard_ready:
         // returns any BORROW the close path could not (idempotent: release_all empties the queue).
         size_t keep = 0;
         for (Client* c : dead_ready_) {
-            if (c->serve_pending() || c->send_inflight() || c->recv_armed() ||
-                client_pipeline_referenced(c)) {
+            if (c->serve_pending() || c->send_inflight() || c->recv_armed()) {
                 dead_ready_[keep++] = c;
                 continue;
             }
@@ -6240,61 +2339,32 @@ ordinary_shard_ready:
     }
 
     Server*    srv_  = nullptr;
-    struct ClientWorkFence {
-        uint64_t dispatch = 0;
-        uint64_t epochs[kMaxThreads] = {};
-    };
     ThreadCtx* self_ = nullptr;
-    IfidBatch ifid_batch_{};
-    WbBatch wb_batch_{};
-    IoPipeDepthGate iopipe_depth_gate_{};
-    size_t ifid_cursor_ = 0;
     static constexpr uint32_t kFlushBackstopEvery = 64;
     // Serves per pass. Sized so a pass's serve work stays comparable to its recv work: ~16 serves
     // x a ~32-op prefix each is one CQ batch worth of replies. The queue, not the pass, absorbs
     // overload.
     static constexpr uint32_t kServeBudget = 16;
     std::deque<Client*> pending_serve_;
-    std::deque<Client*> pending_ifid_;
     std::deque<BorrowRelease> pending_releases_;
     std::deque<Client*> pending_handoffs_;
-    std::vector<ClientMigration> client_migrations_; // source-owned until old-ring fence completes
-    uint64_t client_transfer_failures_ = 0;
-    Client*   flip_client_ = nullptr;       // coordinator's sole unfinished FLIP ROB slot
-    uint64_t  flip_op_id_ = 0;
-    uint64_t  flip_epoch_local_ = 0;
-    uint64_t  flip_prepare_epoch_ = 0;
-    uint64_t  flip_pubsub_rehome_epoch_ = 0;
-    // Allocates only for an unsatisfied WAIT or positive DEBUG SLEEP; never on ordinary commands.
-    std::vector<DeferredTimer> deferred_timers_;
+    struct DeferredWait {
+        Client* client = nullptr;
+        uint64_t op_id = 0;
+        uint64_t deadline_ms = 0;  // zero is Redis's wait-forever spelling
+    };
+    std::vector<DeferredWait> deferred_waits_;  // allocates only after an unsatisfied WAIT
     ScatterArenaPool scatter_pool_;          // touched only by this connection-owning IO thread
     uint32_t flush_tick_ = 0;
     bool     backstop_pass_ = false;
     static constexpr uint32_t kClientCronBeatsPerSecond = 10;
     static constexpr uint32_t kClientCronMinVisits = 5;
     uint64_t client_cron_beat_ms_ = 0;
-    uint64_t lb_client_signal_beat_ms_ = 0;
-    uint64_t lb_controller_beat_ms_ = 0;
     uint64_t save_cron_beat_ms_ = 0;
     size_t   client_cron_cursor_ = 0;
     uint64_t cached_now_ms_ = 0;
     uint32_t cached_now_s_ = 0;
     bool     client_cron_was_armed_ = false;
-    bool     client_lb_signal_armed_ = false;
-    bool     lb_controller_armed_ = false;
-    bool     lb_client_wake_pending_ = false;
-    bool     age_signals_armed_ = false;
-    uint32_t age_sample_rate_cached_ = 0;
-    uint32_t lb_wake_cursor_ = UINT32_MAX;
-    std::vector<LbClientObservation> lb_client_observations_;
-    struct RobHeadAge {
-        uint64_t head_id = 0;
-        uint64_t head_since_us = 0;
-        uint64_t seen_generation = 0;
-    };
-    // Empty and allocation-free while controller age sampling is disarmed.
-    std::unordered_map<Client*, RobHeadAge> rob_head_ages_;
-    uint64_t rob_age_generation_ = 0;
     bool touched_[kMaxThreads] = {};      // dedupe flags for the current parse pass
     uint32_t touched_list_[kMaxThreads] = {}; // the workers actually fed, dense
     uint32_t ntouched_ = 0;
@@ -6308,13 +2378,6 @@ ordinary_shard_ready:
     int        listen_fd_ = -1;
     int        tls_listen_fd_ = -1;
     int        unix_listen_fd_ = -1;
-    uint16_t   configured_port_ = 0;
-    uint64_t   accept_generation_ = 0;
-    uint64_t   accept_cancel_generation_ = 0;
-    bool       initialized_ = false;
-    bool       active_role_ = false;
-    bool       prepared_role_ = false;
-    bool       aof_bound_ = false;
     Ring       ring_;
     // The second engine's state. `epoll_` is boot-latched and read only by run() (to pick the
     // instantiation) and by the two cold non-templated members that cannot carry it in their type
@@ -6327,12 +2390,6 @@ ordinary_shard_ready:
     bool       accept_pending_ = false;
     bool       tls_accept_pending_ = false;
     bool       unix_accept_pending_ = false;
-    bool       accept_armed_ = false;
-    bool       tls_accept_armed_ = false;
-    bool       unix_accept_armed_ = false;
-    bool       accept_quiescing_ = false;
-    bool       accept_cancel_submitted_ = false;
-    bool       tls_accept_cancel_submitted_ = false;
     uint64_t   unix_rr_ = 0;
     uint64_t   random_state_ = 0x9e3779b97f4a7c15ULL;
     uint64_t   aof_gate_target_ = 0;
@@ -6379,44 +2436,6 @@ ordinary_shard_ready:
     std::vector<std::unique_ptr<TlsConn>> tls_slots_;
     std::vector<uint32_t> tls_free_slots_;
 #include "../cmd/climon.inc"
-    struct ClientForwardRoute {
-        bool installed = false;
-        bool monitor = false;
-        bool tracking = false;
-    };
-
-    struct ClientRoutingMigration {
-        using PubSubNode = std::unordered_map<uint64_t, PubSubLocalConn>::node_type;
-        using ClimonNode = std::unordered_map<uint64_t, ClimonConn>::node_type;
-        using ForwardNode = std::unordered_map<uint64_t, ClientForwardRoute>::node_type;
-
-        PubSubNode pubsub;
-        ClimonNode climon;
-        ForwardNode forward;
-        std::vector<std::string> tracking_keys;
-        // Allocated during reversible preparation, but counted and posted only after commit.
-        std::vector<PubSubEvent*> rebind_events;
-        PubSubEvent* installed_event = nullptr;
-        uint64_t client_id = 0;
-        uint32_t source = 0;
-        uint32_t destination = 0;
-        bool monitor = false;
-        bool tracking = false;
-
-        ~ClientRoutingMigration() {
-            for (PubSubEvent* event : rebind_events) delete event;
-            delete installed_event;
-        }
-    };
-    std::unordered_map<uint64_t, ClientForwardRoute> routing_forward_;
-    // Boot-selected fused loop only; appended so split-mode IoLoop offsets stay unchanged.
-    FusedExLoop* fused_executor_ = nullptr;
-    // Cold safety views into run-loop locals. Streams may retain the IFID view across its one
-    // bounded residual rotation; teardown and migration defer while either context owns a Client.
-    WbPipelineBatch* active_wb_context_ = nullptr;
-    bool targeted_ifid_ = false;
-    // Cold teardown/migration state; leave all established hot member offsets intact.
-    mutable std::unordered_map<Client*, ClientWorkFence> client_work_fences_;
 };
 
 }  // namespace tomo

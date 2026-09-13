@@ -966,7 +966,7 @@ void acl_reply_log(Op& op) {
     const int64_t now = acl_wall_milliseconds();
     for (const AclLogEntry& entry : entries) {
         auto sink = op.sink();
-        reply_map_header(sink, 10, op.resp3());
+        reply_array_header(sink, 20);  // RESP2 encoding of vanilla's ten-field map
         reply_bulk(sink, Slice("count", 5));
         reply_int(sink, static_cast<long long>(entry.count));
         reply_bulk(sink, Slice("reason", 6));
@@ -980,8 +980,7 @@ void acl_reply_log(Op& op) {
         reply_bulk(sink, Slice("username", 8));
         reply_bulk(sink, Slice(entry.username.data(), entry.username.size()));
         reply_bulk(sink, Slice("age-seconds", 11));
-        reply_double(sink, std::max<int64_t>(0, now - entry.updated_ms) / 1000.0,
-                     op.resp3());
+        reply_double(sink, std::max<int64_t>(0, now - entry.updated_ms) / 1000.0);
         reply_bulk(sink, Slice("client-info", 11));
         reply_bulk(sink, Slice(entry.client_info.data(), entry.client_info.size()));
         reply_bulk(sink, Slice("entry-id", 8));
@@ -1199,7 +1198,6 @@ __attribute__((cold, noinline)) bool acl_finish_dispatch_denial(
     multi_mark_queue_error(client);
     client.advance_parse(consumed);
     loop.self_->note_command(op.spec->id);
-    loop.flip_fingerprint_note(*op.spec, op);
     acl_reply_denied(client, op, client.acl_user_idx(), denied, denied_arg, *loop.self_);
     loop.finish_prebuilt(&client, op);
     return true;
@@ -1268,7 +1266,7 @@ void acl_recheck_blocking(Client& client, Op& op, ThreadCtx& thread) {
         client.acl_user_idx(), *op.spec, op.argc(),
         [&](uint32_t arg) { return op.arg(arg); }, &denied_arg);
     if (denied == AclDeniedReason::None) return;
-    op.clear_reply();   // direct bytes and the reply code too, or the denial is a SECOND reply
+    op.reply.clear();
     acl_reply_denied(client, op, client.acl_user_idx(), denied, denied_arg, thread);
 }
 
@@ -1338,12 +1336,12 @@ void acl_command_entry(IoLoop& loop, Client& client, Op& op) {
         AclUser* user = acl_slot(found->second);
         const AclUserImage image = acl_image(*user);
         auto sink = op.sink();
-        reply_map_header(sink, 6, op.resp3());
+        reply_array_header(sink, 12);
         reply_bulk(sink, Slice("flags", 5));
         uint32_t nflags = !!(image.flags & AclUserEnabled) + !!(image.flags & AclUserDisabled) +
                           !!(image.flags & AclUserNoPass) + !!(image.flags & AclUserSanitize) +
                           !!(image.flags & AclUserSkipSanitize);
-        reply_set_header(sink, nflags, op.resp3());
+        reply_array_header(sink, nflags);
         if (image.flags & AclUserEnabled) reply_bulk(sink, Slice("on", 2));
         if (image.flags & AclUserDisabled) reply_bulk(sink, Slice("off", 3));
         if (image.flags & AclUserNoPass) reply_bulk(sink, Slice("nopass", 6));
@@ -1367,7 +1365,7 @@ void acl_command_entry(IoLoop& loop, Client& client, Op& op) {
         reply_bulk(sink, Slice("selectors", 9));
         reply_array_header(sink, image.perm.selectors.size());
         for (const AclSelector& selector : image.perm.selectors) {
-            reply_map_header(sink, 3, op.resp3());
+            reply_array_header(sink, 6);
             reply_bulk(sink, Slice("commands", 8));
             const std::string selector_commands = acl_describe_commands(selector);
             reply_bulk(sink, Slice(selector_commands.data(), selector_commands.size()));

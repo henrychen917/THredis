@@ -5,6 +5,7 @@
 namespace tomo {
 namespace {
 
+inline constexpr uint64_t kBitfieldMaxBulkLen = 512ull * 1024 * 1024;
 
 bool bitfield_parse_i64(Slice input, int64_t& output) {
     if (input.n == 0 || input.n >= 32) return false;
@@ -38,14 +39,14 @@ bool bitfield_parse_i64(Slice input, int64_t& output) {
     return true;
 }
 
-Slice bitfield_string_bytes(const KvObj* object, char (&integer)[24],
-                            KvObjRawReadBuffer& raw) {
-    if (!object->is_int()) return kvobj_string_value(object, raw);
+Slice bitfield_string_bytes(const KvObj* object, char (&integer)[24]) {
+    if (!object->is_int()) return object->str_value();
     return Slice(integer, i64_to_dec(integer, object->int_value()));
 }
 
 void reply_bitfield_store_error(Op& op, XshardStringStoreResult result) {
-    op.clear_reply();
+    op.direct_len = 0;
+    op.reply.clear();
     if (result == XshardStringStoreResult::Maxmemory) reply_maxmemory_oom(op);
     else if (result == XshardStringStoreResult::Oom)
         reply_err(op.sink(), "ERR out of memory");
@@ -121,7 +122,7 @@ bool parse_bitfield_offset(Op& op, Slice argument, uint8_t bits, uint64_t& offse
     }
     uint64_t result = static_cast<uint64_t>(parsed);
     if (indexed) result *= bits;
-    if (((result + bits - 1) >> 3) >= command_proto_max_bulk_len()) {
+    if ((result >> 3) >= kBitfieldMaxBulkLen) {
         reply_err(op.sink(), "ERR bit offset is not an integer or out of range");
         return false;
     }
@@ -266,12 +267,10 @@ void bitfield_generic(Shard& shard, Op& op, bool ro_variant) {
         return;
     }
 
-    KvObj* object = readonly ? shard.store_find_read<kNotify>(op.hash, op.key())
-                             : shard.store_find<kNotify>(op.hash, op.key());
+    KvObj* object = shard.store_find<kNotify>(op.hash, op.key());
     if (object && !obj_type_check(object, Type::String, op.sink())) return;
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice old = object ? bitfield_string_bytes(object, integer, raw) : Slice("", 0);
+    const Slice old = object ? bitfield_string_bytes(object, integer) : Slice("", 0);
 
     if (readonly) {
         reply_array_header(op.sink(), operations.size());
@@ -344,14 +343,12 @@ void bitfield_generic(Shard& shard, Op& op, bool ro_variant) {
         }
     }
 
-    const int64_t expire_at_ms = object ? shard.store().deadline(op.hash, object) : -1;
+    const int64_t expire_at_ms = object ? object->expire_at_ms() : -1;
     const Slice replacement(reinterpret_cast<const char*>(image), new_length);
     const XshardStringStoreResult stored = kNotify
         ? xshard_store_string_notify(shard, op.key(), op.hash, replacement,
-                                     expire_at_ms, false,
-                                     object && object->has_ttl_slot())
-        : xshard_store_string(shard, op.key(), op.hash, replacement, expire_at_ms, false,
-                              object && object->has_ttl_slot());
+                                     expire_at_ms, false)
+        : xshard_store_string(shard, op.key(), op.hash, replacement, expire_at_ms, false);
     std::free(image);
     if (stored != XshardStringStoreResult::Stored) {
         reply_bitfield_store_error(op, stored);

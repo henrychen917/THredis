@@ -107,15 +107,6 @@ struct MultiSession {
     MultiExecState* pending = nullptr;       // prepared, but not yet published to owner queues
 };
 
-struct MultiOwnerRecordRefs {
-    // `nodes` is also the pointer retained by every AtomicEntry installed on this executor. Writer
-    // owners begin at one so cleanup cannot release the state's pre-count before the owner has run
-    // all of its outer shard tasks through the transaction's final decision.
-    uint32_t nodes = 0;
-    uint32_t remaining = 0;
-    bool completion_sentinel = false;
-};
-
 // EXEC MUST NEVER BE WEAKER THAN THE SAME COMMANDS RUN BARE.  A bare cross-shard read pins a read
 // cut, so a transaction that carries one has to pin a cut too; SnapshotCut is the shared header
 // that lets it do so through the connection-owning IO thread's ScatterArenaPool, which is the one
@@ -164,11 +155,10 @@ struct alignas(8) MultiExecState : SnapshotCut {
     std::vector<uint8_t> final_shard_done;
     std::vector<uint8_t> aof_shard_done;
     std::vector<uint8_t> execution_noted;
-    std::vector<MultiOwnerRecordRefs> owner_record_refs;
+    std::vector<uint32_t> owner_record_refs;
     ScatterArenaPool scatter_pool;
     std::atomic<uint64_t> epoch{0};
     std::atomic<uint32_t> record_refs{0};
-    bool record_refs_precounted = false;
     std::atomic<uint32_t> watch_refs{0};
     std::atomic<bool> aborted{false};
     std::atomic<bool> watch_failed{false};
@@ -200,29 +190,10 @@ MultiSession* ensure_multi_session(Client& client) {
 }
 
 void release_admission(MultiExecState& state) {
-    if (state.server)
-        state.server->atomic_apply_close(state.owner_io, state.apply_open);
+    if (state.server) state.server->atomic_apply_close(state.apply_open);
     if (!state.admitted) return;
     state.server->atomic_retire_group(state.owner_io, state.admission_generation);
     state.admitted = false;
-}
-
-// Does `group_epoch` name a word THIS transaction publishes through? A transaction is one logical
-// unit spread over several epoch words: the plain per-key installs publish through `state.epoch`,
-// and every cross-shard command lowered inside the same EXEC keeps its own ScatterState and
-// publishes through that one. Anything asking "is there an undecided record here that is not mine"
-// has to accept all of them, or the transaction answers yes against its own RENAME/LMPOP child.
-// `commands` and their scatter pointers are written by IO in prepare_commands() before the first
-// fragment is posted, and cleared only by destroy_multi_children() at retirement, which cannot run
-// while a fragment is still executing -- so this walk is stable on an owner thread.
-bool multi_state_owns_epoch(const MultiExecState& state, const void* group_epoch) {
-    if (!group_epoch) return false;
-    if (group_epoch == static_cast<const void*>(&state.epoch)) return true;
-    for (const auto& command : state.commands)
-        if (command && command->scatter &&
-            group_epoch == static_cast<const void*>(&command->scatter->epoch))
-            return true;
-    return false;
 }
 
 bool multi_records_done(const MultiExecState& state) {
@@ -244,8 +215,6 @@ void destroy_multi_children(MultiExecState& state) {
 
 void destroy_multi_state(MultiExecState* state) {
     if (!state) return;
-    if (__builtin_expect(atomic_tripwire_enabled(), false))
-        atomic_tripwire_forget_scope(state);
     if (!multi_records_done(*state)) std::abort();
     // The cut bracket is register-at-dispatch / unregister-at-retire, both on the connection's own
     // IO thread. Reaching destruction still holding it would mean this thread's published cleanup
@@ -263,8 +232,7 @@ bool command_forbidden_in_multi(const Op& op) {
     // four regular controls and matches it for SSUBSCRIBE/SUNSUBSCRIBE.
     const bool config_mutation = multi_name(op, "config") && op.argc() > 1 &&
                                  !op.arg(1).eq_icase("get");
-    return (op.spec->flags & CmdFlags::NoMulti) ||
-           multi_name(op, "save") || multi_name(op, "flushall") ||
+    return multi_name(op, "save") || multi_name(op, "flushall") ||
            multi_name(op, "flushdb") || config_mutation || multi_name(op, "randomkey") ||
            multi_name(op, "spop") || multi_name(op, "srandmember") ||
            multi_name(op, "zrandmember") || multi_name(op, "hrandfield") ||
@@ -303,15 +271,6 @@ MultiBlockingPop multi_blocking_pop(const MultiQueuedCommand& queued) {
 
 void command_key_args(const MultiQueuedCommand& queued, std::vector<uint32_t>& args) {
     const CommandSpec& spec = *queued.spec;
-    // Script metadata extends through ARGV; only the declared KEYS can own an AOF fragment.
-    if (spec.flags & CmdFlags::ScriptRoute) {
-        int64_t count = 0;
-        if (queued.argv.size() < 3 ||
-            !parse_i64(Slice(queued.argv[2].data(), queued.argv[2].size()), count) ||
-            count < 0 || static_cast<uint64_t>(count) > queued.argv.size() - 3) return;
-        for (uint32_t i = 0; i < static_cast<uint32_t>(count); i++) args.push_back(3 + i);
-        return;
-    }
     if (spec.flags & CmdFlags::StreamRoute) {
         uint32_t streams = 1;
         while (streams < queued.argv.size() &&
@@ -603,16 +562,6 @@ bool prepare_commands(Server& server, MultiExecState& state,
                     return false;
                 }
             }
-            if (command->kind != MultiCommandKind::Prebuilt &&
-                (has_name(command->queued, "mset") || has_name(command->queued, "msetnx")) &&
-                (command->queued.argv.size() & 1u) == 0) {
-                reply_err(command->op->sink(), has_name(command->queued, "mset")
-                    ? "ERR wrong number of arguments for 'mset' command"
-                    : "ERR wrong number of arguments for 'msetnx' command");
-                command->kind = MultiCommandKind::Prebuilt;
-                command->key_args.clear();
-                command->key_shards.clear();
-            }
             if (state.client->resp3()) command->op->mark_resp3();
             if (command->kind == MultiCommandKind::Scan &&
                 !command_prepare_scan_route(server, *command->op))
@@ -627,7 +576,7 @@ bool prepare_commands(Server& server, MultiExecState& state,
                 if (prepared == ScatterPrepare::Ready) {
                     command->kind = MultiCommandKind::Xshard;
                     command->scatter = child_dispatch.state;
-                    xshard_multi_child_bind(*command->scatter, &state);
+                    xshard_multi_child_bind(*command->scatter);
                     xshard_multi_child_capture_groups(
                         *command->scatter, command->xshard_stage_groups[0]);
                     for (uint32_t i = 0; i < child_dispatch.nshards; i++)
@@ -732,7 +681,7 @@ MultiExecState* allocate_state(Server& server, Client& client, uint32_t owner_io
     state->watch_generation = client.watch_generation();
     state->kind = kind;
     try {
-        state->owner_record_refs.assign(server.nthreads(), MultiOwnerRecordRefs{});
+        state->owner_record_refs.assign(server.placement().ex_threads().size(), 0);
         state->shard_commands.resize(server.nshards());
         state->shard_cursors.assign(server.nshards(), 0);
         state->watch_shard_done.assign(server.nshards(), 0);
@@ -745,78 +694,6 @@ MultiExecState* allocate_state(Server& server, Client& client, uint32_t owner_io
         return nullptr;
     }
     return state;
-}
-
-// WRITE_KEYS IS NOT THE SET OF EXECUTORS THAT INSTALL. It is the prepare-time registry key list,
-// and a lowered LMPOP/ZMPOP has none: command_key_args() returns nothing for their numkeys form, so
-// classify_multi_command() sends them down the Xshard arm and multi_execute_task() calls
-// prepare_write_key() at phase two for a key SELECTED THEN, on whichever shard held a non-empty
-// list. Deriving sentinels from write_keys therefore left that executor -- and, for a transaction
-// whose only write is such a command, EVERY executor -- with no pin, which the install then
-// aborted on. The outer task set is the exact and cheaper predicate: every executor that installs
-// anything for this transaction must first have been given one of its shard tasks.
-bool multi_state_may_install(const MultiExecState& state) {
-    for (const auto& command : state.commands) {
-        if (!command_has_owner_work(*command)) continue;
-        if (command->queued.spec->flags & (CmdFlags::Write | CmdFlags::SnapshotWrite))
-            return true;
-    }
-    return false;
-}
-
-void initialize_multi_owner_record_refs(MultiExecState& state) {
-    if (state.kind != MultiStateKind::Execute || !multi_state_may_install(state)) return;
-    if (state.record_refs.load(std::memory_order_relaxed) != 0 ||
-        state.record_refs_precounted) std::abort();
-
-    // Every outer shard task reaches the post-decision completion boundary even when WATCH or
-    // EXECABORT skips its commands. Count all such tasks per executor so only its last one releases
-    // the sentinel protecting whatever records earlier tasks may have installed.
-    uint32_t owners = 0;
-    for (int32_t shard : state.shards) {
-        const uint32_t tid = state.server->worker_of_shard(shard);
-        const uint32_t slot = state.server->executor_slot(tid);
-        if (slot >= state.owner_record_refs.size()) std::abort();
-        MultiOwnerRecordRefs& progress = state.owner_record_refs[slot];
-        if (progress.remaining++) continue;
-        if (progress.nodes || progress.completion_sentinel) std::abort();
-        progress.nodes = 1;
-        progress.completion_sentinel = true;
-        owners++;
-    }
-    if (!owners) std::abort();
-    state.record_refs_precounted = true;
-    state.record_refs.store(owners, std::memory_order_release);
-}
-
-void complete_multi_owner_record_refs(MultiExecState& state, uint32_t owner_thread_id) {
-    if (!state.record_refs_precounted) return;
-    const uint32_t slot = state.server->executor_slot(owner_thread_id);
-    if (slot >= state.owner_record_refs.size()) std::abort();
-    MultiOwnerRecordRefs& progress = state.owner_record_refs[slot];
-    if (!progress.remaining) std::abort();
-    if (--progress.remaining != 0 || !progress.completion_sentinel) return;
-
-    progress.completion_sentinel = false;
-    if (!progress.nodes) std::abort();
-    if (--progress.nodes == 0 &&
-        state.record_refs.fetch_sub(1, std::memory_order_release) == 0) std::abort();
-}
-
-void clear_unpublished_multi_record_refs(MultiExecState& state) {
-    if (!state.record_refs_precounted) return;
-    uint32_t owners = 0;
-    for (MultiOwnerRecordRefs& progress : state.owner_record_refs) {
-        if (!progress.completion_sentinel) continue;
-        // The caller proved no task was published, so only the prepare-time sentinel can be present.
-        if (progress.nodes != 1) std::abort();
-        progress.nodes = 0;
-        progress.completion_sentinel = false;
-        owners++;
-    }
-    if (state.record_refs.load(std::memory_order_relaxed) != owners) std::abort();
-    state.record_refs.store(0, std::memory_order_relaxed);
-    state.record_refs_precounted = false;
 }
 
 MultiExecState* prepare_unwatch_state(Server& server, Client& client, uint32_t owner_io,
@@ -875,20 +752,13 @@ bool load_clone(Shard& shard, Slice key, KvObj* visible, KvObj*& clone) {
     if (!visible) return true;
     ObjectImage image;
     if (!serialize_object(visible, image)) return false;
-    return load_object_image(key, image, shard.type_limits(), clone) ==
-               SnapshotHookStatus::Ok && clone;
+    const SnapshotTypeHooks& hooks = snapshot_type_hooks(image.type);
+    if (!hooks.load) return false;
+    const Slice payload(reinterpret_cast<const char*>(image.payload.data()),
+                        static_cast<uint32_t>(image.payload.size()));
+    return hooks.load(key, image.encoding, image.expire_at_ms, payload,
+                      shard.type_limits(), clone) == SnapshotHookStatus::Ok && clone;
 }
-
-// Violations of the install-time ordering invariant asserted in prepare_write_key() below. It is a
-// bug counter, not a workload counter: every battery that exercises a transaction behind an
-// undecided same-connection unit asserts it is EXACTLY zero, in both atomic modes. Namespace scope
-// rather than Shard::Stats because Shard's layout is locked (sizeof(Shard) == 1440) and because a
-// counter that is never incremented needs no per-shard line of its own.
-// Internal linkage is right for the counter itself -- prepare_write_key() below is its only
-// writer, and it lives in this file's anonymous namespace with the rest of the transaction
-// helpers. The READER that INFO calls cannot: it is declared in multi.h and defined out beyond
-// this anonymous namespace, next to multi_task_owns_epoch().
-std::atomic<uint64_t> g_exec_order_late{0};
 
 enum class MultiPrepareWrite : uint8_t { Ready, Retry, Error };
 
@@ -898,39 +768,22 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
                                     std::atomic<uint32_t>* watch_refs = nullptr) {
     if (!watch_token) watch_token = &state;
     if (!watch_refs) watch_refs = &state.watch_refs;
-    // THE FALSIFIER, and it must read ZERO. It asks EXACTLY the question the dispatch-time park in
-    // ExLoop::execute() asks -- does this owner still hold an undecided record belonging to a
-    // DIFFERENT logical unit of this connection? -- but asks it one step later, at install time.
-    // The park is supposed to foreclose it completely, because only this owner thread may publish
-    // into this owner's pending list, so nothing can appear between the dispatch check and these
-    // installs. A non-zero reading is therefore not a statistic: it is proof that the park's
-    // safety argument is false on this build, and that a transaction could
-    // again clone a withdrawable candidate into an acknowledged write.
-    //
-    // It counts into its OWN counter, deliberately. Sharing atomic_exec_order_holds with the park
-    // would make this arm unreadable: the park is non-zero BY DESIGN in exactly the runs that open
-    // the window, so a sum can never be checked against zero and the falsifier would be inert --
-    // the safety argument would break with no test going red. Split, each counter answers one
-    // question: holds > 0 proves the hold fired, late == 0 proves it fired EARLY ENOUGH.
-    // Not a Shard::Stats field because Shard's layout is locked at 1440 bytes; a namespace-scope
-    // atomic costs nothing here, since the increment is on a path that is never taken.
-    //
-    // Holding the transaction HERE deadlocked with one connection and no WATCH (0 rounds versus
-    // 300 on base): the older group could wait on the transaction's partial installs while the
-    // transaction waited on that group. The dispatch-time park is safe because the fragment has
-    // installed nothing on this owner, so it cannot give the older group a reason to wait here.
-    // The exclusion is BY EPOCH WORD and must cover the transaction's lowered children as well as
-    // its own: a cross-shard child installs through the scatter path with its own ScatterState,
-    // and counting that would report a violation every time a transaction merely met its own
-    // RENAME/LMPOP child.
+    // OBSERVABILITY ONLY -- deliberately not a gate. This counts the hazard window: an EXEC
+    // write installing its candidate for `key` while an OLDER cross-shard group from the SAME
+    // connection is still undecided on this owner. It is the discriminator that isolated the
+    // write loss NOTES-MULTIRES.md describes, and every test of that defect asserts it moved,
+    // so a green run cannot be a vacuous one. &state.epoch excludes THIS transaction's own
+    // records; that exclusion must be by the epoch word rather than the group pointer, because
+    // a cross-shard child command inside this same EXEC installs through the scatter path and
+    // carries a NON-null group pointer.
+    // Holding the transaction here instead of counting was tried and is WRONG: it deadlocks
+    // (NOTES-MULTIRES.md, "two fixes that were wrong and why"). The install order this counter
+    // observes is already correct -- the group is present, which is why the counter can see it.
     if (__builtin_expect(shard.store().atomic_has_records(), false) &&
-        shard.store().atomic_has_foreign_unit_undecided(
-            state.origin_conn_id,
-            [&state](const void* group_epoch) {
-                return multi_state_owns_epoch(state, group_epoch);
-            }))
-        g_exec_order_late.fetch_add(1, std::memory_order_relaxed);
-    if (!shard.watch_write_ready(key, &state)) return MultiPrepareWrite::Retry;
+        shard.store().atomic_has_own_undecided(hash, key, state.origin_conn_id, nullptr,
+                                               &state.epoch))
+        shard.stats().atomic_exec_order_holds++;
+    if (!shard.watch_write_ready(key, watch_token)) return MultiPrepareWrite::Retry;
     shard.watch_reserve_write(key, state.client, state.watch_generation, watch_token,
                               &state.epoch, &state.aborted, watch_refs);
     const auto snapshot = shard.store().snapshot_prepare_write(hash, key);
@@ -952,8 +805,7 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     }
     const uint32_t slot = server.executor_slot(owner_thread_id);
     if (slot >= state.owner_record_refs.size()) std::abort();
-    MultiOwnerRecordRefs& owner_progress = state.owner_record_refs[slot];
-    uint32_t* owner_refs = &owner_progress.nodes;
+    uint32_t* owner_refs = &state.owner_record_refs[slot];
     void* entry = nullptr;
     if (!shard.store().atomic_prepare_transaction(
             key, hash, state.origin_conn_id, &state.epoch, &state.record_refs,
@@ -965,11 +817,7 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     }
     KvObj* installed = clone;
     shard.store().atomic_install_transaction(hash, key, entry, installed);
-    // INVARIANT, not a hope: initialize_multi_owner_record_refs() gave every executor holding an
-    // outer task of an installing transaction its sentinel before the first task became visible,
-    // and this executor is running one of those tasks. A missing pin here would mean cleanup could
-    // release the state's last reference between two of this owner's own installs.
-    if (!owner_progress.completion_sentinel || !*owner_refs) std::abort();
+    if (*owner_refs == 0) state.record_refs.fetch_add(1, std::memory_order_release);
     (*owner_refs)++;
     // Keep the transaction overlay selected for the handler and later keys in this command.
     shard.store().atomic_set_read_context(UINT64_MAX, state.origin_conn_id);
@@ -1035,43 +883,6 @@ uint64_t multi_read_cut(const MultiExecState& state) {
     return state.snapshot_registered ? state.snapshot : UINT64_MAX;
 }
 
-uint64_t multi_tripwire_slot(const Shard& shard, size_t key_index) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(shard.id())) << 32) |
-           static_cast<uint32_t>(key_index);
-}
-
-void multi_tripwire_fragment_begin(MultiExecState& state, Shard& shard) {
-    if (!atomic_tripwire_enabled()) return;
-    const uint32_t shard_id = static_cast<uint32_t>(shard.id());
-    const uint64_t cut = multi_read_cut(state);
-    for (uint32_t command_index : state.shard_commands[shard_id]) {
-        MultiCommand& command = *state.commands[command_index];
-        if (command.kind != MultiCommandKind::Mget &&
-            command.kind != MultiCommandKind::Exists)
-            continue;
-        for (size_t i = 0; i < command.key_args.size(); i++) {
-            if (command.key_shards[i] != shard.id()) continue;
-            const Slice key = command.op->arg(command.key_args[i]);
-            const uint64_t hash = FlatStore::hash_key(key);
-            atomic_tripwire_plain_begin(
-                &state, &command, multi_tripwire_slot(shard, i), hash, cut,
-                shard.store().atomic_tripwire_ticket(hash, key),
-                shard.store().atomic_needs_version(hash, key));
-        }
-    }
-}
-
-void multi_tripwire_read_execution(MultiExecState& state, MultiCommand& command,
-                                   Shard& shard, size_t key_index, Slice key) {
-    if (!atomic_tripwire_enabled()) return;
-    const uint64_t hash = FlatStore::hash_key(key);
-    atomic_tripwire_plain_execution(
-        &state, &command, multi_tripwire_slot(shard, key_index), hash, multi_read_cut(state),
-        shard.store().atomic_tripwire_ticket(hash, key),
-        shard.store().atomic_needs_version(hash, key),
-        shard.store().atomic_tripwire_plain_path());
-}
-
 bool execute_local_command(Server& server, MultiExecState& state, MultiCommand& command,
                            Shard& shard, uint32_t owner_thread_id) {
     if (!prepare_local_write_keys(server, state, command, shard, owner_thread_id)) return false;
@@ -1104,11 +915,8 @@ bool execute_cross_command(Server& server, MultiExecState& state, MultiCommand& 
             if (command.key_shards[i] != shard.id()) continue;
             const uint32_t arg = command.key_args[i];
             const Slice key = op.arg(arg);
-            if (__builtin_expect(atomic_tripwire_enabled(), false))
-                multi_tripwire_read_execution(state, command, shard, i, key);
-            KvObj* object = notify
-                ? shard.store_find_read<true>(FlatStore::hash_key(key), key)
-                : shard.store_find_read<false>(FlatStore::hash_key(key), key);
+            KvObj* object = notify ? shard.store_find<true>(FlatStore::hash_key(key), key)
+                                   : shard.store().find(FlatStore::hash_key(key), key);
             if (!object || static_cast<Type>(object->type) != Type::String) continue;
             MultiValue& value = command.values[i];
             if (object->is_int()) {
@@ -1116,8 +924,7 @@ bool execute_cross_command(Server& server, MultiExecState& state, MultiCommand& 
                 const uint32_t n = i64_to_dec(text, object->int_value());
                 value.value.assign(text, n);
             } else {
-                KvObjRawReadBuffer raw;
-                const Slice bytes = kvobj_string_value(object, raw);
+                const Slice bytes = object->str_value();
                 value.value.assign(bytes.p, bytes.n);
             }
             value.present = true;
@@ -1181,10 +988,8 @@ bool execute_cross_command(Server& server, MultiExecState& state, MultiCommand& 
             if (command.key_shards[i] != shard.id()) continue;
             const uint32_t arg = command.key_args[i];
             const Slice key = op.arg(arg);
-            if (__builtin_expect(atomic_tripwire_enabled(), false))
-                multi_tripwire_read_execution(state, command, shard, i, key);
-            found += (notify ? shard.store_find_read<true>(FlatStore::hash_key(key), key)
-                             : shard.store_find_read<false>(FlatStore::hash_key(key), key)) != nullptr;
+            found += (notify ? shard.store_find<true>(FlatStore::hash_key(key), key)
+                             : shard.store().find(FlatStore::hash_key(key), key)) != nullptr;
         }
         command.integer.fetch_add(found, std::memory_order_relaxed);
     }
@@ -1373,7 +1178,6 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
         MultiExecState* state = allocate_state(server, client, owner_io, MultiStateKind::WatchAdd);
         if (!state) { reply_err(op.sink(), "ERR out of memory"); return MultiIoAction::LocalDone; }
         state->final_reply = MultiFinalReply::Ok;
-        const size_t watched_before = session->watched.size();
         try {
             for (uint32_t i = 1; i < op.argc(); i++) {
                 const std::string key(op.arg(i).p, op.arg(i).n);
@@ -1388,7 +1192,6 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
             }
             for (const MultiWatchedKey& key : state->watched) add_shard(state->shards, key.shard);
         } catch (const std::bad_alloc&) {
-            session->watched.resize(watched_before);
             destroy_multi_state(state);
             reply_err(op.sink(), "ERR out of memory");
             return MultiIoAction::LocalDone;
@@ -1464,7 +1267,7 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
             return MultiIoAction::LocalDone;
         }
         state->admitted = true;
-        server.atomic_apply_open(owner_io, state->apply_open);
+        server.atomic_apply_open(state->apply_open);
         state->admission_generation = generation;
         state->reset_watch = true;
         state->watched = std::move(session->watched);
@@ -1546,8 +1349,7 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
     return MultiIoAction::LocalDone;
 }
 
-template <bool IofusedPrivateQueue>
-bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t consumed) {
+bool multi_dispatch_entry(IoLoop& loop, Client& client, Op& op, uint32_t consumed) {
     MultiSession* queue_session = client.multi_session();
     const bool was_queueing = queue_session && queue_session->active;
     const uint64_t op_id = client.rob().dispatch_id();
@@ -1565,7 +1367,6 @@ bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t co
     if (action == MultiIoAction::LocalDone) {
         client.advance_parse(consumed);
         loop.self_->note_command(op.spec->id);
-        loop.flip_fingerprint_note(*op.spec, op);
         loop.finish_prebuilt(&client, op);
         return true;
     }
@@ -1577,15 +1378,8 @@ bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t co
         needed[loop.srv_->worker_of_shard(sid)]++;
     }
     for (uint32_t tid = 0; tid < loop.srv_->nthreads(); tid++) {
-        if (!needed[tid]) continue;
-        ThreadCtx& owner = loop.srv_->thread(tid);
-        const uint32_t free_slots = [&] {
-            if constexpr (IofusedPrivateQueue)
-                return owner.iofused_task_free_slots(loop.self_->id());
-            else
-                return owner.task_free_slots(loop.self_->id());
-        }();
-        if (free_slots < needed[tid]) {
+        if (needed[tid] &&
+            loop.srv_->thread(tid).task_free_slots(loop.self_->id()) < needed[tid]) {
             // Returning through the one parse-loop continuation reaches the existing top-of-loop
             // backpressure check, which has the same effect as the old in-line break.
             client.set_atomic_backpressure(true);
@@ -1656,11 +1450,6 @@ bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t co
     for (const auto& command : dispatch->commands)
         if (command->scatter) command->scatter->now_cut_ms = dispatch->now_cut_ms;
 
-    // A pending EXEC may survive queue or snapshot-window backpressure while shard ownership
-    // migrates. Derive owner sentinels only on the final, no-failure path immediately before the
-    // first task can become visible, so their slots match the routes used by this publication.
-    initialize_multi_owner_record_refs(*dispatch);
-
     Rob<kRobWindow>& rob = client.rob();
     op.attach_multi_state(dispatch);
     client.atomic_group_started();
@@ -1672,20 +1461,13 @@ bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t co
         const uint32_t tid = loop.srv_->worker_of_shard(sid);
         ThreadCtx& owner = loop.srv_->thread(tid);
         const Task task = multi_make_task(&client, op_id, sid, dispatch);
-        const bool posted = [&] {
-            if constexpr (IofusedPrivateQueue)
-                return owner.post_iofused_task_quiet(loop.self_->id(), task, sig);
-            else
-                return owner.post_task_quiet(loop.self_->id(), task, sig);
-        }();
-        if (!posted) std::abort();
+        if (!owner.post_task_quiet(loop.self_->id(), task, sig)) std::abort();
         if (!loop.touched_[tid]) {
             loop.touched_[tid] = true;
             loop.touched_list_[loop.ntouched_++] = tid;
         }
     }
     loop.self_->note_command(op.spec->id);
-    loop.flip_fingerprint_note(*op.spec, op);
     client.advance_parse(consumed);
     sig.ops++;
     // Released by the quiescence backstop in flush_ready: EXEC's parked lifetime IS its ROB slot,
@@ -1695,14 +1477,6 @@ bool multi_dispatch_entry_impl(IoLoop& loop, Client& client, Op& op, uint32_t co
     loop.barrier_arm(&client, BarrierOwner::Exec);
     loop.mark_active(&client);
     return true;
-}
-
-bool multi_dispatch_entry(IoLoop& loop, Client& client, Op& op, uint32_t consumed) {
-    return multi_dispatch_entry_impl<false>(loop, client, op, consumed);
-}
-
-bool multi_dispatch_entry_iofused(IoLoop& loop, Client& client, Op& op, uint32_t consumed) {
-    return multi_dispatch_entry_impl<true>(loop, client, op, consumed);
 }
 
 void multi_retire_entry(IoLoop& loop, Client& client, Op& op) {
@@ -1740,8 +1514,7 @@ uint32_t multi_owner_reap_entry(IoLoop& loop) {
     return multi_reap_deferred(loop.multi_deferred_);
 }
 
-template <bool IofusedPrivateQueue>
-uint32_t multi_owner_pass_entry_impl(IoLoop& loop) {
+uint32_t multi_owner_pass_entry(IoLoop& loop) {
     uint32_t work = multi_owner_reap_entry(loop);
     while (!loop.pending_multi_cleanups_.empty()) {
         MultiExecState* state = loop.pending_multi_cleanups_.front();
@@ -1751,15 +1524,8 @@ uint32_t multi_owner_pass_entry_impl(IoLoop& loop) {
             needed[loop.srv_->worker_of_shard(multi_dispatch_shard(state, i))]++;
         bool room = true;
         for (uint32_t tid = 0; tid < loop.srv_->nthreads(); tid++) {
-            if (!needed[tid]) continue;
-            ThreadCtx& owner = loop.srv_->thread(tid);
-            const uint32_t free_slots = [&] {
-                if constexpr (IofusedPrivateQueue)
-                    return owner.iofused_task_free_slots(loop.self_->id());
-                else
-                    return owner.task_free_slots(loop.self_->id());
-            }();
-            if (free_slots < needed[tid]) {
+            if (needed[tid] &&
+                loop.srv_->thread(tid).task_free_slots(loop.self_->id()) < needed[tid]) {
                 room = false;
                 break;
             }
@@ -1768,16 +1534,9 @@ uint32_t multi_owner_pass_entry_impl(IoLoop& loop) {
         for (uint32_t i = 0; i < count; i++) {
             const int32_t sid = multi_dispatch_shard(state, i);
             ThreadCtx& owner = loop.srv_->thread(loop.srv_->worker_of_shard(sid));
-            const Task task = multi_make_task(nullptr, UINT64_MAX, sid, state);
-            const bool posted = [&] {
-                if constexpr (IofusedPrivateQueue)
-                    return owner.post_iofused_task(
-                        loop.self_->id(), task, loop.ring_, loop.self_->sig());
-                else
-                    return owner.post_task(
-                        loop.self_->id(), task, loop.ring_, loop.self_->sig());
-            }();
-            if (!posted)
+            if (!owner.post_task(loop.self_->id(),
+                                 multi_make_task(nullptr, UINT64_MAX, sid, state),
+                                 loop.ring_, loop.self_->sig()))
                 std::abort();
         }
         multi_internal_dispatch_started(state);
@@ -1785,14 +1544,6 @@ uint32_t multi_owner_pass_entry_impl(IoLoop& loop) {
         work++;
     }
     return work;
-}
-
-uint32_t multi_owner_pass_entry(IoLoop& loop) {
-    return multi_owner_pass_entry_impl<false>(loop);
-}
-
-uint32_t multi_owner_pass_entry_iofused(IoLoop& loop) {
-    return multi_owner_pass_entry_impl<true>(loop);
 }
 
 void multi_close_entry(IoLoop& loop, Client& client) {
@@ -1827,24 +1578,12 @@ void multi_internal_dispatch_started(MultiExecState* state) {
 
 void multi_abandon_unpublished(MultiExecState* state) {
     if (!state || state->published) return;
-    clear_unpublished_multi_record_refs(*state);
     destroy_multi_state(state);
 }
 
 bool multi_task_tagged(const Task& task) {
     return (reinterpret_cast<uintptr_t>(task.scatter) & kMultiTaskTag) != 0;
 }
-
-bool multi_task_owns_epoch(const Task& task, const void* group_epoch) {
-    const uintptr_t tagged = reinterpret_cast<uintptr_t>(task.scatter);
-    const auto* state = reinterpret_cast<const MultiExecState*>(tagged & ~kMultiTaskTag);
-    return state && multi_state_owns_epoch(*state, group_epoch);
-}
-
-// INFO atomic_exec_order_late. Defined HERE, outside this file's anonymous namespace, because
-// t_server.cc calls it through multi.h: inside, it would be internal-linkage and the reference
-// from the other translation unit would not resolve.
-uint64_t multi_exec_order_late() { return g_exec_order_late.load(std::memory_order_relaxed); }
 
 Task multi_make_task(Client* client, uint64_t op_id, int32_t shard, MultiExecState* state) {
     const uintptr_t tagged = reinterpret_cast<uintptr_t>(state) | kMultiTaskTag;
@@ -1895,13 +1634,9 @@ MultiTaskResult multi_execute_task(Server& server, const Task& task, Shard& shar
     // Without this, two identical reads in one EXEC could disagree about the same key.
     PinnedNowMs now_cut(shard, state.now_cut_ms);
     uint8_t& noted = state.execution_noted[static_cast<uint32_t>(shard.id())];
-    if (!(noted & 1u)) {
+    if (!noted) {
         shard.note_execution(owner_domain);
-        noted |= 1u;
-    }
-    if (__builtin_expect(atomic_tripwire_enabled(), false) && !(noted & 2u)) {
-        multi_tripwire_fragment_begin(state, shard);
-        noted |= 2u;
+        noted = 1;
     }
     if (!state.watch_phase_done.load(std::memory_order_acquire)) {
         if (!execute_watch_phase(state, shard)) return MultiTaskResult::Retry;
@@ -2050,13 +1785,12 @@ MultiTaskResult multi_execute_task(Server& server, const Task& task, Shard& shar
                 // Every owner has joined and the one commit decision is made: nothing this
                 // transaction writes can land on a shard after this point, so it can no longer
                 // straddle a snapshot cut. Closed here, on an OWNER, not at reply retirement.
-                server.atomic_apply_close(owner_thread_id, state.apply_open);
+                server.atomic_apply_close(state.apply_open);
             }
         }
     }
     if (!state.finalized.load(std::memory_order_acquire)) return MultiTaskResult::Retry;
     finalize_reservations(state, shard);
-    complete_multi_owner_record_refs(state, owner_thread_id);
     if (state.tasks_pending.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return MultiTaskResult::Complete;
 
@@ -2291,11 +2025,8 @@ bool Shard::watch_validate_and_reserve(Slice key, Client* client, uint64_t gener
                 reservation.mutates |= mutates;
                 return true;
             }
-    watch_finalize_reservation(owned);
-    // Read-only validation claims can coexist. A conflicting writer instead makes this EXEC
-    // abort, including when it holds a blocking validation claim: waiting here permits cycles
-    // between transactions that already reserved different keys on different owners.
-    // Everything still on this key is an UNDECIDED reservation, and this transaction no
+    if (!watch_finalize_reservation(owned)) return false;
+    // Everything still on this key is now an UNDECIDED atomic-group write, and this transaction no
     // longer waits for it. Waiting was one half of the wait-for cycle, and it buys nothing that is
     // not already available here: a group holding a reservation on this key is a write to a key
     // this client watched, and "the group lands first" is a realizable serialization. Take it, and
@@ -2304,8 +2035,7 @@ bool Shard::watch_validate_and_reserve(Slice key, Client* client, uint64_t gener
     // waiting on this transaction.
     if (auto pending = watch_reservations_.find(owned); pending != watch_reservations_.end())
         for (const WatchReservation& reservation : pending->second)
-            if (reservation.token != token &&
-                (reservation.mutates || (reservation.blocking && mutates))) {
+            if (reservation.token != token && reservation.mutates) {
                 client->set_watch_dirty();
                 stats_.watch_reservation_precommit_aborts++;
                 break;

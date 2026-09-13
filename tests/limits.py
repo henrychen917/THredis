@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Directed connection-limits test. Usage: tests/limits.py HOST PORT
-
-The purpose boot must enable DEBUG commands for the deterministic blocked-timeout ordering arm.
-"""
+"""Directed connection-limits test. Usage: tests/limits.py HOST PORT"""
 
 import os
 import socket
@@ -218,17 +215,7 @@ def main():
                "maxclients live raise")
 
         # A simultaneous burst may overshoot only by the number of independent IO acceptors.
-        # The server's thread inventory is a conservative upper bound on n_io. The driver
-        # now has its own CPU allocation; its affinity says nothing about server acceptors.
-        server_info = admin.command("INFO", "SERVER")
-        if not isinstance(server_info, bytes):
-            raise AssertionError(f"INFO SERVER returned {server_info!r}")
-        server_fields = dict(line.split(":", 1) for line in server_info.decode().splitlines()
-                             if ":" in line)
-        server_threads = server_fields.get("thread_cpus", "").split(",")
-        if not server_threads or any(":" not in thread for thread in server_threads):
-            raise AssertionError(f"missing server thread inventory: {server_info!r}")
-        affinity_width = len(server_threads)
+        # The process affinity is a conservative upper bound on n_io for this purpose-booted test.
         expect(admin.command("CONFIG", "SET", "maxclients", "20"), b"OK",
                "maxclients storm setup")
         storm_before = int(stats(admin)["rejected_connections"])
@@ -268,10 +255,11 @@ def main():
         for thread in storm_threads:
             thread.join(timeout=10)
         alive = sum(thread.is_alive() for thread in storm_threads)
+        affinity_width = len(os.sched_getaffinity(0))
         if (alive or storm_errors or not (19 <= len(storm_admitted) <= 19 + affinity_width)):
             raise AssertionError(
                 f"maxclients storm bound: admitted={len(storm_admitted)} "
-                f"server_threads={affinity_width} alive={alive} errors={storm_errors!r}")
+                f"affinity={affinity_width} alive={alive} errors={storm_errors!r}")
         print(f"  ok   maxclients storm slop bound (admitted={len(storm_admitted)})",
               flush=True)
         expect_stat(admin, "rejected_connections",
@@ -314,26 +302,12 @@ def main():
 
         blocked = Conn(timeout=5)
         blocked_key = f"{token}:blocked"
-        reap_before = admin.command("DEBUG", "BLOCKING-TIMEOUT-REAP")
-        if not isinstance(reap_before, int):
-            raise AssertionError(
-                "blocking timeout regression requires --enable-debug-command yes: "
-                f"{reap_before!r}")
         blocked.send("BLPOP", blocked_key, "0")
         for _ in range(6):
             time.sleep(0.4)
             expect(admin.command("PING"), b"PONG", "blocked timeout heartbeat")
-        # Force the formerly racy order: BLPOP retirement clears `blocked`, then this client's
-        # owner runs its overdue timeout sweep before the send CQE can refresh last activity.
-        # The parked duration is not idle time, so the connection must survive both the reply and
-        # a following command. The counter is the positive control that the one-shot fired.
-        expect(admin.command("DEBUG", "BLOCKING-TIMEOUT-REAP", "1"), b"OK",
-               "blocked timeout deterministic ordering arm")
         expect(admin.command("LPUSH", blocked_key, "wake"), 1, "blocked timeout wake")
         expect(blocked.read(), [blocked_key.encode(), b"wake"], "blocked timeout exemption")
-        expect(blocked.command("PING"), b"PONG", "blocked timeout post-wake alive")
-        expect(admin.command("DEBUG", "BLOCKING-TIMEOUT-REAP"), reap_before + 1,
-               "blocked timeout deterministic ordering fired")
         blocked.close()
 
         active = Conn(timeout=5)

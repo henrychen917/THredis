@@ -19,13 +19,3 @@ __pycache__/
 codex*.log
 BRIEF*.md
 LANE_RULES.md
-# The interactive agent transcript changes during validation and is not project source.
-/CODEX-OUT.md
-
-# replycode lane: measurement drivers are tracked as sources, their binaries are not
-scratchpad/replycode/replay
-scratchpad/replycode/layout
-scratchpad/replycode/*.so
-
-# Exact gate timing and seed history survive make clean.
-.gate-history/

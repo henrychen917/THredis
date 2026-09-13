@@ -57,6 +57,7 @@ bool eq_icase(Slice s, const char* lit) {
     return true;
 }
 
+inline constexpr uint64_t kProtoMaxBulkLen = 512ull * 1024 * 1024;
 
 bool parse_i64(Slice s, int64_t& out) {
     // Redis's string2ll accepts only the representation that formatting the resulting integer
@@ -117,8 +118,8 @@ uint32_t format_long_double(char* text, size_t capacity, long double value) {
     return static_cast<uint32_t>(n);
 }
 
-Slice string_bytes(const KvObj* o, char (&integer)[24], KvObjRawReadBuffer& raw) {
-    if (!o->is_int()) return kvobj_string_value(o, raw);
+Slice string_bytes(const KvObj* o, char (&integer)[24]) {
+    if (!o->is_int()) return o->str_value();
     return Slice(integer, i64_to_dec(integer, o->int_value()));
 }
 
@@ -131,38 +132,36 @@ void clear_reply(Op& op);
 StoreResult map_insert(FlatStore& store, uint64_t hash, KvObj* replacement) {
     const FlatStore::InsertResult inserted = store.insert(hash, replacement);
     if (inserted == FlatStore::InsertResult::Inserted) return StoreResult::Stored;
-    store.discard_set_value(replacement);
+    kvobj_free(replacement);
     return inserted == FlatStore::InsertResult::MaxmemoryOom ? StoreResult::MaxmemoryOom
                                                              : StoreResult::InsertFailed;
 }
 
 StoreResult store_string(Shard& sh, Slice key, uint64_t hash, Slice value, int64_t expire_at_ms,
-                         bool integer_encode, bool reserve_ttl_slot) {
+                         bool integer_encode) {
     int64_t integer = 0;
     if (integer_encode && parse_i64(value, integer)) {
-        KvObj* replacement = sh.store().make_set_int(
-            key, integer, expire_at_ms, reserve_ttl_slot);
+        KvObj* replacement = kvobj_new_int(key, integer, expire_at_ms);
         if (!replacement) return StoreResult::Oom;
         return map_insert(sh.store(), hash, replacement);
     }
 
     // try_overwrite is the only in-place raw mutation. It rejects TTL-bearing and borrowed values;
     // the replacement path below then lets FlatStore retain any borrowed old allocation.
-    if (expire_at_ms < 0 && !reserve_ttl_slot) {
+    if (expire_at_ms == -1) {
         const FlatStore::OverwriteResult overwritten = sh.store().try_overwrite(hash, key, value);
         if (overwritten == FlatStore::OverwriteResult::Updated) return StoreResult::Stored;
         if (overwritten == FlatStore::OverwriteResult::MaxmemoryOom) return StoreResult::MaxmemoryOom;
     }
 
-    KvObj* replacement = sh.store().make_set_string(
-        key, value, expire_at_ms, reserve_ttl_slot);
+    KvObj* replacement = kvobj_new_string(key, value, expire_at_ms);
     if (!replacement) return StoreResult::Oom;
     return map_insert(sh.store(), hash, replacement);
 }
 
 StoreResult store_integer(Shard& sh, Slice key, uint64_t hash, int64_t value,
-                          int64_t expire_at_ms, bool reserve_ttl_slot) {
-    KvObj* replacement = sh.store().make_set_int(key, value, expire_at_ms, reserve_ttl_slot);
+                          int64_t expire_at_ms) {
+    KvObj* replacement = kvobj_new_int(key, value, expire_at_ms);
     if (!replacement) return StoreResult::Oom;
     return map_insert(sh.store(), hash, replacement);
 }
@@ -171,30 +170,27 @@ StoreResult store_integer(Shard& sh, Slice key, uint64_t hash, int64_t value,
 StoreResult map_insert_notify(Shard& sh, uint64_t hash, KvObj* replacement) {
     const FlatStore::InsertResult inserted = sh.store_insert<true>(hash, replacement);
     if (inserted == FlatStore::InsertResult::Inserted) return StoreResult::Stored;
-    sh.store().discard_set_value(replacement);
+    kvobj_free(replacement);
     return inserted == FlatStore::InsertResult::MaxmemoryOom ? StoreResult::MaxmemoryOom
                                                              : StoreResult::InsertFailed;
 }
 
 StoreResult store_string_notify(Shard& sh, Slice key, uint64_t hash, Slice value,
-                                int64_t expire_at_ms, bool integer_encode,
-                                bool reserve_ttl_slot) {
+                                int64_t expire_at_ms, bool integer_encode) {
     int64_t integer = 0;
     if (integer_encode && parse_i64(value, integer)) {
-        KvObj* replacement = sh.store().make_set_int(
-            key, integer, expire_at_ms, reserve_ttl_slot);
+        KvObj* replacement = kvobj_new_int(key, integer, expire_at_ms);
         if (!replacement) return StoreResult::Oom;
         return map_insert_notify(sh, hash, replacement);
     }
-    if (expire_at_ms < 0 && !reserve_ttl_slot) {
+    if (expire_at_ms == -1) {
         const FlatStore::OverwriteResult overwritten =
             sh.store_try_overwrite<true>(hash, key, value);
         if (overwritten == FlatStore::OverwriteResult::Updated) return StoreResult::Stored;
         if (overwritten == FlatStore::OverwriteResult::MaxmemoryOom)
             return StoreResult::MaxmemoryOom;
     }
-    KvObj* replacement = sh.store().make_set_string(
-        key, value, expire_at_ms, reserve_ttl_slot);
+    KvObj* replacement = kvobj_new_string(key, value, expire_at_ms);
     if (!replacement) return StoreResult::Oom;
     return map_insert_notify(sh, hash, replacement);
 }
@@ -202,26 +198,23 @@ StoreResult store_string_notify(Shard& sh, Slice key, uint64_t hash, Slice value
 
 template <bool kNotify>
 StoreResult store_string_for(Shard& sh, Slice key, uint64_t hash, Slice value,
-                             int64_t expire_at_ms, bool integer_encode,
-                             bool reserve_ttl_slot) {
+                             int64_t expire_at_ms, bool integer_encode) {
     if constexpr (kNotify) {
 #ifdef TOMO_STRING_NOTIFY_TU
-        return store_string_notify(
-            sh, key, hash, value, expire_at_ms, integer_encode, reserve_ttl_slot);
+        return store_string_notify(sh, key, hash, value, expire_at_ms, integer_encode);
 #else
         static_assert(!kNotify, "armed string handler instantiated in the clean translation unit");
 #endif
     }
-    return store_string(sh, key, hash, value, expire_at_ms, integer_encode, reserve_ttl_slot);
+    return store_string(sh, key, hash, value, expire_at_ms, integer_encode);
 }
 
 template <bool kNotify>
 StoreResult store_integer_for(Shard& sh, Slice key, uint64_t hash, int64_t value,
-                              int64_t expire_at_ms, bool reserve_ttl_slot) {
-    if constexpr (!kNotify)
-        return store_integer(sh, key, hash, value, expire_at_ms, reserve_ttl_slot);
+                              int64_t expire_at_ms) {
+    if constexpr (!kNotify) return store_integer(sh, key, hash, value, expire_at_ms);
 #ifdef TOMO_STRING_NOTIFY_TU
-    KvObj* replacement = sh.store().make_set_int(key, value, expire_at_ms, reserve_ttl_slot);
+    KvObj* replacement = kvobj_new_int(key, value, expire_at_ms);
     if (!replacement) return StoreResult::Oom;
     return map_insert_notify(sh, hash, replacement);
 #else
@@ -253,17 +246,16 @@ void reply_not_integer(Op& op) {
 enum class ExpireArg : uint8_t { Ok, NotInteger, OutOfRange };
 
 void clear_reply(Op& op) {
-    op.clear_reply();       // bytes AND the reply code -- a discarded reply must leave nothing
+    op.direct_len = 0;
+    op.reply.clear();
 }
 
 }  // namespace
 
 #ifndef TOMO_STRING_NOTIFY_TU
 XshardStringStoreResult xshard_store_string(Shard& shard, Slice key, uint64_t hash, Slice value,
-                                             int64_t expire_at_ms, bool integer_encode,
-                                             bool reserve_ttl_slot) {
-    switch (store_string(
-        shard, key, hash, value, expire_at_ms, integer_encode, reserve_ttl_slot)) {
+                                             int64_t expire_at_ms, bool integer_encode) {
+    switch (store_string(shard, key, hash, value, expire_at_ms, integer_encode)) {
         case StoreResult::Stored: return XshardStringStoreResult::Stored;
         case StoreResult::Oom: return XshardStringStoreResult::Oom;
         case StoreResult::InsertFailed: return XshardStringStoreResult::InsertFailed;
@@ -276,10 +268,8 @@ XshardStringStoreResult xshard_store_string(Shard& shard, Slice key, uint64_t ha
 #ifdef TOMO_STRING_NOTIFY_TU
 XshardStringStoreResult xshard_store_string_notify(Shard& shard, Slice key, uint64_t hash,
                                                    Slice value, int64_t expire_at_ms,
-                                                   bool integer_encode,
-                                                   bool reserve_ttl_slot) {
-    switch (store_string_notify(
-        shard, key, hash, value, expire_at_ms, integer_encode, reserve_ttl_slot)) {
+                                                   bool integer_encode) {
+    switch (store_string_notify(shard, key, hash, value, expire_at_ms, integer_encode)) {
         case StoreResult::Stored: return XshardStringStoreResult::Stored;
         case StoreResult::Oom: return XshardStringStoreResult::Oom;
         case StoreResult::InsertFailed: return XshardStringStoreResult::InsertFailed;
@@ -290,31 +280,28 @@ XshardStringStoreResult xshard_store_string_notify(Shard& shard, Slice key, uint
 #endif
 
 #ifndef TOMO_STRING_NOTIFY_TU
-KvObj* xshard_make_string(Slice key, Slice value, int64_t expire_at_ms, bool integer_encode,
-                          bool reserve_ttl_slot) {
+KvObj* xshard_make_string(Slice key, Slice value, int64_t expire_at_ms, bool integer_encode) {
     int64_t integer = 0;
     if (integer_encode && parse_i64(value, integer))
-        return kvobj_new_int(key, integer, expire_at_ms, reserve_ttl_slot);
-    return kvobj_new_string(key, value, expire_at_ms, reserve_ttl_slot);
+        return kvobj_new_int(key, integer, expire_at_ms);
+    return kvobj_new_string(key, value, expire_at_ms);
 }
 
 KvObj* xshard_make_atomic_string(Shard& shard, Slice key, Slice value,
-                                 int64_t expire_at_ms, bool integer_encode,
-                                 bool reserve_ttl_slot) {
+                                 int64_t expire_at_ms, bool integer_encode) {
     int64_t integer = 0;
-    const bool has_ttl_slot = reserve_ttl_slot || expire_at_ms >= 0;
+    const bool has_ttl = expire_at_ms >= 0;
     if (integer_encode && parse_i64(value, integer)) {
         const size_t allocation = good_size(
-            kvobj_alloc_size(key.n, 0, has_ttl_slot, Enc::Int));
+            kvobj_alloc_size(key.n, 0, has_ttl, Enc::Int));
         void* memory = shard.store().atomic_acquire_value_block(allocation);
-        return kvobj_init_int(memory, key, integer, expire_at_ms, reserve_ttl_slot);
+        return kvobj_init_int(memory, key, integer, expire_at_ms);
     }
-    if (value.n > kEmbedThreshold)
-        return kvobj_new_string(key, value, expire_at_ms, reserve_ttl_slot);
+    if (value.n > kEmbedThreshold) return kvobj_new_string(key, value, expire_at_ms);
     const size_t allocation = good_size(
-        kvobj_alloc_size(key.n, value.n, has_ttl_slot, Enc::Raw));
+        kvobj_alloc_size(key.n, value.n, has_ttl, Enc::Raw));
     void* memory = shard.store().atomic_acquire_value_block(allocation);
-    return kvobj_init_raw_string(memory, key, value, expire_at_ms, reserve_ttl_slot);
+    return kvobj_init_raw_string(memory, key, value, expire_at_ms);
 }
 
 // tomo:: linkage: every type family replies this exact text on admission failure.
@@ -333,71 +320,23 @@ void reply_string_bulk(Op& op, const KvObj* o) {
         reply_bulk(op.sink(), Slice(text, n));
         return;
     }
-    if constexpr (kReadLocalSetTaxAtomicRaw) {
-        if (o->encoding() == Enc::Raw) {
-            const uint32_t length = kvobj_read_local_raw_length(o);
-            auto sink = op.sink();
-            char* frame = sink.reserve(24 + static_cast<size_t>(length) + 2);
-            char* payload = frame;
-            *payload++ = '$';
-            payload += u64_to_dec(payload, length);
-            *payload++ = '\r';
-            *payload++ = '\n';
-            kvobj_read_local_copy_raw(o, o->read_local_flags(), length, payload);
-            payload += length;
-            *payload++ = '\r';
-            *payload++ = '\n';
-            sink.advance(static_cast<size_t>(payload - frame));
-            return;
-        }
-    }
-    KvObjRawReadBuffer raw;
-    reply_bulk(op.sink(), kvobj_string_value(o, raw));
+    reply_bulk(op.sink(), o->str_value());
 }
 
 // GET alone may borrow FlatStore bytes. GETEX/GETDEL/SET GET copy before mutation; extending the
 // borrow protocol to mutation replies would turn a string-only fast path into collection policy.
 template <bool kNotify, bool kAllowBorrow = true>
 void cmd_get(Shard& sh, Op& op) {
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
-    if (!o) { reply_null(op.sink(), op.resp3()); return; }
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
+    if (!o) { sh.stats().misses++; reply_null(op.sink(), op.resp3()); return; }
+    sh.stats().hits++;
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
     if (o->is_int()) { reply_string_bulk(op, o); return; }
-    if constexpr (kReadLocalSetTaxAtomicRaw) {
-        if (o->encoding() == Enc::Raw) {
-            if constexpr (kReadLocalSetTaxVariant ==
-                              ReadLocalSetTaxVariant::ObjectSequenceOverwrite &&
-                          kAllowBorrow) {
-                const uint32_t length = kvobj_read_local_raw_length(o);
-                const uint32_t zc_min = sh.zc_min();
-                if (zc_min && length >= zc_min) {
-                    reply_bulk_header(op.sink(), length);
-                    op.zc_ptr = o->str_data();
-                    op.zc_len = length;
-                    op.zc_shard = sh.id();
-                    // The owner publishes this registry entry before it can run another command;
-                    // selector 3's overwrite gate then leaves these exact bytes immutable.
-                    sh.store().borrow(op.zc_ptr);
-                    return;
-                }
-            }
-            if constexpr (!kAllowBorrow) {
-                const uint32_t zc_min = sh.zc_min();
-                if (zc_min && kvobj_read_local_raw_length(o) >= zc_min) op.mark_no_borrow();
-            }
-            reply_string_bulk(op, o);
-            return;
-        }
-    }
-    KvObjRawReadBuffer raw;
-    const Slice value = kvobj_string_value(o, raw);
+    const Slice value = o->str_value();
     if constexpr (kAllowBorrow) {
         const uint32_t zc_min = sh.zc_min();
-        bool may_borrow = true;
-        if constexpr (kReadLocalSetTaxVariant == ReadLocalSetTaxVariant::SequenceOverwrite)
-            may_borrow = o->encoding() != Enc::Raw;
-        if (may_borrow && zc_min && value.n >= zc_min) {
+        if (zc_min && value.n >= zc_min) {
             reply_bulk_header(op.sink(), value.n);
             op.zc_ptr = value.p;
             op.zc_len = value.n;
@@ -491,7 +430,7 @@ void cmd_set(Shard& sh, Op& op) {
     // Preserve the allocation-free raw fast path while still applying Redis integer encoding.
     if (op.argc() == 3) {
         const StoreResult result =
-            store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true, false);
+            store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true);
         if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
         if constexpr (kNotify)
             notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Set, op.key());
@@ -513,12 +452,12 @@ void cmd_set(Shard& sh, Op& op) {
     }
 
     int64_t expire = options.expire_at_ms;
-    const bool reserve_ttl_slot = options.keep_ttl && old && old->has_ttl_slot();
-    if (options.keep_ttl && old) expire = sh.store().deadline(op.hash, old);
+    if (options.keep_ttl && old && (old->flags & KvObjFlags::HasTtl))
+        expire = old->expire_at_ms();
     // Redis treats an already elapsed absolute SET deadline as set-then-expire: the old value is
     // removed, no dead replacement is left for DBSIZE/active expiry, and GET (if requested) keeps
     // the reply copied above. Relative EX/PX cannot reach here with a non-future deadline.
-    if (expire >= 0 && expire <= sh.now_ms()) {
+    if (expire != -1 && expire <= sh.now_ms()) {
         if (old) sh.store_erase<kNotify>(op.hash, op.key());
         else if constexpr (kNotify)
             notify_record(sh, op, NOTIFY_GENERIC, NotifyEventId::Del, op.key());
@@ -526,8 +465,7 @@ void cmd_set(Shard& sh, Op& op) {
         return;
     }
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), expire, true,
-                                  reserve_ttl_slot);
+        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), expire, true);
     if (result != StoreResult::Stored) { reply_store_error(op, result, options.get); return; }
     if constexpr (kNotify) {
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Set, op.key());
@@ -544,8 +482,7 @@ void cmd_set(Shard& sh, Op& op) {
 template <>
 void cmd_set<false>(Shard& sh, Op& op) {
     if (op.argc() == 3) {
-        const StoreResult result = store_string(
-            sh, op.key(), op.hash, op.arg(2), -1, true, false);
+        const StoreResult result = store_string(sh, op.key(), op.hash, op.arg(2), -1, true);
         if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
         reply_ok(op.sink());
         return;
@@ -565,15 +502,14 @@ void cmd_set<false>(Shard& sh, Op& op) {
     }
 
     int64_t expire = options.expire_at_ms;
-    const bool reserve_ttl_slot = options.keep_ttl && old && old->has_ttl_slot();
-    if (options.keep_ttl && old) expire = sh.store().deadline(op.hash, old);
-    if (expire >= 0 && expire <= sh.now_ms()) {
+    if (options.keep_ttl && old && (old->flags & KvObjFlags::HasTtl))
+        expire = old->expire_at_ms();
+    if (expire != -1 && expire <= sh.now_ms()) {
         if (old) sh.store().erase(op.hash, op.key());
         if (!options.get) reply_ok(op.sink());
         return;
     }
-    const StoreResult result = store_string(
-        sh, op.key(), op.hash, op.arg(2), expire, true, reserve_ttl_slot);
+    const StoreResult result = store_string(sh, op.key(), op.hash, op.arg(2), expire, true);
     if (result != StoreResult::Stored) { reply_store_error(op, result, options.get); return; }
     if (!options.get) reply_ok(op.sink());
 }
@@ -615,7 +551,7 @@ void cmd_getex(Shard& sh, Op& op) {
     bool persist = false;
     if (!parse_getex_options(op, kind, expire_arg, persist)) return;
 
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_null(op.sink(), op.resp3()); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
@@ -646,7 +582,7 @@ void cmd_getex(Shard& sh, Op& op) {
 
 template <bool kNotify>
 void cmd_getdel(Shard& sh, Op& op) {
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_null(op.sink(), op.resp3()); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
@@ -669,7 +605,7 @@ void cmd_exists(Shard& sh, Op& op) {
     uint64_t found = 0;
     for (uint32_t i = 1; i < op.argc(); i++) {
         const uint64_t hash = i == 1 ? op.hash : FlatStore::hash_key(op.arg(i));
-        found += sh.store_find_read<kNotify>(hash, op.arg(i)) != nullptr;
+        found += sh.store_find<kNotify>(hash, op.arg(i)) != nullptr;
     }
     reply_int(op.sink(), static_cast<long long>(found));
 }
@@ -679,7 +615,7 @@ void cmd_append(Shard& sh, Op& op) {
     KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) {
         const StoreResult result =
-            store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true, false);
+            store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true);
         if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
         if constexpr (kNotify)
             notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Append, op.key());
@@ -690,8 +626,7 @@ void cmd_append(Shard& sh, Op& op) {
     if (!obj_type_check(o, Type::String, sink)) return;
 
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice old = string_bytes(o, integer, raw);
+    const Slice old = string_bytes(o, integer);
     // A raw empty append changes no observable value or encoding. Integer encoding is the one
     // exception: Redis's append path materializes it even when the appended byte count is zero.
     if (op.arg(2).n == 0 && !o->is_int()) {
@@ -700,7 +635,7 @@ void cmd_append(Shard& sh, Op& op) {
         reply_int(op.sink(), old.n); return;
     }
     const uint64_t total = static_cast<uint64_t>(old.n) + op.arg(2).n;
-    if (total > command_proto_max_bulk_len()) {
+    if (total > kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
         return;
     }
@@ -708,10 +643,9 @@ void cmd_append(Shard& sh, Op& op) {
     if (!merged) { reply_err(op.sink(), "ERR out of memory"); return; }
     std::memcpy(merged, old.p, old.n);
     std::memcpy(merged + old.n, op.arg(2).p, op.arg(2).n);
-    const int64_t expire = sh.store().deadline(op.hash, o);
+    const int64_t expire = o->expire_at_ms();
     const StoreResult result = store_string_for<kNotify>(
-        sh, op.key(), op.hash, Slice(merged, static_cast<uint32_t>(total)), expire, false,
-        o->has_ttl_slot());
+        sh, op.key(), op.hash, Slice(merged, static_cast<uint32_t>(total)), expire, false);
     std::free(merged);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
@@ -721,17 +655,13 @@ void cmd_append(Shard& sh, Op& op) {
 
 template <bool kNotify>
 void cmd_strlen(Shard& sh, Op& op) {
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), 0); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
-    if (!o->is_int()) {
-        reply_int(op.sink(), kvobj_string_length(o));
-        return;
-    }
+    if (!o->is_int()) { reply_int(op.sink(), o->str_value().n); return; }
     char integer[24];
-    KvObjRawReadBuffer raw;
-    reply_int(op.sink(), string_bytes(o, integer, raw).n);
+    reply_int(op.sink(), string_bytes(o, integer).n);
 }
 
 template <bool kNotify>
@@ -741,14 +671,13 @@ void cmd_getrange(Shard& sh, Op& op) {
         reply_err(op.sink(), "ERR value is not an integer or out of range");
         return;
     }
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_emptystr(op.sink()); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
 
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice value = string_bytes(o, integer, raw);
+    const Slice value = string_bytes(o, integer);
     const int64_t length = value.n;
     if (start < 0 && end < 0 && start > end) { reply_emptystr(op.sink()); return; }
     if (start < 0) start = length + start;
@@ -777,29 +706,26 @@ void cmd_setrange(Shard& sh, Op& op) {
     if (op.arg(3).n == 0) {
         if (!o) { reply_int(op.sink(), 0); return; }
         char integer[24];
-        KvObjRawReadBuffer raw;
-        reply_int(op.sink(), string_bytes(o, integer, raw).n);
+        reply_int(op.sink(), string_bytes(o, integer).n);
         return;
     }
 
     const uint64_t write_end = static_cast<uint64_t>(offset) + op.arg(3).n;
-    if (write_end > command_proto_max_bulk_len()) {
+    if (write_end > kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
         return;
     }
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice old = o ? string_bytes(o, integer, raw) : Slice("", 0);
+    const Slice old = o ? string_bytes(o, integer) : Slice("", 0);
     const uint32_t new_length = static_cast<uint32_t>(std::max<uint64_t>(old.n, write_end));
     char* changed = static_cast<char*>(std::malloc(new_length));
     if (!changed) { reply_err(op.sink(), "ERR out of memory"); return; }
     std::memcpy(changed, old.p, old.n);
     if (new_length > old.n) std::memset(changed + old.n, 0, new_length - old.n);
     std::memcpy(changed + offset, op.arg(3).p, op.arg(3).n);
-    const int64_t expire = o ? sh.store().deadline(op.hash, o) : -1;
+    const int64_t expire = o ? o->expire_at_ms() : -1;
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(changed, new_length), expire, false,
-                                  o && o->has_ttl_slot());
+        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(changed, new_length), expire, false);
     std::free(changed);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
@@ -810,7 +736,7 @@ void cmd_setrange(Shard& sh, Op& op) {
 bool parse_bit_offset(Op& op, Slice argument, uint64_t& offset) {
     int64_t parsed = 0;
     if (!parse_i64(argument, parsed) || parsed < 0 ||
-        (static_cast<uint64_t>(parsed) >> 3) >= command_proto_max_bulk_len()) {
+        (static_cast<uint64_t>(parsed) >> 3) >= kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR bit offset is not an integer or out of range");
         return false;
     }
@@ -834,8 +760,7 @@ void cmd_setbit(Shard& sh, Op& op) {
         if (!obj_type_check(o, Type::String, sink)) return;
     }
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice old = o ? string_bytes(o, integer, raw) : Slice("", 0);
+    const Slice old = o ? string_bytes(o, integer) : Slice("", 0);
     const uint32_t byte = static_cast<uint32_t>(offset >> 3);
     const uint8_t mask = static_cast<uint8_t>(1u << (7 - (offset & 7)));
     const int old_bit = byte < old.n && (static_cast<uint8_t>(old.p[byte]) & mask) ? 1 : 0;
@@ -857,10 +782,9 @@ void cmd_setbit(Shard& sh, Op& op) {
     uint8_t& selected = reinterpret_cast<uint8_t*>(changed)[byte];
     selected = bit_value ? static_cast<uint8_t>(selected | mask)
                          : static_cast<uint8_t>(selected & ~mask);
-    const int64_t expire = o ? sh.store().deadline(op.hash, o) : -1;
+    const int64_t expire = o ? o->expire_at_ms() : -1;
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(changed, new_length), expire, false,
-                                  o && o->has_ttl_slot());
+        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(changed, new_length), expire, false);
     std::free(changed);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
@@ -872,13 +796,12 @@ template <bool kNotify>
 void cmd_getbit(Shard& sh, Op& op) {
     uint64_t offset = 0;
     if (!parse_bit_offset(op, op.arg(2), offset)) return;
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), 0); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice value = string_bytes(o, integer, raw);
+    const Slice value = string_bytes(o, integer);
     const uint64_t byte = offset >> 3;
     const uint8_t mask = static_cast<uint8_t>(1u << (7 - (offset & 7)));
     const bool set = byte < value.n && (static_cast<uint8_t>(value.p[byte]) & mask);
@@ -921,13 +844,12 @@ void cmd_bitcount(Shard& sh, Op& op) {
         return;
     }
 
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), 0); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice value = string_bytes(o, integer, raw);
+    const Slice value = string_bytes(o, integer);
     if (!ranged) {
         reply_int(op.sink(), static_cast<long long>(bitmap_popcount(
             reinterpret_cast<const uint8_t*>(value.p), value.n)));
@@ -1023,13 +945,12 @@ void cmd_bitpos(Shard& sh, Op& op) {
         }
     }
 
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), bit ? -1 : 0); return; }
     auto sink = op.sink();
     if (!obj_type_check(o, Type::String, sink)) return;
     char integer[24];
-    KvObjRawReadBuffer raw;
-    const Slice value = string_bytes(o, integer, raw);
+    const Slice value = string_bytes(o, integer);
     int64_t total = bit_unit ? static_cast<int64_t>(value.n) * 8 : value.n;
 
     if (!ranged) {
@@ -1060,12 +981,12 @@ void cmd_bitpos(Shard& sh, Op& op) {
 
 template <bool kNotify>
 void cmd_getset(Shard& sh, Op& op) {
-    KvObj* old = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* old = sh.store_find<kNotify>(op.hash, op.key());
     auto sink = op.sink();
     if (!obj_type_check(old, Type::String, sink)) return;
     reply_string_bulk(op, old);
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true, false);
+        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true);
     if (result != StoreResult::Stored) { reply_store_error(op, result, true); return; }
     if constexpr (kNotify)
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Set, op.key());
@@ -1075,7 +996,7 @@ template <bool kNotify>
 void cmd_setnx(Shard& sh, Op& op) {
     if (sh.store_find<kNotify>(op.hash, op.key())) { reply_int(op.sink(), 0); return; }
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true, false);
+        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(2), -1, true);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Set, op.key());
@@ -1087,7 +1008,7 @@ void setex_generic(Shard& sh, Op& op, ExpireKind kind, const char* command) {
     int64_t expire = -1;
     if (!apply_expiry_arg(sh, op, op.arg(2), kind, expire, command)) return;
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(3), expire, true, false);
+        store_string_for<kNotify>(sh, op.key(), op.hash, op.arg(3), expire, true);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify) {
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Set, op.key());
@@ -1110,22 +1031,18 @@ void incr_decr(Shard& sh, Op& op, int64_t increment) {
         auto sink = op.sink();
         if (!obj_type_check(o, Type::String, sink)) return;
         if (o->is_int()) old = o->int_value();
-        else {
-            KvObjRawReadBuffer raw;
-            if (!parse_i64(kvobj_string_value(o, raw), old)) {
-                reply_err(op.sink(), "ERR value is not an integer or out of range");
-                return;
-            }
+        else if (!parse_i64(o->str_value(), old)) {
+            reply_err(op.sink(), "ERR value is not an integer or out of range");
+            return;
         }
-        expire = sh.store().deadline(op.hash, o);
+        expire = o->expire_at_ms();
     }
     int64_t value = 0;
     if (__builtin_add_overflow(old, increment, &value)) {
         reply_err(op.sink(), "ERR increment or decrement would overflow");
         return;
     }
-    const StoreResult result = store_integer_for<kNotify>(
-        sh, op.key(), op.hash, value, expire, o && o->has_ttl_slot());
+    const StoreResult result = store_integer_for<kNotify>(sh, op.key(), op.hash, value, expire);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Incrby, op.key());
@@ -1172,12 +1089,9 @@ void cmd_incrbyfloat(Shard& sh, Op& op) {
     long double value = 0;
     if (o) {
         if (o->is_int()) value = static_cast<long double>(o->int_value());
-        else {
-            KvObjRawReadBuffer raw;
-            if (!parse_long_double(kvobj_string_value(o, raw), value)) {
-                reply_err(op.sink(), "ERR value is not a valid float");
-                return;
-            }
+        else if (!parse_long_double(o->str_value(), value)) {
+            reply_err(op.sink(), "ERR value is not a valid float");
+            return;
         }
     }
     long double increment = 0;
@@ -1194,10 +1108,9 @@ void cmd_incrbyfloat(Shard& sh, Op& op) {
     char text[kLongDoubleChars];
     const uint32_t length = format_long_double(text, sizeof(text), value);
     if (length == 0) { reply_err(op.sink(), "ERR out of memory"); return; }
-    const int64_t expire = o ? sh.store().deadline(op.hash, o) : -1;
+    const int64_t expire = o ? o->expire_at_ms() : -1;
     const StoreResult result =
-        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(text, length), expire, false,
-                                  o && o->has_ttl_slot());
+        store_string_for<kNotify>(sh, op.key(), op.hash, Slice(text, length), expire, false);
     if (result != StoreResult::Stored) { reply_store_error(op, result); return; }
     if constexpr (kNotify)
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Incrbyfloat, op.key());
@@ -1212,7 +1125,7 @@ void reply_hll_corrupt(Op& op) {
     reply_err(op.sink(), "INVALIDOBJ Corrupted HLL object detected");
 }
 
-bool hll_object_image(KvObj* object, Op& op, Slice& image, KvObjRawReadBuffer& raw) {
+bool hll_object_image(KvObj* object, Op& op, Slice& image) {
     if (static_cast<Type>(object->type) != Type::String) {
         reply_wrongtype(op.sink());
         return false;
@@ -1221,7 +1134,7 @@ bool hll_object_image(KvObj* object, Op& op, Slice& image, KvObjRawReadBuffer& r
         reply_hll_bad_header(op);
         return false;
     }
-    image = kvobj_string_value(object, raw);
+    image = object->str_value();
     if (!hll::header_valid(image)) {
         reply_hll_bad_header(op);
         return false;
@@ -1233,8 +1146,7 @@ template <bool kNotify>
 void cmd_pfadd(Shard& sh, Op& op) {
     KvObj* object = sh.store_find<kNotify>(op.hash, op.key());
     Slice current;
-    KvObjRawReadBuffer raw;
-    if (object && !hll_object_image(object, op, current, raw)) return;
+    if (object && !hll_object_image(object, op, current)) return;
 
     std::string image;
     try {
@@ -1258,10 +1170,10 @@ void cmd_pfadd(Shard& sh, Op& op) {
     if (!updated) { reply_int(op.sink(), 0); return; }
 
     hll::invalidate_cache(image);
-    const int64_t expire_at_ms = object ? sh.store().deadline(op.hash, object) : -1;
+    const int64_t expire_at_ms = object ? object->expire_at_ms() : -1;
     const StoreResult stored = store_string_for<kNotify>(
         sh, op.key(), op.hash, Slice(image.data(), static_cast<uint32_t>(image.size())),
-        expire_at_ms, false, object && object->has_ttl_slot());
+        expire_at_ms, false);
     if (stored != StoreResult::Stored) { reply_store_error(op, stored); return; }
     if constexpr (kNotify)
         notify_record(sh, op, NOTIFY_STRING, NotifyEventId::Pfadd, op.key());
@@ -1276,11 +1188,10 @@ void cmd_pfcount(Shard& sh, Op& op) {
         reply_err(op.sink(), "ERR internal cross-shard routing error");
         return;
     }
-    KvObj* object = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* object = sh.store_find<kNotify>(op.hash, op.key());
     if (!object) { reply_int(op.sink(), 0); return; }
     Slice current;
-    KvObjRawReadBuffer raw;
-    if (!hll_object_image(object, op, current, raw)) return;
+    if (!hll_object_image(object, op, current)) return;
     if (hll::cache_valid(current)) {
         reply_int(op.sink(), static_cast<long long>(hll::cached_count(current)));
         return;
@@ -1299,7 +1210,7 @@ void cmd_pfcount(Shard& sh, Op& op) {
     hll::set_cached_count(image, cardinality);
     const StoreResult stored = store_string_for<kNotify>(
         sh, op.key(), op.hash, Slice(image.data(), static_cast<uint32_t>(image.size())),
-        sh.store().deadline(op.hash, object), false, object->has_ttl_slot());
+        object->expire_at_ms(), false);
     if (stored != StoreResult::Stored) { reply_store_error(op, stored); return; }
     reply_int(op.sink(), static_cast<long long>(cardinality));
 }
@@ -1366,11 +1277,11 @@ void expire_generic(Shard& sh, Op& op, bool absolute, bool seconds, const char* 
 
     KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), 0); return; }
-    const int64_t current = sh.store().deadline(op.hash, o);
-    if ((conditions.nx && current >= 0) ||
-        (conditions.xx && current < 0) ||
-        (conditions.gt && (current < 0 || when <= current)) ||
-        (conditions.lt && current >= 0 && when >= current)) {
+    const int64_t current = o->expire_at_ms();
+    if ((conditions.nx && current != -1) ||
+        (conditions.xx && current == -1) ||
+        (conditions.gt && (current == -1 || when <= current)) ||
+        (conditions.lt && current != -1 && when >= current)) {
         reply_int(op.sink(), 0);
         return;
     }
@@ -1405,10 +1316,10 @@ int64_t rounded_seconds(int64_t ms) {
 
 template <bool kNotify>
 void ttl_generic(Shard& sh, Op& op, bool milliseconds, bool absolute) {
-    KvObj* o = sh.store_find_read<kNotify>(op.hash, op.key());
+    KvObj* o = sh.store_find<kNotify>(op.hash, op.key());
     if (!o) { reply_int(op.sink(), -2); return; }
-    const int64_t expire = sh.store().deadline(op.hash, o);
-    if (expire < 0) { reply_int(op.sink(), -1); return; }
+    const int64_t expire = o->expire_at_ms();
+    if (expire == -1) { reply_int(op.sink(), -1); return; }
     int64_t value = absolute ? expire : expire - sh.now_ms();
     if (value < 0) value = 0;
     reply_int(op.sink(), milliseconds ? value : rounded_seconds(value));
@@ -1451,7 +1362,7 @@ const char* type_name(const KvObj* o) {
 
 template <bool kNotify>
 void cmd_type(Shard& sh, Op& op) {
-    reply_simple(op.sink(), type_name(sh.store_find_read<kNotify>(op.hash, op.key())));
+    reply_simple(op.sink(), type_name(sh.store_find<kNotify>(op.hash, op.key())));
 }
 
 
@@ -1461,8 +1372,7 @@ void cmd_type(Shard& sh, Op& op) {
 
 static const CommandSpec kTable[] = {
     // name          min max flags                                  handler          first last step
-    {"GET",           2,  2,  CmdFlags::Readonly | CmdFlags::ReadLocalEligible,
-                                                                    TOMO_HANDLER_PAIR(cmd_get, 1, 1, 1)},
+    {"GET",           2,  2,  CmdFlags::Readonly,                    TOMO_HANDLER_PAIR(cmd_get, 1, 1, 1)},
     {"SET",           3, -1,  CmdFlags::Write | CmdFlags::DenyOom,  TOMO_HANDLER_PAIR(cmd_set, 1, 1, 1)},
     {"APPEND",        3,  3,  CmdFlags::Write | CmdFlags::DenyOom,  TOMO_HANDLER_PAIR(cmd_append, 1, 1, 1)},
     {"STRLEN",        2,  2,  CmdFlags::Readonly,                    TOMO_HANDLER_PAIR(cmd_strlen, 1, 1, 1)},
@@ -1489,8 +1399,7 @@ static const CommandSpec kTable[] = {
     {"UNLINK",        2, -1,  CmdFlags::Write | CmdFlags::MultiShard,TOMO_HANDLER_PAIR(cmd_del, 1, -1, 1)},
     {"EXISTS",        2, -1,  CmdFlags::Readonly | CmdFlags::MultiShard,TOMO_HANDLER_PAIR(cmd_exists, 1, -1, 1)},
     {"TOUCH",         2, -1,  CmdFlags::Readonly | CmdFlags::MultiShard,TOMO_HANDLER_PAIR(cmd_exists, 1, -1, 1)},
-    {"MGET",          2, -1,  CmdFlags::Readonly | CmdFlags::MultiShard |
-                                      CmdFlags::ReadLocalEligible,       cmd_xshard_only,1,-1, 1},
+    {"MGET",          2, -1,  CmdFlags::Readonly | CmdFlags::MultiShard,cmd_xshard_only,1,-1, 1},
     {"MSET",          3, -1,  CmdFlags::Write | CmdFlags::MultiShard,cmd_xshard_only,  1, -1,  2},
     {"MSETNX",        3, -1,  CmdFlags::Write | CmdFlags::MultiShard,cmd_xshard_only,  1, -1,  2},
     {"RENAME",        3,  3,  CmdFlags::Write | CmdFlags::MultiShard,cmd_xshard_only,  1,  2,  1},
@@ -1544,7 +1453,7 @@ SnapshotHookStatus string_snapshot_begin(const KvObj& object, SnapshotSaveCursor
     cursor = {};
     cursor.object = &object;
     encoding = object.enc;
-    cursor.total = object.is_int() ? sizeof(int64_t) : kvobj_string_length(&object);
+    cursor.total = object.is_int() ? sizeof(int64_t) : object.str_value().n;
     return SnapshotHookStatus::Ok;
 }
 
@@ -1560,8 +1469,7 @@ SnapshotHookStatus string_snapshot_read(SnapshotSaveCursor& cursor, uint8_t* des
         snapshot_put_u64(bytes, static_cast<uint64_t>(cursor.object->int_value()));
         std::memcpy(destination, bytes + cursor.offset, take);
     } else {
-        KvObjRawReadBuffer raw;
-        const Slice value = kvobj_string_value(cursor.object, raw);
+        const Slice value = cursor.object->str_value();
         std::memcpy(destination, value.p + cursor.offset, take);
     }
     cursor.offset += take;

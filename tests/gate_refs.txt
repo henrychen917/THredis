@@ -18,14 +18,5 @@
 # changes (coalescing, IRQ affinity, MTU) they need re-pinning again -- and the header must say so,
 # because a loopback/NIC mix-up is invisible in the output.
 p1_8c         0-7    7:1    16     1    64-79   16  512   0:1  850000
-p128_32c_get  0-31   18:14  64     128  64-127  64  512   0:1  21600000
-p128_32c_set  0-31   18:14  64     128  64-127  64  512   1:0  20470000
-# Re-pinned 2026-09-01: rig level drifted ~2.5-3% (b55ec084b re-measured identical to HEAD
-# across 8 ABBA points, so the span since the old refs is exonerated -- the RIG moved, the
-# code did not). Medians of 8 same-hour points: get 21.60M, set 20.47M.
-#
-# Kernel pin. The refs above were measured BEFORE the box moved to 7.0.0-30 on 2026-09-02 and
-# have NOT been re-pinned since. tests/gate.sh compares this line with `uname -r` and prints a
-# WARN row when they differ; it never re-pins. When you re-pin on the box, set this line to the
-# exact `uname -r` you measured on, e.g. `# kernel: 7.0.0-30-generic`.
-# kernel: pre-7.0.0-30 (unknown exact; refs not yet re-measured on the 2026-09-02 kernel)
+p128_32c_get  0-31   18:14  64     128  64-127  64  512   0:1  22210000
+p128_32c_set  0-31   18:14  64     128  64-127  64  512   1:0  21300000

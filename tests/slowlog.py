@@ -98,17 +98,6 @@ def counters(c):
     return out
 
 
-def recording_threads(c):
-    rows = dict(line.split(":", 1) for line in c.cmd("INFO", "SERVER").splitlines()
-                if ":" in line)
-    # Fused client and owner roles overlap: adding those role counts would double count rings.
-    count = (int(rows["fused_threads"]) if rows["thread_mode"] == "1s" else
-             int(rows["io_threads"]) + int(rows["ex_threads"]))
-    if count <= 0:
-        raise AssertionError("INFO SERVER reported no recording threads: %r" % rows)
-    return count
-
-
 def err(text):
     return lambda got: isinstance(got, RuntimeError) and str(got) == text
 
@@ -196,17 +185,13 @@ def main():
     print("slowlog-max-len")
     check("set max-len 5", c.cmd("CONFIG", "SET", "slowlog-max-len", "5"), "OK")
     c.cmd("SLOWLOG", "RESET")
-    nrecorders = recording_threads(c)
-    # More writes than the aggregate capacity, even at a 16+ CPU boot. Induce failure by
-    # disabling SlowLog's ring eviction/trim: the log then exceeds 5*nrecorders or nrecorders.
-    for i in range(5 * nrecorders + 1):
+    for i in range(40):
         c.cmd("SET", "sl:trim%d" % i, "v")
-    # Both IO-local and owner commands record, one ring per live thread.
-    check("max-len bounds the log", c.cmd("SLOWLOG", "LEN"),
-          lambda v: 0 < v <= 5 * nrecorders)
+    # The ring is per-executor, so the global bound is max-len per recording thread.
+    check("max-len bounds the log", c.cmd("SLOWLOG", "LEN"), lambda v: 0 < v <= 5 * 8)
     check("shrinking max-len trims immediately",
           (c.cmd("CONFIG", "SET", "slowlog-max-len", "1"), c.cmd("SLOWLOG", "LEN"))[1],
-          lambda v: 0 < v <= nrecorders)
+          lambda v: v <= 8)
     check("max-len 0 keeps nothing", c.cmd("CONFIG", "SET", "slowlog-max-len", "0"), "OK")
     c.cmd("SLOWLOG", "RESET")
     for i in range(20):

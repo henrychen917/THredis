@@ -4,10 +4,9 @@
 //
 //   * The key -> interested-connections table is PER IO OWNER and holds only that owner's own
 //     connections (IoLoop::climon_track_keys_). A connection is owned by exactly one io thread
-//     at a time; migration extracts and installs its entries at the ownership commit edge. Thus
-//     each table still has exactly one reader and one writer and NO LOCK EXISTS ON ANY ARMED PATH.
-//     A single global table would have put a lock on the tracking-armed write path, which is
-//     precisely where writes live.
+//     for life, so this table has exactly one reader and one writer and NO LOCK EXISTS ON ANY
+//     ARMED PATH. That is the property the brief asks for; a single global table would have put
+//     a lock on the tracking-armed write path, which is precisely where writes live.
 //
 //   * Read registration is io-side, inside the one armed gate parse_and_dispatch already reaches
 //     (climon_armed_gate). The io thread already holds the connection, the command spec and the
@@ -28,7 +27,6 @@
 // REDIRECT sends the invalidation to another connection, which may be owned by a different io
 // thread; that is one extra hop through the same transport (TrackingDeliver).
 
-#include "t_stream.h"
 #include "../core/io_loop.h"
 
 namespace tomo {
@@ -59,18 +57,16 @@ void track_filter_clear() {
         g_track_filter[i].store(0, std::memory_order_relaxed);
 }
 
-size_t track_prefix_match_count(const std::vector<std::string>& prefixes, Slice key) {
-    if (prefixes.empty()) return 1;   // BCAST with no PREFIX tracks the whole keyspace
-    size_t matches = 0;
+bool track_prefix_matches(const std::vector<std::string>& prefixes, Slice key) {
+    if (prefixes.empty()) return true;   // BCAST with no PREFIX tracks the whole keyspace
     for (const std::string& prefix : prefixes) {
         if (prefix.size() > key.n) continue;
-        if (std::memcmp(prefix.data(), key.p, prefix.size()) == 0) matches++;
+        if (std::memcmp(prefix.data(), key.p, prefix.size()) == 0) return true;
     }
-    return matches;
+    return false;
 }
 
-// Explicit BCAST prefixes cannot overlap; adding the implicit empty prefix later is Redis's
-// exception, handled after validation below and with per-prefix delivery above.
+// Redis refuses overlapping BCAST prefixes so a key can never be reported twice.
 bool track_prefix_overlaps(const std::string& a, const std::string& b) {
     const size_t shortest = std::min(a.size(), b.size());
     return std::memcmp(a.data(), b.data(), shortest) == 0;
@@ -95,39 +91,26 @@ void IoLoop::tracking_note_prefix_registered(const std::string& prefix, bool add
 // at all -- its prefix registry is the whole subscription -- so only default (per-key
 // remembering) mode registers here.
 void IoLoop::tracking_register_read(Client* client, ClimonConn& state, Op& op) {
-    // Redis preserves CACHING across every CLIENT command, including introspection and errors.
-    // Consuming it before TRACKINGINFO both hides the flag and loses the following OPTIN read's
-    // invalidation (or wrongly subscribes an exempted OPTOUT read). CLIENT has no keys to enroll.
-    if (op.cmd_name().eq_icase("client")) return;
     const bool caching = state.caching_armed;
-    state.caching_armed = false;   // CLIENT subcommands above do not consume the choice
+    state.caching_armed = false;   // CLIENT CACHING covers exactly the next command
     if (state.bcast) return;
     const CommandSpec* spec = op.spec;
     if (!spec) return;
     // Only genuine reads register. A write from the tracking connection is not a subscription.
     if (!(spec->flags & CmdFlags::Readonly) || (spec->flags & CmdFlags::Write)) return;
+    if (spec->first_key <= 0) return;
     // OPTIN: register only when the previous command was CLIENT CACHING yes.
     // OPTOUT: register unless the previous command was CLIENT CACHING no.
     if (state.optin && !caching) return;
     if (state.optout && caching) return;
 
-    uint32_t first = spec->first_key > 0 ? static_cast<uint32_t>(spec->first_key) : 0;
-    uint32_t end = spec->last_key < 0 ? op.argc()
-        : std::min<uint32_t>(op.argc(), static_cast<uint32_t>(spec->last_key) + 1);
-    if (spec->flags & CmdFlags::StreamRoute) {
-        // Registration must not append a parser error to the real reply; dispatch owns that error.
-        Op probe;
-        for (uint32_t i = 0; i < op.argc(); ++i)
-            if (!probe.push_arg(op.arg(i))) return;
-        StreamXreadArgs parsed;
-        if (!stream_parse_xread(probe, parsed)) return;
-        first = parsed.first_key;
-        end = first + parsed.key_count;
-    }
-    if (!first) return;
     const uint64_t id = client->id();
+    const int32_t last = spec->last_key;
     const int32_t step = spec->key_step > 0 ? spec->key_step : 1;
-    for (uint32_t i = first; i < end;
+    const uint32_t end = last < 0 ? op.argc()
+                                  : std::min<uint32_t>(op.argc(),
+                                                       static_cast<uint32_t>(last) + 1);
+    for (uint32_t i = static_cast<uint32_t>(spec->first_key); i < end;
          i += static_cast<uint32_t>(step)) {
         const Slice key = op.arg(i);
         if (srv_->cfg().tracking_table_max_keys &&
@@ -188,68 +171,9 @@ void IoLoop::tracking_forget_client(uint64_t id, ClimonConn& state) {
     }
 }
 
-void IoLoop::tracking_migration_snapshot(uint64_t id, std::vector<std::string>& keys) const {
-    for (const auto& entry : climon_track_keys_)
-        if (std::find(entry.second.begin(), entry.second.end(), id) != entry.second.end())
-            keys.push_back(entry.first);
-}
-
-void IoLoop::tracking_migration_extract(uint64_t id, std::vector<std::string>& keys) {
-    size_t out = 0;
-    for (size_t i = 0; i < keys.size(); i++) {
-        std::string& key = keys[i];
-        auto entry = climon_track_keys_.find(key);
-        if (entry == climon_track_keys_.end()) continue;  // invalidated since reversible prepare
-        auto owner = std::find(entry->second.begin(), entry->second.end(), id);
-        if (owner == entry->second.end()) continue;
-        *owner = entry->second.back();
-        entry->second.pop_back();
-        srv_->climon_note_tracking_item_delta(-1);
-        if (entry->second.empty()) {
-            srv_->climon_note_tracking_key_delta(-1);
-            climon_track_keys_.erase(entry);
-        }
-        if (out != i) keys[out] = std::move(key);
-        out++;
-    }
-    keys.resize(out);
-}
-
-bool IoLoop::tracking_migration_install(uint64_t id, const std::vector<std::string>& keys) {
-    try {
-        climon_track_keys_.reserve(climon_track_keys_.size() + keys.size());
-        for (const std::string& key : keys) {
-            std::vector<uint64_t>& owners = climon_track_keys_[key];
-            if (owners.empty()) srv_->climon_note_tracking_key_delta(1);
-            if (std::find(owners.begin(), owners.end(), id) == owners.end()) {
-                owners.push_back(id);
-                srv_->climon_note_tracking_item_delta(1);
-            }
-            track_filter_add(FlatStore::hash_key(Slice(
-                key.data(), static_cast<uint32_t>(key.size()))));
-        }
-    } catch (const std::bad_alloc&) {
-        return false;
-    }
-    return true;
-}
-
 // ---- delivery ------------------------------------------------------------------------------
 
 void IoLoop::tracking_emit_invalidation(Client* target, bool redirected, Slice key, bool flush) {
-    const uint32_t live_io = target->ifid_thread();
-    if (live_io != self_->id()) {
-        PubSubEvent* event = pubsub_new_event(PubSubEventKind::TrackingDeliver);
-        event->target_io = live_io;
-        event->origin_io = self_->id();
-        event->client_id = target->id();
-        event->subscribe = redirected;
-        event->count = flush ? 1 : 0;
-        event->channel.assign(key.p, key.n);
-        pubsub_post(live_io, event);
-        srv_->tracking_forwarded_stale_added();
-        return;
-    }
     // Redis decides after resolving REDIRECT. RESP3 always has a push channel; RESP2 only has a
     // valid carriage when another connection is the target and that connection is in pub/sub mode.
     const bool resp3_push = target->resp3();
@@ -321,7 +245,6 @@ void IoLoop::tracking_deliver_frame(ClimonConn& state, uint64_t owner_id, Slice 
     event->target_io = owner_io;
     event->origin_io = self_->id();
     event->client_id = state.redirect;
-    event->subscribe = true;
     event->count = flush ? 1 : 0;
     event->channel.assign(key.p, key.n);
     pubsub_post(owner_io, event);
@@ -334,11 +257,8 @@ void IoLoop::tracking_invalidate_local(Slice key, uint64_t writer_id) {
         ClimonConn& state = entry.second;
         if (!state.tracking_on || !state.bcast) continue;
         if (state.noloop && entry.first == writer_id) continue;
-        // Re-enabling BCAST without PREFIX adds the implicit empty prefix even when an
-        // explicit prefix is held. Redis delivers once per matching subscription in that
-        // case; coalescing the two matches would silently change its invalidation stream.
-        for (size_t matches = track_prefix_match_count(state.prefixes, key); matches; matches--)
-            tracking_deliver_frame(state, entry.first, key, false);
+        if (!track_prefix_matches(state.prefixes, key)) continue;
+        tracking_deliver_frame(state, entry.first, key, false);
     }
     // 2. Per-key remembering. Redis forgets the key once it has reported it.
     if (climon_track_keys_.empty()) return;
@@ -376,14 +296,10 @@ void IoLoop::tracking_broadcast_keys(const std::vector<std::string>& keys, uint6
     }
     if (interesting.empty()) return;
 
-    PubSubEvent local;
-    local.kind = PubSubEventKind::TrackingInvalidate;
-    local.route_mask = mask;
-    local.caller_id = writer_id;
-    local.items.reserve(interesting.size());
-    for (const std::string& key : interesting)
-        local.items.push_back(PubSubEventItem{0, false, 0, key});
-    if ((mask >> (self_->id() & 63)) & 1) tracking_handle_event(local);
+    if ((mask >> (self_->id() & 63)) & 1)
+        for (const std::string& key : interesting)
+            tracking_invalidate_local(Slice(key.data(), static_cast<uint32_t>(key.size())),
+                                      writer_id);
     for (uint32_t io : srv_->placement().ifid_threads()) {
         if (io == self_->id()) continue;
         if (!((mask >> (io & 63)) & 1)) continue;
@@ -391,8 +307,9 @@ void IoLoop::tracking_broadcast_keys(const std::vector<std::string>& keys, uint6
         event->target_io = io;
         event->origin_io = self_->id();
         event->caller_id = writer_id;
-        event->route_mask = mask;
-        event->items = local.items;
+        event->items.reserve(interesting.size());
+        for (const std::string& key : interesting)
+            event->items.push_back(PubSubEventItem{0, false, 0, key});
         pubsub_post(io, event);
     }
 }
@@ -401,17 +318,24 @@ void IoLoop::tracking_broadcast_flush() {
     track_filter_clear();
     const uint64_t mask = srv_->climon_tracking_io_mask();
     if (!mask) return;
-    PubSubEvent local;
-    local.kind = PubSubEventKind::TrackingFlush;
-    local.route_mask = mask;
-    if ((mask >> (self_->id() & 63)) & 1) tracking_handle_event(local);
+    if ((mask >> (self_->id() & 63)) & 1) {
+        for (auto& entry : climon_conn_) {
+            ClimonConn& state = entry.second;
+            if (!state.tracking_on) continue;
+            tracking_deliver_frame(state, entry.first, Slice(), true);
+        }
+        for (auto& entry : climon_track_keys_) {
+            srv_->climon_note_tracking_item_delta(-static_cast<int64_t>(entry.second.size()));
+            srv_->climon_note_tracking_key_delta(-1);
+        }
+        climon_track_keys_.clear();
+    }
     for (uint32_t io : srv_->placement().ifid_threads()) {
         if (io == self_->id()) continue;
         if (!((mask >> (io & 63)) & 1)) continue;
         PubSubEvent* event = pubsub_new_event(PubSubEventKind::TrackingFlush);
         event->target_io = io;
         event->origin_io = self_->id();
-        event->route_mask = mask;
         pubsub_post(io, event);
     }
 }
@@ -423,7 +347,6 @@ void IoLoop::tracking_handle_event(PubSubEvent& event) {
                 tracking_invalidate_local(
                     Slice(item.value.data(), static_cast<uint32_t>(item.value.size())),
                     event.caller_id);
-            tracking_forward_stale(event);
             break;
         case PubSubEventKind::TrackingFlush: {
             for (auto& entry : climon_conn_) {
@@ -437,59 +360,21 @@ void IoLoop::tracking_handle_event(PubSubEvent& event) {
                 srv_->climon_note_tracking_key_delta(-1);
             }
             climon_track_keys_.clear();
-            tracking_forward_stale(event);
             break;
         }
         case PubSubEventKind::TrackingDeliver: {
-            uint32_t live_io = 0;
-            if (command_client_directory_find(event.client_id, live_io) &&
-                live_io != self_->id()) {
-                PubSubEvent* forward = pubsub_new_event(PubSubEventKind::TrackingDeliver);
-                forward->target_io = live_io;
-                forward->origin_io = self_->id();
-                forward->client_id = event.client_id;
-                forward->subscribe = event.subscribe;
-                forward->count = event.count;
-                forward->channel = event.channel;
-                pubsub_post(live_io, forward);
-                srv_->tracking_forwarded_stale_added();
-                break;
-            }
             Client* target = nullptr;
             for (Client* c : self_->clients())
                 if (c && c->id() == event.client_id) { target = c; break; }
             if (!target || target->dead() || target->closing()) break;
             tracking_emit_invalidation(
-                target, event.subscribe,
+                target, true,
                 Slice(event.channel.data(), static_cast<uint32_t>(event.channel.size())),
                 event.count != 0);
             break;
         }
         default:
             break;
-    }
-}
-
-void IoLoop::tracking_forward_stale(const PubSubEvent& event) {
-    if (routing_forward_.empty()) return;
-    uint64_t posted = event.route_mask;
-    for (const auto& entry : routing_forward_) {
-        if (!entry.second.tracking) continue;
-        uint32_t live_io = 0;
-        if (!command_client_directory_find(entry.first, live_io) || live_io == self_->id())
-            continue;
-        const uint64_t bit = 1ull << (live_io & 63);
-        if (posted & bit) continue;
-        PubSubEvent* forward = pubsub_new_event(event.kind);
-        forward->target_io = live_io;
-        forward->origin_io = self_->id();
-        forward->caller_id = event.caller_id;
-        forward->route_mask = posted | bit;
-        forward->items = event.items;
-        pubsub_post(live_io, forward);
-        posted |= bit;
-        srv_->tracking_forwarded_stale_added(
-            event.kind == PubSubEventKind::TrackingFlush ? 1 : event.items.size());
     }
 }
 
@@ -640,11 +525,11 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
         }
     }
 
-    // Mode checks precede prefix validation; seed 20 pins prefix-collision precedence below.
+    // ORACLE-DERIVED CHECK ORDER (each step is pinned by a differ case):
     //   1 OPTIN+OPTOUT together        4 OPTIN/OPTOUT switch on an already-on client
     //   2 PREFIX without BCAST         5 BCAST combined with OPTIN/OPTOUT
-    //   3 BCAST switch on an           6 for each supplied prefix, overlap with held prefixes,
-    //     already-on client              then with later prefixes supplied by this command
+    //   3 BCAST switch on an           6 overlap against prefixes this client already holds
+    //     already-on client            7 overlap among the prefixes this command provides
     // `CLIENT TRACKING off <anything>` is accepted by redis, so every rule is enable-gated.
     ClimonConn* existing = climon_conn_find(client->id());
     const bool live = existing != nullptr && existing->tracking_on && enable;
@@ -677,20 +562,19 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
             "ERR OPTIN and OPTOUT are not compatible with BCAST");
         return ClimonStartResult::Sync;
     }
-    // Validation is ordered by the supplied prefix, not by collision category: with held "a"
-    // and supplied "b", "", Redis reports the supplied b/empty collision before empty/held a.
-    for (size_t a = 0; enable && a < prefixes.size(); a++) {
-        if (live)
+    if (live)
+        for (const std::string& fresh : prefixes)
             for (const std::string& held : existing->prefixes)
-                if (track_prefix_overlaps(prefixes[a], held)) {
+                if (track_prefix_overlaps(fresh, held)) {
                     std::string error = "ERR Prefix '";
-                    error += prefixes[a];
+                    error += fresh;
                     error += "' overlaps with an existing prefix '";
                     error += held;
                     error += "'. Prefixes for a single client must not overlap.";
                     reply_err(op.sink(), error.c_str());
                     return ClimonStartResult::Sync;
                 }
+    for (size_t a = 0; enable && a < prefixes.size(); a++)
         for (size_t b = a + 1; b < prefixes.size(); b++)
             if (track_prefix_overlaps(prefixes[a], prefixes[b])) {
                 // Oracle wording: the FIRST-listed prefix is named first.
@@ -702,7 +586,6 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
                 reply_err(op.sink(), error.c_str());
                 return ClimonStartResult::Sync;
             }
-    }
 
     if (!enable) {
         if (existing) {
@@ -726,13 +609,9 @@ IoLoop::ClimonStartResult IoLoop::tracking_client_subcommand(Client* client, Op&
     // `CLIENT TRACKING on` after `on OPTIN`/`on NOLOOP` clears optin/noloop (differ-pinned).
     // Only an explicit contradiction (OPTIN while OPTOUT is held) is refused, above.
     state.bcast = bcast;
-    // Seed 23: omitting PREFIX adds the implicit empty prefix even to an existing explicit
-    // prefix set. It bypasses the supplied-prefix collision checks above, is registered once,
-    // and sorts first for TRACKINGINFO and later overlap errors. Repeated ON BCAST must not
-    // duplicate either the subscription or its allocation/accounting.
-    if (bcast && prefixes.empty() &&
-        std::find(state.prefixes.begin(), state.prefixes.end(), std::string{}) == state.prefixes.end())
-        prefixes.emplace_back();
+    // Oracle-confirmed: `CLIENT TRACKING on BCAST` with no PREFIX registers the EMPTY prefix,
+    // which TRACKINGINFO reports as one zero-length entry and which matches every key.
+    if (bcast && prefixes.empty() && state.prefixes.empty()) prefixes.emplace_back();
     state.optin = optin;
     state.optout = optout;
     state.noloop = noloop;

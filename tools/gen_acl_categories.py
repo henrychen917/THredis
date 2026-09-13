@@ -35,12 +35,6 @@ COMMAND_SOURCES = [
     "src/cmd/pfdebug.cc",
 ]
 
-# TomoKV-only commands have no Redis source row to inherit. Keep their categories here so the
-# generated registry table remains reproducible against the pinned vanilla Redis 7.4 oracle.
-TOMOKV_COMMAND_CATEGORIES = {
-    "FLIP": ("WRITE", "ADMIN", "SLOW", "DANGEROUS"),
-}
-
 
 def macro_arguments(line: str, marker: str) -> list[str]:
     start = line.index(marker) + len(marker)
@@ -180,10 +174,6 @@ def tomo_commands(repo_root: pathlib.Path) -> list[str]:
 def generated_text(repo_root: pathlib.Path, redis_root: pathlib.Path) -> str:
     categories, token_bits = redis_categories(redis_root)
     redis = redis_commands(redis_root, token_bits)
-    for name, category_tokens in TOMOKV_COMMAND_CATEGORIES.items():
-        if name in redis:
-            raise ValueError(f"TomoKV-only command now exists in Redis 7.4: {name}")
-        redis[name] = sum(1 << token_bits[token] for token in category_tokens)
     tomo = tomo_commands(repo_root)
     missing = sorted(set(tomo) - set(redis))
     if missing:

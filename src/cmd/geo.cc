@@ -498,9 +498,8 @@ void cmd_geoadd(Shard& shard, Op& op) {
 
     std::vector<ZsetEntry> entries;
     int64_t expire_at_ms = -1;
-    bool reserve_ttl_slot = false;
-    const ZsetOwnerResult read = zset_owner_read(shard, op.key(), op.hash, kNotify, false,
-                                                 entries, expire_at_ms, &reserve_ttl_slot);
+    const ZsetOwnerResult read = zset_owner_read(shard, op.key(), op.hash, kNotify,
+                                                 entries, expire_at_ms);
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {
         reply_owner_error(op, read); return;
     }
@@ -529,8 +528,7 @@ void cmd_geoadd(Shard& shard, Op& op) {
     } catch (const std::bad_alloc&) { reply_err(op.sink(), "ERR out of memory"); return; }
     if (added || changed) {
         const ZsetOwnerResult stored = zset_owner_replace(shard, op.key(), op.hash, kNotify,
-                                                          entries, expire_at_ms,
-                                                          reserve_ttl_slot);
+                                                          entries, expire_at_ms);
         if (stored != ZsetOwnerResult::Ok) { reply_owner_error(op, stored); return; }
         if constexpr (kNotify)
             notify_record(shard, op, NOTIFY_ZSET, NotifyEventId::Zadd, op.key());
@@ -543,8 +541,7 @@ template <bool kNotify>
 void cmd_geopos(Shard& shard, Op& op) {
     std::vector<ZsetEntry> entries;
     int64_t expire = -1;
-    const ZsetOwnerResult read = zset_owner_read(
-        shard, op.key(), op.hash, kNotify, true, entries, expire);
+    const ZsetOwnerResult read = zset_owner_read(shard, op.key(), op.hash, kNotify, entries, expire);
     if (read == ZsetOwnerResult::WrongType) { reply_wrongtype(op.sink()); return; }
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {
         reply_owner_error(op, read); return;
@@ -568,8 +565,7 @@ template <bool kNotify>
 void cmd_geohash(Shard& shard, Op& op) {
     std::vector<ZsetEntry> entries;
     int64_t expire = -1;
-    const ZsetOwnerResult read = zset_owner_read(
-        shard, op.key(), op.hash, kNotify, true, entries, expire);
+    const ZsetOwnerResult read = zset_owner_read(shard, op.key(), op.hash, kNotify, entries, expire);
     if (read == ZsetOwnerResult::WrongType) { reply_wrongtype(op.sink()); return; }
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {
         reply_owner_error(op, read); return;
@@ -615,8 +611,7 @@ void cmd_geodist(Shard& shard, Op& op) {
     if (op.argc() == 5 && !parse_unit(op.arg(4), unit_m)) { reply_bad_unit(op); return; }
     std::vector<ZsetEntry> entries;
     int64_t expire = -1;
-    const ZsetOwnerResult read = zset_owner_read(
-        shard, op.key(), op.hash, kNotify, true, entries, expire);
+    const ZsetOwnerResult read = zset_owner_read(shard, op.key(), op.hash, kNotify, entries, expire);
     if (read == ZsetOwnerResult::WrongType) { reply_wrongtype(op.sink()); return; }
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {
         reply_owner_error(op, read); return;
@@ -645,8 +640,7 @@ void cmd_geosearch(Shard& shard, Op& op) {
     int64_t expire = -1;
     const Slice key = op.arg(options.source_arg);
     const uint64_t hash = FlatStore::hash_key(key);
-    const ZsetOwnerResult read = zset_owner_read(
-        shard, key, hash, kNotify, true, entries, expire);
+    const ZsetOwnerResult read = zset_owner_read(shard, key, hash, kNotify, entries, expire);
     if (read == ZsetOwnerResult::WrongType) { reply_wrongtype(op.sink()); return; }
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {
         reply_owner_error(op, read); return;
@@ -743,7 +737,7 @@ void cmd_geo_xshard_local(Shard& shard, Op& op, bool notify) {
     const uint64_t source_hash = FlatStore::hash_key(source_key);
     std::vector<ZsetEntry> source;
     int64_t expire = -1;
-    const ZsetOwnerResult read = zset_owner_read(shard, source_key, source_hash, notify, true,
+    const ZsetOwnerResult read = zset_owner_read(shard, source_key, source_hash, notify,
                                                  source, expire);
     if (read == ZsetOwnerResult::WrongType) { reply_wrongtype(op.sink()); return; }
     if (read != ZsetOwnerResult::Ok && read != ZsetOwnerResult::Missing) {

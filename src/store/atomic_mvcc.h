@@ -8,7 +8,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include "kv_block_cache.h"
 #include "kvobj.h"
 
 namespace tomo {
@@ -36,12 +35,6 @@ struct AtomicEntry {
     uint32_t capacity = 0;
     uint32_t key_len = 0;
     bool linked = false;
-    // Set after prepare publishes every key occurrence in the foreign-read safety filter (and the
-    // legacy whole-shard pending witness). It remains set through install, linking and collapse.
-    bool foreign_read_unsafe_published = false;
-    // DEL/UNLINK groups own packed key bytes in this allocation instead of one empty KvObj per
-    // key. The flag consumes header padding; AtomicEntry's locked size stays unchanged.
-    bool copied_group_keys = false;
 
     KvObj** parked() { return reinterpret_cast<KvObj**>(this + 1); }
     KvObj* const* parked() const { return reinterpret_cast<KvObj* const*>(this + 1); }
@@ -49,25 +42,8 @@ struct AtomicEntry {
     const char* plain_key_data() const {
         return reinterpret_cast<const char*>(parked() + capacity);
     }
-    uint32_t* group_key_offsets() {
-        return reinterpret_cast<uint32_t*>(parked() + capacity);
-    }
-    const uint32_t* group_key_offsets() const {
-        return reinterpret_cast<const uint32_t*>(parked() + capacity);
-    }
-    char* group_key_data() {
-        return reinterpret_cast<char*>(group_key_offsets() + capacity);
-    }
-    const char* group_key_data() const {
-        return reinterpret_cast<const char*>(group_key_offsets() + capacity);
-    }
     bool plain() const { return group == nullptr; }
 };
-
-// The foreign-read lifetime marker consumes existing tail padding. Atomic entries are pooled by
-// allocation class, so growing the header would change both the disabled allocation path and its
-// cache geometry.
-static_assert(sizeof(AtomicEntry) == 144);
 
 // Owner-local protection installed while a cross-owner script is staged.  It deliberately lives
 // beside the cold MVCC list rather than in KvObj: ordinary databases that never execute a cross
@@ -87,7 +63,7 @@ struct AtomicPendingState {
         FreeValue* next;
         size_t allocation;
     };
-    static constexpr uint32_t kPoolClasses = KvBlockCache::kClasses;
+    static constexpr uint32_t kPoolClasses = 48;
     AtomicEntry* head = nullptr;
     AtomicEntry* tail = nullptr;
     AtomicEntry* conn_heads[64] = {};
@@ -100,21 +76,11 @@ struct AtomicPendingState {
     AtomicEntry* free_entries[kPoolClasses] = {};
     FreeValue* free_values[kPoolClasses] = {};
     uint32_t cached_entries = 0;
-    // Read-local uses an extended allocation whose first member is this exact baseline state.
-    // The discriminator consumes the pre-existing four-byte hole before cleanup_fast, so the
-    // disabled allocation size and every following offset remain locked.
-    bool read_local_extended = false;
-    // Owner-task-only: an install span has physical candidates but is not linked yet. Eviction
-    // cannot resolve their ownership until publication. Uses existing padding; offsets stay put.
-    bool group_installing = false;
     uint64_t cleanup_fast = 0;
     uint64_t cleanup_slow = 0;
     size_t cached_entry_bytes = 0;
     size_t cached_value_bytes = 0;
 };
-
-static_assert(sizeof(AtomicPendingState) == 1352);
-static_assert(offsetof(AtomicPendingState, read_local_extended) == 1316);
 
 struct AtomicResolved {
     KvObj* value = nullptr;
@@ -162,7 +128,14 @@ static uint64_t atomic_membership_bit(uint64_t hash) {
     return uint64_t{1} << (hash & 63);
 }
 
-// One definition, shared with the owner's block cache so the two size-class tables cannot drift.
-static uint32_t atomic_pool_class(size_t allocation) { return kv_block_class(allocation); }
+static uint32_t atomic_pool_class(size_t allocation) {
+    if (allocation <= 8) return 0;
+    if (allocation <= 128) return static_cast<uint32_t>(allocation / 16);
+    const int k = 63 - __builtin_clzll(
+        static_cast<unsigned long long>(allocation - 1));
+    const size_t step = size_t{1} << (k - 2);
+    const uint32_t quarter = static_cast<uint32_t>(allocation / step);
+    return 9u + 4u * static_cast<uint32_t>(k - 7) + (quarter - 5u);
+}
 
 }  // namespace tomo
