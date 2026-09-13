@@ -1143,6 +1143,7 @@ public:
     std::atomic<bool>& stop_flag() { return stop_; }
 
 private:
+    friend struct ThreadCtxLayoutLock;
     uint32_t          id_ = 0;
     std::atomic<Role> role_{Role::Idle};
     std::atomic<Role> ready_role_{Role::Idle};
@@ -1163,11 +1164,16 @@ private:
     std::unique_ptr<TransferChan[]> transfer_in_;
     std::unique_ptr<uint64_t[]> command_counts_;
     uint32_t command_count_size_ = 0;
-    uint64_t total_commands_ = 0;
+    // Peers read the transport pointers on this line. Keep the exceptional scan-hold counter
+    // here instead of making every command write the line they need to post work.
+    uint64_t atomic_scan_holds_ = 0;
     FlipFingerprintWriter flip_fingerprint_;
     uint64_t atomic_groups_ = 0;
     uint64_t atomic_localfast_ = 0;
-    uint64_t atomic_scan_holds_ = 0;
+    // Swap equal-sized counters: no footprint growth, allocation, or indirection. This line already
+    // holds owner-written accounting and sampled fingerprint state. The flip controller still
+    // samples total_commands_; the swap removes sharing with transport, not all peer reads.
+    uint64_t total_commands_ = 0;
     AtomicAdmissionState atomic_admission_state_;
     ReadyMask  ready_;                     // as a sender: which of my clients completed work
     std::vector<Client*>  slots_;          // slot -> client, sender-owned
@@ -1202,6 +1208,20 @@ private:
     std::unique_ptr<ReadLocalThreadState> read_local_state_;
 };
 
+struct ThreadCtxLayoutLock {
+    static constexpr size_t task_in_offset = offsetof(ThreadCtx, task_in_);
+    static constexpr size_t transfer_in_offset = offsetof(ThreadCtx, transfer_in_);
+    static constexpr size_t scan_holds_offset = offsetof(ThreadCtx, atomic_scan_holds_);
+    static constexpr size_t total_commands_offset = offsetof(ThreadCtx, total_commands_);
+};
+
+// Size alone cannot detect the two counters returning to their old lines. ThreadCtx is already
+// cache-line aligned, so these offsets also lock the transport/accounting separation.
+static_assert(alignof(ThreadCtx) == 64);
+static_assert(ThreadCtxLayoutLock::task_in_offset == 72);
+static_assert(ThreadCtxLayoutLock::transfer_in_offset == 96);
+static_assert(ThreadCtxLayoutLock::scan_holds_offset == 120);
+static_assert(ThreadCtxLayoutLock::total_commands_offset == 408);
 static_assert(sizeof(ThreadCtx) == 1408,
               "read-local state must stay out of the baseline ThreadCtx allocation");
 

@@ -119,6 +119,15 @@ build/store-regression-tsan: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wil
 build/waits-unit: tests/waits_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/waits_unit.cc -o $@
+# F11's external reply homes and asynchronous send descriptors, without a server or io_uring.
+build/stage-split-unit: tests/stage_split_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. $< -o $@
+build/stage-split-alloc-unit: tests/stage_split_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+	  -DTOMO_STAGE_SPLIT_ALLOCATIONS -I. $< -o $@ \
+	  -Wl,--wrap=malloc -Wl,--wrap=realloc -Wl,--wrap=_Znwm
 unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit build/reorder-unit build/waits-unit
 	./build/config-parser-test
 	./build/flipctl-unit

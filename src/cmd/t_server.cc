@@ -2,7 +2,7 @@
 //
 // Connection-local handlers use a thread-local context bound for the duration of the synchronous
 // IO-thread call. Client metadata lives in a cold, locked catalog here rather than enlarging the
-// 1984-byte Client. Store handlers still receive only (Shard&, Op&) and never touch a socket.
+// Client header. Store handlers still receive only (Shard&, Op&) and never touch a socket.
 #include "command.h"
 #include "acl.h"
 #include "auth.h"
@@ -242,7 +242,7 @@ std::string client_info_line_impl(const Client& client, const ClientMeta& meta, 
     const uint64_t qbuf_free = client.rcap() >= client.rlen()
         ? client.rcap() - client.rlen() : 0;
     const uint64_t omem = client.buffered_output_bytes();
-    const uint64_t total_mem = sizeof(Client) + client.rcap() + omem +
+    const uint64_t total_mem = sizeof(Client) + client.send_state_bytes() + client.rcap() + omem +
                                multi_session_memory(client);
     const int64_t multi = multi_session_active(client)
         ? static_cast<int64_t>(multi_session_queue_size(client)) : -1;

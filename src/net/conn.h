@@ -40,6 +40,7 @@
 #include <atomic>
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <utility>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -508,14 +509,28 @@ public:
         return true;
     }
     uint32_t build_segment_iov(bool& has_borrow, uint32_t& bytes) {
-        const uint32_t n = segments_.build_iov(send_iov_, kMaxSendIov, kMaxSendBytes,
+        // Only the IO-owned segmented send path needs these kernel descriptors. In particular,
+        // accept and legacy sends do not allocate a descriptor body merely because a connection
+        // exists. Segmented sends need it even with overlap/reorder=0; neither scheduling switch
+        // owns this storage. Retain it through CQEs, short sends and owner migration:
+        // sendmsg holds both addresses asynchronously, so a stack window or a per-pump reset is
+        // invalid even though constructing the window itself is synchronous.
+        if (!send_state_) {
+            if (segments_.empty()) { has_borrow = false; bytes = 0; return 0; }
+            send_state_ = std::make_unique<SendState>();
+        }
+        SendState& send = *send_state_;
+        const uint32_t n = segments_.build_iov(send.iov, kMaxSendIov, kMaxSendBytes,
                                                has_borrow, bytes);
-        std::memset(&send_msg_, 0, sizeof(send_msg_));
-        send_msg_.msg_iov = send_iov_;
-        send_msg_.msg_iovlen = n;
+        std::memset(&send.msg, 0, sizeof(send.msg));
+        send.msg.msg_iov = send.iov;
+        send.msg.msg_iovlen = n;
         return n;
     }
-    msghdr* send_msg() { return &send_msg_; }
+    // Every production caller first builds a nonempty window; null also makes the unused state
+    // inspectable without accidentally allocating it (CLIENT memory accounting and unit checks).
+    msghdr* send_msg() { return send_state_ ? &send_state_->msg : nullptr; }
+    size_t send_state_bytes() const { return send_state_ ? sizeof(SendState) : 0; }
     template <typename ReleaseFn>
     uint64_t consume_segments(uint32_t bytes, ReleaseFn&& release) {
         const uint64_t borrowed = segments_.consume(bytes, std::forward<ReleaseFn>(release));
@@ -679,7 +694,7 @@ public:
     }
 
     // MULTI/WATCH state is cold and allocated only on first use.  These fields consume padding in
-    // the executor-facing tail; the signed 1984-byte Client footprint remains unchanged.
+    // the executor-facing tail; the flag still shares the same connection byte.
     MultiSession* multi_session() const { return multi_session_; }
     void set_multi_session(MultiSession* state) { multi_session_ = state; }
     uint64_t watch_generation() const {
@@ -832,11 +847,17 @@ private:
     // --- write buffers (ex writes the direct-reply DATA region inside; header fields io-only) ---
     SmallBuf<kWbufInline> buf_[2];
 
-    // sendmsg reads both the iovec array and msghdr asynchronously, so both live with the Client.
+    // F11's IO-stage body. SegmentQueue stays inline: ordinary pump/retire tests its header, so
+    // moving that would charge every reply a pointer chase to discover an empty queue. The two
+    // kernel descriptors are unused by ordinary byte sends and can leave the shared allocation.
     static constexpr uint32_t kMaxSendIov = 16;
     SegmentQueue<8> segments_;
-    iovec           send_iov_[kMaxSendIov] = {};
-    msghdr          send_msg_ = {};
+    struct SendState {
+        iovec iov[kMaxSendIov] = {};
+        msghdr msg = {};
+    };
+    static_assert(sizeof(SendState) == 312);
+    std::unique_ptr<SendState> send_state_;
 
     // --- the executor-facing line: READ by executors on every completion, written per op by
     // nobody. notify_sender loads ifid_thread_ and wb_slot_ for every completed op, and id_ for
@@ -846,19 +867,19 @@ private:
     // per-op io writes that used to share this line -- obuf_bytes_ (per append under an armed
     // output limit) and atomic_groups_io_ (per atomic multi-key op) -- moved to io-private
     // lines above; the static_asserts after the class pin both facts.
-    alignas(64) std::atomic<bool>     retire_queued_{false};   // 1920
-    std::atomic<uint32_t> wb_slot_{kNoWbSlot};                 // 1924
-    std::atomic<uint32_t> ifid_thread_{0};                     // 1928
-    MultiSession* multi_session_ = nullptr;                    // 1936
-    std::atomic<uint64_t> watch_generation_{0};                // 1944
-    std::atomic<uint32_t> watched_refs_{0};                    // 1952
-    std::atomic<bool> watch_dirty_{false};                     // 1956
-    uint64_t id_ = 0;                                          // 1960
-    uint32_t obuf_soft_since_s_ = 0;   // 1968: cron-written only; 0 = not continuously over soft
-    bool obuf_tracking_ = false;        // 1972: flips once per arm/disarm, never per append
-    bool authenticated_ = false;        // 1973: requirepass state
-    uint32_t acl_user_idx_ = 0;          // 1976: ACL user handle
-    uint32_t tls_slot_ = kNoTlsSlot;     // 1980: out-of-line TlsConn handle
+    alignas(64) std::atomic<bool> retire_queued_{false};        // 1664
+    std::atomic<uint32_t> wb_slot_{kNoWbSlot};                 // 1668
+    std::atomic<uint32_t> ifid_thread_{0};                     // 1672
+    MultiSession* multi_session_ = nullptr;                   // 1680
+    std::atomic<uint64_t> watch_generation_{0};                // 1688
+    std::atomic<uint32_t> watched_refs_{0};                    // 1696
+    std::atomic<bool> watch_dirty_{false};                    // 1700
+    uint64_t id_ = 0;                                         // 1704
+    uint32_t obuf_soft_since_s_ = 0;   // 1712: cron-written only; 0 = not continuously over soft
+    bool obuf_tracking_ = false;       // 1716: flips once per arm/disarm, never per append
+    bool authenticated_ = false;       // 1717: requirepass state
+    uint32_t acl_user_idx_ = 0;         // 1720: ACL user handle
+    uint32_t tls_slot_ = kNoTlsSlot;    // 1724: out-of-line TlsConn handle
 };
 
 constexpr size_t Client::acl_user_idx_offset() { return offsetof(Client, acl_user_idx_); }
@@ -867,7 +888,7 @@ constexpr size_t Client::connection_flags_offset() { return offsetof(Client, con
 static_assert(Client::connection_flags_offset() == 55,
               "connection flags moved: re-run the declaration-order Client mirror probe");
 constexpr size_t Client::tls_slot_offset() { return offsetof(Client, tls_slot_); }
-static_assert(Client::tls_slot_offset() == 1980,
+static_assert(Client::tls_slot_offset() == 1724,
               "TLS slot moved: re-run the declaration-order Client mirror probe");
 
 // COHERENCE LOCK. Executors read ifid_thread_, wb_slot_ and id_ once per completed op: they must
@@ -894,10 +915,10 @@ static_assert(Client::obuf_bytes_offset() / 64 == 0,
 static_assert(Client::atomic_groups_io_offset() / 64 == 1,
               "atomic_groups_io_ is written per atomic op: it belongs on io-only line 1");
 
-// Same footprint law as Op: Client is per-connection resident memory and its io-hot head is
-// layout-tuned. Growing it is allowed -- knowingly. 1984 = 1408 + the zero-copy send state
-// (segment queue, iovec window, msghdr), which must persist per conn across send CQEs; signed
-// against the 64c A/B of the zc merge.
-static_assert(sizeof(Client) == 1984, "Client grew: re-check the io-hot line packing and idle RSS");
+// F11 re-lock: 1984 -> 1728 bytes, with a lazy 312-byte IO-only descriptor body. A connection that
+// has used segmented sends therefore holds 2040 raw bytes, 56 MORE than before; one that has not
+// saves 256. Allocator rounding and the share of such connections decide the footprint break-even.
+// The completion line stays isolated from per-op IO stores; only its absolute address changed.
+static_assert(sizeof(Client) == 1728, "Client stage header changed: re-price its send body too");
 
 }  // namespace tomo

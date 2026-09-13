@@ -27,13 +27,14 @@
 // retirement is strictly in order, the oldest live op is always slot(flush_id) — so every byte
 // before that op's rbuf_off is dead. No refcounting, no generation numbers.
 //
-// SLOTS ARE CHUNKED, NOT INLINE AND NOT SCATTERED. An ExecContext is ~328 bytes; held by value a
-// 64-slot ROB is ~21KB resident per connection whether it ever pipelines or not. The first pointer
+// SLOTS ARE CHUNKED, NOT INLINE AND NOT SCATTERED. Holding every execution context by value made
+// a 64-slot ROB ~21KB resident per connection whether it ever pipelined or not. The first pointer
 // version fixed that with one heap Op per slot — and measured a −3% SET p32 regression, because 64
 // scattered allocations lost the sequential locality the drain used to get from the inline array
 // for free. So: contexts materialize in CONTIGUOUS CHUNKS of eight, on the first touch of any slot
-// in the chunk. A p1 connection holds one chunk (~2.6KB), a 32-deep pipeliner four, and the drain
-// walks sequential memory within every chunk. Each context recycles in place forever ("flushed"
+// in the chunk. F11 separates each chunk's reply bodies from its contiguous 248-byte headers,
+// retaining one allocation (2752 raw bytes) per eight slots. A p1 connection holds one chunk,
+// a 32-deep pipeliner four, and the drain walks sequential headers. Each context recycles in place forever ("flushed"
 // logically at retire — state goes Free — never returned to the allocator until the connection
 // dies); steady-state allocator traffic is zero, and jemalloc needs no pool in front of it.
 #pragma once
@@ -746,7 +747,7 @@ public:
     const Op& at(uint64_t id) const { return const_cast<Rob*>(this)->at(id); }
 
     ~Rob() {
-        for (uint32_t i = 0; i < kChunks; i++) delete[] chunks_[i];
+        for (uint32_t i = 0; i < kChunks; i++) delete chunks_[i];
         delete read_local_state_ptr();
     }
 
@@ -758,9 +759,9 @@ private:
     // may_grow is true only from acquire() — the parser. Everyone else dereferences ground the
     // parser already materialized.
     __attribute__((always_inline)) Op* slot(uint32_t idx, bool may_grow) {
-        Op*& ch = chunks_[idx / kChunkOps];
-        if (!ch && may_grow) ch = new Op[kChunkOps];
-        return &ch[idx % kChunkOps];
+        OpChunk<kChunkOps>*& ch = chunks_[idx / kChunkOps];
+        if (!ch && may_grow) ch = new OpChunk<kChunkOps>;
+        return &ch->ops[idx % kChunkOps];
     }
 
     static constexpr uint64_t capacity_slots_mask() {
@@ -1015,7 +1016,7 @@ private:
         state.write_count++;
     }
 
-    Op* chunks_[kChunks] = {};
+    OpChunk<kChunkOps>* chunks_[kChunks] = {};
     // Separate cache lines: the producer writes dispatch_ while the consumer writes flush_, and
     // sharing a line would make every publish invalidate the consumer's copy and vice versa.
     alignas(64) std::atomic<uint64_t> dispatch_{0};

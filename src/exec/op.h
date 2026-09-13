@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string_view>
 #include "../base/slice.h"
 
@@ -39,11 +40,87 @@ enum class OpState : uint8_t {
 inline constexpr uint32_t kInlineArgv = 8;
 
 // A GET reply for a 64-byte value is ~72 bytes, so 96 inline still keeps the common case
-// allocation-free. 96, not 128: the direct-reply fields took 16 bytes and the zero-copy borrow
-// descriptor took 16 more; both are paid out of the inline reply so sizeof(Op) stays 336 -- the
-// 352B version measured -3.7% at 64c p32, where the server sits on the DRAM wall and ROB
-// footprint is the price of everything.
+// allocation-free in a ROB chunk. These bytes live after the chunk's contiguous Op headers:
+// parsing, routing and coded/direct replies need the buffer metadata but not its unused payload.
 inline constexpr size_t kInlineReply = 96;
+
+template <size_t Count> struct OpChunk;
+
+// Same byte-sink contract as SmallBuf, with its inline storage supplied by the ROB chunk. Keep
+// data/length/capacity in the shared header: reset and Sink's empty/capacity tests must not chase
+// a cold body. Only payload accesses follow data_, exactly as they did in SmallBuf. The fourth
+// pointer is the stable home used at shrink/destruction, never a cross-thread publication.
+//
+// Standalone Lua/MULTI Ops have no chunk. They allocate on their first byte reply and retain that
+// allocation until shrink/destruction; constructing/resetting a direct or coded Op allocates
+// nothing. Every chunk binds its homes before publishing any slot and never relocates them.
+class OpReply {
+public:
+    OpReply() = default;
+    ~OpReply() { if (data_ != home_) std::free(data_); }
+    OpReply(const OpReply&) = delete;
+    OpReply& operator=(const OpReply&) = delete;
+
+    char* data() { return data_; }
+    const char* data() const { return data_; }
+    size_t size() const { return len_; }
+    bool empty() const { return len_ == 0; }
+    size_t cap() const { return cap_; }
+    void clear() { len_ = 0; }
+    void advance(size_t n) { len_ += n; }
+    void commit_raw(size_t n) { len_ += n; }
+    void shrink_to_inline() {
+        if (data_ != home_) { std::free(data_); data_ = home_; }
+        cap_ = home_ == empty_ ? 0 : kInlineReply;
+        len_ = 0;
+    }
+    char* reserve(size_t n) {
+        if (len_ + n > cap_) grow(len_ + n);
+        return data_ + len_;
+    }
+    void append(const char* s, size_t n) {
+        char* p = reserve(n);
+        std::memcpy(p, s, n);
+        advance(n);
+    }
+    void append(std::string_view s) { append(s.data(), s.size()); }
+    void append(Slice s) { append(s.p, s.n); }
+    template <size_t N> void append(const char (&lit)[N]) {
+        static_assert(N >= 1);
+        if constexpr (N - 1 <= 16) {
+            char* p = reserve(N - 1);
+            __builtin_memcpy(p, lit, N - 1);
+            advance(N - 1);
+        } else {
+            append(static_cast<const char*>(lit), N - 1);
+        }
+    }
+    void push_back(char ch) { *reserve(1) = ch; advance(1); }
+
+private:
+    template <size_t Count> friend struct OpChunk;
+    void bind_inline(char* home) {
+        data_ = home_ = home;
+        cap_ = kInlineReply;
+    }
+    void grow(size_t need) {
+        size_t ncap = cap_ ? cap_ * 2 : kInlineReply;
+        while (ncap < need) ncap *= 2;
+        char* next = static_cast<char*>(std::malloc(ncap));
+        if (!next) throw std::bad_alloc();
+        std::memcpy(next, data_, len_);
+        if (data_ != home_) std::free(data_);
+        data_ = next;
+        cap_ = ncap;
+    }
+    // A valid empty data() also preserves callers that build a string from (data(), 0).
+    inline static char empty_[1] = {};
+    char* data_ = empty_;
+    size_t len_ = 0;
+    size_t cap_ = 0;
+    char* home_ = empty_;
+};
+static_assert(sizeof(OpReply) == 32);
 
 // REPLY CODES -- the executor's side of the owner's split: "the executor writes only bytes it
 // alone knows; everything else it returns as a result, and the connection's owner formats."
@@ -162,8 +239,7 @@ public:
     // order, and the owner resolves against that instead of "now". Writes deliberately keep
     // "newest": a write's read is the base of its own update and staleness there is a lost update.
     //
-    // Only the low 32 bits are kept -- Op's 336-byte footprint has exactly this 4-byte hole and no
-    // more, and the owner widens the value against the live sequence. The reconstruction is exact
+    // Only the low 32 bits are kept; the owner widens the value against the live sequence. The reconstruction is exact
     // while fewer than 2^31 commits separate dispatch from execution; the highest commit rate this
     // engine has produced would need ~40 seconds of queueing to reach that, and the widening
     // saturates to a stale-but-safe (older) cut rather than a newer one if it ever did.
@@ -178,8 +254,7 @@ public:
 
     // IO knows whether this command was issued behind an unfinished cross-shard atomic group on
     // the same connection. Capture that fact before publish so executors can skip the owner-local
-    // pending lookup without reading a remote Client cache line. The bit occupies existing padding
-    // before SmallBuf; Op's signed 336-byte footprint is unchanged.
+    // pending lookup without reading a remote Client cache line. The bit shares the routing byte.
     void mark_atomic_hazard() { route_flags_ |= kAtomicHazard; }
     bool atomic_hazard() const { return route_flags_ & kAtomicHazard; }
     void mark_no_borrow() { route_flags_ |= kNoBorrow; }
@@ -223,8 +298,7 @@ public:
     bool read_local_precise_write() const { return route_flags_ & kReadLocalPreciseWrite; }
     uint8_t route_flags_ = 0;
 
-    // THE CODED REPLY. Free real estate: rbuf_off ends at 28 and SmallBuf's pointer forces the
-    // next field to 32, so bytes 29..31 were pure padding. Op stays 336 bytes (asserted below).
+    // THE CODED REPLY. rbuf_off ends at 28; the following pointer aligns to 32, leaving these bytes.
     // Non-zero means "this op's whole reply is this code"; the owner formats it at retire.
     uint8_t reply_code_ = 0;
 
@@ -240,7 +314,14 @@ public:
     // touch this: a ROB slot is armed once and is a ROB slot forever.
     uint8_t reply_code_ok_ = 0;
 
-    SmallBuf<kInlineReply> reply;           // worker writes RESP here (the spill/general sink)
+private:
+    // Parse and execute both inspect argc/heap even for two inline arguments. Keeping that
+    // metadata beside routing avoids fetching the tail solely to discover there is no heap.
+    Slice*   argv_heap_ = nullptr;
+    uint32_t argv_cap_  = 0;
+    uint32_t argc_      = 0;
+public:
+    OpReply reply;                         // metadata here; bytes in the chunk's reply body
 
     // DIRECT REPLY (owner's c->buf trick, both postures). When io dispatches an op that is the ROB
     // HEAD of a connection with an EMPTY fill buffer, it points `direct` at that buffer's storage.
@@ -267,9 +348,8 @@ public:
     std::atomic<OpState> state{OpState::Free};
 
     // The integer that goes with ReplyCode::Int -- a value the executor computed, not a format.
-    // `state` is one byte at offset 184 and argv_inline_ needs 8-byte alignment at 192, so 185..191
-    // was padding; this lands at the 4-aligned 188 and costs nothing. int32 rather than int64
-    // because that is what the hole holds: a count or a counter outside +/-2^31 simply keeps the
+    // `state` leaves seven bytes before the aligned argv array; the integer uses four of them.
+    // A count or a counter outside +/-2^31 simply keeps the
     // byte path, which emits the identical digits.
     int32_t reply_ival_ = 0;
 
@@ -452,14 +532,25 @@ private:
     static constexpr uint8_t kReadLocal = 1u << 6;
     static constexpr uint8_t kReadLocalPreciseWrite = 1u << 7;
     Slice    argv_inline_[kInlineArgv];
-    Slice*   argv_heap_ = nullptr;
-    uint32_t argv_cap_  = 0;
-    uint32_t argc_      = 0;
 };
 
-// THE FOOTPRINT LOCK (owner law, 2026-08-24): +16 bytes on Op measured -3.7% at 64c p32 -- at
-// the DRAM wall, ROB footprint is throughput. Growing Op requires paying for it elsewhere in the
-// struct (kInlineReply bought the direct-reply fields) or re-earning the size with an A/B.
-static_assert(sizeof(Op) == 336, "Op grew: pay for it inside the struct or re-run the 64c A/B");
+// One allocation still owns eight consecutive slots: per-slot allocations previously lost SET
+// locality. Header-only stages traverse 248-byte strides instead of stepping over 96 unused reply
+// bytes. Executors write body bytes only for nondirect byte replies; IO reads them after Done.
+// This is stage storage, not a new owner or handoff. Destruction occurs only after ROB quiescence.
+template <size_t Count> struct OpChunk {
+    Op ops[Count];
+    char reply_bytes[Count][kInlineReply];
+    OpChunk() {
+        for (size_t i = 0; i < Count; i++) ops[i].reply.bind_inline(reply_bytes[i]);
+    }
+};
+
+// F11 re-lock: 336 -> 248 header bytes, plus 96 body bytes per materialized slot. The stable home
+// pointer costs 8 bytes/slot in total; one 8-slot allocation is 2752 bytes (before allocator
+// rounding), versus the former 2688-byte array plus its destructor cookie. S4 must price the
+// whole allocation, not claim the smaller header as an RSS reduction.
+static_assert(sizeof(Op) == 248, "Op stage header changed: re-price header and body together");
+static_assert(sizeof(OpChunk<8>) == 2752, "Op chunk footprint changed");
 
 }  // namespace tomo

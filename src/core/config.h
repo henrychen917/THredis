@@ -15,7 +15,7 @@
 //   ValueSlot::kInline 1024   cmd/scatter_engine.inc  gather slot capacity; pairs with zc-min as
 //                                             the unified copy-vs-borrow cutover (min of the two)
 //   kCommonBytes      16KiB   cmd/xshard.h    pooled scatter arena block size
-//   sizeof(Op)==336, sizeof(Client)==1984     footprint locks (static_assert, do not move)
+//   sizeof(Op)==248, sizeof(Client)==1728     F11 headers; body footprints locked in op.h/conn.h
 
 #pragma once
 
