@@ -61,7 +61,11 @@ def main():
             wanted = args.mode if name == "thread_mode" else 1 if name == "atomic" else getattr(args, name)
             require(before[name] == str(wanted), "INFO mismatch: " + name)
         nthreads = int(before["io_threads"]) + int(before["ex_threads"]) if args.mode == "2s" else int(before["fused_threads"])
-        require(int(before.get("schedule_stats_threads", 0)) == (nthreads if args.overlap or args.reorder else 0),
+        # O1's fused arm is deliberately the baseline, including allocation and completion wiring.
+        # This is an asserted mode contract, not a skip when an interleave fails to engage.
+        overlap_enabled = args.mode == "2s" and args.overlap == 1
+        require(before.get("overlap_enabled") == str(int(overlap_enabled)), "effective overlap mismatch")
+        require(int(before.get("schedule_stats_threads", 0)) == (nthreads if overlap_enabled or args.reorder else 0),
                 "disabled schedule knobs allocated witnesses, or enabled witnesses are absent")
         topo = _lib.topology(ctl)
         prefix = "orthog:%d" % time.time_ns()
@@ -160,14 +164,14 @@ def main():
             require(all(int(final.get(name, 0)) == 0 for name in
                         ("reorder_batches", "reorder_multi_client_runs", "reorder_permuted_runs", "reorder_max_batch")),
                     "reorder ran while disabled")
-        schedule = "plain" if not args.overlap else "split-io-overlap" if args.mode == "2s" else "fused-overlap"
+        schedule = "split-io-overlap" if overlap_enabled else "plain"
         require(final.get("overlap_schedule", "plain") == schedule, "actual schedule differs from requested mode")
-        if args.overlap:
+        if overlap_enabled:
             require(int(final["overlap_passes"]) > int(start["overlap_passes"]), "overlap did not run")
             require(int(final["overlap_interleaved_passes"]) > 0, "overlap never entered its interleaved arm")
         else:
             require(int(final.get("overlap_passes", 0)) == int(final.get("overlap_interleaved_passes", 0)) == 0,
-                    "overlap ran while disabled")
+                    "overlap ran while disabled or in the fused no-op arm")
         if not args.read_local:
             require(int(_lib.info(ctl, "stats")["read_local_hits"]) == 0, "disabled lane completed reads")
         evidence = {"requested": expected, "before": before, "local_info": local_info,

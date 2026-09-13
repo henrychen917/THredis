@@ -89,7 +89,7 @@ void IoLoop::run_split_read_local() {
             else run_loop<false, false, false, true, Pipeline, true>();
         }
     };
-    if (srv_->cfg().overlap) run.template operator()<1>();
+    if (srv_->cfg().overlap_enabled()) run.template operator()<1>();
     else run.template operator()<0>();
 }
 

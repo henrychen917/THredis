@@ -320,11 +320,9 @@ int main() {
         if (tomo::validate_config(invalid_overlap) != tomo::kConfigError)
             fail("programmatic overlap 2 was accepted");
     }
-    if (rejection_text({"--thread-mode", "1s", "--overlap", "1",
-                        "--net-io", "epoll"}, true) !=
-            "--thread-mode 1s with --overlap 1 requires --net-io uring "
-            "for its single submit boundary\n")
-        fail("overlap engine validation rejection text is not canonical");
+    if (!parses_threads({"--thread-mode", "1s", "--overlap", "1",
+                         "--net-io", "epoll"}, tomo::ThreadMode::Fused, 1))
+        fail("O1 fused no-op rejected the baseline engine");
     tomo::Config read_local;
     tomo::ConfigParseState read_local_state;
     const std::vector<const char*> read_local_args = {
@@ -364,6 +362,8 @@ int main() {
                cfg.thread_mode == ((!std::strcmp(mode, "1s") || !std::strcmp(mode, "fused"))
                    ? tomo::ThreadMode::Fused : tomo::ThreadMode::Split) &&
                cfg.overlap == static_cast<uint32_t>(*overlap - '0') &&
+               cfg.overlap_enabled() == (*overlap == '1' &&
+                   (std::strcmp(mode, "2s") == 0 || std::strcmp(mode, "split") == 0)) &&
                cfg.reorder == static_cast<uint32_t>(*reorder - '0') &&
                cfg.read_local == static_cast<uint32_t>(*lane - '0');
     };
@@ -373,11 +373,8 @@ int main() {
                 for (const char* reorder : {"0", "1"}) {
                     if (!parses_read_local_cell(mode, overlap, lane, reorder, "uring"))
                         fail("overlap/read-local/reorder boot cell was rejected");
-                    const bool fused = !std::strcmp(mode, "1s") || !std::strcmp(mode, "fused");
-                    const bool epoll_supported = !fused || *overlap == '0';
                     StderrSilencer quiet;
-                    if (parses_read_local_cell(mode, overlap, lane, reorder, "epoll") !=
-                        epoll_supported)
+                    if (!parses_read_local_cell(mode, overlap, lane, reorder, "epoll"))
                         fail("epoll overlap/read-local/reorder validation differs");
                 }
 

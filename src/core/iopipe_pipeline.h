@@ -6,6 +6,7 @@
 // fibers, request schedulers, or per-request stage machines.
 #pragma once
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace tomo {
@@ -15,7 +16,6 @@ namespace tomo {
 // caps cover the 64-slot ROB/ordinary depth cell while keeping control and quiesce latency bounded.
 // A shallow pass still contains only the one or few clients/frames that actually arrived.
 inline constexpr uint32_t kIoPipeIfidBatchClients = 64;
-inline constexpr uint32_t kIoPipeIfidBatchOpsPerClient = 64;
 
 // WB buffers completion/serve requests by connection.  A ROB holds at most 64 operations, so this
 // window covers every possible retireable prefix instead of letting an unprefetched tail leak into
@@ -77,6 +77,14 @@ struct IoPipeDepthGate {
     bool natural = false;
 };
 
+// State belongs to an armed IO role tenure, not to every allocated IoLoop. The plain-loop
+// specialization must remain empty: overlap 0 has neither history updates nor scratch storage.
+template <bool Armed> struct IoPipeLoopState {};
+template <> struct IoPipeLoopState<true> {
+    IoPipeDepthGate depth;
+    size_t cursor = 0;
+};
+
 enum class IoPipeStage : uint8_t {
     WbObserve,
     IfidRx,
@@ -87,17 +95,18 @@ enum class IoPipeStage : uint8_t {
     WbSubmitReclaim,
 };
 
-// THE HOT ROTATION.  This is expanded directly, in this order, by IoLoop::pipeline_pass().  Keeping
-// the array here makes schedule changes reviewable beside the batch geometry instead of hiding
-// them among control/cron maintenance in the outer loop.
-inline constexpr std::array<IoPipeStage, 7> kIoPipeSchedule = {
-    IoPipeStage::WbObserve,
-    IoPipeStage::IfidRx,
-    IoPipeStage::WbPrefetch,
-    IoPipeStage::IfidParseHash,
-    IoPipeStage::WbRetirePrepare,
-    IoPipeStage::IfidPost,
-    IoPipeStage::WbSubmitReclaim,
-};
+// THE HOT ROTATION. Expand the historical schedule at compile time. A range-for over a constexpr
+// array still permits a runtime loop and switch at -O2; this form emits only the stage bodies.
+// IFID publishes queue tails while WB work hides their latency; notifications precede SEND.
+template <typename StageFn>
+__attribute__((always_inline)) inline void io_pipe_schedule(StageFn&& stage) {
+    stage.template operator()<IoPipeStage::WbObserve>();
+    stage.template operator()<IoPipeStage::IfidRx>();
+    stage.template operator()<IoPipeStage::WbPrefetch>();
+    stage.template operator()<IoPipeStage::IfidParseHash>();
+    stage.template operator()<IoPipeStage::WbRetirePrepare>();
+    stage.template operator()<IoPipeStage::IfidPost>();
+    stage.template operator()<IoPipeStage::WbSubmitReclaim>();
+}
 
 }  // namespace tomo

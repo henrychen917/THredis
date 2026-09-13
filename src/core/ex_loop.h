@@ -179,11 +179,11 @@ public:
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
         reorder_enabled_ = srv->cfg().reorder != 0;
-        pipeline_batches_ = Fused && srv->thread_mode() == ThreadMode::Fused &&
-                            srv->cfg().overlap != 0;
-        // Fused overlap uses fixed producer lanes; synchronous local-read demotion resolves
-        // every reservation before the producer resumes. Split readers use ordinary inboxes.
-        iofused_ = pipeline_batches_;
+        // O1 changes only the split IO schedule. Both fused knob values use the baseline
+        // executor geometry and inboxes; selecting only its loop without these latches would
+        // still leave a different producer transport and retirement cadence behind.
+        pipeline_batches_ = false;
+        iofused_ = false;
         if constexpr (Fused) {
             if (srv->read_local_enabled()) {
                 std::unique_ptr<ReadLocalExImpl> impl(new (std::nothrow) ReadLocalExImpl);

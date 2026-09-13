@@ -37,7 +37,7 @@ def feature_evidence():
     before.update(read_local_active_threads='1', schedule_stats_threads='2',
                   tomokv_keylb_bucket_weight_spread_current='0',
                   tomokv_keylb_client_weight_spread_current='0',
-                  overlap_schedule='split-io-overlap',
+                  overlap_schedule='split-io-overlap', overlap_enabled='1',
                   read_local_thread_0='role=ifid,shards=0,active=1,hits_total=0,mget_hits_total=0',
                   read_local_thread_1='role=ex,shards=16,active=0,hits_total=0,mget_hits_total=0')
     after = dict(before, **{key: '10' for key in keys})
@@ -103,6 +103,37 @@ class FeatureFailures(unittest.TestCase):
         for key in ('overlap', 'reorder', 'atomic', 'key-lb', 'client-lb', 'flip-auto'):
             with self.subTest(key=key), self.assertRaises(AssertionError):
                 feature.check_activity(b, a, dict(knobs, **{key: 0}), 2, True)
+
+    def test_fused_overlap_is_inert_with_readers_and_reorder_armed(self):
+        b, a, knobs = feature_evidence()
+        knobs.update({'thread-mode': '1s', 'flip-auto': 0})
+        for row in (b, a):
+            row.update(overlap_schedule='plain', overlap_enabled='0',
+                       overlap_passes='0', overlap_interleaved_passes='0',
+                       read_local_active_threads='2', flipctl_triggers='0')
+            for tid in range(2):
+                hits = '0' if row is b else '10'
+                row[f'read_local_thread_{tid}'] = (
+                    f'role=unified,shards=8,active=1,hits_total={hits},mget_hits_total={hits}')
+        feature.check_activity(b, a, knobs, 2, True)
+        for field, value in (('overlap_enabled', '1'), ('overlap_schedule', 'fused-overlap'),
+                             ('overlap_passes', '1'), ('overlap_interleaved_passes', '1'),
+                             ('reorder_permuted_runs', '0')):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                feature.check_activity(b, dict(a, **{field: value}), knobs, 2, True)
+
+        # With reorder off too, the no-op must not allocate the witness sidecar at all.
+        knobs['reorder'] = 0
+        for row in (b, a):
+            for field in list(row):
+                if (field.startswith('reorder_') or field.startswith('overlap_') or
+                        field == 'schedule_stats_threads') and field != 'overlap_enabled':
+                    del row[field]
+        feature.check_activity(b, a, knobs, 2, True)
+        for field, value in (('schedule_stats_threads', '2'), ('overlap_passes', '0'),
+                             ('overlap_interleaved_passes', '1')):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                feature.check_activity(b, dict(a, **{field: value}), knobs, 2, True)
 
 
 class PerformanceFailures(unittest.TestCase):

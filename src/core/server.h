@@ -336,7 +336,7 @@ public:
                 }
             }
         }
-        if (cfg_.overlap || cfg_.reorder) {
+        if (cfg_.overlap_enabled() || cfg_.reorder) {
             mode_schedule_stats_.reset(new (std::nothrow) ModeScheduleStats[nthreads]);
             if (!mode_schedule_stats_) {
                 std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");

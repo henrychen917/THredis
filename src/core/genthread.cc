@@ -60,11 +60,9 @@ void IoLoop::run_fused() {
             else run_loop<false, false, false, true, Pipeline>();
         }
     };
-    switch (srv_->cfg().overlap) {
-        case 0: run_pipeline(std::integral_constant<uint8_t, 0>{}); break;
-        case 1: run_pipeline(std::integral_constant<uint8_t, 1>{}); break;
-        default: std::abort();
-    }
+    // O1 is the split stage-idle control. Both fused knob values enter the exact same
+    // baseline instantiation, including read-local, completion hooks, and submit boundaries.
+    run_pipeline(std::integral_constant<uint8_t, 0>{});
 }
 
 int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
@@ -75,7 +73,7 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
     const Config& cfg = srv.cfg();
     const uint32_t nthreads = srv.nthreads();
     std::printf("tomokv-cpp: %u unified threads, %u shard(s), thread-mode=1s,"
-                " overlap=%u, %s, alloc=%s\n", nthreads, cfg.shards,
+                " overlap=%u (effective=0), %s, alloc=%s\n", nthreads, cfg.shards,
                 cfg.overlap,
                 cfg.net_io == NetIoEngine::Epoll ? "epoll" : "io_uring", alloc_backend());
     for (const ThreadPlacement& placement : srv.placement().threads())
@@ -163,18 +161,11 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
             if (ok) {
                 executors[tid].activate_fused(&ios[tid].ring());
                 ios[tid].bind_fused_executor(&executors[tid]);
-                if (cfg.overlap == 0)
-                    executors[tid].bind_fused_completion(
-                        &ios[tid],
-                        [](void* p, Client* client) {
-                            static_cast<IoLoop*>(p)->fused_executor_completion<false>(client);
-                        });
-                else
-                    executors[tid].bind_fused_completion(
-                        &ios[tid],
-                        [](void* p, Client* client) {
-                            static_cast<IoLoop*>(p)->fused_executor_completion<true>(client);
-                        });
+                executors[tid].bind_fused_completion(
+                    &ios[tid],
+                    [](void* p, Client* client) {
+                        static_cast<IoLoop*>(p)->fused_executor_completion<false>(client);
+                    });
                 if (srv.read_local_enabled())
                     executors[tid].bind_read_local_demotion(
                         &ios[tid],
@@ -184,27 +175,14 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
                             return static_cast<IoLoop*>(p)->fused_demote_local_read_batch(
                                 client, probed, fallbacks, probed_count, demoted);
                         });
-                if (cfg.overlap == 0)
-                    self.bind_fused_executor_hooks(
-                        &executors[tid],
-                        [](void* p) {
-                            return static_cast<FusedExLoop*>(p)->fused_baseline_pass();
-                        },
-                        [](void* p, SnapshotManager* manager) {
-                            static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
-                        });
-                else
-                    self.bind_fused_executor_hooks(
-                        &executors[tid],
-                        [](void* p) {
-                            // Snapshot's blocking progress loop has no WB filler to interleave.
-                            // Use the private-lane coarse turn; the main overlap loop supplies
-                            // the three-way callback only at its ordinary batch seam.
-                            return static_cast<FusedExLoop*>(p)->fused_coarse_pass();
-                        },
-                        [](void* p, SnapshotManager* manager) {
-                            static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
-                        });
+                self.bind_fused_executor_hooks(
+                    &executors[tid],
+                    [](void* p) {
+                        return static_cast<FusedExLoop*>(p)->fused_baseline_pass();
+                    },
+                    [](void* p, SnapshotManager* manager) {
+                        static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
+                    });
             }
             if (!boot.arrive_loaded(tid, ok, local_error)) return;
             if (!boot.wait_until_ready(tid, self.stop_flag())) return;

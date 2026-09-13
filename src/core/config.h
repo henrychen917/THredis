@@ -305,9 +305,11 @@ struct Config {
     uint32_t tcp_keepalive  = 300;       // live for newly accepted TCP clients, 0 = off
     uint32_t tcp_backlog    = 511;       // boot-only, passed directly to listen(2)
     NetIoEngine net_io      = NetIoEngine::Uring;  // boot-only: which network event engine io runs
-    // Boot-only amortization schedule: 0=off, 1=on. Split overlaps IO writeback;
-    // fused selects the gated three-way schedule, including when read-local is armed.
+    // O1 overlaps split IO writeback with parsing. Its fused arm uses the baseline loop:
+    // the historical fused interleave lost, so O1 must not carry that tax into 1s.
+    // Keep the requested knob for CONFIG/INFO; all boot consumers use the effective schedule.
     uint32_t overlap = 0;
+    bool overlap_enabled() const { return overlap != 0 && thread_mode == ThreadMode::Split; }
     ClientOutputBufferLimits client_output_buffer_limits;
 
     // ---- security / test commands ----------------------------------------------------------
@@ -958,7 +960,7 @@ inline int parse_config_args(const std::vector<const char*>& args, Config& cfg,
                         "  file. See tomokv.conf in the repo root for the annotated full set.\n"
                         "  threading: --thread-mode 2s|1s --overlap 0|1 --read-local 0|1 (defaults 2s, 0, 0)\n"
                         "             (split/fused are mode aliases)\n"
-                        "    --overlap 1                 2s: IO-overlapped writeback; 1s: all overlap (uring)\n"
+                        "    --overlap 1                 2s: stage-idle IO overlap; 1s: baseline (no-op)\n"
                         "    --reorder 0|1 (default 0)   cross-connection reordering in an executor batch for latency; per-connection order always preserved\n"
                         "  placement (default derived from allowed CPUs):\n"
                         "    --ratio io:ex               global counts, split mode only\n"
@@ -1030,13 +1032,6 @@ inline int validate_config(const Config& cfg) {
     }
     if (cfg.overlap > 1) {
         std::fprintf(stderr, "--overlap wants 0 or 1\n");
-        return kConfigError;
-    }
-    if (cfg.thread_mode == ThreadMode::Fused && cfg.overlap != 0 &&
-        cfg.net_io != NetIoEngine::Uring) {
-        std::fprintf(stderr,
-                     "--thread-mode 1s with --overlap %u requires --net-io uring for its single submit boundary\n",
-                     cfg.overlap);
         return kConfigError;
     }
     if (cfg.thread_mode == ThreadMode::Fused && (cfg.even_ifid || cfg.even_ex)) {
