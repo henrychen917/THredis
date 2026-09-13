@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <memory>
 #include <vector>
+#include "src/core/config.h"
 #include "src/core/reorder.h"
 
 // This fixture never creates a MULTI session or executes a command. Keep the only out-of-line
@@ -26,7 +27,7 @@ void unused_handler(Shard&, Op&) { fail("fixture executed a command"); }
 
 constexpr CommandSpec spec(const char* name, CommandLengthClass length, uint32_t flags) {
     CommandSpec out(name, 2, 2, flags, unused_handler, 1, 1, 1, unused_handler);
-    out.length_class = static_cast<uint8_t>(length);
+    out.set_length_class(length);
     return out;
 }
 constexpr auto point = spec("GET", CommandLengthClass::Point, CmdFlags::Readonly);
@@ -34,6 +35,16 @@ constexpr auto small = spec("MGET", CommandLengthClass::SmallMulti,
                             CmdFlags::Readonly | CmdFlags::MultiShard);
 constexpr auto long_op = spec("BITCOUNT", CommandLengthClass::Long, CmdFlags::Readonly);
 constexpr auto admin = spec("DEBUG", CommandLengthClass::Point, CmdFlags::Admin);
+constexpr auto other_point = spec("STRLEN", CommandLengthClass::Point, CmdFlags::Readonly);
+
+static_assert(sizeof(Op) == 336 && sizeof(Client) == 1984 && sizeof(ThreadCtx) == 1408);
+static_assert(sizeof(Shard) == 1440 && sizeof(FlatStore) == 944 && sizeof(Rob<64>) == 192);
+static_assert(sizeof(AtomicEntry) == 144 && sizeof(Config) == 624);
+static_assert(sizeof(CommandSpec) == 48 && sizeof(Task) == 32);
+static_assert((point.flags & CmdFlags::ReorderClasses) == CmdFlags::ReorderPoint);
+static_assert((small.flags & CmdFlags::ReorderClasses) == CmdFlags::ReorderPoint << 1);
+static_assert((long_op.flags & CmdFlags::ReorderClasses) == CmdFlags::ReorderPoint << 2);
+static_assert((admin.flags & CmdFlags::ReorderClasses) == 0);
 
 Task publish(Client& client, const CommandSpec& command, bool hazard = false) {
     auto& rob = client.rob();
@@ -251,6 +262,93 @@ void hidden_predecessors() {
     }
     std::puts("  predecessor controls: missing head, in-run gap and atomic hazard widen to Long");
 }
+
+// R2's trigger is STATIC class, never rank spread, command identity, or an atomic-hazard bit.
+// These controls have legal cross-client rank permutations in the old scheduler. Checking exact
+// FIFO alone is insufficient: a rank/dependency scan returning identity must also be rejected.
+template <size_t Capacity>
+void uniform_controls() {
+    for (const CommandSpec* cost : {&point, &small, &long_op}) {
+        Client a(-1), b(-1);
+        Task tasks[Capacity];
+        constexpr uint32_t per_client = Capacity / 2;
+        for (uint32_t i = 0; i < per_client; i++) tasks[i] = publish(a, *cost, i == 0);
+        for (uint32_t i = 0; i < per_client; i++)
+            tasks[per_client + i] = publish(b, cost == &point && i % 2 ? other_point : *cost);
+        require(tasks[per_client - 1].op_id - a.rob().flush_id() > 1,
+                "uniform wide-rank control never armed");
+        ExReorderScreen screen(tasks, Capacity);
+        for (const Task& task : tasks) {
+            const uint32_t flags = task.client->rob().at(task.op_id).spec->flags;
+            require(screen.prefetch(flags), "uniform ordinary prefetch was suppressed");
+        }
+        require(!screen.mixed(), "uniform batch entered scheduler branch");
+        const std::vector<Task> expected(tasks, tasks + Capacity);
+        const ReorderResult result = ex_schedule_batch(tasks, Capacity);
+        require(result.multi_client_runs == 0 && result.permuted_runs == 0,
+                "uniform batch sampled ranks/dependencies");
+        verify(tasks, expected, false);
+        retire_all(a);
+        retire_all(b);
+
+        // An absent live predecessor can widen cost after admission, but cannot admit a batch.
+        (void)publish(a, *cost);
+        (void)publish(a, *cost);
+        tasks[0] = publish(a, *cost, true);
+        tasks[1] = publish(b, *cost);
+        ExReorderScreen hidden(tasks, 2);
+        require(hidden.prefetch(cost->flags) && hidden.prefetch(cost->flags) && !hidden.mixed(),
+                "hidden predecessor manufactured a static class mix");
+        verify(tasks, {tasks[0], tasks[1]}, false);
+        retire_all(a);
+        retire_all(b);
+    }
+    std::printf("  R2 uniform: capacity %zu, all classes, wide ranks, hidden heads and hazards\n", Capacity);
+}
+
+void screen_controls() {
+    Client a(-1), b(-1), c(-1);
+    Task tasks[kGenthreadExBatchOps];
+    tasks[0] = publish(a, long_op);
+    tasks[1] = publish(b, point);
+    ExReorderScreen mixed(tasks, 2);
+    require(mixed.prefetch(long_op.flags) && !mixed.mixed(), "first class triggered scheduling");
+    require(mixed.prefetch(point.flags) && mixed.mixed(), "mixed classes never triggered scheduling");
+    require(!mixed.prefetch(CmdFlags::CursorShard | point.flags), "cursor prefetch lost its barrier");
+    require(!mixed.prefetch(CmdFlags::RandomShard | point.flags), "random prefetch lost its barrier");
+    require(mixed.prefetch(long_op.flags), "screen stopped prefetching after the trigger");
+    retire_all(a);
+    retire_all(b);
+
+    // A special first task must not be mistaken for a Point command or dereferenced as an Op.
+    tasks[0] = Task(nullptr, UINT64_MAX, -1, nullptr);
+    tasks[1] = publish(a, small);
+    tasks[2] = publish(b, small);
+    ExReorderScreen special(tasks, 3);
+    require(special.prefetch(small.flags) && special.prefetch(small.flags) && !special.mixed(),
+            "null-client barrier manufactured a mix");
+    tasks[0] = Task(&c, UINT64_MAX, -1, reinterpret_cast<ScatterState*>(&c));
+    ExReorderScreen scatter(tasks, 3);
+    require(scatter.prefetch(small.flags) && !scatter.mixed(), "scatter was used as a class seed");
+    retire_all(a);
+    retire_all(b);
+
+    // The batch as a whole mixes classes; its separate eligible runs do not. A wide rank
+    // spread on the uniform prefix would be enough to sort if the inner-run guard were lost.
+    tasks[0] = publish(a, point);
+    tasks[1] = publish(a, point);
+    tasks[2] = publish(a, point);
+    tasks[3] = publish(b, point);
+    tasks[4] = publish(c, admin);
+    tasks[5] = publish(c, long_op);
+    const ReorderResult split = ex_schedule_batch(tasks, 6);
+    require(split.multi_client_runs == 0 && split.permuted_runs == 0,
+            "class mix across a barrier armed a uniform run");
+    retire_all(a);
+    retire_all(b);
+    retire_all(c);
+    std::puts("  R2 screen: mixed witness, special/scatter seeds, prefetch barriers and uniform runs");
+}
 }  // namespace
 
 int main() {
@@ -264,6 +362,9 @@ int main() {
     barriers<kGenthreadPipelineExBatchOps>();
     fifo_controls();
     hidden_predecessors();
+    uniform_controls<kGenthreadExBatchOps>();
+    uniform_controls<kGenthreadPipelineExBatchOps>();
+    screen_controls();
     require(permutations == 175, "a required positive case silently disappeared");
     std::printf("reorder battery: PASS, %u witnessed permutations, max batch 128\n", permutations);
 }

@@ -121,7 +121,8 @@ CommandLengthClass command_length_class_for(const CommandSpec& spec, bool read_l
 
 HotCommandSpecs g_hot_command_specs;
 
-bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_armed) {
+bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_armed,
+                           bool reorder_armed) {
     if (g_registry.built) return true;
     const CommandTable families[] = {
         string_command_table(), hash_command_table(), hash_ttl_command_table(),
@@ -180,6 +181,13 @@ bool command_registry_init(bool tls_enabled, bool fused_mode, bool read_local_ar
         g_registry.slots.clear();
         return false;
     }
+
+    // The existing static byte remains available to command metadata and the shared scope
+    // instrument in either arm. Only reorder=1 needs the mirror in flags: keep its boot walk
+    // and stamping behind one enable test as well as keeping the execution screen disarmed.
+    if (reorder_armed)
+        for (CommandSpec& entry : g_registry.entries)
+            entry.set_length_class(command_length_class(entry));
 
     try {
         g_registry.notify_entries = g_registry.entries;

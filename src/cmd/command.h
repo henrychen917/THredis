@@ -111,6 +111,17 @@ struct CmdFlags {
     // IoLoop's cold timer list. This bit does not make DEBUG generally deferred: all other DEBUG
     // subcommands retain their synchronous control-plane path.
     static constexpr uint32_t DebugSleep = 1u << 27;
+
+    // Registry-internal one-hot copy of the static cost class, stamped only with reorder armed.
+    // The executor already tests this
+    // flags word while prefetching: including the other classes in that test screens a batch
+    // without a second Op/spec walk or a per-operation class accumulator. No public flag is
+    // serialized from these bits, and neither CommandSpec nor any queued Task grows.
+    static constexpr uint32_t ReorderPoint = 1u << 28;
+    static constexpr uint32_t ReorderClasses = 7u << 28;
+    static constexpr uint32_t ReorderBarrier =
+        Admin | ConnLocal | AllShards | RandomShard | CursorShard | ConfigRoute | ScriptRoute |
+        PubSub | Blocking | Transaction | StreamRoute | SubcmdRoute | FlipAsync;
 };
 
 using CmdHandler = void (*)(Shard&, Op&);
@@ -153,6 +164,13 @@ struct CommandSpec {
           key_step(key_step_),
           handler_notify(handler_notify_ ? handler_notify_ :
                          (handler_ == cmd_xshard_only ? cmd_xshard_only_notify : handler_)) {}
+
+    constexpr void set_length_class(CommandLengthClass length) {
+        length_class = static_cast<uint8_t>(length);
+        flags &= ~CmdFlags::ReorderClasses;
+        if (!(flags & CmdFlags::ReorderBarrier))
+            flags |= CmdFlags::ReorderPoint << length_class;
+    }
 };
 
 // 48 = the ACL audit's measured 40 plus the notify v2 handler_notify tail pointer. Registry rows
@@ -229,7 +247,7 @@ CommandTable pfdebug_command_table();
 // Built once before threads start. Lookup hashes the uppercase-normalized bytes into an open-
 // addressed table; the load factor is capped at 1/2 so ordinary command names land in one probe.
 bool command_registry_init(bool tls_enabled, bool fused_mode = false,
-                           bool read_local_armed = false);
+                           bool read_local_armed = false, bool reorder_armed = false);
 
 // Clean registry rows for the verbs command_lookup resolves inline. command_registry_init stamps
 // them from the same rows the hash table indexes and re-checks the two against each other; they

@@ -2007,10 +2007,7 @@ private:
         auto execute_batch = [&] {
             if (!held) return;
             if (!filler_used && xshard_retries_.empty()) {
-                if (__builtin_expect(reorder_enabled_, false))
-                    srv_->mode_schedule_stats(self_->id()).note_reorder(
-                        held, ex_schedule_batch(batch, held));
-                prefetch_exec_batch(batch, held);
+                prefetch_and_reorder_batch(batch, held);
                 filler();
                 filler_used = true;
                 exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
@@ -2381,7 +2378,15 @@ private:
 
     // Prefetch the whole batch's slots, THEN execute. Issuing the loads up front lets their DRAM
     // round trips overlap instead of each op stalling on its own miss in turn.
-    void prefetch_exec_batch(const Task* batch, uint32_t n) {
+    template <bool ScreenReorder = false>
+    bool prefetch_exec_batch(const Task* batch, uint32_t n) {
+        // In the disabled instantiation this object and its first-class lookup do not exist.
+        // The armed uniform arm reuses the original per-task flag test with a different mask.
+        using Screen = std::conditional_t<ScreenReorder, ExReorderScreen, std::nullptr_t>;
+        [[maybe_unused]] Screen screen = [&] {
+            if constexpr (ScreenReorder) return ExReorderScreen(batch, n);
+            else return nullptr;
+        }();
         for (uint32_t i = 0; i < n; i++) {
             if (!batch[i].client) continue;
             const Op& op = batch[i].client->rob().at(batch[i].op_id);
@@ -2390,9 +2395,32 @@ private:
             // order as pipelined E1. A route can go stale after enqueue; even a prefetch through
             // the old FlatStore is formally an ownership violation under TSAN's model.
             if (shard >= 0 && !batch[i].scatter &&
-                srv_->worker_of_shard(shard) == self_->id() &&
-                !(op.spec->flags & (CmdFlags::CursorShard | CmdFlags::RandomShard)))
-                srv_->shard(shard).store().prefetch(op.hash);
+                srv_->worker_of_shard(shard) == self_->id()) {
+                const uint32_t flags = op.spec->flags;
+                if constexpr (ScreenReorder) {
+                    if (screen.prefetch(flags)) srv_->shard(shard).store().prefetch(op.hash);
+                } else {
+                    if (!(flags & ExReorderScreen::kPrefetchSkip))
+                        srv_->shard(shard).store().prefetch(op.hash);
+                }
+            }
+        }
+        if constexpr (ScreenReorder) return screen.mixed();
+        else return false;
+    }
+
+    template <size_t BatchOps>
+    void prefetch_and_reorder_batch(Task (&batch)[BatchOps], uint32_t n) {
+        if (__builtin_expect(reorder_enabled_ && n > 1, false)) {
+            // All hints still precede execution and each bucket is hinted once. Screening at
+            // this existing walk removes the scheduler's separate class scan from uniform
+            // batches. Stale routes excluded by prefetch need no scheduling on this owner;
+            // execute still forwards them before any store access. No filler or execution is
+            // moved across this boundary. Only mixed batches touch the scheduler/stats sidecar.
+            if (__builtin_expect(prefetch_exec_batch<true>(batch, n), false))
+                srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
+        } else {
+            prefetch_exec_batch(batch, n);
         }
     }
 
@@ -2473,15 +2501,13 @@ private:
     // micro-stage.
     template <bool IofusedPrivateQueue = false, size_t BatchOps>
     void exec_batch(Task (&batch)[BatchOps], uint32_t n) {
-        // Deferral first (skip wasted prefetch on the rare retry path), then the opt-in
-        // reorder BEFORE prefetch so prefetch order matches execution order.
+        // Deferral first, then one prefetch pass which also screens armed batches for a static
+        // cost mix. A uniform batch never calls the scheduler, regardless of its ROB ranks.
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
         }
-        if (__builtin_expect(reorder_enabled_, false))
-            srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
-        prefetch_exec_batch(batch, n);
+        prefetch_and_reorder_batch(batch, n);
         exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
 
