@@ -412,8 +412,11 @@ row_begin(){
   # 0.42s), so a history-derived budget kills every genuine measurement at 30s -- three overnight
   # rounds on 2026-09-13 died exactly that way. The row only reports now; give it the full-matrix
   # budget unconditionally rather than one derived from its own failures.
-  if [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ]; then
-    ROW_TIMEOUT=43200; ROW_BASIS=no-history-full-matrix-conservative-default
+  # An EXPLICIT plan entry (basis != own-row-history) is honoured -- that is how the timeout
+  # self-test drives this row with a 0.3s budget. Only a HISTORY-derived budget is overridden,
+  # because the row's history is instant aborts and would kill every real measurement.
+  if [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ] && [ "$ROW_BASIS" = own-row-history ]; then
+    ROW_TIMEOUT=43200; ROW_BASIS=abba-full-matrix-not-history
   fi
   ROW_MARKER="$TMPDIR/row-timeout-$BASHPID.json"
   rm -f "$ROW_MARKER"
