@@ -38,6 +38,7 @@
 #include <vector>
 #include "shard.h"
 #include "signal.h"
+#include "read_local_observe.h"
 #include "../net/rob.h"     // ReadLocalArmStats: the armed lane's cold arm-on-demand counters
 #include "flipctl.h"
 #include "pubsub_event.h"
@@ -298,12 +299,16 @@ struct ReadLocalThreadState {
     // Published only on actual reader-loop entry/exit, including FLIP. INFO must distinguish
     // an enabled boot knob from a live parser/executor lane. No per-operation publication.
     std::atomic<bool> lane_active{false};
+    // Appended to the optional allocation: the publication and existing counters keep their
+    // offsets, all locked layouts stay fixed, and read-local=0 allocates no observation state.
+    ReadLocalObservation observation{};
 };
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
 static_assert(offsetof(ReadLocalThreadState, lane_active) == 376,
               "resize retirement adds two cold sink hooks to the optional sidecar");
-static_assert(sizeof(ReadLocalThreadState) == 384,
-              "resize retirement grows only the armed sidecar by 16 bytes, never ThreadCtx");
+static_assert(offsetof(ReadLocalThreadState, observation) == 384);
+static_assert(sizeof(ReadLocalThreadState) == 576,
+              "observation adds 192 bytes only to the armed sidecar, never ThreadCtx");
 #endif
 
 class ThreadCtx {
@@ -456,6 +461,14 @@ public:
     const ReadLocalStats& read_local_stats() const {
         if (!read_local_state_) std::abort();
         return read_local_state_->stats;
+    }
+    ReadLocalObservation& read_local_observation() {
+        if (!read_local_state_) std::abort();
+        return read_local_state_->observation;
+    }
+    const ReadLocalObservation& read_local_observation() const {
+        if (!read_local_state_) std::abort();
+        return read_local_state_->observation;
     }
     // Owner-local: counts how often a whole-owner walker (KEYS / exact DBSIZE / FLUSH) was held
     // behind an older same-connection task parked on this shard.  It is the fired-mechanism proof
@@ -843,6 +856,7 @@ public:
     // controller compares like with like — the failure mode behind every balancer defect in the
     // fork was comparing two quantities that were not the same kind of thing.
     LoopSignals& sig() { return sig_; }
+    const LoopSignals& sig() const { return sig_; }
 
     // IO-only INFO surface. Published for each IO tenure when IoLoop binds its send engine; INFO then
     // sums the engine's single-writer counters with the same exceptional cross-thread read shape

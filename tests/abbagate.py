@@ -930,6 +930,102 @@ def info(conn, section):
     return dict(line.split(":", 1) for line in raw.decode().splitlines() if ":" in line)
 
 
+def read_local_endpoint(conn):
+    """Recording only, outside the central rate/perf interval; keep the raw endpoint."""
+    started = time.monotonic()
+    raw = info(conn, "read_local")
+    return dict(raw=raw, read_started_monotonic=started, read_finished_monotonic=time.monotonic())
+
+
+def read_local_between(before, after):
+    """Lifetime counters and histogram DELTAS, with placement gauges at both endpoints.
+
+    Old references have no section: unavailable is not zero hits or an empty histogram.
+    Malformed/reset telemetry remains explicit diagnostic evidence and cannot change rate,
+    saturation, thresholds, accounting or a verdict. Histogram buckets are noncumulative;
+    bytes cover sampled RESP replies only. These are independent counter snapshots, so a
+    concurrently published sample can straddle fields. Never repair their sums or extrapolate.
+    """
+    result = dict(schema=1, decision_input=False, status="UNAVAILABLE")
+    if not before["raw"] or not after["raw"]:
+        result["reason"] = "INFO read_local unavailable at one or both endpoints"
+        return result
+    try:
+        def number(raw):
+            if not isinstance(raw, str) or not re.fullmatch(r"[0-9]+", raw):
+                raise ValueError(f"invalid unsigned read-local counter: {raw!r}")
+            return int(raw)
+
+        def parse(endpoint):
+            raw = endpoint["raw"]
+            if raw["read_local_schema"] != "1":
+                raise ValueError("unsupported read-local schema")
+            bounds = raw["read_local_latency_bucket_upper_ns"].split(",")
+            if bounds != ["128", "256", "512", "1024", "2048", "4096", "16384", "65536", "inf"]:
+                raise ValueError("unsupported read-local histogram bounds")
+            def histogram(value):
+                values = [number(x) for x in value.split(",")]
+                if len(values) != len(bounds):
+                    raise ValueError("read-local histogram bucket count differs")
+                return values
+            counters = {name: number(raw["read_local_" + name]) for name in (
+                "hits_total", "misses_total", "arms_total", "sampled_hits", "sampled_reply_bytes",
+                "sampled_service_ns", "sampled_mget_hits", "uncommitted_samples")}
+            threads = {}
+            for key, value in raw.items():
+                match = re.fullmatch(r"read_local_thread_([0-9]+)_observation", key)
+                if match:
+                    tid = match[1]
+                    fields = dict(item.split("=", 1) for item in value.split(","))
+                    row = {name: number(fields[name]) for name in (
+                        "role", "active", "shards", "connections", "accepts", "hits", "misses",
+                        "arms", "write_ring_sidecars", "sampled_hits", "sampled_reply_bytes",
+                        "sampled_service_ns", "sampled_mget_hits", "uncommitted_samples",
+                        "defer_quota", "defer_lane_full", "mget_generation_retries")}
+                    row["histogram"] = histogram(raw[f"read_local_thread_{tid}_latency_histogram"])
+                    threads[tid] = row
+            if set(threads) != {str(tid) for tid in range(number(raw["read_local_threads"]))}:
+                raise ValueError("read-local thread rows missing or extra")
+            return dict(counters=counters, threads=threads,
+                        histogram=histogram(raw["read_local_latency_histogram"]))
+
+        first, last = parse(before), parse(after)
+        metadata = result["metadata"] = {}
+        for name in ("schema", "enabled", "counter_scope", "snapshot_scope", "misses_scope",
+                     "bytes_scope", "sample_period_ms", "latency_scope", "latency_bucket_upper_ns"):
+            key = "read_local_" + name
+            if before["raw"][key] != after["raw"][key]:
+                raise ValueError(f"read-local metadata changed: {name}")
+            metadata[name] = before["raw"][key]
+        if metadata["enabled"] not in ("0", "1") or metadata["counter_scope"] != "lifetime":
+            raise ValueError("invalid read-local enabled/scope metadata")
+        if first["threads"].keys() != last["threads"].keys():
+            raise ValueError("read-local thread set changed")
+        def delta(a, b):
+            if b < a:
+                raise ValueError("read-local counter decreased")
+            return b - a
+        def histogram_delta(a, b):
+            return [delta(x, y) for x, y in zip(a, b)]
+        result["deltas"] = {key: delta(value, last["counters"][key])
+                            for key, value in first["counters"].items()}
+        result["histogram"] = histogram_delta(first["histogram"], last["histogram"])
+        gauges = ("role", "active", "shards", "connections")
+        result["threads"] = {}
+        for tid, a in first["threads"].items():
+            b = last["threads"][tid]
+            result["threads"][tid] = dict(
+                before={key: a[key] for key in gauges}, after={key: b[key] for key in gauges},
+                deltas={key: delta(value, b[key]) for key, value in a.items()
+                        if key not in (*gauges, "histogram")},
+                histogram=histogram_delta(a["histogram"], b["histogram"]))
+        result["window_seconds"] = after["read_finished_monotonic"] - before["read_finished_monotonic"]
+        result["status"] = "COMPLETE"
+    except (KeyError, TypeError, ValueError) as error:
+        result.update(status="INVALID", reason=str(error))
+    return result
+
+
 def cpu_seconds(pid):
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
@@ -1255,6 +1351,7 @@ class Runner:
             result["thread_roles"] = roles
             before_mode = info(conn, "server") if cell.op == "REORDER" else {}
             before_commands = info(conn, "commandstats")
+            result["read_local_before"] = read_local_endpoint(conn)
             # The added /proc reads lie OUTSIDE the unchanged central stats/timer window.
             # Save each raw endpoint immediately so an exit/reset preserves partial evidence.
             generator_cpu = result["generator_cpu"] = {
@@ -1304,6 +1401,14 @@ class Runner:
             after_lb_at = time.monotonic()
             after_commands = info(conn, "commandstats")
             after_mode = info(conn, "server") if cell.op == "REORDER" else {}
+            result["read_local_after"] = read_local_endpoint(conn)
+            observation = result["read_local"] = read_local_between(
+                result["read_local_before"], result["read_local_after"])
+            observation.update(central_start_monotonic=t0, central_end_monotonic=t1)
+            recorded = observation if observation["status"] == "COMPLETE" else {}
+            result.update(read_local_hits=recorded.get("deltas", {}).get("hits_total"),
+                          read_local_misses=recorded.get("deltas", {}).get("misses_total"),
+                          read_local_histogram=recorded.get("histogram"))
             if any(p.poll() is not None for p in generators):
                 raise RuntimeError(f"load generator ended inside the {window}-second window")
             if int(info(conn, "clients")["connected_clients"]) != cell.conns + 1:
@@ -1880,6 +1985,70 @@ def self_test():
             self.quiet_factory = patcher.start()
             self.addCleanup(patcher.stop)
 
+        @staticmethod
+        def read_local_fixture(count, *, clients=4, role=2, enabled=1):
+            raw = {"read_local_schema": "1", "read_local_enabled": str(enabled),
+                   "read_local_counter_scope": "lifetime", "read_local_snapshot_scope": "independent_counters",
+                   "read_local_misses_scope": "command_fallbacks_not_keyspace_misses",
+                   "read_local_bytes_scope": "sampled_resp_replies", "read_local_sample_period_ms": "1",
+                   "read_local_latency_scope": "sampled_prepare_local_read_ns",
+                   "read_local_latency_bucket_upper_ns": "128,256,512,1024,2048,4096,16384,65536,inf",
+                   "read_local_threads": "1"}
+            counters = dict(hits_total=count * 100, misses_total=count * 2, arms_total=4,
+                            sampled_hits=count, sampled_reply_bytes=count * 71,
+                            sampled_service_ns=count * 100, sampled_mget_hits=0, uncommitted_samples=0)
+            raw.update({"read_local_" + key: str(value) for key, value in counters.items()})
+            row = dict(role=role, active=enabled, shards=16, connections=clients, accepts=4,
+                       hits=counters["hits_total"], misses=counters["misses_total"], arms=4, write_ring_sidecars=0,
+                       defer_quota=0, defer_lane_full=0, mget_generation_retries=0,
+                       **{key: value for key, value in counters.items() if not key.endswith("_total")})
+            raw["read_local_thread_0_observation"] = ",".join(f"{key}={value}" for key, value in row.items())
+            raw["read_local_latency_histogram"] = raw["read_local_thread_0_latency_histogram"] = ",".join(
+                map(str, [count] + [0] * 8))
+            return dict(raw=raw, read_started_monotonic=count, read_finished_monotonic=count + .01)
+
+        def test_read_local_records_deltas_and_preserves_placement_gauges(self):
+            before = self.read_local_fixture(100)
+            after = self.read_local_fixture(120, clients=1, role=1)
+            record = read_local_between(before, after)
+            self.assertEqual(record["status"], "COMPLETE")
+            self.assertFalse(record["decision_input"])
+            self.assertEqual(record["deltas"]["hits_total"], 2000)
+            self.assertEqual(record["deltas"]["misses_total"], 40)
+            self.assertEqual(record["deltas"]["sampled_reply_bytes"], 1420)
+            self.assertEqual(record["histogram"], [20] + [0] * 8)
+            thread = record["threads"]["0"]
+            self.assertEqual(thread["before"]["connections"], 4)
+            self.assertEqual(thread["after"]["connections"], 1)
+            self.assertEqual(thread["after"]["role"], 1)
+            self.assertEqual(thread["deltas"]["arms"], 0)  # already armed before WINDOW
+            self.assertAlmostEqual(record["window_seconds"], 20)
+            # Reporting has no authority to repair a sample split across independently read fields.
+            after["raw"]["read_local_sampled_hits"] = "121"
+            self.assertEqual(read_local_between(before, after)["deltas"]["sampled_hits"], 21)
+            self.assertEqual(read_local_between(before, after)["histogram"][0], 20)
+
+        def test_read_local_unavailable_and_corrupt_are_never_zero_evidence(self):
+            before = self.read_local_fixture(100)
+            record = read_local_between({"raw": {}}, before)
+            self.assertEqual(record["status"], "UNAVAILABLE")
+            self.assertNotIn("deltas", record)
+            for key, value in (("read_local_hits_total", "9999"), ("read_local_misses_total", "-1"),
+                               ("read_local_latency_histogram", "0"), ("read_local_schema", "2"),
+                               ("read_local_thread_0_latency_histogram", ",".join(["0"] * 9))):
+                with self.subTest(key=key):
+                    after = self.read_local_fixture(120)
+                    after["raw"][key] = value
+                    record = read_local_between(before, after)
+                    self.assertEqual(record["status"], "INVALID")
+                    self.assertFalse(record["decision_input"])
+            after = self.read_local_fixture(120)
+            del after["raw"]["read_local_thread_0_observation"]
+            self.assertEqual(read_local_between(before, after)["status"], "INVALID")
+            # Disabled telemetry is available, as distinct from an old binary with no section.
+            off = self.read_local_fixture(0, enabled=0)
+            self.assertEqual(read_local_between(off, off)["deltas"]["sampled_hits"], 0)
+
         def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
             from itertools import product
             cells = read_cells(ROOT / "tests/headline_cells.txt")
@@ -2163,6 +2332,9 @@ def self_test():
                     children = SimpleNamespace(start=start, stop=lambda process: stopped.append(process.pid))
                     conn = SimpleNamespace(must=lambda *args: [args[-1].encode(), b"1"], close=lambda: None)
                     def snapshot(_conn, section):
+                        if section == "read_local":
+                            events.append(("read-local", phase["window"]))
+                            return self.read_local_fixture(120 if phase["window"] == 2 else 100)["raw"]
                         if section == "server":
                             return {"process_id": "123", "read_local": str(cell.read_local)}
                         if section == "clients":
@@ -2328,6 +2500,15 @@ def self_test():
                         self.assertIn("whole_run_commandstats_after", retained)
                         self.assertEqual(len(retained["memtier"]), 2)
                         self.assertEqual(cpu["status"], "COMPLETE")
+                        self.assertEqual(retained["read_local_hits"], 2000)
+                        self.assertEqual(retained["read_local_misses"], 40)
+                        self.assertEqual(retained["read_local_histogram"], [20] + [0] * 8)
+                        self.assertEqual([event for event in events if isinstance(event, tuple)
+                                          and event[0] == "read-local"], [("read-local", 1), ("read-local", 2)])
+                        self.assertLessEqual(retained["read_local_before"]["read_finished_monotonic"],
+                                             cpu["central_start_monotonic"])
+                        self.assertGreaterEqual(retained["read_local_after"]["read_started_monotonic"],
+                                                cpu["central_end_monotonic"])
                         self.assertEqual([event for event in events if isinstance(event, tuple) and event[0] == "generator-cpu"],
                                          [("generator-cpu", 1, 124), ("generator-cpu", 1, 125),
                                           ("generator-cpu", 2, 124), ("generator-cpu", 2, 125)])

@@ -1417,11 +1417,21 @@ private:
             return 0;
         } else {
             if (!read_local_enabled() || !op_budget) return 0;
+            if (read_local_impl().lane_count &&
+                self_->read_local_observation().last_sample_ms != cached_now_ms_)
+                return drain_local_reads_observed<YieldToOwner>(op_budget);
             return drain_local_reads_bounded_impl<YieldToOwner>(op_budget);
         }
     }
 
     template <bool YieldToOwner>
+    __attribute__((noinline))
+    uint32_t drain_local_reads_observed(uint32_t op_budget) {
+        self_->read_local_observation().last_sample_ms = cached_now_ms_;
+        return drain_local_reads_bounded_impl<YieldToOwner, true>(op_budget);
+    }
+
+    template <bool YieldToOwner, bool Observe = false>
     uint32_t drain_local_reads_bounded_impl(uint32_t op_budget) {
         static_assert(Fused);
         auto& lane = read_local_impl();
@@ -1496,6 +1506,10 @@ private:
                 count++;
             }
             if (!count) std::abort();
+            ReadLocalObservation::Sample sample;
+            if constexpr (Observe)
+                if (!consumed)
+                    sample.index = self_->read_local_observation().choose(count, self_->id());
             consumed += count;
 
             // Pure point chunks retain the widest I0/C0/E0 overlap. A mixed chunk captures and
@@ -1545,11 +1559,22 @@ private:
                 }
                 if (chunk.fallbacks[i] == ReadLocalFallbackReason::None) {
                     PreparedLocalRead prepared;
+                    uint64_t sample_started = 0;
+                    if constexpr (Observe)
+                        if (i == sample.index) sample_started = now_ns();
                     if (point_capture_batch) {
                         prepared = prepare_local_read(
                             op, chunk.stores[i], false, &captures.entries[i]);
                     } else {
                         prepared = prepare_local_read(op, chunk.stores[i], mget);
+                    }
+                    if constexpr (Observe) {
+                        if (i == sample.index) {
+                            sample.elapsed_ns = now_ns() - sample_started;
+                            sample.bytes = op.direct_len + op.reply.size();
+                            sample.prepared = true;
+                            sample.mget = mget;
+                        }
                     }
                     chunk.fallbacks[i] = prepared.fallback;
                     if (first_fallback == count &&
@@ -1565,6 +1590,11 @@ private:
                 if (chunk.fallbacks[i] != ReadLocalFallbackReason::None &&
                     first_fallback == count) first_fallback = i;
             }
+
+            // Keep sample publication OUTSIDE the completion lambda: even a discarded constexpr
+            // arm can add captures to its closure and stores to the ordinary drain's stack.
+            if constexpr (Observe)
+                self_->read_local_observation().record(sample, first_fallback);
 
             // Completion is chunk-aggregated: one pending-mask clear, one demand release and one
             // add per statistic instead of six read-modify-writes per op; the prefix accumulators

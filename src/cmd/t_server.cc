@@ -1744,6 +1744,13 @@ void cmd_flip(Shard&, Op& op) {
 
 void cmd_info(Shard&, Op& op) {
     std::string body;
+    // The lane's observation request needs no shard/command-stat scan or RESETSTAT baseline.
+    // Keep it cheap enough to take endpoints around a benchmark window without perturbing it.
+    if (g_server && op.argc() == 2 && eq_icase(op.arg(1), "read_local")) {
+        append_read_local_observation_info(body, *g_server);
+        reply_verbatim(op.sink(), Slice(body.data(), body.size()), "txt", op.resp3());
+        return;
+    }
     uint64_t keys = 0, expires = 0, obj_bytes = 0, hits = 0, misses = 0, expired = 0,
              evicted = 0, keyspace_rehashes = 0, active_expire_reap_lag_ms_max = 0;
     uint64_t total_ops = 0, sampled_ops = 0, connections = 0, rejected = 0;
@@ -2755,6 +2762,8 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(keys), static_cast<unsigned long long>(expires));
     }
     if (g_server && info_section(op, "LB", false)) lbsignals_info_section(*g_server, body);
+    if (g_server && info_section(op, "READ_LOCAL", false))
+        append_read_local_observation_info(body, *g_server);
     reply_verbatim(op.sink(), Slice(body.data(), body.size()), "txt", op.resp3());
 }
 
