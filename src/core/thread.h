@@ -1163,11 +1163,14 @@ private:
     std::unique_ptr<TransferChan[]> transfer_in_;
     std::unique_ptr<uint64_t[]> command_counts_;
     uint32_t command_count_size_ = 0;
-    uint64_t total_commands_ = 0;
+    // Peer producers read the transport pointers on this line when posting work. Candidate 1
+    // exchanges two equal-sized counters so ordinary command accounting no longer writes that
+    // line. Scan holds still write it on their rare path; keep their accounting unchanged.
+    uint64_t atomic_scan_holds_ = 0;
     FlipFingerprintWriter flip_fingerprint_;
     uint64_t atomic_groups_ = 0;
     uint64_t atomic_localfast_ = 0;
-    uint64_t atomic_scan_holds_ = 0;
+    uint64_t total_commands_ = 0;
     AtomicAdmissionState atomic_admission_state_;
     ReadyMask  ready_;                     // as a sender: which of my clients completed work
     std::vector<Client*>  slots_;          // slot -> client, sender-owned
