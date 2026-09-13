@@ -24,9 +24,6 @@ import abbagate as abba
 WINDOW = 10
 
 
-PLATEAU_TOLERANCE_PCT = abba.PLATEAU_TOLERANCE_PCT
-
-
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -69,24 +66,16 @@ def select_calibration_floor(cell, rounds):
         rows.append(dict(instances=n, rate=run["rate"], worker_threads=workers,
                          assigned_cpus=assigned, saturation_pct=abba.saturation_score(run, cell)))
     selected = confirmation = None
-    if abba.saturation_exempt(cell):
+    if cell.depth == 1:
         selected = 0
     else:
         for index, (current, above) in enumerate(zip(rows, rows[1:])):
-            # "Non-increasing" needs a tolerance, or a flat plateau is a coin flip. h27 on
-            # 2026-09-12: n=4 30.07M, n=8 30.27M -- a +0.7% jitter on a plateau the instrument
-            # itself scores as saturated from n=4 -- read as "still climbing", and the search walked
-            # to the 16-instance ceiling and pinned nothing; the previous run of the same cell dipped
-            # 2% at n=8 and pinned at 4. The tolerance is the instrument's demonstrated rate error on
-            # IDENTICAL bytes, measured by two standing nulls (0.71%, and 0.6-1.0% across 15 cells),
-            # not a chosen number. A genuine climb is 100%+ per rung here and cannot hide inside it.
             if (current["saturation_pct"] >= abba.BUSY_FLOOR and
-                    above["worker_threads"] > current["worker_threads"] and
-                    above["rate"] < current["rate"] * (1 + PLATEAU_TOLERANCE_PCT / 100)):
+                    above["worker_threads"] > current["worker_threads"] and above["rate"] <= current["rate"]):
                 selected, confirmation = index, index + 1
                 break
     return dict(method="one-arm-observed-peak-v1", measurement_valid=True,
-        status="EXEMPT" if abba.saturation_exempt(cell) else "PIN" if selected is not None else "UNPROVEN",
+        status="EXEMPT" if cell.depth == 1 else "PIN" if selected is not None else "UNPROVEN",
         selected_index=selected, confirmation_index=confirmation,
         lowest_tested_qualifying_instances=rows[selected]["instances"] if selected is not None else None,
         confirmation_instances=rows[confirmation]["instances"] if confirmation is not None else None,
@@ -270,15 +259,9 @@ def self_test():
             self.assertEqual(fast["confirmation_instances"], 4)
 
         def test_unconfirmed_unsaturated_or_no_capacity_increase_cannot_pin(self):
-            # A rise at or beyond the measured plateau jitter (PLATEAU_TOLERANCE_PCT) is still a
-            # climb; a rise inside it is plateau noise and confirms the lower rung.
-            for rounds in ([self.block(1)], [self.block(1, 100), self.block(2, 102)],
-                           [self.block(1, 100), self.block(2, 100 * (1 + PLATEAU_TOLERANCE_PCT / 100))],
+            for rounds in ([self.block(1)], [self.block(1, 100), self.block(2, 101)],
                            [self.block(1, 100, 20), self.block(2, 99)]):
                 self.assertEqual(select_calibration_floor(self.cell, rounds)["status"], "UNPROVEN")
-            within = select_calibration_floor(self.cell, [self.block(1, 100), self.block(2, 100.5)])
-            self.assertEqual((within["status"], within["lowest_tested_qualifying_instances"],
-                              within["confirmation_instances"]), ("PIN", 1, 2))
             rounds = [self.block(1), self.block(2)]
             # Two generators with eight workers each do not add capacity to one
             # sixteen-worker generator, even though instance count increased.

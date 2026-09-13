@@ -7,8 +7,7 @@ import math
 import re
 
 from abba_instrument import validate_fingerprint
-from abba_saturation import (replay_saturation, require_saturation_window, SATURATION_FLOOR,
-                             RUN_SATURATION_MARGIN)
+from abba_saturation import replay_saturation, require_saturation_window, SATURATION_FLOOR
 
 ORDER = ["A", "B", "B", "A"]
 NULL_MAX_AGE = 24 * 60 * 60
@@ -83,19 +82,9 @@ def validate_quiet(quiet, environment, *, now, started, elapsed):
     require(screening.get("capacity_fraction") == .0015 and
             screening.get("server_physical_cores") == len(environment["server_physical"]),
             "quiet CPU screening policy or server core count changed")
-    # The budget is denominated in the cores the guard actually SAMPLED. sample() sums busy ticks
-    # over server AND load CPUs, so a server-only denominator judged 112 cores of idle noise against
-    # a 32-core allowance and refused every run by ~1% (2026-09-11). A record that states its
-    # sampled count must match server+load exactly; a legacy record without it is server-only.
-    sampled = screening.get("sampled_physical_cores")
-    if sampled is None:
-        sampled = len(environment["server_physical"])
-    else:
-        require(sampled == len(environment["server_physical"]) + len(environment["load_physical"]),
-                "quiet CPU screening sampled-core count differs from server+load")
     window = number(screening.get("window_seconds"), "quiet screening window", positive=True)
     budget = number(screening.get("cpu_budget_seconds"), "quiet CPU budget", positive=True)
-    require(math.isclose(budget, .0015 * sampled * window,
+    require(math.isclose(budget, .0015 * len(environment["server_physical"]) * window,
                          rel_tol=1e-12, abs_tol=0), "quiet CPU budget differs from its fixed policy")
     peak = screening.get("peak_rolling")
     require(isinstance(peak, dict) and
@@ -180,16 +169,9 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
         require(isinstance(assessment, dict), "invalid ABBA assessment")
         require(assessment.get("verdict") == "PASS" and assessment.get("reasons") == [],
                 f"unassessed/failed ABBA cell: {cell['id']}")
-        exempt = cell["depth"] == 1 or cell.get("score") == "p999"
-        require(assessment.get("saturation_exempt") is exempt, "invalid saturation exemption")
-        # A null-control run MEASURES the loss-vs-threshold discrepancy on identical bytes -- that
-        # discrepancy is the instrument's resolution, and enforcing it here would make the null
-        # unable to report the very thing it exists to report. Comparison runs store a threshold
-        # already floored by the standing null, so the check stays exact for them.
-        if report.get("run_kind") != "null-control":
-            require(signed_number(assessment.get("loss_pct"), "loss") <=
-                    number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
-        judged_occupancy = []
+        require(assessment.get("saturation_exempt") is (cell["depth"] == 1), "invalid saturation exemption")
+        require(signed_number(assessment.get("loss_pct"), "loss") <=
+                number(assessment.get("threshold_pct"), "threshold"), "cell loss exceeds its threshold")
         rounds = row.get("rounds", [])
         require(isinstance(rounds, list) and rounds and all(isinstance(block, dict) for block in rounds),
                 f"unreached ABBA cell: {cell['id']}")
@@ -213,24 +195,12 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
                     mode=cell["mode"], thread_count=len(environment["server_cpus"]))
                 central_saturation = require_saturation_window(saturation, run)
                 if cell["depth"] > 1 and block["instances"] == assessment["instances"]:
-                    # Per-RUN, so it reproduces the min() bias the assessment moved away from: a cell
-                    # sitting near the floor fails whenever any one of four samples dips under. The
-                    # occupancy of the judged block is collected here and checked once, against the
-                    # BLOCK MEAN, exactly as assess() does (t01, 2026-09-12: 94.24/95.35/95.39/95.21
-                    # on identical bytes, mean 95.05 vs a 95 floor).
-                    judged_occupancy.append(central_saturation)
+                    require(central_saturation["floor_met"], "judged block is below the productive-role floor")
                 require(type(run.get("pid")) is int and run["pid"] > 0, "measurement never booted a server")
                 if cell["op"] == "REORDER":
                     number(run.get("p999_ms"), "short p99.9", positive=True)
                     number(run.get("long_p999_ms"), "long p99.9", positive=True)
                 windows += run["window_seconds"]
-        if judged_occupancy:
-            scores = [number(x.get("score_pct"), "productive-role occupancy", positive=True)
-                      for x in judged_occupancy]
-            mean = sum(scores) / len(scores)
-            require(mean >= SATURATION_FLOOR and min(scores) >= SATURATION_FLOOR - RUN_SATURATION_MARGIN,
-                    f"{cell['id']}: judged block is below the productive-role floor "
-                    f"(mean {mean:.2f}%, worst {min(scores):.2f}%, floor {SATURATION_FLOOR:g}%)")
     require(qend - qstart >= windows, "quiet observer did not span all measurement windows")
     return started, environment
 
@@ -238,8 +208,9 @@ def validate_measurements(report, *, now, expected_source=None, expected_cells=N
 def null_resolution(report):
     """A byte-identical gain is instrument error just as a loss is.
 
-    Comparison assessments deliberately reject only regressions. A null records
-    BOTH signs of the paired delta against the measured spreads of both arms. Recompute from every raw block, including unselected escalation probes:
+    Comparison assessments deliberately reject only regressions. A null instead
+    requires BOTH signs of the paired delta to fit the same measured reference
+    spread. Recompute from every raw block, including unselected escalation probes:
     neither a cached PASS nor selecting another rung may hide a failed control.
     There is no new floor, multiplier, or change to a code comparison's threshold.
     The range of two reference samples is not a confidence or prediction bound:
@@ -262,18 +233,12 @@ def null_resolution(report):
                 denominator = number(a1 + a2, "null reference sum", positive=True)
                 delta = signed_number(100 * ((b1 - a1) + (b2 - a2)) / denominator, "null paired delta")
                 threshold = number(200 * abs(a1 - a2) / denominator, "null reference spread")
-                cand_denominator = number(b1 + b2, "null candidate sum", positive=True)
-                candidate_spread = number(200 * abs(b1 - b2) / cand_denominator, "null candidate spread")
-                # OWNER RULING (2026-09-11, item 7): the null MEASURES the instrument's resolution on
-                # identical bytes; it does not pass or fail on it. On this box a 15-cell null failed
-                # 10 cells against the flat rules -- paired deltas of 0.6-1.0% against thresholds of
-                # 0.2-0.6%, and p99.9 spreads of 3-7% against a flat 2% -- which means the rules
-                # claimed resolution the instrument does not have. Recording, not requiring, turns
-                # that into the per-cell floor a comparison must respect (see resolution_bounds).
+                require(abs(delta) <= threshold,
+                        f"{cell['id']} n={block['instances']} {scored} null resolution failed: "
+                        f"absolute paired delta {abs(delta):.6g}% (signed {delta:+.6g}%) "
+                        f"exceeds measured reference spread {threshold:.6g}%")
                 evidence.append(dict(cell=cell["id"], instances=block["instances"], metric=scored,
-                                     delta_pct=delta, absolute_delta_pct=abs(delta),
-                                     reference_spread_pct=threshold, candidate_spread_pct=candidate_spread,
-                                     within_reference_spread=abs(delta) <= threshold))
+                                     delta_pct=delta, absolute_delta_pct=abs(delta), reference_spread_pct=threshold))
     return evidence
 
 

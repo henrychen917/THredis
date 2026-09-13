@@ -252,7 +252,7 @@ python3 tests/gate_history.py prepare --history "$ROW_HISTORY" "${HISTORY_ARGS[@
 # negative control BEFORE the quick exit (quick +1, full +1) and the mandatory headline result
 # AFTER it (full +1). 418+1 = 419 quick; 467-32+2 = 437 full.
 EXPECT_QUICK=419
-EXPECT_FULL=436                 # ABBA row reports and is not counted; self-test row remains.
+EXPECT_FULL=437                 # full without the optional NIC row.
 say(){ printf '  %-52s %s\n' "$1" "$2"; }
 canonical_label(){ sed -E \
       -e 's/(direct|hits|records|skipped|suppressed|zc_sends)=[0-9]+/\1=N/g' \
@@ -408,15 +408,8 @@ row_begin(){
   # The whole ABBA matrix is a single historical gate row. Until it has exact
   # history, its conservative budget must accommodate the full escalation matrix.
   # This bound is not a license to accept partial results; ABBA still scores all cells.
-  # The ABBA row's recorded history is dominated by runs that aborted before measuring (median
-  # 0.42s), so a history-derived budget kills every genuine measurement at 30s -- three overnight
-  # rounds on 2026-09-13 died exactly that way. The row only reports now; give it the full-matrix
-  # budget unconditionally rather than one derived from its own failures.
-  # An EXPLICIT plan entry (basis != own-row-history) is honoured -- that is how the timeout
-  # self-test drives this row with a 0.3s budget. Only a HISTORY-derived budget is overridden,
-  # because the row's history is instant aborts and would kill every real measurement.
-  if [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ] && [ "$ROW_BASIS" = own-row-history ]; then
-    ROW_TIMEOUT=43200; ROW_BASIS=abba-full-matrix-not-history
+  if [ "$ROW_MEDIAN" = - ] && [ "$ROW_ID" = 'headline ABBA vs last pushed binary' ]; then
+    ROW_TIMEOUT=43200; ROW_BASIS=no-history-full-matrix-conservative-default
   fi
   ROW_MARKER="$TMPDIR/row-timeout-$BASHPID.json"
   rm -f "$ROW_MARKER"
@@ -2817,22 +2810,10 @@ ABBA_PID=$!
 wait "$ABBA_PID"
 ABBA_RC=$?
 ABBA_PID=0
-# ABBA REPORTS. CORRECTNESS GATES. (Owner ruling 2026-09-13: gate work stops here.)
-# The tier runs on every version and its per-cell numbers print above and land in results.json;
-# read them. It does not decide the gate, for two measured reasons:
-#   * its own per-row timeout is derived from the row's history, and that history is dominated by
-#     runs that aborted before measuring (median 0.42s) -- so every genuine measurement was killed
-#     at 30s. Three overnight rounds, three identical timeouts.
-#   * its calibrate -> import -> gate loop has not closed once in two days; one cell's failed
-#     calibration ("t01: failed calibration cell") declines the whole import, and the tier then
-#     searches every ladder from scratch, which no timeout budget survives.
-# Correctness (437 rows, 12 slots, ~9 min) has been green since 2026-09-12 and is what protects a
-# merge. Numbers you can trust to gate on again come from the read-local observability lane first
-# (SLOWLOG never sees lane reads; no read_local_hits are recorded), not from more tier machinery.
 case "$ABBA_RC" in
-  0) say "headline ABBA" "measured; no cell regressed (reporting only, not gating)";;
-  3) say "headline ABBA" "did not run (no reference / skipped); reporting only, not gating";;
-  *) say "headline ABBA" "measured; see per-cell numbers above and results.json (reporting only, not gating)";;
+  0) ok "headline ABBA vs last pushed binary";;
+  3) bad "headline ABBA vs last pushed binary" "no trusted comparison PASS (partial diagnostic or skipped); see ABBA output";;
+  *) bad "headline ABBA vs last pushed binary" "see ABBA output and results.json";;
 esac
 
 phase abba-end

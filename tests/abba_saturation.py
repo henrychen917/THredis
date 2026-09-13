@@ -11,12 +11,6 @@ import math
 from pathlib import Path
 
 SATURATION_FLOOR = 95.0
-# A SINGLE run may sit this far under the floor without condemning the block. Saturation is a
-# property of the block, judged by its mean; one sample below is scatter, not lost saturation.
-# Measured on identical bytes (t01, 1s + overlap, REORDER p8, 2026-09-12): occupancy 93.9-95.4%
-# around a 95.1% mean, i.e. ~1.5pp peak-to-trough on a cell whose occupancy does not rise with
-# load. 5pp is >3x that scatter and still unambiguously flags a genuinely idle run.
-RUN_SATURATION_MARGIN = 5.0
 
 
 @dataclass(frozen=True)

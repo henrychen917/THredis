@@ -193,7 +193,6 @@ class QuietMonitor:
             sample_artifact=str(self.sample_artifact) if self.sample_artifact else None,
             **({"cpu_activity": self.sample_events} if not self.sample_artifact else {}),
             generic_cpu_screening=dict(scope="preflight", server_physical_cores=self.server_physical_cores,
-                sampled_physical_cores=self.sampled_physical_cores,
                 capacity_fraction=BACKGROUND_CPU_FRACTION, window_seconds=self.window_seconds,
                 cpu_budget_seconds=self.cpu_budget_seconds, preflight_seconds=self.preflight_seconds,
                 peak_rolling=dict(cpu_ticks=self.preflight_cpu_ticks,

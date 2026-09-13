@@ -19,7 +19,7 @@ def saturation_record(mode="1s", score=99.9, threads=32, window_seconds=20, inac
 
 def quiet_record(*, cpus=tuple(range(128)), samples=2, started_at=0., finished_at=20.,
                  sample_artifact="/fake/quiet-samples.jsonl", ports=(8700,),
-                 server_physical_cores=32, window_seconds=20, sampled_physical_cores=None):
+                 server_physical_cores=32, window_seconds=20):
     """Selected-core evidence for serverless validators; no process inventory."""
     return dict(complete=True, interference=None, started_at=started_at, finished_at=finished_at,
         samples=samples, cpu_samples=samples, sample_interval_seconds=1,
@@ -27,6 +27,5 @@ def quiet_record(*, cpus=tuple(range(128)), samples=2, started_at=0., finished_a
         sample_artifact=str(sample_artifact), ports=list(ports), listener_checks=1,
         generic_cpu_screening=dict(scope="preflight", preflight_seconds=20., capacity_fraction=.0015,
             server_physical_cores=server_physical_cores, window_seconds=window_seconds,
-            **({"sampled_physical_cores": sampled_physical_cores} if sampled_physical_cores else {}),
-            cpu_budget_seconds=.0015 * (sampled_physical_cores or server_physical_cores) * window_seconds,
+            cpu_budget_seconds=.0015 * server_physical_cores * window_seconds,
             peak_rolling=dict(cpu_ticks=0, cpu_seconds=0.)))

@@ -73,8 +73,7 @@ from gateplan import validate_axes, read_topology, permitted_cpus, default_physi
 from gate_measurements import (load as load_measurements, ratio as measured_ratio,
                                apply_floor, configured_reference, instrument_digest)
 from gate_quiet import QuietMonitor, QuietViolation
-from abba_saturation import (RUN_SATURATION_MARGIN,
-                             parse_snapshot, productive_saturation, bottleneck_saturation,
+from abba_saturation import (parse_snapshot, productive_saturation, bottleneck_saturation,
                             replay_saturation, require_saturation_window, SATURATION_FLOOR,
                             self_test as saturation_self_test)
 from gate_receipt import harness_fingerprint, read_json
@@ -91,32 +90,6 @@ TAIL = 5
 KEYS = 2_000_000
 MIN_BUSY = 98.0        # the busy level we PREFER, and still record; no longer a hard gate
 BUSY_FLOOR = SATURATION_FLOOR  # productive-role occupancy; plateau remains independently required
-# Run-to-run scatter of one binary's own rate and occupancy on identical bytes, measured by the
-# standing nulls (0.71%; 0.6-1.0% across 15 cells). Used to decide when two saturated rungs are the
-# same plateau, and how far a single occupancy sample may sit under the floor before the block is
-# judged unsaturated. Lives here because load_calibration imports this module.
-PLATEAU_TOLERANCE_PCT = 1.0
-# Read-local cells above depth 1 run at this box's highest throughput (54-56 Mops/s on GET p32) and
-# repeat far less tightly than the rest: measured on IDENTICAL bytes, h11 4.56%, h31 4.62%,
-# h27 5.44%, h15 6.51%, against 0.08-1.8% for every non-read-local cell in the same run. Their
-# threshold floors here so the tier stops reporting its own scatter as a regression. The cost is
-# stated plainly: a real read-local regression smaller than this is not detectable by this cell,
-# and needs the multi-instance variance explained rather than a tighter number.
-READ_LOCAL_THRESHOLD_FLOOR_PCT = 5.0
-
-
-def saturation_exempt(cell):
-    """Cells whose verdict is a LATENCY, so an occupancy floor does not protect it.
-
-    The floor exists so a throughput regression cannot hide in server headroom. A tail-latency
-    verdict is not protected by it: p99.9 does not improve because the server is busier. Depth 1
-    was already exempt for this reason; the blocker-mix reorder cells need the same treatment and
-    for a stronger reason -- their workload DELIBERATELY idles the server on long commands, so they
-    sit at or under the floor by construction. Measured 2026-09-12 on identical bytes: t03 ran
-    92.0-96.4% occupancy across six rungs and could never pin, t01 95.4/95.5, t02 96.7/97.4,
-    t04 93.7-97.9. Requiring 95% of them asks the workload not to be what it is.
-    """
-    return cell.depth == 1 or cell.metric == "p999_ms"
 #
 # SATURATION IS ESTABLISHED BY A RATE PLATEAU, NOT BY A BUSY PERCENTAGE ALONE (owner ruling
 # 2026-09-10). Demanding >=98% busy in every run fails a candidate FOR BEING FASTER: a quicker
@@ -416,41 +389,7 @@ def saturation_score(run, cell):
     return require_saturation_window(evidence, run)["score_pct"]
 
 
-# A null run measures resolution and must not be vetoed by the flat rules it is measuring.
-NULL_MODE = "null-mode"
-
-
-def resolution_bounds(control, cell_id):
-    """Per-metric floors this cell earned from the standing null, or None without one.
-
-    spread     : the largest spread either arm showed on identical bytes -- the stability bound
-                 cannot honestly be tighter than what the same binary repeats to;
-    abs_delta  : the largest |paired delta| on identical bytes -- the threshold cannot honestly
-                 be tighter than the instrument's own between-arm error.
-    Both are MAXIMUMS over every block the null ran, so an unselected noisy probe still counts.
-    """
-    if not control:
-        return None
-    rows = [r for r in (control.get("null_control") or {}).get("resolution") or [] if r.get("cell") == cell_id]
-    if not rows:
-        return None
-    bounds = {}
-    for r in rows:
-        b = bounds.setdefault(r["metric"], {"spread": 0.0, "abs_delta": 0.0})
-        b["spread"] = max(b["spread"], r.get("reference_spread_pct", 0.0), r.get("candidate_spread_pct", 0.0))
-        b["abs_delta"] = max(b["abs_delta"], r.get("absolute_delta_pct", 0.0))
-    return bounds
-
-
-def spread_limit(metric, bounds):
-    if bounds is NULL_MODE:
-        return math.inf
-    if bounds and metric in bounds:
-        return max(MAX_SPREAD, bounds[metric]["spread"])
-    return MAX_SPREAD
-
-
-def load_block_evidence(cell, block, bounds=None):
+def load_block_evidence(cell, block):
     """Validate every measured block, including probes not selected for the comparison.
 
     A noisy probe must not certify a quieter neighbor. Keep its failure even if a later
@@ -466,10 +405,9 @@ def load_block_evidence(cell, block, bounds=None):
         metrics.append("long_p999_ms")
     for metric in dict.fromkeys(metrics):
         values = paired(runs, metric)
-        limit = spread_limit(metric, bounds)
         for arm in ("reference", "candidate"):
-            if values[f"{arm}_spread_pct"] > limit:
-                reasons.append(f"{arm} {metric} spread exceeds the project's {limit:g}% stability boundary")
+            if values[f"{arm}_spread_pct"] > MAX_SPREAD:
+                reasons.append(f"{arm} {metric} spread exceeds the project's {MAX_SPREAD:g}% stability boundary")
     if any(run.get("complete") is not True or run.get("error") for run in runs):
         reasons.append("incomplete or failed ABBA measurement")
     if any(run.get("instances") != n for run in runs):
@@ -512,7 +450,7 @@ def load_block_evidence(cell, block, bounds=None):
             "rate": rate, "worker_threads": workers, "load_layout": layout}
 
 
-def select_load_floor(cell, rounds, bounds=None):
+def select_load_floor(cell, rounds):
     """Choose the lowest TESTED stable plateau, with a larger worker-capacity probe.
 
     Compare each arm with itself at the next rung. Taking max(A,B) before comparing can
@@ -525,7 +463,7 @@ def select_load_floor(cell, rounds, bounds=None):
         raise ValueError("invalid load rung")
     if any(a["instances"] >= b["instances"] for a, b in zip(rounds, rounds[1:])):
         raise ValueError("load escalation must use increasing distinct rungs")
-    evidence = [load_block_evidence(cell, block, bounds) for block in rounds]
+    evidence = [load_block_evidence(cell, block) for block in rounds]
     invalid = [f"measurement n={row['instances']}: {reason}"
                for row in evidence for reason in row["validation_reasons"]]
     numerical_peak = peak_index(rounds)
@@ -536,7 +474,7 @@ def select_load_floor(cell, rounds, bounds=None):
     for index, current in enumerate(evidence):
         row = {**current, "rejection_reasons": list(current["validation_reasons"])}
         tested.append(row)
-        if saturation_exempt(cell) or pinned:
+        if cell.depth == 1 or pinned:
             if not invalid:
                 selected = index
             continue
@@ -572,7 +510,7 @@ def select_load_floor(cell, rounds, bounds=None):
     chosen = tested[selected] if selected is not None else None
     return {"method": "lowest-tested-confirmed-rung-v1", "measurement_valid": not invalid,
             "measurement_failures": invalid,
-            "status": "INVALID" if invalid else "EXEMPT" if saturation_exempt(cell) else
+            "status": "INVALID" if invalid else "EXEMPT" if cell.depth == 1 else
                       "PINNED" if pinned else "CONFIRMED" if chosen else "UNPROVEN",
             "selected_index": selected, "confirmation_index": confirmation,
             "lowest_tested_qualifying_instances": chosen["instances"] if chosen and not pinned and cell.depth > 1 else None,
@@ -583,8 +521,8 @@ def select_load_floor(cell, rounds, bounds=None):
                                        for row in tested[:selected if selected is not None else len(tested)]]}
 
 
-def assess(cell, rounds, bounds=None):
-    selection = select_load_floor(cell, rounds, bounds)
+def assess(cell, rounds):
+    selection = select_load_floor(cell, rounds)
     selected = selection["selected_index"]
     # An unqualified peak is retained for diagnosis only. Its row stays FAIL and cannot
     # become a pin recommendation, standing null, or trusted performance result.
@@ -593,51 +531,21 @@ def assess(cell, rounds, bounds=None):
     p = paired(current["runs"], cell.metric)
     reasons = list(selection["measurement_failures"])
     loss = -p["delta_pct"] if cell.metric == "rate" else p["delta_pct"]
-    # The threshold can never be tighter than the instrument's own between-arm error, which the
-    # standing null measured on identical bytes for this very cell. Without that floor, a
-    # reference that happened to repeat to 0.2% failed a candidate for a 0.7% drift the same
-    # binary shows against itself.
-    threshold = p["threshold_pct"]
-    if bounds and bounds is not NULL_MODE and cell.metric in bounds:
-        threshold = max(threshold, bounds[cell.metric]["abs_delta"])
-    if cell.read_local and cell.depth > 1:
-        threshold = max(threshold, READ_LOCAL_THRESHOLD_FLOOR_PCT)
-    source = ("reference-spread" if threshold == p["threshold_pct"]
-              else "read-local-floor" if threshold == READ_LOCAL_THRESHOLD_FLOOR_PCT else "null-floor")
-    p = {**p, "threshold_pct": threshold, "threshold_source": source}
-    if bounds is not NULL_MODE and loss > threshold:
+    if loss > p["threshold_pct"]:
         reasons.append("paired regression exceeds measured reference spread")
     long_tail = None
     if cell.metric == "p999_ms":
         long_tail = paired(current["runs"], "long_p999_ms")
-        # Same contract as the primary metric: the blocker command's p99.9 threshold is floored by
-        # the null's measured error for THIS metric, and a null run never vetoes on it. Missed on the
-        # first pass; it failed t02 on identical bytes after the other fourteen cells passed.
-        long_threshold = long_tail["threshold_pct"]
-        if bounds and bounds is not NULL_MODE and "long_p999_ms" in bounds:
-            long_threshold = max(long_threshold, bounds["long_p999_ms"]["abs_delta"])
-        long_tail = {**long_tail, "threshold_pct": long_threshold}
-        if bounds is not NULL_MODE and long_tail["delta_pct"] > long_threshold:
+        if long_tail["delta_pct"] > long_tail["threshold_pct"]:
             reasons.append("long-command p99.9 regression exceeds measured reference spread")
     gain, plateau_noise = None, None
-    if not saturation_exempt(cell):
+    if cell.depth > 1:
         if selection["status"] == "PINNED":
             occupancy = [saturation_score(run, cell) for run in current["runs"]]
-            # Judge the BLOCK's occupancy by its mean, not by its worst single run. min() of four
-            # noisy samples is biased low, so a cell whose true occupancy sits near the floor fails
-            # about half the time by chance -- t01 (1s + overlap, REORDER p8) measured 95.26, 95.43
-            # at calibration and 94.24 / 95.35 / 95.39 / 95.21 at its pinned rung on IDENTICAL bytes:
-            # mean 95.05% against a 95% floor, one sample 0.76pp under. That is measurement scatter,
-            # not lost saturation, and re-pinning cannot fix it because the cell's occupancy does not
-            # rise with load. A genuinely unsaturated rung moves the mean, and a single run far below
-            # the floor still fails via the spread guard below.
-            mean_occupancy = sum(occupancy) / len(occupancy)
-            worst_allowed = BUSY_FLOOR - RUN_SATURATION_MARGIN
-            if mean_occupancy < BUSY_FLOOR or min(occupancy) < worst_allowed:
+            if any(value < BUSY_FLOOR for value in occupancy):
                 reasons.append(
                     f"pinned load level {cell.instances} no longer saturates this cell "
-                    f"(productive-role occupancy mean {mean_occupancy:.1f}%, worst {min(occupancy):.1f}%, "
-                    f"floor {BUSY_FLOOR:g}%); "
+                    f"(productive-role occupancy {min(occupancy):.1f}% < {BUSY_FLOOR:g}%); "
                     f"re-pin it with --escalate and import the calibration into gate_measurements.json")
         elif selected is None:
             reasons.append("no lowest tested load rung has valid saturation and higher-capacity plateau confirmation")
@@ -656,12 +564,12 @@ def assess(cell, rounds, bounds=None):
             "loss_pct": loss, "margin_pct": loss - p["threshold_pct"],
             "fastest_gain_pct": gain, "plateau_noise_pct": plateau_noise,
             "load_selection": selection, "measurement_valid": selection["measurement_valid"],
-            "saturation_exempt": saturation_exempt(cell),
+            "saturation_exempt": cell.depth == 1,
             "verdict": "FAIL" if reasons else "PASS", "reasons": reasons}
 
 
-def saturation_done(cell, rounds, bounds=None):
-    selection = select_load_floor(cell, rounds, bounds)
+def saturation_done(cell, rounds):
+    selection = select_load_floor(cell, rounds)
     return selection["measurement_valid"] and selection["status"] in ("EXEMPT", "CONFIRMED")
 
 
@@ -1565,17 +1473,8 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
         report["coverage"] = coverage(cells)
         pending = [cell.id for cell in cells if cell.pin_required and not cell.instances]
         if pending and not args.escalate:
-            # AN UNPINNED CELL SEARCHES; IT DOES NOT VETO THE OTHER SIXTEEN. Refusing the whole
-            # tier here made every cell hostage to the flakiest one: through 2026-09-12 a single
-            # cell that would not pin (t03's flat plateau, then t05/t06's unobservable GET cost)
-            # repeatedly produced ZERO measurements and cost a full ~60 minute cycle each time.
-            # The pinned cells still run one block against their measured floor -- the fast path is
-            # unchanged -- and an unpinned cell falls back to searching its ladder, which is slower
-            # and still yields a real comparison. The run says plainly which cells did that, so an
-            # unpinned cell is visible and gets re-pinned, rather than silently costing everything.
-            print("  UNPINNED, searching their ladders (slower; re-pin with --calibrate): "
-                  + ",".join(pending), flush=True)
-            report["unpinned_cells"] = pending
+            raise ValueError("unmeasured load floors for " + ",".join(pending) +
+                             "; calibrate with --escalate and record the validated pins before gating")
         # Standing nulls can use another server binary, but must use these exact harness bytes.
         # Capture before the quiet observer starts, and check again after its final sample so
         # fingerprinting itself never becomes foreign CPU work inside a measurement interval.
@@ -1706,11 +1605,10 @@ def main(args, *, diagnostic_monitor=None, diagnostic_profile=0,
                         if diagnostic_monitor is not None:
                             quiet.set_phase("between-measurements")
                         quiet.check()
-                    bounds = NULL_MODE if args.collect_null else resolution_bounds(control, cell.id)
-                    row["assessment"] = assess(assessed_cell, row["rounds"], bounds)
+                    row["assessment"] = assess(assessed_cell, row["rounds"])
                     row["verdict"] = row["assessment"]["verdict"]
                     print_cell(row)
-                    if saturation_done(assessed_cell, row["rounds"], bounds):
+                    if saturation_done(assessed_cell, row["rounds"]):
                         break
                     # For a VERDICT run an unstable block is permanent evidence, never an excuse to
                     # search for a later block that happens to pass -- that is re-rolling until green.
@@ -1868,9 +1766,7 @@ def self_test():
 
     class ABBA(unittest.TestCase):
         def setUp(self):
-            # read_local=0, matching the real h01 and keeping threshold tests independent of the
-            # read-local floor; the read-local cases construct their own cell with it enabled.
-            self.cell = Cell("h01", "1s", 0, 0, 0, "GET", 32, 512)
+            self.cell = Cell("h01", "1s", 1, 0, 0, "GET", 32, 512)
             # Serverless loop tests replace the selected-CPU observer too. Dedicated
             # negative controls below inject failures through the same main path.
             self.quiet = mock.Mock()
@@ -1883,7 +1779,7 @@ def self_test():
         def test_full_coverage_preserves_original_axes_and_restores_multikey(self):
             from itertools import product
             cells = read_cells(ROOT / "tests/headline_cells.txt")
-            self.assertEqual(len(cells), 180)   # +2: the t05/t06 reorder synergy pair
+            self.assertEqual(len(cells), 178)
             original = [cell for cell in cells if cell.id.startswith("h")]
             self.assertEqual(len(original), 64)
             axes = lambda cell: (cell.mode, cell.read_local, cell.overlap, cell.reorder, cell.op, cell.depth)
@@ -1896,26 +1792,17 @@ def self_test():
             self.assertEqual({cell.atomic for cell in cells}, {0, 1})
             self.assertEqual({cell.conns for cell in cells}, {512, 2048})
 
-        def test_smoke_is_seventeen_justified_cells_not_a_cross_product(self):
+        def test_smoke_is_fifteen_justified_cells_not_a_cross_product(self):
             cells = selected_cells(read_cells(ROOT / "tests/headline_cells.txt"), "smoke")
-            self.assertEqual(len(cells), 17)
+            self.assertEqual(len(cells), 15)
             for mode in ("1s", "2s"):
                 sweep = [cell for cell in cells if cell.mode == mode and cell.op == "GET"]
                 self.assertEqual({(cell.read_local, cell.overlap, cell.reorder) for cell in sweep},
                                  {(1, 1, 1), (0, 1, 1), (1, 0, 1), (0, 0, 0)})
                 self.assertTrue(all(cell.depth == 32 for cell in sweep))
                 tail = [cell for cell in cells if cell.mode == mode and cell.op == "REORDER"]
-                # Both modes carry reorder off AND on -- reorder can only show against its own
-                # absence -- on an 8:2 quick:heavy mix, since a uniform-cost workload has no long
-                # blockers to reorder around.
                 self.assertEqual({cell.reorder for cell in tail}, {0, 1})
                 self.assertTrue(all(cell.depth > 1 and cell.metric == "p999_ms" for cell in tail))
-                self.assertTrue(all(cell.mix == "8:2" for cell in tail))
-            # The synergy pair: everything on, and the same with reorder off, so reorder's
-            # contribution is measured in the posture it ships in rather than in isolation.
-            synergy = {(c.read_local, c.overlap, c.reorder) for c in cells
-                       if c.op == "REORDER" and c.read_local}
-            self.assertEqual(synergy, {(1, 1, 1), (1, 1, 0)})
             self.assertEqual({cell.op for cell in cells}, {"GET", "SET", "MGET", "MSET", "REORDER"})
             self.assertIn(1, {cell.depth for cell in cells})
 
@@ -2422,10 +2309,7 @@ def self_test():
             result = assess(cell, [round_])
             self.assertEqual(result["verdict"], "FAIL")
             self.assertIn("long-command p99.9 regression exceeds measured reference spread", result["reasons"])
-            # p999 cells are saturation-EXEMPT (their blocker mix idles the server by design and
-            # their verdict is a latency), but the exemption touches only the occupancy floor --
-            # the long-tail regression above still fails, which is the point of this test.
-            self.assertTrue(result["saturation_exempt"])
+            self.assertFalse(result["saturation_exempt"])
 
         def test_hdr_decoder_matches_recorded_memtier_output_and_rejects_corruption(self):
             from abba_workloads import decode_histogram, percentile
@@ -2462,7 +2346,7 @@ def self_test():
             self.assertEqual(tails["long_p999_ms"], 2)
             self.assertEqual(tails["short_count"], 101000)
 
-        def test_new_unmeasured_pins_search_instead_of_vetoing_the_tier(self):
+        def test_new_unmeasured_pins_fail_before_reference_or_measurement(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                 out = Path(tmp) / "out"
                 source = Path(tmp) / "unmeasured-cells"
@@ -2474,17 +2358,15 @@ def self_test():
                          "--cells", str(source), "--server-cores", "0-31", "--server-smt", "",
                          "--load-cores", "32-63", "--load-smt", ""]):
                     args = parse_args()
-                # An unpinned cell no longer stops the run before the reference: it searches its
-                # ladder. The run must SAY so, so an unpinned cell is visible and gets re-pinned
-                # rather than silently costing every other cell its measurement.
-                with mock.patch(__name__ + ".resolve_reference", side_effect=RuntimeError("reference reached")), \
+                with mock.patch(__name__ + ".resolve_reference", side_effect=AssertionError("unmeasured pin reached reference")), \
                      mock.patch(__name__ + ".check_placement"), mock.patch.object(os, "sched_setaffinity"), \
                      mock.patch.dict(os.environ, {"GATE_QUIET_FILE": ""}), \
                      contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(main(args), 1)
                 result = json.loads((out / "results.json").read_text())
-                self.assertEqual(result["unpinned_cells"], ["u01"])
-                self.assertIn("reference reached", str(result.get("reason")))
+                self.assertIn("unmeasured load floors", result["reason"])
+                self.assertIn("--escalate", result["reason"])
+                self.assertEqual(result["cells"], [])
 
         def round(self, rates, n=1, busy=99.5, latency=None, mode="1s"):
             layout = load_layout(list(range(32, 128)) + list(range(160, 256)), n, self.cell.conns)
@@ -2502,7 +2384,7 @@ def self_test():
             self.assertGreater(p["pair_deltas_pct"][0], 0)
             self.assertLess(p["pair_deltas_pct"][1], 0)
 
-        def test_null_resolution_records_equal_gain_and_loss_for_every_scored_metric(self):
+        def test_null_resolution_rejects_equal_gain_and_loss_for_every_scored_metric(self):
             from abba_evidence import null_resolution
             for score, depth, metric in (("rate", 32, "rate"), ("latency", 1, "latency_ms"),
                                          ("p999", 32, "p999_ms"), ("p999", 32, "long_p999_ms")):
@@ -2518,86 +2400,25 @@ def self_test():
                         # allowance; only raw observations establish null resolution.
                         report = {"cells": [dict(cell=asdict(cell), assessment={"verdict": "PASS", "threshold_pct": 99},
                                                  rounds=[dict(instances=4, runs=runs)])]}
-                        # Owner ruling: a null MEASURES resolution, it does not fail on it. Both signs
-                        # are recorded with their spreads; a comparison inherits them as floors.
-                        checks = null_resolution(report)
-                        scored = next(row for row in checks if row["metric"] == metric)
-                        self.assertAlmostEqual(scored["absolute_delta_pct"], abs(error))
-                        self.assertEqual(scored["reference_spread_pct"], 1.)
-                        self.assertEqual(scored["candidate_spread_pct"], 0.)
-                        self.assertEqual(scored["within_reference_spread"], abs(error) <= 1)
-                        self.assertEqual(len(checks), 2 if score == "p999" else 1)
+                        if abs(error) > 1:
+                            with self.assertRaisesRegex(ValueError, metric + " null resolution failed"):
+                                null_resolution(report)
+                        else:
+                            checks = null_resolution(report)
+                            scored = next(row for row in checks if row["metric"] == metric)
+                            self.assertAlmostEqual(scored["absolute_delta_pct"], abs(error))
+                            self.assertEqual(scored["reference_spread_pct"], 1.)
+                            self.assertEqual(len(checks), 2 if score == "p999" else 1)
 
-        def test_comparison_inherits_the_null_floor_and_can_still_fail(self):
-            cell = replace(self.cell, score="rate", instances=4)   # pinned: one rung is a measurement
-            control = {"null_control": {"resolution": [dict(cell=cell.id, instances=4, metric="rate",
-                delta_pct=-1., absolute_delta_pct=1., reference_spread_pct=.3, candidate_spread_pct=2.5,
-                within_reference_spread=False)]}}
-            bounds = resolution_bounds(control, cell.id)
-            self.assertEqual(bounds, {"rate": {"spread": 2.5, "abs_delta": 1.}})
-            # A 0.8% loss against a reference that repeats to 0.3%: the flat rule calls it a
-            # regression; the null proved the instrument itself drifts 1.0% on identical bytes.
-            drift = [self.round([100.15, 99.2, 99.2, 99.85], n=4)]
-            self.assertEqual(assess(cell, drift)["verdict"], "FAIL")
-            floored = assess(cell, drift, bounds)
-            self.assertEqual(floored["verdict"], "PASS")
-            self.assertEqual(floored["threshold_source"], "null-floor")
-            # A candidate spread of 2.3% fails the flat 2% bound and passes the null's 2.5%.
-            noisy = [self.round([100, 98.85, 101.15, 100], n=4)]
-            self.assertIn("stability boundary", " ".join(assess(cell, noisy)["reasons"]))
-            self.assertNotIn("stability boundary", " ".join(assess(cell, noisy, bounds)["reasons"]))
-            # The floor is a floor, not a pass: a 1.5% loss still fails with it.
-            real = [self.round([100.1, 98.5, 98.5, 99.9], n=4)]
-            self.assertEqual(assess(cell, real, bounds)["verdict"], "FAIL")
-            # NULL_MODE never vetoes on spread or threshold; measurement validity still applies.
-            self.assertEqual(assess(cell, real, NULL_MODE)["verdict"], "PASS")
-            self.assertIsNone(resolution_bounds(None, cell.id))
-            self.assertIsNone(resolution_bounds(control, "other"))
-            # Read-local above depth 1 floors at its measured scatter (4.6-6.5% on identical bytes).
-            rl = replace(self.cell, score="rate", read_local=1, instances=4)
-            drift4 = [self.round([100.5, 96.5, 96.5, 99.5], n=4)]          # ~4% loss
-            a = assess(rl, drift4)
-            self.assertEqual((a["verdict"], a["threshold_source"]), ("PASS", "read-local-floor"))
-            self.assertEqual(a["threshold_pct"], READ_LOCAL_THRESHOLD_FLOOR_PCT)
-            # It is a floor, not a licence: a 7% loss on the same cell still fails.
-            self.assertEqual(assess(rl, [self.round([100.5, 93., 93., 99.5], n=4)])["verdict"], "FAIL")
-            # Depth 1 and non-read-local cells keep the tighter thresholds.
-            off = replace(self.cell, score="rate", read_local=0, instances=4)
-            self.assertEqual(assess(off, drift4)["verdict"], "FAIL")
-            p1 = replace(self.cell, score="latency", read_local=1, depth=1, instances=0)
-            self.assertNotEqual(assess(p1, [self.round([100] * 4, n=1)]).get("threshold_source"),
-                                "read-local-floor")
-            # The blocker command's p99.9 has its own threshold and must follow the same contract.
-            tail = replace(self.cell, score="p999", op="REORDER", instances=4)
-            def tail_round(short, long_):
-                r = self.round([100] * 4, n=4)
-                for run, s_, l_ in zip(r["runs"], short, long_):
-                    run.update(p999_ms=s_, long_p999_ms=l_)
-                return r
-            # long p99.9 drifts +0.8% (B slower) against a reference that repeats to 0.3%.
-            drift_tail = [tail_round([1., 1., 1., 1.], [1.0015, 1.0095, 1.0095, .9985])]
-            self.assertIn("long-command p99.9", " ".join(assess(tail, drift_tail)["reasons"]))
-            tail_control = {"null_control": {"resolution": [
-                dict(cell=tail.id, instances=4, metric="p999_ms", delta_pct=0., absolute_delta_pct=0.,
-                     reference_spread_pct=.1, candidate_spread_pct=.1, within_reference_spread=True),
-                dict(cell=tail.id, instances=4, metric="long_p999_ms", delta_pct=1., absolute_delta_pct=1.,
-                     reference_spread_pct=.3, candidate_spread_pct=.3, within_reference_spread=False)]}}
-            tb = resolution_bounds(tail_control, tail.id)
-            self.assertNotIn("long-command p99.9", " ".join(assess(tail, drift_tail, tb)["reasons"]))
-            self.assertNotIn("long-command p99.9", " ".join(assess(tail, drift_tail, NULL_MODE)["reasons"]))
-
-        def test_null_resolution_retains_a_failing_escalation_probe(self):
+        def test_null_resolution_cannot_discard_a_failing_escalation_probe(self):
             from abba_evidence import null_resolution
             cell = replace(self.cell, score="rate")
             good = self.round([100] * 4, n=1)
             bad = self.round([100, 101, 101, 100], n=2)
             report = {"cells": [dict(cell=asdict(cell), rounds=[good, bad],
                                      assessment={"instances": 1, "verdict": "PASS"})]}
-            checks = null_resolution(report)
-            probe = [row for row in checks if row["instances"] == 2 and row["metric"] == "rate"]
-            self.assertEqual(len(probe), 1)
-            self.assertFalse(probe[0]["within_reference_spread"])
-            self.assertAlmostEqual(probe[0]["absolute_delta_pct"], 1.)
+            with self.assertRaisesRegex(ValueError, "n=2 rate null resolution failed"):
+                null_resolution(report)
 
         def test_aabb_is_rejected(self):
             runs = self.round([100] * 4)["runs"]
@@ -2761,7 +2582,7 @@ def self_test():
         def test_historical_numbers_are_not_inputs(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
                 f = Path(tmp) / "cells"
-                f.write_text("h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | garbage | stale | ignored\n")
+                f.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | garbage | stale | ignored\n")
                 self.assertEqual(read_cells(f), [self.cell])
                 f.write_text(f.read_text() * 2)
                 with self.assertRaises(ValueError):
@@ -3269,7 +3090,7 @@ def self_test():
                 binary.write_bytes(b"test executable identity; never executed")
                 binary.chmod(0o700)
                 source = directory / "cells"
-                source.write_text("h01 | 1s | rl=0 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | stale\n")
+                source.write_text("h01 | 1s | rl=1 | ov=0 | ro=0 | GET | p32 | 512 | stale | stale | stale\n")
                 for candidate_rate, expected in ((100, 3), (98, 1)):
                     output = directory / str(candidate_rate)
                     argv = ["abbagate.py", "--candidate", str(binary), "--cells", str(source),
@@ -3393,16 +3214,16 @@ def self_test():
                 self.assertEqual(calibrated["coverage"]["requested_pending_pins"], ["n1", "n2"])
                 self.assertEqual(calibrated["coverage"]["pending_pins"], [])
                 self.assertEqual([row["cell"]["instances"] for row in calibrated["cells"]], [0, 0])
-                # A +-1% delta on identical arms is the INSTRUMENT'S error. The null records it as
-                # this cell's resolution instead of failing; a later comparison inherits it as a
-                # floor on its threshold. Either sign is the same measurement.
+                # The same magnitude in either direction fails an identical-arm
+                # collection. The favorable direction still passes a normal code
+                # comparison: this changes null validity, not regression thresholds.
                 for rate in (99, 101):
-                    rc, calls, noisy_null, _ = run(collect=True, candidate_rate=rate)
-                    self.assertEqual((rc, len(calls), noisy_null["verdict"]), (3, 8, "PARTIAL"))
-                    self.assertEqual(noisy_null["null_control"]["verdict"], "PASS")
-                    rows = [r for r in noisy_null["null_control"]["resolution"] if r["metric"] == "rate"]
-                    self.assertTrue(rows and all(abs(r["absolute_delta_pct"] - 1.) < 1e-6 for r in rows))
-                    self.assertTrue(all(r["within_reference_spread"] is False for r in rows))
+                    rc, calls, failed_null, _ = run(collect=True, candidate_rate=rate)
+                    self.assertEqual((rc, len(calls), failed_null["verdict"]), (1, 8, "FAIL"))
+                    self.assertNotEqual(failed_null.get("null_control", {}).get("verdict"), "PASS")
+                    if rate == 101:
+                        self.assertEqual(failed_null["statistical_verdict"], "PASS")
+                        self.assertIn("null resolution failed", failed_null["null_control"]["reason"])
                 rc, calls, improvement, _ = run(control=control, candidate_rate=101)
                 self.assertEqual((rc, len(calls), improvement["verdict"]), (0, 8, "PASS"))
                 binary.write_bytes(b"a later candidate may reuse this instrument control")
@@ -3453,30 +3274,21 @@ def self_test():
                 rc, calls, report, _ = run(control=control, candidate_rate=98)
                 self.assertEqual((rc, len(calls), report["statistical_verdict"], report["verdict"]),
                                  (1, 8, "FAIL", "FAIL"))
-                # The same 2% on IDENTICAL bytes is not a regression, it is the instrument's error:
-                # the null records it as this cell's resolution (and a later comparison would inherit
-                # a 2% floor -- honest, since the instrument demonstrably cannot see below that).
                 rc, calls, report, _ = run(collect=True, candidate_rate=98)
                 self.assertEqual((rc, len(calls), report["statistical_verdict"], report["null_control"]["verdict"]),
-                                 (3, 8, "PASS", "PASS"))
-                res = [r for r in report["null_control"]["resolution"] if r["metric"] == "rate"]
-                self.assertTrue(res and all(abs(r["absolute_delta_pct"] - 2.) < 1e-6 and
-                                            r["within_reference_spread"] is False for r in res))
+                                 (1, 8, "FAIL", "FAIL"))
                 ticks[0] += 86401
                 rc, calls, report, _ = run(control=control)
                 self.assertEqual((rc, len(calls), report["verdict"]), (3, 8, "PARTIAL"))
                 self.assertIn("24 hours", report["standing_null"]["reason"])
-                # Execute the gate's actual ABBA classifier with the collection's exit 3. The row
-                # REPORTS and does not gate (owner ruling 2026-09-13), so it must count neither a
-                # pass nor a failure, for any exit code -- the tally is untouched either way.
+                # Execute the gate's actual ABBA exit classifier with the collection's exit 3.
+                # Its counted row must go red even though null_control itself passed.
                 gate = (ROOT / "tests/gate.sh").read_text()
                 block = gate[gate.index('case "$ABBA_RC" in'):gate.index("\nphase abba-end")]
-                for rc in (0, 1, 3):
-                    script = (f'PASS=0; FAIL=0; ABBA_RC={rc}\nok(){{ PASS=$((PASS+1)); }}; '
-                              'bad(){ FAIL=$((FAIL+1)); }; say(){ :; };\n')
-                    checked = subprocess.run(["bash"], input=script + block + '\n[ "$PASS:$FAIL" = 0:0 ]\n',
-                        text=True, capture_output=True)
-                    self.assertEqual(checked.returncode, 0, f"rc={rc}: " + checked.stdout + checked.stderr)
+                script = 'PASS=0; FAIL=0; ABBA_RC=3\nok(){ PASS=$((PASS+1)); }; bad(){ FAIL=$((FAIL+1)); };\n'
+                checked = subprocess.run(["bash"], input=script + block + '\n[ "$PASS:$FAIL" = 0:1 ]\n',
+                    text=True, capture_output=True)
+                self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
         def test_physical_load_ceiling_keeps_unproven_saturation_red(self):
             with tempfile.TemporaryDirectory(dir=ROOT / "build") as tmp:
@@ -3561,22 +3373,13 @@ def self_test():
                     # A killed grandchild may remain a zombie until PID 1 reaps it; it cannot do
                     # CPU work. Check that state without ever discovering a process by its argv.
                     status = Path(f"/proc/{compiler_pid}/stat")
-                    # The child must STOP; whether it is caught as a zombie (Z) or already fully
-                    # reaped (X, or the status file gone) is a race this test does not control.
-                    # Under the gate's 12 parallel slots the reap wins often enough that asserting
-                    # Z alone is flaky -- it failed there on 2026-09-12 while passing standalone.
-                    stopped = {"Z", "X"}
                     deadline = time.monotonic() + 5
                     while status.exists() and time.monotonic() < deadline:
-                        if status.read_text().rsplit(")", 1)[1].split()[0] in stopped:
+                        if status.read_text().rsplit(")", 1)[1].split()[0] == "Z":
                             break
                         time.sleep(.01)
-                    try:
-                        state = status.read_text().rsplit(")", 1)[1].split()[0]
-                    except (FileNotFoundError, ProcessLookupError):
-                        state = None      # fully reaped between the check and the read
-                    if state is not None:
-                        self.assertIn(state, stopped)
+                    if status.exists():
+                        self.assertEqual(status.read_text().rsplit(")", 1)[1].split()[0], "Z")
             finally:
                 if build and build.poll() is None:
                     stop_build(build)
