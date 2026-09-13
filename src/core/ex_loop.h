@@ -2010,10 +2010,11 @@ private:
                 if (__builtin_expect(reorder_enabled_, false))
                     srv_->mode_schedule_stats(self_->id()).note_reorder(
                         held, ex_schedule_batch(batch, held));
-                prefetch_exec_batch(batch, held);
+                const uint32_t window = srv_->mode_schedule_stats(self_->id()).overlap_cache.ex_ops;
+                prefetch_exec_batch(batch, window ? std::min(held, window) : held);
                 filler();
                 filler_used = true;
-                exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
+                exec_batch_prefetched<IofusedPrivateQueue, true, true>(batch, held);
             } else {
                 exec_batch<IofusedPrivateQueue>(batch, held);
             }
@@ -2313,7 +2314,8 @@ private:
     // arms per-op timing for the next kSlowlogEscalateBatches batches instead, and the recurrence
     // is timed exactly. This is the documented divergence from redis, which times every command.
     //
-    template <bool IofusedPrivateQueue = false>
+    template <bool IofusedPrivateQueue = false, bool CacheBudget = false,
+              bool FirstPrefetched = false>
     __attribute__((noinline, cold))
     void exec_batch_timed(const Task* batch, uint32_t n) {
         Server::ClientWorkScope client_work(*srv_, self_->id());
@@ -2324,6 +2326,17 @@ private:
         flush_xshard_commits();
 
         if (slowlog_state_.escalate_batches || n == 1) {
+            // Exact per-command tracing is an exceptional schedule. Preserve its timing and
+            // capture boundaries; cache overlap applies to the ordinary batch-timed arm below.
+            if constexpr (CacheBudget) {
+                uint32_t warmed = 0;
+                if constexpr (FirstPrefetched) {
+                    const uint32_t width =
+                        srv_->mode_schedule_stats(self_->id()).overlap_cache.ex_ops;
+                    warmed = width ? std::min(n, width) : n;
+                }
+                prefetch_exec_batch(batch + warmed, n - warmed);
+            }
             if (slowlog_state_.escalate_batches) slowlog_state_.escalate_batches--;
             for (uint32_t i = 0; i < n; i++) {
                 // Snapshot argv BEFORE execution. execute() publishes Done, after which the owning
@@ -2354,14 +2367,37 @@ private:
             return;
         }
 
+        [[maybe_unused]] uint32_t width = 0;
+        if constexpr (CacheBudget) {
+            width = srv_->mode_schedule_stats(self_->id()).overlap_cache.ex_ops;
+            if constexpr (!FirstPrefetched)
+                prefetch_exec_batch(batch, width ? std::min(n, width) : n);
+        }
         const uint64_t started = now_ns();
         uint32_t executed = n;
-        for (uint32_t i = 0; i < n; i++) {
-            if (execute<IofusedPrivateQueue>(batch[i])) continue;
-            xshard_retries_.push_back(batch[i]);
-            for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
-            executed = i;
-            break;
+        if constexpr (CacheBudget) {
+            auto prefetch = [&](uint32_t begin, uint32_t count) {
+                prefetch_exec_batch(batch + begin, count);
+            };
+            auto consume = [&](uint32_t begin, uint32_t count) {
+                for (uint32_t i = begin; i < begin + count; i++) {
+                    if (execute<IofusedPrivateQueue>(batch[i])) continue;
+                    xshard_retries_.push_back(batch[i]);
+                    for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                    executed = i;
+                    return false;
+                }
+                return true;
+            };
+            OverlapCache::windows<true>(n, width, prefetch, consume);
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                if (execute<IofusedPrivateQueue>(batch[i])) continue;
+                xshard_retries_.push_back(batch[i]);
+                for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                executed = i;
+                break;
+            }
         }
         flush_xshard_commits();
         const uint64_t elapsed = now_ns() - started;
@@ -2399,7 +2435,8 @@ private:
     // Consume a bucket-prefetched homogeneous batch. The interwoven schedule calls this
     // immediately after the prefetch loop; an interleaved schedule reaches it after independent-
     // stream filler.
-    template <bool IofusedPrivateQueue = false>
+    template <bool IofusedPrivateQueue = false, bool CacheBudget = false,
+              bool FirstPrefetched = false>
     void exec_batch_prefetched(const Task* batch, uint32_t n) {
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
@@ -2415,7 +2452,26 @@ private:
             // not linked into this loop at all. The armed body is out of line in
             // exec_batch_timed().
             if (__builtin_expect(slowlog_armed_, false)) {
-                exec_batch_timed<IofusedPrivateQueue>(batch, n);
+                // Keep one timing interval and escalation decision for the original gathered
+                // batch. Instrumented execution is not split into smaller slow-log observations.
+                exec_batch_timed<IofusedPrivateQueue, CacheBudget, FirstPrefetched>(batch, n);
+            } else if constexpr (CacheBudget) {
+                const uint32_t width = srv_->mode_schedule_stats(self_->id()).overlap_cache.ex_ops;
+                auto prefetch = [&](uint32_t begin, uint32_t count) {
+                    prefetch_exec_batch(batch + begin, count);
+                };
+                auto consume = [&](uint32_t begin, uint32_t count) {
+                    for (uint32_t i = begin; i < begin + count; i++) {
+                        if (execute<IofusedPrivateQueue>(batch[i])) continue;
+                        xshard_retries_.push_back(batch[i]);
+                        // A barrier defers the whole gathered suffix, including windows not yet
+                        // consumed. Reorder ran once before prefetch and never crosses this cut.
+                        for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                        return false;
+                    }
+                    return true;
+                };
+                OverlapCache::windows<FirstPrefetched>(n, width, prefetch, consume);
             } else {
                 for (uint32_t i = 0; i < n; i++) {
                     if (execute<IofusedPrivateQueue>(batch[i])) continue;
@@ -2481,8 +2537,15 @@ private:
         }
         if (__builtin_expect(reorder_enabled_, false))
             srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
-        prefetch_exec_batch(batch, n);
-        exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
+        if constexpr (BatchOps == kGenthreadPipelineExBatchOps) {
+            // This capacity is exclusive to armed fused overlap. Windows subdivide prefetch and
+            // consumption, not notification, size publication, cleanup, or source retirement.
+            static_assert(Fused);
+            exec_batch_prefetched<IofusedPrivateQueue, true>(batch, n);
+        } else {
+            prefetch_exec_batch(batch, n);
+            exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
+        }
     }
 
     template <bool IofusedPrivateQueue = false, bool ReadLocalNoEvict = false>

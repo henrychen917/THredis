@@ -176,6 +176,7 @@ static_assert(sizeof(ReadLocalPendingFilter) == 32, "fills the Rob's spare flush
 
 template <uint32_t Capacity>
 class Rob {
+    friend struct OverlapCache; // armed windowed retirement preserves this drain's single flush cut
     static_assert((Capacity & (Capacity - 1)) == 0, "capacity must be a power of two");
     static_assert(Capacity <= 64, "read-local slot accounting uses one footprint-free word");
     static constexpr uint32_t kMask = Capacity - 1;

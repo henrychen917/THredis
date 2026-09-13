@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include "overlap_cache.h"
 
 namespace tomo {
 
@@ -24,6 +25,7 @@ struct alignas(64) ModeScheduleStats {
     std::atomic<uint64_t> reorder_permuted_runs{0};
     std::atomic<uint32_t> reorder_max_batch{0};
     std::atomic<OverlapSchedule> overlap_schedule{OverlapSchedule::None};
+    OverlapCache overlap_cache;
 
     // Each element has one physical-thread writer for its entire lifetime, including FLIP.
     // INFO reads atomically; no locked RMW and no changes to the shared ThreadCtx cache lines.
@@ -47,7 +49,7 @@ static_assert(sizeof(ModeScheduleStats) == 64);
 
 __attribute__((noinline, cold))
 inline void append_mode_schedule_info(std::string& body, const ModeScheduleStats* stats,
-                                     uint32_t nthreads) {
+                                     uint32_t nthreads, bool overlap_enabled) {
     uint64_t passes = 0, interleaved = 0, batches = 0, multi = 0, permutations = 0;
     uint32_t max_batch = 0, schedules = 0;
     if (stats) for (uint32_t tid = 0; tid < nthreads; tid++) {
@@ -74,6 +76,16 @@ inline void append_mode_schedule_info(std::string& body, const ModeScheduleStats
         static_cast<unsigned long long>(permutations), max_batch);
     if (n < 0 || static_cast<size_t>(n) >= sizeof(row)) std::abort();
     body.append(row, static_cast<size_t>(n));
+    if (overlap_enabled && stats) for (uint32_t tid = 0; tid < nthreads; tid++) {
+        const OverlapCache& cache = stats[tid].overlap_cache;
+        if (!cache.line_bytes) continue;
+        const int bytes = std::snprintf(row, sizeof(row),
+            "overlap_cache_thread_%u:l1d=%u,l2=%u,line=%u,stages=%u,ex_ops=%u,wb_ops=%u\r\n",
+            tid, cache.l1d_bytes, cache.l2_bytes, cache.line_bytes, cache.stages,
+            cache.ex_ops, cache.wb_ops);
+        if (bytes < 0 || static_cast<size_t>(bytes) >= sizeof(row)) std::abort();
+        body.append(row, static_cast<size_t>(bytes));
+    }
 }
 
 } // namespace tomo

@@ -2052,7 +2052,8 @@ void cmd_info(Shard&, Op& op) {
         if (g_server && g_server->read_local_enabled())
             append_read_local_thread_info(body, *g_server);
         if (g_server && g_server->mode_schedule_stats())
-            append_mode_schedule_info(body, g_server->mode_schedule_stats(), g_server->nthreads());
+            append_mode_schedule_info(body, g_server->mode_schedule_stats(), g_server->nthreads(),
+                                      g_server->cfg().overlap != 0);
         if (g_server && g_server->thread_mode() == ThreadMode::Fused) {
             appendf(body,
                     "fused_threads:%u\r\nclient_threads:%u\r\nowner_threads:%u\r\n"

@@ -68,6 +68,8 @@
 #include "tls.h"
 #include "uring.h"
 #include "../core/signal.h"
+#include "../core/genthread_pipeline.h"
+#include "../core/overlap_cache.h"
 
 namespace tomo {
 
@@ -202,79 +204,89 @@ public:
     // deleted with those postures; see the head of this file), so no lock exists or is needed and
     // the ROB stays SPSC by construction. Returns true if it did anything, so a caller can tell
     // progress from an empty poll.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
-    bool serve(Client& c) {
+    template <bool kEp = false, bool ClassifySend = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool serve(Client& c, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, true, ClassifySend, Coded>(c);
-        return serve_impl<false, false, kEp, true, ClassifySend, Coded>(c);
+            return serve_impl<true, false, kEp, true, ClassifySend, Coded, CacheBudget>(c, nullptr, cache);
+        return serve_impl<false, false, kEp, true, ClassifySend, Coded, CacheBudget>(c, nullptr, cache);
     }
 
     // Micro-pipeline retirement half. It drains exactly the same in-order prefix and stages the
     // same buffers/segments as serve(), but deliberately leaves SQE construction to pump().
-    template <bool kEp = false, bool Coded = false>
-    bool prepare(Client& c, bool& submit_allowed) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare(Client& c, bool& submit_allowed, const OverlapCache* cache = nullptr) {
         submit_allowed = true;
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, false, false, Coded>(c, &submit_allowed);
-        return serve_impl<false, false, kEp, false, false, Coded>(c, &submit_allowed);
+            return serve_impl<true, false, kEp, false, false, Coded, CacheBudget>(c, &submit_allowed, cache);
+        return serve_impl<false, false, kEp, false, false, Coded, CacheBudget>(c, &submit_allowed, cache);
     }
 
     // Unified pipeline batches already guard a nullable Client slot before their submit half. Its
     // bound limit callback tombstones that slot on the rare refusal, avoiding a parallel bool on
     // every ordinary reply while leaving the established split-pipeline prepare API untouched.
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline(Client& c) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare_pipeline(Client& c, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, false, kEp, false, false, Coded>(c);
-        return serve_impl<false, false, kEp, false, false, Coded>(c);
+            return serve_impl<true, false, kEp, false, false, Coded, CacheBudget>(c, nullptr, cache);
+        return serve_impl<false, false, kEp, false, false, Coded, CacheBudget>(c, nullptr, cache);
     }
 
     // kTLS uses the ordinary plaintext staging and send path. This separate instantiation only
     // enforces/counts the pre-existing TLS no-borrow contract; plaintext clients pay no mode test.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
-    bool serve_ktls(Client& c) {
+    template <bool kEp = false, bool ClassifySend = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool serve_ktls(Client& c, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, true, ClassifySend, Coded>(c);
-        return serve_impl<false, true, kEp, true, ClassifySend, Coded>(c);
+            return serve_impl<true, true, kEp, true, ClassifySend, Coded, CacheBudget>(c, nullptr, cache);
+        return serve_impl<false, true, kEp, true, ClassifySend, Coded, CacheBudget>(c, nullptr, cache);
     }
 
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_ktls(Client& c, bool& submit_allowed) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare_ktls(Client& c, bool& submit_allowed, const OverlapCache* cache = nullptr) {
         submit_allowed = true;
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, false, false, Coded>(c, &submit_allowed);
-        return serve_impl<false, true, kEp, false, false, Coded>(c, &submit_allowed);
+            return serve_impl<true, true, kEp, false, false, Coded, CacheBudget>(c, &submit_allowed, cache);
+        return serve_impl<false, true, kEp, false, false, Coded, CacheBudget>(c, &submit_allowed, cache);
     }
 
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline_ktls(Client& c) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare_pipeline_ktls(Client& c, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_impl<true, true, kEp, false, false, Coded>(c);
-        return serve_impl<false, true, kEp, false, false, Coded>(c);
+            return serve_impl<true, true, kEp, false, false, Coded, CacheBudget>(c, nullptr, cache);
+        return serve_impl<false, true, kEp, false, false, Coded, CacheBudget>(c, nullptr, cache);
     }
 
     // TLS is a separate write-back variant selected by the IO owner. Plain serve()/pump() above
     // remain untouched and are the only instantiated path when tls-port is zero.
-    template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
-    bool serve_tls(Client& c, TlsConn& tls) {
+    template <bool kEp = false, bool ClassifySend = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool serve_tls(Client& c, TlsConn& tls, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, true, ClassifySend, Coded>(c, tls);
-        return serve_tls_impl<false, kEp, true, ClassifySend, Coded>(c, tls);
+            return serve_tls_impl<true, kEp, true, ClassifySend, Coded, CacheBudget>(c, tls, nullptr, cache);
+        return serve_tls_impl<false, kEp, true, ClassifySend, Coded, CacheBudget>(c, tls, nullptr, cache);
     }
 
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_tls(Client& c, TlsConn& tls, bool& submit_allowed) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare_tls(Client& c, TlsConn& tls, bool& submit_allowed,
+                     const OverlapCache* cache = nullptr) {
         submit_allowed = true;
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, false, false, Coded>(c, tls, &submit_allowed);
-        return serve_tls_impl<false, kEp, false, false, Coded>(c, tls, &submit_allowed);
+            return serve_tls_impl<true, kEp, false, false, Coded, CacheBudget>(c, tls, &submit_allowed, cache);
+        return serve_tls_impl<false, kEp, false, false, Coded, CacheBudget>(c, tls, &submit_allowed, cache);
     }
 
-    template <bool kEp = false, bool Coded = false>
-    bool prepare_pipeline_tls(Client& c, TlsConn& tls) {
+    template <bool kEp = false, bool Coded = false,
+              bool CacheBudget = false>
+    bool prepare_pipeline_tls(Client& c, TlsConn& tls, const OverlapCache* cache = nullptr) {
         if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
-            return serve_tls_impl<true, kEp, false, false, Coded>(c, tls);
-        return serve_tls_impl<false, kEp, false, false, Coded>(c, tls);
+            return serve_tls_impl<true, kEp, false, false, Coded, CacheBudget>(c, tls, nullptr, cache);
+        return serve_tls_impl<false, kEp, false, false, Coded, CacheBudget>(c, tls, nullptr, cache);
     }
 
     // THE ENGINE'S ONE ESCALATION CHANNEL. Under io_uring a fatal send error is reported by
@@ -781,15 +793,16 @@ private:
     // With Coded=false every coded block below is deleted by `if constexpr`, so a 2s instantiation
     // is the pre-reply-code function, not a variant of it.
     template <bool TrackOutput, bool TlsNoBorrow, bool kEp, bool Submit, bool ClassifySend,
-              bool Coded>
-    bool serve_impl(Client& c, bool* submit_allowed = nullptr) {
+              bool Coded, bool CacheBudget = false>
+    bool serve_impl(Client& c, bool* submit_allowed = nullptr,
+                    const OverlapCache* cache = nullptr) {
         TOMO_FORENSIC(c.n_serves.fetch_add(1, std::memory_order_relaxed));
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
         else conn.stop_obuf_tracking();
         draining_ = &c;
-        const uint32_t retired = c.rob().drain([&](Op& op) {
+        const uint32_t retired = OverlapCache::drain<CacheBudget>(c.rob(), [&](Op& op) {
             if constexpr (TlsNoBorrow) {
                 if (op.no_borrow()) note_zc_suppressed_tls();
             }
@@ -853,7 +866,7 @@ private:
                     else conn.fill_buf().append(op.reply.data(), op.reply.size());
                 }
             }
-        });
+        }, cache, kGenthreadWbBorrowPrefetchBytes);
         draining_ = nullptr;
         bool did = retired != 0;
         did |= flush_deferred_oob(conn);
@@ -874,15 +887,17 @@ private:
         return did;
     }
 
-    template <bool TrackOutput, bool kEp, bool Submit, bool ClassifySend, bool Coded>
-    bool serve_tls_impl(Client& c, TlsConn& tls, bool* submit_allowed = nullptr) {
+    template <bool TrackOutput, bool kEp, bool Submit, bool ClassifySend, bool Coded,
+              bool CacheBudget = false>
+    bool serve_tls_impl(Client& c, TlsConn& tls, bool* submit_allowed = nullptr,
+                        const OverlapCache* cache = nullptr) {
         TOMO_FORENSIC(c.n_serves.fetch_add(1, std::memory_order_relaxed));
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
         else conn.stop_obuf_tracking();
         draining_ = &c;
-        const uint32_t retired = c.rob().drain([&](Op& op) {
+        const uint32_t retired = OverlapCache::drain<CacheBudget>(c.rob(), [&](Op& op) {
             if (op.no_borrow()) note_zc_suppressed_tls();
             if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
             if (op.zc_ptr) {
@@ -927,7 +942,7 @@ private:
                     else conn.fill_buf().append(op.reply.data(), op.reply.size());
                 }
             }
-        });
+        }, cache, kGenthreadWbBorrowPrefetchBytes);
         draining_ = nullptr;
         bool did = retired != 0;
         did |= flush_deferred_oob(conn);

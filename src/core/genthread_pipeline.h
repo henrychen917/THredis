@@ -1,5 +1,5 @@
-// Compile-time geometry for the generalized-thread schedules. The boot knob selects a fixed loop
-// shape; these remain build-time constants so no per-operation tuning state reaches a hot path.
+// Compile-time batch caps for the generalized-thread schedules. The boot knob selects the loop
+// shape; overlap_cache.h derives prefetch windows at boot, with no per-operation tuning state.
 #pragma once
 #include <cstdint>
 

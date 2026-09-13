@@ -102,6 +102,10 @@ build/read-local-write-ring-unit: tests/read_local_write_ring_unit.cc $(wildcard
 build/reorder-unit: tests/reorder_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/reorder_unit.cc -o $@
+# Serverless O2 window/ROB checks; the maintainer runs this explicitly (no gate row added).
+build/overlap-cache-unit: tests/overlap_cache_unit.cc $(wildcard src/*/*.h) Makefile
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -I. tests/overlap_cache_unit.cc -o $@
 STORE_REGRESSION_SRC := tests/store_regression.cc src/cmd/t_hash.cc src/cmd/t_hash_ttl.cc
 build/store-regression: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
 	@mkdir -p build

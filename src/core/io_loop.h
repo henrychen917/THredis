@@ -4942,9 +4942,10 @@ ordinary_shard_ready:
     // FUSED OVERLAP ON (formerly 2): iofused's ready lists and whole batches, with the first EX
     // batch split at its existing prefetch seam. The gate samples only work completed by this
     // pass. Closed rotations use the literal coarse IFID -> EX -> WB owner order; an open rotation
-    // freezes and warms WB first, then runs IFID -> EX loads -> WB stores -> EX consumption. The WB
-    // callback is synchronous, so neither its client batch nor EX's stack task batch crosses an
-    // outer boundary.
+    // freezes WB first, then runs IFID -> first EX window -> windowed WB -> EX consumption. Warm
+    // the next EX/ROB window while consuming the current one; do not warm every Op before IFID.
+    // The WB callback is synchronous, so neither its client batch nor EX's stack task batch
+    // crosses an outer boundary.
     template <bool HasUnix, bool HasTls, bool kEp>
     uint32_t genthread_three_way_pass(WbPipelineBatch& batch, bool& gate_open) {
         srv_->mode_schedule_stats(self_->id()).note_overlap(OverlapSchedule::Fused, gate_open);
@@ -4996,36 +4997,9 @@ ordinary_shard_ready:
             aof_gate_target_ = 0;
         }
 
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (!client || client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(
-                last - first, kGenthreadWbPrefetchOpsPerConn);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(
-                    op.zc_len, kGenthreadWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kGenthreadCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
-        }
-
+        // Warm at retirement, in cache-sized Op windows. Warming every client's entire ROB
+        // before IFID lets parse evict that data and makes the next EX prefetch compete with it.
+        // The frozen client set and AOF gate stay exactly where the original schedule put them.
         const uint32_t wb_occupancy = batch.count;
         occupancy = std::max(occupancy, wb_occupancy);
         work += wb_occupancy;
@@ -5034,6 +5008,7 @@ ordinary_shard_ready:
         note_ops_since(before_ifid);
         if (__builtin_expect(pubsub_pass_pending_, false)) work += pubsub_pass_flush();
 
+        const OverlapCache* cache = &srv_->mode_schedule_stats(self_->id()).overlap_cache;
         bool wb_filled = false;
         auto wb_filler = [&] {
             if (wb_filled) std::abort();
@@ -5052,13 +5027,13 @@ ordinary_shard_ready:
                 }
                 if constexpr (HasTls) {
                     if (TlsConn* tls = tls_engine(client))
-                        (void)wb_.prepare_pipeline_tls<kEp, true>(*client, *tls);
+                        (void)wb_.prepare_pipeline_tls<kEp, true, true>(*client, *tls, cache);
                     else if (TlsConn* slot = tls_slot_conn(client); slot && slot->ktls())
-                        (void)wb_.prepare_pipeline_ktls<kEp, true>(*client);
+                        (void)wb_.prepare_pipeline_ktls<kEp, true, true>(*client, cache);
                     else
-                        (void)wb_.prepare_pipeline<kEp, true>(*client);
+                        (void)wb_.prepare_pipeline<kEp, true, true>(*client, cache);
                 } else {
-                    (void)wb_.prepare_pipeline<kEp, true>(*client);
+                    (void)wb_.prepare_pipeline<kEp, true, true>(*client, cache);
                 }
             }
             for (uint32_t i = 0; i < batch.count; i++) {
@@ -5127,6 +5102,7 @@ ordinary_shard_ready:
         } else {
             aof_gate_target_ = 0;
         }
+        const OverlapCache* cache = &srv_->mode_schedule_stats(self_->id()).overlap_cache;
         uint32_t served = 0;
         while (served < kGenthreadPipelineWbBatchConns && !pending_serve_.empty()) {
             Client* c = pending_serve_.front();
@@ -5143,17 +5119,17 @@ ordinary_shard_ready:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, true, true>(*c, *tls)) work++;
+                    if (wb_.serve_tls<kEp, true, true, true>(*c, *tls, cache)) work++;
                     if (tls->socket_userspace() && tls->has_pinned_plain())
                         arm_tls_socket_poll<kEp>(c, tls->wanted());
                     if (tls->failed())
                         close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, true, true>(*c)) work++;
-                } else if (wb_.serve<kEp, true, true>(*c)) {
+                    if (wb_.serve_ktls<kEp, true, true, true>(*c, cache)) work++;
+                } else if (wb_.serve<kEp, true, true, true>(*c, cache)) {
                     work++;
                 }
-            } else if (wb_.serve<kEp, true, true>(*c)) {
+            } else if (wb_.serve<kEp, true, true, true>(*c, cache)) {
                 work++;
             }
             if constexpr (kEp)
@@ -5229,45 +5205,11 @@ ordinary_shard_ready:
         return batch.count;
     }
 
-    // WB.OBSERVE: consume completion hints, then gather the shallow pipeline's WB batch early so
-    // its state/payload prefetch can overlap IFID work.
+    // WB.OBSERVE: consume completion hints and freeze the shallow pipeline's WB client batch.
+    // State/payload prefetch now stays inside cache-sized windows at retirement.
     template <bool HasUnix, bool kEp>
     uint32_t wb_observe(bool unmasked, WbBatch& batch) {
         return collect_retire_work<HasUnix, kEp>(unmasked) + wb_gather(batch);
-    }
-
-    // WB.PF pass 1 issues hints for every potentially retireable state line. Pass 2 performs the
-    // required acquire and, only for a published plain BORROW, hints the store payload. The hint
-    // neither reads nor copies payload bytes and never changes the borrow lifetime.
-    void wb_prefetch(WbBatch& batch) {
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++)
-                __builtin_prefetch(&rob.at(first + off).state, 0, 3);
-        }
-        for (uint32_t i = 0; i < batch.count; i++) {
-            Client* client = batch.clients[i];
-            if (client->dead()) continue;
-            Rob<kRobWindow>& rob = client->rob();
-            const uint64_t first = rob.flush_id();
-            const uint64_t last = rob.dispatch_id();
-            const uint64_t count = std::min<uint64_t>(last - first,
-                                                       kIoPipeWbPrefetchOpsPerClient);
-            for (uint64_t off = 0; off < count; off++) {
-                Op& op = rob.at(first + off);
-                if (op.state.load(std::memory_order_acquire) != OpState::Done) break;
-                if (!op.zc_ptr || op.zc_shard < 0 || !op.zc_len) continue;
-                const uint32_t bytes = std::min(op.zc_len, kIoPipeWbBorrowPrefetchBytes);
-                for (uint32_t pos = 0; pos < bytes; pos += kIoPipeCacheLineBytes)
-                    __builtin_prefetch(op.zc_ptr + pos, 0, 1);
-            }
-        }
     }
 
     // IFID.RX: harvest this thread's wire completions/readiness, then select a bounded slice of the
@@ -5447,6 +5389,7 @@ ordinary_shard_ready:
     // engine methods are the ordinary serve bodies with their final pump deliberately omitted.
     template <bool HasTls, bool kEp, bool Coded = false>
     uint32_t wb_retire_prepare(WbBatch& batch) {
+        const OverlapCache* cache = &srv_->mode_schedule_stats(self_->id()).overlap_cache;
         uint32_t work = 0;
         for (uint32_t i = 0; i < batch.count; i++) {
             Client* c = batch.clients[i];
@@ -5458,14 +5401,14 @@ ordinary_shard_ready:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.prepare_tls<kEp, Coded>(*c, *tls, batch.submit_allowed[i])) work++;
+                    if (wb_.prepare_tls<kEp, Coded, true>(*c, *tls, batch.submit_allowed[i], cache)) work++;
                     if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.prepare_ktls<kEp, Coded>(*c, batch.submit_allowed[i])) work++;
-                } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
+                    if (wb_.prepare_ktls<kEp, Coded, true>(*c, batch.submit_allowed[i], cache)) work++;
+                } else if (wb_.prepare<kEp, Coded, true>(*c, batch.submit_allowed[i], cache)) {
                     work++;
                 }
-            } else if (wb_.prepare<kEp, Coded>(*c, batch.submit_allowed[i])) {
+            } else if (wb_.prepare<kEp, Coded, true>(*c, batch.submit_allowed[i], cache)) {
                 work++;
             }
         }
@@ -5506,10 +5449,11 @@ ordinary_shard_ready:
         return work;
     }
 
-    // At depth, completed IFID work already provides the latency-hiding window. Retain the plain
-    // split loop's combined retire/stage/pump order and skip the separate WB prefetch walks.
+    // At depth retain the plain split loop's combined retire/stage/pump order. Cache-sized
+    // prefetch windows live inside each drain, so high depth no longer disables that mechanism.
     template <bool HasTls, bool kEp, bool Coded = false>
     uint32_t wb_serve_natural(WbBatch& batch, bool& submitted) {
+        const OverlapCache* cache = &srv_->mode_schedule_stats(self_->id()).overlap_cache;
         uint32_t work = 0;
         for (uint32_t i = 0; i < batch.count; i++) {
             Client* c = batch.clients[i];
@@ -5523,16 +5467,16 @@ ordinary_shard_ready:
             }
             if constexpr (HasTls) {
                 if (TlsConn* tls = tls_engine(c)) {
-                    if (wb_.serve_tls<kEp, false, Coded>(*c, *tls)) work++;
+                    if (wb_.serve_tls<kEp, false, Coded, true>(*c, *tls, cache)) work++;
                     if (tls->socket_userspace() && tls->has_pinned_plain())
                         arm_tls_socket_poll<kEp>(c, tls->wanted());
                     if (tls->failed()) close_client(c, tls->output_pending() || c->send_inflight());
                 } else if (TlsConn* slot = tls_slot_conn(c); slot && slot->ktls()) {
-                    if (wb_.serve_ktls<kEp, false, Coded>(*c)) work++;
-                } else if (wb_.serve<kEp, false, Coded>(*c)) {
+                    if (wb_.serve_ktls<kEp, false, Coded, true>(*c, cache)) work++;
+                } else if (wb_.serve<kEp, false, Coded, true>(*c, cache)) {
                     work++;
                 }
-            } else if (wb_.serve<kEp, false, Coded>(*c)) {
+            } else if (wb_.serve<kEp, false, Coded, true>(*c, cache)) {
                 work++;
             }
             if constexpr (kEp)
@@ -5572,9 +5516,6 @@ ordinary_shard_ready:
                         break;
                     case IoPipeStage::IfidRx:
                         work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
-                        break;
-                    case IoPipeStage::WbPrefetch:
-                        wb_prefetch(wb);
                         break;
                     case IoPipeStage::IfidParseHash:
                         work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);

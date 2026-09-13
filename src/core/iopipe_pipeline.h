@@ -1,6 +1,7 @@
 // iopipe_pipeline.h -- fixed geometry for the split-IO micro-pipeline experiment.
 //
-// Keep every batch size, buffer count, prefetch window, and schedule entry in this one block.  The
+// Keep the client batch caps and schedule entries here; overlap_cache.h derives Op prefetch
+// windows from this worker's measured L1d/L2. The
 // `--overlap 1` selects this one static loop shape in 2s; the geometry itself is not tunable. A
 // stage is batch-granular and returns immediately when its stream buffer is empty; there are no
 // fibers, request schedulers, or per-request stage machines.
@@ -17,14 +18,9 @@ namespace tomo {
 inline constexpr uint32_t kIoPipeIfidBatchClients = 64;
 inline constexpr uint32_t kIoPipeIfidBatchOpsPerClient = 64;
 
-// WB buffers completion/serve requests by connection.  A ROB holds at most 64 operations, so this
-// window covers every possible retireable prefix instead of letting an unprefetched tail leak into
-// the warm retirement stage.  Borrow hints cover the first eight payload cache lines; they remain
-// hints only and neither copy nor extend the store borrow's lifetime.
+// WB buffers completion/serve requests by connection. Op prefetching belongs to the bounded
+// retirement windows, not this client cap. The drain retains each borrow through its last hint.
 inline constexpr uint32_t kIoPipeWbBatchClients = 64;
-inline constexpr uint32_t kIoPipeWbPrefetchOpsPerClient = 64;
-inline constexpr uint32_t kIoPipeWbBorrowPrefetchBytes = 512;
-inline constexpr uint32_t kIoPipeCacheLineBytes = 64;
 
 // The ready mask is the ordinary WB selector. Once per this many rotations, IFID also nominates
 // the clients it visits as the mask-independent completion backstop. This is the existing cadence,
@@ -34,8 +30,8 @@ inline constexpr uint32_t kIoPipeWbBackstopTurns = 64;
 // The order gate is sampled exactly once at the outer loop-pass boundary.  Four completed passes
 // form its window; distinct enter/leave levels avoid changing order around the threshold.  One ROB
 // window per pass is already enough independent natural-order work to amortize cross-core latency,
-// while many concurrent p1 connections remain below it.  The WB prefetch interleave is therefore
-// reserved for the shallow regime it was built to help.
+// while many concurrent p1 connections remain below it. This gate still selects stage order;
+// cache-sized Op prefetch windows apply inside retirement in BOTH orders.
 inline constexpr uint32_t kIoPipeDepthWindowPasses = 4;
 inline constexpr uint32_t kIoPipeNaturalEnterFramesPerPass = 64;
 inline constexpr uint32_t kIoPipeNaturalLeaveFramesPerPass = 32;
@@ -80,7 +76,6 @@ struct IoPipeDepthGate {
 enum class IoPipeStage : uint8_t {
     WbObserve,
     IfidRx,
-    WbPrefetch,
     IfidParseHash,
     WbRetirePrepare,
     IfidPost,
@@ -90,10 +85,9 @@ enum class IoPipeStage : uint8_t {
 // THE HOT ROTATION.  This is expanded directly, in this order, by IoLoop::pipeline_pass().  Keeping
 // the array here makes schedule changes reviewable beside the batch geometry instead of hiding
 // them among control/cron maintenance in the outer loop.
-inline constexpr std::array<IoPipeStage, 7> kIoPipeSchedule = {
+inline constexpr std::array<IoPipeStage, 6> kIoPipeSchedule = {
     IoPipeStage::WbObserve,
     IoPipeStage::IfidRx,
-    IoPipeStage::WbPrefetch,
     IoPipeStage::IfidParseHash,
     IoPipeStage::WbRetirePrepare,
     IoPipeStage::IfidPost,

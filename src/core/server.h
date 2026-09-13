@@ -32,6 +32,7 @@
 #include "live_config.h"
 #include "atomic_admission.h"
 #include "orthog.h"
+#include "genthread_pipeline.h"
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -341,6 +342,54 @@ public:
             if (!mode_schedule_stats_) {
                 std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");
                 return false;
+            }
+        }
+        if (cfg_.overlap) {
+            cpu_set_t workers;
+            CPU_ZERO(&workers);
+            if (cfg_.pin_threads) {
+                for (const auto& thread : placement_.threads()) {
+                    if (thread.cpu < 0 || thread.cpu >= CPU_SETSIZE) return false;
+                    CPU_SET(thread.cpu, &workers);
+                }
+            } else if (sched_getaffinity(0, sizeof(workers), &workers) != 0) {
+                return false;
+            }
+            // Unpinned workers can migrate between unlike cores. Use the smallest measured share
+            // of every CPU they may reach, and budget for the greatest live-stage count of either
+            // role. FLIP changes role/ownership, not the physical worker's cache entitlement.
+            OverlapCache unpinned{};
+            if (!cfg_.pin_threads) {
+                for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+                    if (!CPU_ISSET(cpu, &workers)) continue;
+                    OverlapCache measured{};
+                    if (!OverlapCache::discover(cpu, workers, measured) ||
+                        (unpinned.line_bytes && unpinned.line_bytes != measured.line_bytes)) {
+                        std::fprintf(stderr, "overlap: L1d/L2 discovery failed for CPU %d\n", cpu);
+                        return false;
+                    }
+                    if (!unpinned.line_bytes) unpinned = measured;
+                    else {
+                        unpinned.l1d_bytes = std::min(unpinned.l1d_bytes, measured.l1d_bytes);
+                        unpinned.l2_bytes = std::min(unpinned.l2_bytes, measured.l2_bytes);
+                    }
+                }
+            }
+            for (uint32_t tid = 0; tid < nthreads; tid++) {
+                auto& cache = mode_schedule_stats_[tid].overlap_cache;
+                const int cpu = placement_.cpu_of_thread(tid);
+                if (cfg_.pin_threads) {
+                    if (!OverlapCache::discover(cpu, workers, cache)) {
+                        std::fprintf(stderr, "overlap: L1d/L2 discovery failed for CPU %d\n", cpu);
+                        return false;
+                    }
+                } else cache = unpinned;
+                cache.derive(cfg_.thread_mode == ThreadMode::Fused ? 3 : 2,
+                    sizeof(ThreadCtx) + sizeof(Client), sizeof(Task),
+                    kGenthreadWbBorrowPrefetchBytes, kGenthreadPipelineExBatchOps, kRobWindow);
+                // Split EX keeps the already-measured 32-task prefetch. Split IO can become EX
+                // under FLIP, so its immutable WB geometry remains available across role changes.
+                if (cfg_.thread_mode == ThreadMode::Split) cache.ex_ops = 0;
             }
         }
         if (lb_controller_enabled()) {
