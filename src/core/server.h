@@ -8,10 +8,8 @@
 //
 // THE ONE MUTABLE HOT-PATH STRUCTURE is shard_owner_: shard id -> thread id, one atomic load per
 // dispatch. Router's packed bucket array remains the bucket-granularity authority; shard_owner_ is
-// its derived shard-granularity fast path, published only at a quiesced commit. Shards move only
-// after executing, deferred, group and pinned-read work drains; destination routes publish after
-// the ownership edge. An IO may enqueue using an old route after that edge, so tasks and borrow
-// releases recheck ownership and forward before shard access instead of carrying routing epochs.
+// its derived shard-granularity fast path, published only at a quiesced commit. See
+// NOTES-MIGRATE.md for the handoff and stale-route forwarding contract.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -29,9 +27,6 @@
 #include "weighted_lb.h"
 #include "placement.h"
 #include "config.h"        // struct Config: every runtime knob, one home
-#include "live_config.h"
-#include "atomic_admission.h"
-#include "orthog.h"
 #include "../base/topology.h"
 #include "../net/conn.h"   // kRobWindow: one source of truth for the window size
 #include "../net/wb.h"
@@ -44,6 +39,35 @@
 #endif
 
 namespace tomo {
+
+struct LiveConfigSnapshot {
+    uint64_t version;
+    uint64_t maxmemory;
+    MaxmemoryPolicy policy;
+    uint32_t samples;
+    uint32_t notify_events;
+    // Lane F: CLIENT TRACKING arms the same executor-side write observer keyspace notifications
+    // use.  It rides the existing live-config snapshot so ExLoop's per-pass shard mask refresh
+    // stays one load, and so a shard never reads a second armed word per operation.
+    bool     tracking_armed;
+    // Appended at the tail: executors latch these once per pass through the same seqlock, so the
+    // slow-log arming decision costs the pass nothing beyond the version compare it already made.
+    int64_t  slowlog_log_slower_than;
+    uint32_t latency_monitor_threshold;
+    bool     save_armed;
+    uint64_t proto_max_bulk_len;
+    // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER), the read-local half. Fused executors latch it once
+    // per pass with the rest of this snapshot, so the local MGET path pays one thread-private test
+    // and no atomic load; arm/disarm publishes it by bumping the version, exactly like CONFIG SET.
+    uint32_t debug_fanout_defer_us;
+};
+
+struct ClientLimitsConfigSnapshot {
+    uint64_t version = 0;
+    uint32_t timeout = 0;
+    ClientBufferLimit normal{};
+    ClientBufferLimit pubsub{};
+};
 
 struct LbClientObservation {
     uint64_t id = 0;
@@ -78,7 +102,6 @@ enum class LbStage : uint8_t {
     ExDrain,
     ClientDrain,
     ClientMoving,
-    IoDrain,
 };
 
 struct LbShardMove {
@@ -111,7 +134,7 @@ struct FlipReport {
     bool moving = false;
 };
 
-// Allocated only for the boot-armed read-local lane. The Server keeps only one pointer at its
+// Allocated only for the boot-armed fused read-local lane. The Server keeps only one pointer at its
 // true tail, so baseline member offsets and cache-line sharing remain unchanged.
 struct ReadLocalServerState {
     std::atomic<uint64_t> epoch{1};
@@ -129,39 +152,10 @@ static_assert(sizeof(AtomicApplySlot) == 64);
 static_assert(alignof(AtomicApplySlot) == 64);
 
 class Server {
-    friend struct CoreConcurrencyTest;
 public:
-    // Done releases the ROB slot, but executor code may still be notifying its IO.
-    // Odd means an executor scope can hold Client pointers; an even value ends that
-    // scope. Nested calls retain the outer scope. Writers own separate cache lines.
-    class ClientWorkScope {
-    public:
-        ClientWorkScope(Server& server, uint32_t tid)
-            : epoch_(server.client_work_[tid].epoch) {
-            const uint64_t before = epoch_.load(std::memory_order_relaxed);
-            outer_ = !(before & 1);
-            if (outer_) {
-                end_ = before + 2;
-                epoch_.store(before + 1, std::memory_order_release);
-            }
-        }
-        ~ClientWorkScope() {
-            if (outer_) epoch_.store(end_, std::memory_order_release);
-        }
-        ClientWorkScope(const ClientWorkScope&) = delete;
-        ClientWorkScope& operator=(const ClientWorkScope&) = delete;
-    private:
-        std::atomic<uint64_t>& epoch_;
-        uint64_t end_ = 0;
-        bool outer_ = false;
-    };
-    uint64_t client_work_epoch(uint32_t tid) const {
-        return client_work_[tid].epoch.load(std::memory_order_acquire);
-    }
     static constexpr uint64_t kAtomicEnabledBit = uint64_t{1} << 63;
 
     Server() = default;
-    friend struct NetcmdRegression;
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
@@ -253,7 +247,9 @@ public:
         atomic_activity_.store(cfg.atomic ? kAtomicEnabledBit : 0,
                                std::memory_order_relaxed);
         // Measured in-flight credit optimum, always derived from the resolved geometry.
-        atomic_credits_.init(std::min<uint32_t>(16u * cfg.shards, 1024u));
+        const uint32_t resolved_window = std::min<uint32_t>(16u * cfg.shards, 1024u);
+        live_atomic_window_.store(resolved_window, std::memory_order_relaxed);
+        atomic_credit_pool_.store(resolved_window, std::memory_order_relaxed);
         script_stage_bytes_ = cfg.maxmemory
             ? std::max<uint64_t>(4ull * 1024 * 1024,
                   std::min<uint64_t>(cfg.maxmemory / cfg.shards / 16, 64ull * 1024 * 1024))
@@ -264,7 +260,7 @@ public:
         if (!adjust_open_files_limit()) return false;
         check_tcp_backlog_settings();
         // Shard maps are resolved exactly once at boot; parsing never leaks onto a request path.
-        if (!placement_.assign_shard_homes(cfg.shards, cfg.shard_home)) return false;
+        if (!placement_.assign_shard_homes(cfg.shards)) return false;
 
         // ---- shards: bucket ranges, fixed for the life of the process ----------------------------
         shards_.resize(cfg.shards);
@@ -273,7 +269,7 @@ public:
             const uint32_t b0 = i * per;
             const uint32_t b1 = (i + 1 == cfg.shards) ? kNumBuckets : (i + 1) * per;
             shards_[i] = std::make_unique<Shard>();
-            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.encodings.type_limits(),
+            shards_[i]->init(this, static_cast<int32_t>(i), b0, b1, cfg.zc_min, cfg.type_limits,
                              cfg.stream_limits);
             if (key_lb_signals_enabled() && !shards_[i]->enable_lb_signals()) {
                 std::fprintf(stderr, "fatal: could not allocate weighted-placement signals\n");
@@ -293,28 +289,24 @@ public:
         // and transfer channels stay uniform per-thread arrays.
         const uint32_t nthreads = placement_.total_threads();
         if (!flipctl_.init(cfg.thread_mode == ThreadMode::Split && cfg.flip_auto != 0,
-                           nthreads)) {
+                           -1, nthreads)) {
             std::fprintf(stderr, "fatal: could not allocate flip controller state\n");
             return false;
         }
+        for (uint32_t i = 0; i < kMaxThreads; i++) executor_slots_[i] = UINT8_MAX;
+        // Role changes may make any physical thread an executor. Stable tid-indexed slots avoid
+        // renumbering live atomic-group arrays at each flip.
+        for (uint32_t tid = 0; tid < nthreads; tid++)
+            executor_slots_[tid] = static_cast<uint8_t>(tid);
         threads_.resize(nthreads);
-        // One consumer per physical worker, plus the serialized ownership-transfer coordinator.
-        live_config_mailboxes_.reset(new (std::nothrow) LiveConfigMailbox[nthreads + 1]);
-        if (!live_config_mailboxes_) {
-            std::fprintf(stderr, "fatal: could not allocate live configuration mailboxes\n");
-            return false;
-        }
-        live_config_committed_ = capture_live_config(2);
-        for (uint32_t i = 0; i <= nthreads; i++)
-            live_config_mailboxes_[i].init(live_config_committed_);
         for (uint32_t i = 0; i < nthreads; i++) {
             threads_[i] = std::make_unique<ThreadCtx>();
             // The fingerprint writer is armed only when its one reader, the flip controller, is
-            // enabled: with --flip-auto 0 and in 1s mode it is dark and costs
-            // one predicted branch per op. The enabled sampler keeps its measured 1-in-100 policy.
+            // enabled (DESIGN-flipfp.md): with --flip-auto 0 and in 1s mode it is dark and costs
+            // one predicted branch per op. flip_work_window keeps its CONFIG value either way.
             threads_[i]->init(i, placement_.role_of(i), nthreads,
                               0,
-                              flip_fingerprint_window(flipctl_.enabled()));
+                              flipctl_.enabled() ? cfg.flip_work_window : 0);
             threads_[i]->init_command_counts(command_registry_size());
         }
         if (read_local_enabled()) {
@@ -334,13 +326,6 @@ public:
                     std::fprintf(stderr, "fatal: could not allocate read-local store state\n");
                     return false;
                 }
-            }
-        }
-        if (cfg_.overlap || cfg_.reorder) {
-            mode_schedule_stats_.reset(new (std::nothrow) ModeScheduleStats[nthreads]);
-            if (!mode_schedule_stats_) {
-                std::fprintf(stderr, "fatal: could not allocate schedule witnesses\n");
-                return false;
             }
         }
         if (lb_controller_enabled()) {
@@ -408,11 +393,14 @@ public:
         return cfg_.thread_mode == ThreadMode::Fused ? "1s" : "2s";
     }
 
+    bool lb_machinery_enabled() const {
+        return cfg_.lb != 0;
+    }
     bool key_lb_signals_enabled() const {
-        return cfg_.key_lb != 0;
+        return lb_machinery_enabled();
     }
     bool client_lb_signals_enabled() const {
-        return cfg_.client_lb != 0;
+        return lb_machinery_enabled();
     }
     bool lb_controller_enabled() const {
         return key_lb_signals_enabled() || client_lb_signals_enabled();
@@ -600,14 +588,8 @@ public:
         return count;
     }
 
-    ModeScheduleStats& mode_schedule_stats(uint32_t tid) {
-        return mode_schedule_stats_[tid];
-    }
-    const ModeScheduleStats* mode_schedule_stats() const { return mode_schedule_stats_.get(); }
-
     static bool read_local_enabled(const Config& cfg) {
-        // Both modes and both schedules consume local captures before publishing QSBR.
-        return cfg.read_local != 0;
+        return cfg.thread_mode == ThreadMode::Fused && cfg.overlap == 0 && cfg.read_local != 0;
     }
     bool read_local_enabled() const { return read_local_enabled(cfg_); }
     uint64_t read_local_epoch() const {
@@ -698,10 +680,7 @@ public:
     bool flip_dispatch_paused() const { return flip_stage() != FlipStage::Idle; }
     LbStage lb_stage() const { return lb_stage_.load(std::memory_order_acquire); }
     uint64_t lb_epoch() const { return lb_epoch_.load(std::memory_order_acquire); }
-    bool lb_dispatch_paused() const {
-        const LbStage stage = lb_stage();
-        return stage == LbStage::IoDrain || stage == LbStage::ExDrain;
-    }
+    bool lb_dispatch_paused() const { return lb_stage() == LbStage::ExDrain; }
     bool placement_transition_active() const {
         return flip_dispatch_paused() || lb_stage() != LbStage::Idle;
     }
@@ -718,7 +697,7 @@ public:
     LbClientMove lb_client_move() const { return lb_client_move_; }
     bool lb_should_pause(uint32_t owner, uint64_t id) const {
         const LbStage stage = lb_stage();
-        return stage == LbStage::IoDrain || stage == LbStage::ExDrain ||
+        return stage == LbStage::ExDrain ||
                (stage == LbStage::ClientDrain && lb_client_move_.source == owner &&
                 lb_client_move_.id == id);
     }
@@ -735,21 +714,6 @@ public:
         for (uint32_t tid = 0; tid < nthreads(); tid++)
             if (live_executor(tid) && !lb_acked(tid)) return false;
         return true;
-    }
-    bool lb_all_io_acked() const {
-        for (uint32_t tid : placement_.ifid_threads())
-            if (!lb_acked(tid)) return false;
-        return true;
-    }
-    bool lb_begin_ex_drain() {
-        if (lb_stage() != LbStage::IoDrain || !lb_all_io_acked()) return false;
-        // Every producer has left its parse/post pass. Only now may an empty executor
-        // inbox prove that no old-route task remains unpublished.
-        lb_stage_.store(LbStage::ExDrain, std::memory_order_release);
-        return true;
-    }
-    void lb_start_shard_drain() {
-        lb_stage_.store(LbStage::IoDrain, std::memory_order_release);
     }
     uint64_t lb_ticks() const { return lb_ticks_.load(std::memory_order_relaxed); }
     uint64_t lb_bucket_moves() const {
@@ -1401,7 +1365,7 @@ public:
                 lb_bucket_bytes_spread_after_.store(
                     static_cast<uint64_t>(bytes_after + 0.5), std::memory_order_relaxed);
                 lb_bucket_hot_streak_ = 0;
-                lb_start_shard_drain();
+                lb_stage_.store(LbStage::ExDrain, std::memory_order_release);
             }
             lb_prefer_client_ = !choose_client;
             return true;
@@ -1530,8 +1494,7 @@ public:
         }
         std::lock_guard<std::mutex> transition_lock(shape_transition_mu_);
         const LbStage live_lb_stage = lb_stage();
-        if (live_lb_stage == LbStage::IoDrain || live_lb_stage == LbStage::ExDrain ||
-            live_lb_stage == LbStage::ClientDrain) {
+        if (live_lb_stage == LbStage::ExDrain || live_lb_stage == LbStage::ClientDrain) {
             // An explicit shape change wins over an uncommitted cron candidate. No ownership edge
             // exists in either stage, so withdrawing it is exact. A ClientMoving request has
             // already crossed its reversible preflight; FLIP admits it and IoDrain waits for that
@@ -1971,7 +1934,7 @@ public:
         shard_owner_[shard_id].store(thread_id, std::memory_order_release);
     }
 
-    // The caller must hold both executor loops at the safe point:
+    // The caller must hold both executor loops at the safe point described in NOTES-MIGRATE.md:
     // no executing/retry/group/snapshot work may touch this shard.  Queue entries which arrive via
     // a stale pre-commit route are harmless because ExLoop rechecks and forwards before access.
     // Vector capacity and membership are settled while PREPARING still names the source.  The
@@ -1990,7 +1953,7 @@ public:
     // lost, a block ends up linked twice, and the damage surfaces later as either
     // KvBlockCache::put's `heads[cls] == memory` abort or a take() of a still-linked block whose
     // KvObj header overwrites the list `next`, so that the NEXT take dereferences a wild pointer.
-    // Both were observed.
+    // Both were observed (see DESIGN-P0REPLY.md).
     //
     // The rebind used to be deferred to the destination's own next executor pass
     // (`lb_rebind_pending_` -> `read_local_rebind_owned_shards_after_lb`). Nothing ordered that
@@ -2104,7 +2067,7 @@ public:
         from.erase(std::remove_if(from.begin(), from.end(), [&](Shard* shard) {
             return std::find(moving.begin(), moving.end(), shard) != moving.end();
         }), from.end());
-        for (Shard* shard : moving) adopt_shard_owner_state(*shard, destination);
+        for (Shard* shard : moving) adopt_read_local_retire_sink(*shard, destination);
         router_.commit_transfer();
         for (Shard* shard : moving)
             shard_owner_[shard->id()].store(destination, std::memory_order_release);
@@ -2132,7 +2095,7 @@ public:
         to.push_back(&shard);                       // capacity was reserved before PREPARING
         *found = from.back();
         from.pop_back();
-        adopt_shard_owner_state(shard, destination);
+        adopt_read_local_retire_sink(shard, destination);
         router_.commit_transfer();                 // THE single bucket ownership edge
         shard_owner_[shard_id].store(destination, std::memory_order_release);
         router_.finish_transfer();
@@ -2150,39 +2113,13 @@ public:
         }
     }
 
-    void bind_owner_notify_pending(uint32_t tid, bool* pending) {
-        owner_notify_pending_[tid] = pending;
-    }
-
-    void adopt_shard_owner_state(Shard& shard, uint32_t destination) {
-        adopt_read_local_retire_sink(shard, destination);
-        // A destination may already have cached this version while the source's last
-        // pass used the previous one. Configure the incoming store at the ownership
-        // edge; an unchanged destination version must never leave it on stale limits.
-        // Transfers are serialized by the shape transition, but IO-side tracking/ACL publication
-        // may continue while executors are quiesced. The coordinator has its OWN mailbox: neither
-        // the writer's mutable committed copy nor the destination's consumer slot is safe here.
-        const LiveConfigSnapshot config =
-            live_config_mailboxes_[nthreads()].read(live_config_version_).live;
-        shard.configure_maxmemory(config.maxmemory != 0, config.maxmemory / nshards(),
-                                  config.policy, config.samples);
-        shard.set_notify_mask(config.notify_events |
-                              (config.tracking_armed ? NOTIFY_TRACKING : 0u) |
-                              (config.save_armed ? NOTIFY_SAVE : 0u));
-        bool* pending = owner_notify_pending_[destination];
-        if (!pending) std::abort();
-        shard.bind_notify_pending(pending);
-        *pending = true; // service any output carried with the shard on the first owner pass
-    }
-
     bool live_executor(uint32_t tid) const {
         if (tid >= nthreads()) return false;
         return cfg_.thread_mode == ThreadMode::Fused
             ? placement_.is_executor(tid) : thread(tid).role() == Role::Ex;
     }
     uint32_t executor_slot(uint32_t thread_id) const {
-        // Atomic-group arrays use stable physical thread IDs, including across role changes.
-        return thread_id < nthreads() ? thread_id : UINT8_MAX;
+        return thread_id < kMaxThreads ? executor_slots_[thread_id] : UINT8_MAX;
     }
 
     std::atomic<uint64_t>& next_client_id() { return next_client_id_; }
@@ -2223,8 +2160,20 @@ public:
         end_live_config_update(version);
     }
 
-    ClientLimitsConfigSnapshot client_limits_snapshot(uint32_t reader_tid) const {
-        return live_config_mailboxes_[reader_tid].read(live_config_version_).clients;
+    ClientLimitsConfigSnapshot client_limits_snapshot() const {
+        for (;;) {
+            ClientLimitsConfigSnapshot out;
+            out.version = live_config_version_.load(std::memory_order_acquire);
+            if (out.version & 1) continue;
+            out.timeout = live_timeout_.load(std::memory_order_relaxed);
+            out.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
+            out.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
+            out.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
+            out.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
+            out.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
+            out.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
+            if (live_config_version_.load(std::memory_order_acquire) == out.version) return out;
+        }
     }
     void set_client_output_buffer_limits(const ClientOutputBufferLimits& limits) {
         const uint64_t version = begin_live_config_update();
@@ -2254,8 +2203,8 @@ public:
     }
     uint64_t climon_monitors() const { return climon_monitors_.load(std::memory_order_relaxed); }
 
-    // Tracking arms shard-side write observation, so it publishes through the same mailboxes
-    // executors already poll (one version compare per pass when nothing changed).
+    // Tracking arms shard-side write observation, so it must publish through the live-config
+    // seqlock the executors already poll (one version compare per pass when nothing changed).
     void climon_tracking_added() {
         const uint64_t version = begin_live_config_update();
         climon_tracking_.fetch_add(1, std::memory_order_relaxed);
@@ -2506,59 +2455,113 @@ public:
     bool atomic_enabled() const { return atomic_mode_state() & kAtomicEnabledBit; }
     bool atomic_work_active() const { return (atomic_mode_state() & ~kAtomicEnabledBit) != 0; }
     uint32_t atomic_window() const {
-        return atomic_credits_.window();
+        return live_atomic_window_.load(std::memory_order_acquire);
     }
     void set_atomic_enabled(bool enabled) {
         if (enabled) {
+            atomic_reconfigure_credits(atomic_window());
             atomic_activity_.fetch_or(kAtomicEnabledBit, std::memory_order_release);
         } else {
             atomic_activity_.fetch_and(~kAtomicEnabledBit, std::memory_order_release);
+            atomic_reconfigure_credits(atomic_window());
         }
     }
+
     bool atomic_tracking_active() const {
         return atomic_mode_state() != 0;
     }
-    bool atomic_can_admit(uint32_t /*owner_io*/, bool force = false) const {
+    bool atomic_can_admit(uint32_t owner_io, bool force = false) const {
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return true;
-        return atomic_credits_.can_admit();
+        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        if (generation & 1) return false;
+        const uint32_t window = atomic_window();
+        if (!window) return true;
+        const AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        return (lease.generation == generation && lease.available != 0) ||
+               atomic_credit_pool_.load(std::memory_order_acquire) != 0;
     }
-    bool atomic_try_admit(uint32_t owner_io, uint64_t& admission_token,
+    bool atomic_try_admit(uint32_t owner_io, uint64_t& admitted_generation,
                           bool force = false) {
-        admission_token = 0;
+        admitted_generation = 0;
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire)) return false;
         if (!force && !(atomic_mode_state() & kAtomicEnabledBit)) return false;
-        const auto attempt = atomic_credits_.try_admit();
-        if (attempt != AtomicAdmissionCredits::Attempt::Admitted) {
-            if (attempt == AtomicAdmissionCredits::Attempt::Full)
-                atomic_window_stalls_.fetch_add(1, std::memory_order_relaxed);
-            return false;
+        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        if (generation & 1) return false;
+        const uint32_t window = atomic_window();
+        if (lease.generation != generation) {
+            lease.generation = generation;
+            lease.available = 0; // the reconfiguration reset the global pool without old leases
         }
-        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
-        const bool first = local.active++ == 0;
+        if (window && lease.available == 0) {
+            atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+            if (atomic_credit_generation_.load(std::memory_order_acquire) != generation) {
+                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+                return false;
+            }
+            uint32_t available = atomic_credit_pool_.load(std::memory_order_relaxed);
+            bool borrowed = false;
+            while (available) {
+                const uint32_t take = std::min<uint32_t>(available, kAtomicLeaseBatch);
+                if (atomic_credit_pool_.compare_exchange_weak(
+                        available, available - take, std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    lease.available = take;
+                    borrowed = true;
+                    break;
+                }
+            }
+            atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+            if (!borrowed) {
+                atomic_window_stalls_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        if (window) lease.available--;
+        const bool first = lease.active++ == 0;
+        lease.published_active.store(lease.active, std::memory_order_release);
         if (first) atomic_activity_.fetch_add(1, std::memory_order_release);
         if (snapshot_atomic_barrier_.load(std::memory_order_acquire) ||
+            atomic_credit_generation_.load(std::memory_order_acquire) != generation ||
             (!force && !(atomic_mode_state() & kAtomicEnabledBit))) {
-            local.active--;
+            lease.active--;
+            lease.published_active.store(lease.active, std::memory_order_release);
             if (first) atomic_activity_.fetch_sub(1, std::memory_order_release);
-            atomic_credits_.retire();
+            atomic_release_admission_credit(lease, generation);
             return false;
         }
         thread(owner_io).note_atomic_group();
-        // Existing EXEC/scatter state has a receipt word named admission_generation. Keep its
-        // representation (and layouts) while removing generation-dependent credit accounting.
-        admission_token = 1;
+        admitted_generation = generation;
         return true;
     }
     void set_snapshot_atomic_barrier(bool enabled) {
         snapshot_atomic_barrier_.store(enabled, std::memory_order_release);
     }
-    void atomic_retire_group(uint32_t owner_io, uint64_t admission_token) {
-        AtomicAdmissionState& local = thread(owner_io).atomic_admission_state();
-        if (admission_token != 1 || !local.active) std::abort();
-        local.active--;
-        atomic_credits_.retire();
-        if (!local.active) atomic_activity_.fetch_sub(1, std::memory_order_release);
+    void atomic_retire_group(uint32_t owner_io, uint64_t admitted_generation) {
+        AtomicAdmissionLease& lease = thread(owner_io).atomic_admission_lease();
+        if (!lease.active) std::abort();
+        lease.active--;
+        lease.published_active.store(lease.active, std::memory_order_release);
+
+        atomic_release_admission_credit(lease, admitted_generation);
+
+        if (lease.active == 0) {
+            atomic_activity_.fetch_sub(1, std::memory_order_release);
+            // An idle IO must not strand its lease while a hot peer is window-stalled. The config
+            // generation plus credit_ops handshake makes returning this batch race-free.
+            const uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+            if (atomic_window() && !(generation & 1) && lease.generation == generation &&
+                lease.available) {
+                const uint32_t returned = lease.available;
+                atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+                if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
+                    atomic_credit_pool_.fetch_add(returned, std::memory_order_release);
+                    lease.available = 0;
+                }
+                atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+            }
+        }
     }
     // GROUP COMMIT IS TWO STEPS AND A READER MUST NEVER SEE THE FIRST WITHOUT THE SECOND.
     // A cross-shard group installs its versions on every owner while the shared epoch word still
@@ -2783,7 +2786,13 @@ public:
         for (uint32_t io : placement_.ifid_threads()) groups += thread(io).atomic_groups();
         return groups;
     }
-    uint64_t atomic_inflight() const { return atomic_credits_.active(); }
+    uint64_t atomic_inflight() const {
+        uint64_t inflight = 0;
+        for (uint32_t io : placement_.ifid_threads())
+            inflight += thread(io).atomic_admission_lease().published_active.load(
+                std::memory_order_acquire);
+        return inflight;
+    }
     // GROUPS WHOSE RECORDS ARE ONLY PARTLY INSTALLED -- the quantity a snapshot cut must wait on.
     // It is NOT atomic_inflight(). A group leaves atomic_inflight() only when its REPLY retires on
     // the IO thread that admitted it, and that retire runs in the very loop a blocking SAVE is
@@ -2829,7 +2838,7 @@ public:
     // is xshard_prepare()'s already-cold direct-RENAME arm, so the disabled cost is nothing on any
     // other command. It widens -- deterministically -- the window in which a younger whole-owner
     // walker could overtake an older same-connection group on the destination shard.
-    // TEST HOOK: effective local-read LANE CAPACITY for admission. 0 means
+    // TEST HOOK (P128.md section 8): effective local-read LANE CAPACITY for admission. 0 means
     // derive, which is kInboxSlots and is what production always runs. A non-zero value only makes
     // the armed parser stop admitting sooner; the physical ring keeps its kInboxSlots entries and
     // its masking, so this can never overrun anything. It exists because lane oversubscription is
@@ -2863,16 +2872,6 @@ public:
     }
     void set_debug_hop_delay(uint32_t microseconds) {
         debug_hop_delay_.store(microseconds, std::memory_order_relaxed);
-    }
-    // DEBUG ATOMIC-COMMIT-HOLD: retain the existing owner-private commit queue before drawing
-    // tickets, without blocking the executor. Admission/reconfiguration tests can then run
-    // CONFIG while groups are live. The ticket-publication delay above serves a different test:
-    // it deliberately stalls INSIDE the reserve/publish interval to exercise safe read cuts.
-    bool debug_atomic_commit_hold() const {
-        return debug_atomic_commit_hold_.load(std::memory_order_relaxed);
-    }
-    void set_debug_atomic_commit_hold(bool held) {
-        debug_atomic_commit_hold_.store(held, std::memory_order_relaxed);
     }
     // TEST HOOK (DEBUG ATOMIC-FANOUT-DEFER). Microseconds every fragment of a cross-shard READ
     // except the one on its lead shard is PARKED -- re-queued, not spun -- after the command is
@@ -2937,11 +2936,9 @@ public:
     // is already set. Nothing on GET/SET touches it.
     //
     // Why a hook is needed at all: the barrier's six owners cannot overlap on any reachable
-    // sequence: a blocking op requires an empty ROB, then sets the barrier before any younger
-    // frame can be parsed; a resumed scatter inherits that same slot and barrier. The state the
-    // owner-scoped release exists to survive -- a release that must NOT drop the barrier -- has
-    // to be injected. It is held past ROB quiescence on purpose; barrier_release_quiesced()
-    // exempts this one bit for that reason.
+    // sequence (NOTES-BARRIER.md section 2), so the state the owner-scoped release exists to
+    // survive -- a release that must NOT drop the barrier -- has to be injected. It is held past
+    // ROB quiescence on purpose; barrier_release_quiesced() exempts this one bit for that reason.
     //
     // A LATCH, NOT A DEADLINE, and that is not a style choice. A barred connection's io thread has
     // nothing left to do and parks on submit_and_wait(1) -- unbounded under io_uring. A hold that
@@ -2972,11 +2969,12 @@ public:
         return debug_blocking_timeout_reaps_.load(std::memory_order_relaxed);
     }
     // An overlap: some owner took the parse barrier while another owner already held it. With
-    // DEBUG BARRIER-HOLD off this must read ZERO -- if it ever moves on production traffic the
-    // latent case just went live and the owner-scoped release in blocking_retire() became
-    // load-bearing rather than defensive. With the latch ON it advances once per blocking dispatch,
-    // which is the counter's own positive control: a "must be zero" reading proves nothing until
-    // something has been shown able to make it non-zero.
+    // DEBUG BARRIER-HOLD off this must read ZERO -- it is the live form of the reachability verdict
+    // in NOTES-BARRIER.md, and if it ever moves on production traffic the latent case just went
+    // live and the owner-scoped release in blocking_retire() became load-bearing rather than
+    // defensive. With the latch ON it advances once per blocking dispatch, which is the counter's
+    // own positive control: a "must be zero" reading proves nothing until something has been shown
+    // able to make it non-zero.
     void note_barrier_overlap() {
         barrier_owner_overlaps_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3039,18 +3037,47 @@ public:
         const uint64_t deadline = now_ns() + static_cast<uint64_t>(microseconds) * 1000ull;
         while (now_ns() < deadline) __builtin_ia32_pause();
     }
-    uint32_t atomic_credit_pool() const { return atomic_credits_.pool(); }
-    uint32_t atomic_credit_debt() const { return atomic_credits_.debt(); }
-
-    // A mailbox belongs to a physical worker, across fused/split roles and shard migrations.
-    // Callers copy the result before their next snapshot call; only the consumer-owned slot is read.
-    LiveConfigSnapshot live_config_snapshot(uint32_t reader_tid) const {
-        return live_config_mailboxes_[reader_tid].read(live_config_version_).live;
+    uint32_t atomic_credit_pool() const {
+        return atomic_credit_pool_.load(std::memory_order_acquire);
     }
-    bool live_config_snapshot_if_changed(uint32_t reader_tid, uint64_t known_version,
+    uint32_t atomic_credit_debt() const {
+        return atomic_credit_debt_.load(std::memory_order_acquire);
+    }
+
+    LiveConfigSnapshot live_config_snapshot() const {
+        // CONFIG writers make version odd around a change. Executors take this coherent snapshot
+        // once per pass; no atomic reaches an individual operation or store lookup.
+        for (;;) {
+            LiveConfigSnapshot snapshot;
+            snapshot.version = live_config_version_.load(std::memory_order_acquire);
+            if (snapshot.version & 1) continue;
+            snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
+            snapshot.policy = static_cast<MaxmemoryPolicy>(
+                live_maxmemory_policy_.load(std::memory_order_relaxed));
+            snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
+            snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
+            snapshot.tracking_armed =
+                (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
+            snapshot.slowlog_log_slower_than =
+                live_slowlog_us_.load(std::memory_order_relaxed);
+            snapshot.latency_monitor_threshold =
+                live_latency_ms_.load(std::memory_order_relaxed);
+            snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
+            snapshot.proto_max_bulk_len =
+                live_proto_max_bulk_len_.load(std::memory_order_relaxed);
+            snapshot.debug_fanout_defer_us =
+                debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
+            if (live_config_version_.load(std::memory_order_acquire) == snapshot.version)
+                return snapshot;
+        }
+    }
+    bool live_config_snapshot_if_changed(uint64_t known_version,
                                          LiveConfigSnapshot& snapshot) const {
-        if (live_config_version_.load(std::memory_order_acquire) == known_version) return false;
-        snapshot = live_config_snapshot(reader_tid);
+        // The unchanged per-pass case is one acquire load. Field loads and the retry loop exist
+        // only after CONFIG has published a different stable version.
+        const uint64_t version = live_config_version_.load(std::memory_order_acquire);
+        if (version == known_version) return false;
+        snapshot = live_config_snapshot();
         return snapshot.version != known_version;
     }
     void set_maxmemory_config(uint64_t memory, MaxmemoryPolicy policy, uint32_t samples,
@@ -3204,6 +3231,8 @@ public:
     }
 
 private:
+    static constexpr uint32_t kAtomicLeaseBatch = 8;
+
     bool adjust_open_files_limit() {
         rlimit limit{};
         if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
@@ -3279,34 +3308,73 @@ private:
                                  normal || pubsub, std::memory_order_release);
     }
 
-    // Only boot or the serialized CONFIG writer reads these mutable fields as a group. Readers
-    // consume immutable, committed mailbox copies and never collect/revalidate these atomics.
-    LiveConfigValues capture_live_config(uint64_t version) const {
-        LiveConfigValues values;
-        auto& snapshot = values.live;
-        snapshot.version = version;
-        snapshot.maxmemory = live_maxmemory_.load(std::memory_order_relaxed);
-        snapshot.policy = static_cast<MaxmemoryPolicy>(
-            live_maxmemory_policy_.load(std::memory_order_relaxed));
-        snapshot.samples = live_maxmemory_samples_.load(std::memory_order_relaxed);
-        snapshot.notify_events = live_notify_events_.load(std::memory_order_relaxed);
-        snapshot.tracking_armed =
-            (climon_armed_.load(std::memory_order_relaxed) & kClimonTracking) != 0;
-        snapshot.slowlog_log_slower_than = live_slowlog_us_.load(std::memory_order_relaxed);
-        snapshot.latency_monitor_threshold = live_latency_ms_.load(std::memory_order_relaxed);
-        snapshot.save_armed = live_save_armed_.load(std::memory_order_relaxed);
-        snapshot.proto_max_bulk_len = live_proto_max_bulk_len_.load(std::memory_order_relaxed);
-        snapshot.debug_fanout_defer_us = debug_atomic_fanout_defer_.load(std::memory_order_relaxed);
-        auto& clients = values.clients;
-        clients.version = version;
-        clients.timeout = live_timeout_.load(std::memory_order_relaxed);
-        clients.normal.hard_bytes = live_obuf_normal_hard_.load(std::memory_order_relaxed);
-        clients.normal.soft_bytes = live_obuf_normal_soft_.load(std::memory_order_relaxed);
-        clients.normal.soft_seconds = live_obuf_normal_seconds_.load(std::memory_order_relaxed);
-        clients.pubsub.hard_bytes = live_obuf_pubsub_hard_.load(std::memory_order_relaxed);
-        clients.pubsub.soft_bytes = live_obuf_pubsub_soft_.load(std::memory_order_relaxed);
-        clients.pubsub.soft_seconds = live_obuf_pubsub_seconds_.load(std::memory_order_relaxed);
-        return values;
+    void atomic_release_admission_credit(AtomicAdmissionLease& lease,
+                                         uint64_t admitted_generation) {
+        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        while (generation & 1) {
+            __builtin_ia32_pause();
+            generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        }
+        if (!atomic_window()) return;
+        if (admitted_generation == generation && lease.generation == generation) {
+            lease.available++;
+            return;
+        }
+        if (admitted_generation == generation) return;
+        uint32_t carry = lease.reconfig_carry.load(std::memory_order_relaxed);
+        while (carry && !lease.reconfig_carry.compare_exchange_weak(
+                              carry, carry - 1, std::memory_order_acq_rel,
+                              std::memory_order_relaxed)) {}
+        if (carry) atomic_return_reconfigured_credit(generation);
+    }
+
+    void atomic_return_reconfigured_credit(uint64_t generation) {
+        atomic_credit_ops_.fetch_add(1, std::memory_order_acq_rel);
+        if (atomic_credit_generation_.load(std::memory_order_acquire) == generation) {
+            uint32_t debt = atomic_credit_debt_.load(std::memory_order_relaxed);
+            while (debt && !atomic_credit_debt_.compare_exchange_weak(
+                               debt, debt - 1, std::memory_order_acq_rel,
+                               std::memory_order_relaxed)) {}
+            if (!debt) atomic_credit_pool_.fetch_add(1, std::memory_order_release);
+        }
+        atomic_credit_ops_.fetch_sub(1, std::memory_order_release);
+    }
+
+    void atomic_reconfigure_credits(uint32_t window) {
+        // Odd generations close admission while CONFIG takes an exact active-group snapshot.
+        // Borrow/return operations announce themselves so the rebuilt pool cannot race a credit
+        // mutation. IO-local available batches are intentionally discarded by the generation
+        // change; only published active groups survive into the new accounting epoch.
+        uint64_t generation = atomic_credit_generation_.load(std::memory_order_acquire);
+        for (;;) {
+            if (generation & 1) {
+                generation = atomic_credit_generation_.load(std::memory_order_acquire);
+                continue;
+            }
+            if (atomic_credit_generation_.compare_exchange_weak(
+                    generation, generation + 1, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                break;
+        }
+        while (atomic_credit_ops_.load(std::memory_order_acquire) != 0)
+            __builtin_ia32_pause();
+
+        uint64_t active = 0;
+        for (uint32_t io : placement_.ifid_threads()) {
+            AtomicAdmissionLease& lease = thread(io).atomic_admission_lease();
+            const uint32_t live = lease.published_active.load(std::memory_order_acquire);
+            lease.reconfig_carry.store(live, std::memory_order_release);
+            active += live;
+        }
+        live_atomic_window_.store(window, std::memory_order_release);
+        const uint64_t bounded = std::min<uint64_t>(active, UINT32_MAX);
+        atomic_credit_pool_.store(
+            window && bounded < window ? window - static_cast<uint32_t>(bounded) : 0,
+            std::memory_order_release);
+        atomic_credit_debt_.store(
+            window && bounded > window ? static_cast<uint32_t>(bounded - window) : 0,
+            std::memory_order_release);
+        atomic_credit_generation_.store(generation + 2, std::memory_order_release);
     }
 
     uint64_t begin_live_config_update() {
@@ -3322,11 +3390,6 @@ private:
         }
     }
     void end_live_config_update(uint64_t write_version) {
-        const LiveConfigValues next = capture_live_config(write_version + 1);
-        if (live_config_mailboxes_)
-            for (uint32_t tid = 0; tid <= nthreads(); tid++)
-                live_config_mailboxes_[tid].publish(live_config_committed_, next);
-        live_config_committed_ = next;
         live_config_version_.store(write_version + 1, std::memory_order_release);
     }
 
@@ -3422,8 +3485,8 @@ private:
     std::atomic<uint64_t> lb_bucket_bytes_spread_before_{0};
     std::atomic<uint64_t> lb_bucket_bytes_spread_after_{0};
 
-    // Weighted-placement state is absent when both key-lb and client-lb are 0. Bucket arrays
-    // are indexed by the immutable routing id; client state is keyed by the immutable connection id. The mutex is a
+    // Weighted-placement state is absent when lb=0. Bucket arrays are indexed by the
+    // immutable routing id; client state is keyed by the immutable connection id. The mutex is a
     // once-per-controller-beat/read-side lock and is never acquired on an operation path.
     std::unique_ptr<LbAutotune> lb_policy_;
     mutable std::mutex lb_signal_mu_;
@@ -3442,6 +3505,7 @@ private:
     uint64_t script_stage_bytes_ = 4ull * 1024 * 1024;
     std::atomic<uint32_t> loading_{0};
 
+    uint8_t executor_slots_[kMaxThreads] = {};
     std::atomic<uint64_t> next_client_id_{1};
     std::atomic<bool>     shutting_down_{false};
     std::atomic<uint64_t> live_clients_{0};
@@ -3487,8 +3551,7 @@ private:
     std::atomic<uint64_t> climon_tracking_keys_{0};
     std::atomic<uint64_t> climon_tracking_items_{0};
     std::atomic<uint64_t> climon_tracking_prefixes_{0};
-    // Preserve the commit-watermark block's placement after folding window into atomic_credits_.
-    uint32_t atomic_window_layout_padding_ = 0;
+    std::atomic<uint32_t> live_atomic_window_{256};
     // The drawn sequence and the visible read watermark share a line on purpose: readers used to
     // load commit_seq_ itself, so keeping the watermark beside it leaves reader traffic exactly
     // where it was, and a committer touches all three in one go.
@@ -3501,7 +3564,6 @@ private:
     std::atomic<uint32_t> debug_atomic_direct_defer_{0};
     std::atomic<uint32_t> debug_read_local_lane_cap_{0};   // 0 = derive (kInboxSlots)
     std::atomic<uint32_t> debug_hop_delay_{0};
-    std::atomic<bool> debug_atomic_commit_hold_{false};
     std::atomic<uint32_t> debug_atomic_read_delay_{0};
     std::atomic<uint32_t> debug_atomic_fanout_defer_{0};
     std::atomic<uint32_t> debug_script_stage_defer_{0};
@@ -3515,11 +3577,11 @@ private:
     std::atomic<uint64_t> atomic_read_cuts_held_{0};
     std::atomic<uint64_t> atomic_fanout_cuts_{0};
     std::atomic<uint64_t> atomic_exec_read_cuts_{0};
-    AtomicAdmissionCredits atomic_credits_;
-    // Preserve every following cache-line offset formerly occupied by pool/debt/credit_ops.
-    uint32_t atomic_credit_layout_padding_[3] = {};
-    // Enabled is the high bit; every IO with admitted groups and every live record contributes
-    // one low-bit unit. Exact group counts belong to atomic_credits_.
+    std::atomic<uint64_t> atomic_credit_generation_{2};
+    std::atomic<uint32_t> atomic_credit_pool_{0};
+    std::atomic<uint32_t> atomic_credit_debt_{0};
+    std::atomic<uint32_t> atomic_credit_ops_{0};
+    // Enabled is the high bit; every admitted group and live record contributes one low-bit unit.
     // Dispatch therefore decides OFF/ON/draining with one acquire load and one predictable test.
     std::atomic<uint64_t> atomic_activity_{0};
     std::atomic<uint64_t> atomic_read_floors_[kMaxThreads] = {};
@@ -3576,7 +3638,7 @@ private:
     // Cold observability for proving CLIENT catalog work reached every IO owner.
     std::atomic<uint64_t> client_scatter_requests_{0};
     std::atomic<uint64_t> client_scatter_io_responses_{0};
-    // Slow-log arming, published through the same mailboxes as the eviction/notify knobs and read
+    // Slow-log arming, published through the same seqlock as the eviction/notify knobs and read
     // once per executor pass. Appended at the true tail so no pre-existing offset moves.
     std::atomic<int64_t>  live_slowlog_us_{10000};
     std::atomic<uint32_t> live_latency_ms_{0};
@@ -3590,19 +3652,8 @@ private:
     // Appended cold state: disabled servers allocate no epoch state and no established offset
     // moves. Later test-only knobs stay behind this pointer for the same reason.
     std::unique_ptr<ReadLocalServerState> read_local_state_;
-    std::unique_ptr<ModeScheduleStats[]> mode_schedule_stats_;
     // Appended at the true tail: this test-only knob must not move any production member.
     std::atomic<uint64_t> debug_atomic_conditional_deadline_{0};
-    // Registered at executor construction (including dormant FLIP roles), then read
-    // only while all executors are quiesced at an ownership transfer. Keep this state
-    // at the tail so existing members retain their offsets.
-    bool* owner_notify_pending_[kMaxThreads] = {};
-    struct alignas(64) ClientWorkEpoch { std::atomic<uint64_t> epoch{0}; };
-    ClientWorkEpoch client_work_[kMaxThreads];
-    // Fixed storage per physical worker plus one transfer consumer, allocated before workers start.
-    // CONFIG copies into this storage; arbitrarily many updates or a stopped reader cannot grow it.
-    std::unique_ptr<LiveConfigMailbox[]> live_config_mailboxes_;
-    LiveConfigValues live_config_committed_{}; // serialized CONFIG writer only
 };
 
 }  // namespace tomo

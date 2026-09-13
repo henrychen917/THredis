@@ -1,10 +1,11 @@
-// ex_loop.h — executes ops against owned shards. The connection's IO owner retires and sends
-// their replies, using the same Channel signalling and LoopSignals units.
+// ex_loop.h — the EX stage. Executes ops against the shards it owns; a sender (io in 2s, wb in 3s)
+// turns the completions into bytes. Same Channel signalling and LoopSignals units as io/wb loops.
 //
 //   in   task_in from IO threads         a parsed op to execute
-//   out  ready-mask bit / client_in      completed ops for the connection's IO owner
+//   out  ready-mask bit / client_in      "you have completed ops to retire" to the FIXED sender
 //
-// The executor's Ring receives wakes and submits its snapshot/AOF persistence work.
+// A worker owns no file descriptors, so its "events" are channel entries. It still owns a Ring
+// because it needs somewhere to receive wakes.
 //
 // WAITING IS THE INTERESTING PART. A worker with an empty inbox must not spin a core at 100% — that
 // is a real cost at 64 workers and it distorts every utilisation reading a controller might use. It
@@ -22,7 +23,6 @@
 #include "signal.h"
 #include "genthread_pipeline.h"
 #include "read_local.h"
-#include "reorder.h"
 #include "../net/conn.h"
 #include "../net/resp.h"
 #include "../net/uring.h"
@@ -56,7 +56,7 @@ inline constexpr uint32_t kReadLocalMaxChunksBetweenOwnerBatches = 1;
 // Leave that credit outside the pending-read fanout budget so the combined reservation can always
 // fit an empty producer lane and therefore cannot retry forever.
 inline constexpr uint32_t kReadLocalDemotionBudget = kInboxSlots - 1;
-// Lane ADMISSION pressure window. A LANE-FULL deferral arms this many fused rotations
+// Lane ADMISSION pressure window (P128.md). A LANE-FULL deferral arms this many fused rotations
 // during which the parser bounds every connection to kInboxSlots / active connections in flight.
 // It decays by one per rotation and is re-armed only by the next lane-full event -- never by the
 // quota's own deferrals (the actuator must not police itself) -- so under sustained oversubscription
@@ -64,6 +64,10 @@ inline constexpr uint32_t kReadLocalDemotionBudget = kInboxSlots - 1;
 // stayed under the lane for this many rotations the bound is UINT32_MAX and the steady state pays
 // one predicted byte test per parse pass and nothing per op.
 inline constexpr uint8_t kReadLocalLanePressureRotations = 8;
+inline constexpr uint32_t kExSchedClasses =
+    static_cast<uint32_t>(CommandLengthClass::Count);
+inline constexpr uint32_t kExSchedBuckets = kRobWindow * kExSchedClasses;
+inline constexpr uint32_t kExSchedBucketWords = (kExSchedBuckets + 63) / 64;
 static_assert(kExecBatch <= UINT8_MAX);
 static_assert(kExecBatch <= 32);
 static_assert(kGenthreadIfidBatchOps <= kExecBatch);
@@ -71,6 +75,7 @@ static_assert(kReadLocalDrainChunkOps == kExecBatch);
 static_assert(kReadLocalOwnerTaskChunkOps == kExecBatch);
 static_assert(kReadLocalMaxChunksBetweenOwnerBatches > 0);
 static_assert((kExecBatch & (kExecBatch - 1)) == 0);
+static_assert(kExSchedBuckets == 192);
 
 // Constructed only for an armed declared-key-precise write whose owner has since enabled eviction.
 // Keeping the existing maxmemory admission active but forcing NoEviction makes the IO-side promise
@@ -138,8 +143,7 @@ struct ReadLocalExState<true> {
         // already sat at offset 38 between reserved_schedule and demote_context, on the same first
         // cache line as lane_head/lane_tail/lane_count that every admission test already reads, so
         // the struct does not grow, nothing moves, and reading it costs no line the caller did not
-        // already own. Lowering admission lets one pipelined socket write fill the lane inside
-        // one parse pass, before a drain can race the test; traffic volume alone cannot force it.
+        // already own. See P128.md section 8.
         uint16_t lane_admit_cap = static_cast<uint16_t>(kInboxSlots);
         void* demote_context = nullptr;
         DemoteFn demote = nullptr;
@@ -159,8 +163,11 @@ struct ReadLocalExState<true> {
 using ReadLocalExImpl = ReadLocalExState<true>::Impl;
 static_assert(std::is_empty_v<ReadLocalExState<false>>);
 
+template <bool Enabled, uint32_t Capacity>
+struct ReadLocalCaptureBuffer {};
+
 template <uint32_t Capacity>
-struct ReadLocalCaptureBuffer {
+struct ReadLocalCaptureBuffer<true, Capacity> {
     FlatStore::ReadLocalPrefetchCapture entries[Capacity];
 };
 
@@ -169,21 +176,21 @@ class ExLoopT {
 public:
     using FusedCompletionFn = void (*)(void*, Client*);
 
+    WbEngine& engine() { return wb_; }
     bool init(Server* srv, ThreadCtx* self, bool dormant = false) {
         srv_ = srv; self_ = self;
-        srv_->bind_owner_notify_pending(self_->id(), &notify_keyless_pending_);
         aof_manager_ = srv->aof().configured() ? &srv->aof() : nullptr;
         foreign_touch_random_ ^= (static_cast<uint64_t>(self->id()) + 1) * 0x9e3779b97f4a7c15ULL;
         lb_sample_rate_ = srv->key_lb_signals_enabled() ? srv->lb_sample_rate() : 0;
         lb_sample_countdown_ = lb_sample_rate_;
         lb_controller_armed_ = srv->key_lb_signals_enabled();
         age_sample_rate_cached_ = srv->effective_age_sample_rate();
-        reorder_enabled_ = srv->cfg().reorder != 0;
-        pipeline_batches_ = Fused && srv->thread_mode() == ThreadMode::Fused &&
-                            srv->cfg().overlap != 0;
-        // Fused overlap uses fixed producer lanes; synchronous local-read demotion resolves
-        // every reservation before the producer resumes. Split readers use ordinary inboxes.
-        iofused_ = pipeline_batches_;
+        ex_sched_enabled_ = srv->cfg().ex_sched != 0;
+        pipeline_batches_ = Fused && srv->cfg().overlap != 0;
+        // Both interwoven schedules use the proven iofused fixed producer lanes.  The legacy
+        // streams implementation remains in this file for branch comparison, but overlap 2 no
+        // longer reaches its reservation-aware task transport.
+        iofused_ = Fused && srv->cfg().overlap != 0;
         if constexpr (Fused) {
             if (srv->read_local_enabled()) {
                 std::unique_ptr<ReadLocalExImpl> impl(new (std::nothrow) ReadLocalExImpl);
@@ -201,6 +208,7 @@ public:
         }
         if (!ring_.init(1024)) return false;
         fused_handoff_ring_ = &ring_;
+        wb_.bind(&ring_);
         initialized_ = true;
         if (!dormant) activate();
         return true;
@@ -223,7 +231,7 @@ public:
         // Interwoven schedules put executor-originated task/client handoffs on the network ring.
         // That leaves this private ring with control/persistence SQEs; both iofused-family arms
         // amortize at their shared N2 boundary. Pipeline 0 retains its existing ring ownership.
-        if (iofused_ && handoff_ring)
+        if (srv_->cfg().overlap != 0 && handoff_ring)
             fused_handoff_ring_ = handoff_ring;
         blocking_bind_executor(srv_, self_, &ring_);
         if (read_local_enabled())
@@ -276,7 +284,7 @@ public:
                    kReadLocalDemotionBudget - state.lane_demotion_demand;
     }
 
-    // LANE ADMISSION. The parser asks once per parse pass how many lane slots (pending
+    // LANE ADMISSION (P128.md). The parser asks once per parse pass how many lane slots (pending
     // local reads) one connection may hold. Unbounded while the lane is not under pressure -- below
     // kInboxSlots of aggregate demand per rotation. Under pressure it is the lane divided among the
     // connections competing for it, which by construction keeps the sum of admitted local reads
@@ -310,8 +318,8 @@ public:
     // IoLoop fields it does read live on two other lines entirely (notify_armed_ 7864,
     // proto_max_bulk_len_ 7872). That made always-on machinery cost one cold-line demand fill per
     // parse pass while every counter it owns still read zero -- measured on the owner's 32-core box
-    // at 512 connections as +11% DRAM and +3.4% same-CCX fills per op with instructions flat.
-    // A hint must never be load-bearing, and machinery that has not fired must be
+    // at 512 connections as +11% DRAM and +3.4% same-CCX fills per op with instructions flat
+    // (P128.md 9.5). A hint must never be load-bearing, and machinery that has not fired must be
     // free: gate the argument, not just the answer.
     bool read_local_lane_under_pressure() const {
         static_assert(Fused);
@@ -381,13 +389,12 @@ public:
 
     uint32_t fused_baseline_pass() {
         static_assert(Fused);
-        if (srv_->thread_mode() == ThreadMode::Split) return split_read_local_pass();
-        if (read_local_enabled())
+        if (read_local_interleave_enabled())
             return fused_pass_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_pass_impl<kGenthreadExBatchOps, true, false>();
     }
 
-    // Private-lane whole-batch turn shared by overlap's thin path, idle repair,
+    // Private-lane whole-batch turn shared by source iofused, overlap-2's thin path, idle repair,
     // and blocking snapshot progress. It has no streams pipeline-state probes.
     uint32_t fused_coarse_pass() {
         static_assert(Fused);
@@ -405,6 +412,12 @@ public:
             &filler);
     }
 
+    // Legacy streams entry retained for branch archaeology; overlap-2 dispatch has no caller.
+    uint32_t fused_streams_pass() {
+        static_assert(Fused);
+        return fused_pass_impl<kGenthreadPipelineExBatchOps, true, false>();
+    }
+
     // Buffered schedules keep control/persistence work in the executor owner but let the fused
     // loop own task gather/prefetch/execute. This has no internal park and never consumes a Task.
     uint32_t fused_pipeline_control() {
@@ -416,7 +429,6 @@ public:
               bool IofusedPrivateQueue = false, bool InterleaveLocalReads = false,
               typename Filler = void>
     uint32_t fused_pass_impl(Filler* filler = nullptr) {
-        Server::ClientWorkScope client_work(*srv_, self_->id());
         constexpr bool HasFiller = !std::is_void_v<Filler>;
         [[maybe_unused]] bool filler_used = false;
         auto finish_filler = [&] {
@@ -473,7 +485,7 @@ public:
         if constexpr (InterleaveLocalReads) {
             static_assert(Fused && ConsumeTasks);
             static_assert(BatchOps == kReadLocalOwnerTaskChunkOps);
-            if (!read_local_enabled()) std::abort();
+            if (!read_local_interleave_enabled()) std::abort();
             // Exceptional debt keeps its established total order. The ordinary saturated turn is
             // the only place that caps fresh owner work before WB.
             fairlane_turn = !lb_frozen && !fairlane_owner_debt_pending();
@@ -487,10 +499,6 @@ public:
             // EARLY: reads parsed by the preceding IFID phase get the first execution/reply slots.
             did += drain_local_reads_bounded(kReadLocalDrainChunkOps);
         } else {
-            // Coarse overlap consumes every local capture inside this call. On a clean
-            // three-way turn WB runs later at the owner prefetch seam; on an exceptional turn
-            // it already ran above. Neither WB nor owner mutation runs inside a local chunk,
-            // so no foreign pointer survives into either or across RotationBoundary's tick.
             did += drain_local_reads();
         }
         if (lb_frozen) {
@@ -554,6 +562,8 @@ public:
             }
             did += aof_flush_pass();
             did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
+            did += lb_control_pass();
+            lb_bucket_bytes_pass();
         }
         if (fairlane_turn) {
             owner_work_remains |= fairlane_owner_debt_pending();
@@ -563,7 +573,7 @@ public:
         }
         if (read_local_enabled()) {
             did += read_local_impl().deferred.drain_ready();
-            // One rotation of the lane-admission pressure window has elapsed.
+            // One rotation of the lane-admission pressure window has elapsed (P128.md).
             if (__builtin_expect(read_local_impl().lane_pressure != 0, false))
                 read_local_impl().lane_pressure--;
             // Adopt the test lane cap, if one is set. ONE relaxed load per ROTATION of a
@@ -578,8 +588,8 @@ public:
             if (__builtin_expect(read_local_impl().lane_admit_cap != want, false))
                 read_local_impl().lane_admit_cap = want;
         }
-        if (!lb_frozen) did += owner_control_tail();
         if (did) {
+            did += drain_notify_keyless(self_->sig());
             fused_submit_boundary<CoalesceSubmit>();
             fused_idle_spins_ = 0;
             return did;
@@ -621,8 +631,7 @@ public:
 
     uint32_t fused_baseline_sweep() {
         static_assert(Fused);
-        if (srv_->thread_mode() == ThreadMode::Split) return split_read_local_pass();
-        if (read_local_enabled())
+        if (read_local_interleave_enabled())
             return fused_sweep_impl<kGenthreadExBatchOps, true, false, false, true>();
         return fused_sweep_impl<kGenthreadExBatchOps, true, false>();
     }
@@ -655,7 +664,7 @@ public:
         if (lb_rebind_pending_) read_local_rebind_owned_shards_after_lb();
         uint32_t did = 0;
         if constexpr (InterleaveLocalReads) {
-            if (!read_local_enabled()) std::abort();
+            if (!read_local_interleave_enabled()) std::abort();
             if (fairlane_owner_debt_pending()) {
                 did += drain_local_reads() +
                     sweep<BatchOps, ConsumeTasks, IofusedPrivateQueue>();
@@ -684,29 +693,12 @@ public:
 
     Ring& ring() { return ring_; }
 
-    // Defined with the split read-local runtime in rl2s.cc. The IO role never services owner
-    // tasks or shard housekeeping, even while FLIP installs its future EX shard vector.
-    uint32_t split_read_local_pass();
-
     void run() {
-        if constexpr (Fused) {
-            // Only RL2S instantiates the owner loop with the fused-capable executor. Its lane
-            // was drained before role conversion; owner commands use no local-read captures.
-            if (!read_local_enabled() || read_local_impl().lane_count != 0) std::abort();
-            self_->publish_read_local_parked(srv_->read_local_epoch());
-            // A preceding shard-less IO tenure may have consumed this CONFIG version without
-            // applying it to shards. Reapply once ownership is installed and dispatch resumes.
-            live_config_version_ = UINT64_MAX;
-        }
         LoopSignals& sig = self_->sig();
         uint32_t idle_spins = 0;
 
         while (!self_->stop_flag().load(std::memory_order_relaxed) &&
                self_->role() == Role::Ex) {
-#ifdef TOMO_RL_CACHE_DEBUG
-            if constexpr (Fused)
-                srv_->debug_assert_read_local_sinks_follow_ownership(self_->id());
-#endif
             cached_now_ms_ = realtime_ms();
             const bool flip_frozen = srv_->flip_stage() >= FlipStage::ExDrain;
             const bool lb_frozen = lb_controller_armed_ && srv_->lb_dispatch_paused();
@@ -723,7 +715,6 @@ public:
             uint32_t did = 0;
             uint64_t pass_ns = 0;
             {
-                Server::ClientWorkScope client_work(*srv_, self_->id());
                 Span busy(pass_ns);
                 if (self_->sample_depth(busy.start_ns() / 1000)) {
                     const uint32_t age_rate = srv_->effective_age_sample_rate();
@@ -752,12 +743,10 @@ public:
                         flush_xshard_commits();
                         did += aof_flush_pass();
                         did += drain_notify_keyless(sig);
-                        if constexpr (Fused)
-                            did += read_local_impl().deferred.drain_ready();
                     }
                     did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
-                    did += lb_control_pass();
                     did += flip_control_pass();
+                    did += lb_control_pass();
                 } else {
                     did += snapshot_control_pass();
                     did += service_stale_forwards();
@@ -780,9 +769,9 @@ public:
                     }
                     did += aof_flush_pass();
                     did += ring_.for_each_cqe([&](io_uring_cqe* cqe) { on_cqe(cqe); });
-                    if constexpr (Fused)
-                        did += read_local_impl().deferred.drain_ready();
-                    did += owner_control_tail();
+                    did += flip_control_pass();
+                    did += lb_control_pass();
+                    lb_bucket_bytes_pass();
                 }
             }
             // A pass that found nothing -- every drain and control pass came back empty -- is
@@ -799,6 +788,7 @@ public:
             // the busy path without submitting strands them in the SQ forever, and the peer
             // that is waiting on that wake never runs.
             if (did) {
+                did += drain_notify_keyless(sig);
                 ring_.submit_and_reap(); idle_spins = 0; continue;
             }
 
@@ -839,14 +829,15 @@ public:
 
 private:
     friend class IoLoop;
-    friend struct CoreConcurrencyTest;
-#ifdef TOMO_CORE_CONCURRENCY_TEST
-    inline static void (*test_after_done_)(Client*) = nullptr;
-    inline static void (*test_after_drain_ack_)() = nullptr;
-#endif
 
     bool read_local_enabled() const {
         if constexpr (Fused) return read_local_.impl != nullptr;
+        return false;
+    }
+
+    bool read_local_interleave_enabled() const {
+        if constexpr (Fused)
+            return read_local_.impl != nullptr;
         return false;
     }
 
@@ -1171,6 +1162,135 @@ private:
         Server::debug_stall_us(debug_fanout_defer_us_);
     }
 
+    PreparedLocalRead prepare_local_mget(Op& op) {
+        static constexpr uint32_t kAttempts = 2;
+        const uint32_t key_count = op.argc() - 1;
+        if (!key_count || srv_->nshards() > LocalMgetWindow::kMaxShards) std::abort();
+
+        uint64_t hashes[LocalMgetWindow::kMaxEpochKeys];
+        int32_t shards[LocalMgetWindow::kMaxEpochKeys];
+        const bool cached_routes = key_count <= LocalMgetWindow::kMaxEpochKeys;
+        uint64_t touched[LocalMgetWindow::kMaxShards / 64] = {};
+        for (uint32_t key = 0; key < key_count; key++) {
+            const uint64_t hash = FlatStore::hash_key(op.arg(key + 1));
+            const int32_t shard_id = srv_->router().shard_of(hash);
+            touched[static_cast<uint32_t>(shard_id) >> 6] |=
+                uint64_t{1} << (static_cast<uint32_t>(shard_id) & 63);
+            if (cached_routes) {
+                hashes[key] = hash;
+                shards[key] = shard_id;
+            }
+        }
+        const int64_t command_now_ms = cached_now_ms_;
+        if (__builtin_expect(debug_fanout_defer_us_ != 0, false)) debug_fanout_stall_local();
+
+        ReadLocalFallbackReason transient = ReadLocalFallbackReason::Generation;
+        for (uint32_t attempt = 0; attempt < kAttempts; attempt++) {
+            LocalMgetWindow window;
+            PreparedLocalRead prepared;
+            read_local_clear_reply(op);
+
+            // Capture every participant before touching any value. The close below is after every
+            // copy, giving all stable participant intervals one command-wide intersection.
+            transient = local_mget_window_open(
+                window, touched, hashes, shards, key_count, cached_routes);
+            bool retry = transient != ReadLocalFallbackReason::None;
+            if (!retry) reply_array_header(op.sink(), key_count);
+
+            for (uint32_t key = 0; key < key_count && !retry; key++) {
+                const Slice name = op.arg(key + 1);
+                const uint64_t hash = cached_routes ? hashes[key] : FlatStore::hash_key(name);
+                const int32_t shard_id = cached_routes
+                    ? shards[key] : srv_->router().shard_of(hash);
+                FlatStore& store = srv_->shard(shard_id).store();
+                store.read_local_prefetch(hash);
+                const FlatStore::ReadLocalProbe probe = store.read_local_probe(hash, name);
+                if (probe.result == FlatStore::ReadLocalProbeResult::AtomicPending) {
+                    read_local_clear_reply(op);
+                    return {ReadLocalFallbackReason::AtomicPending};
+                }
+                if (probe.result == FlatStore::ReadLocalProbeResult::Churn) {
+                    transient = ReadLocalFallbackReason::SeqChurn;
+                    retry = true;
+                    break;
+                }
+                if (probe.result == FlatStore::ReadLocalProbeResult::Missing) {
+                    // Parser admission excludes an armed keymiss notification, whose owner lookup
+                    // may emit an event. With that state ruled out, a validated absent slot has no
+                    // lazy-expiry side effect and is an ordinary array nil element.
+                    reply_null(op.sink(), op.resp3());
+                    prepared.keyspace_misses++;
+                    if (!window.use_epochs && !store.read_local_validate(probe.state)) {
+                        transient = ReadLocalFallbackReason::SeqChurn;
+                        retry = true;
+                    }
+                    continue;
+                }
+
+                const KvObj* object = probe.object;
+                if (!object) std::abort();
+                const uint8_t flags = object->read_local_flags();
+                if (static_cast<Type>(object->type) != Type::String) {
+                    read_local_clear_reply(op);
+                    return {ReadLocalFallbackReason::Typed};
+                }
+                if (flags & KvObjFlags::HasTtl) {
+                    const int64_t deadline = object->read_local_expire_at_ms(flags);
+                    if (deadline >= 0 && deadline <= command_now_ms) {
+                        // Unlike a plain stable miss, expiry-due needs the owner to perform lazy
+                        // expiry and its accounting/notifications, so one such key demotes all
+                        // MGET.
+                        read_local_clear_reply(op);
+                        return {ReadLocalFallbackReason::Expired};
+                    }
+                }
+
+                const Enc encoding = object->encoding();
+                if (encoding == Enc::Int) {
+                    char text[24];
+                    const uint32_t length = i64_to_dec(
+                        text, object->read_local_int_value(flags));
+                    reply_bulk(op.sink(), Slice(text, length));
+                } else if (encoding == Enc::Raw || encoding == Enc::Extern) {
+                    if (!read_local_reply_string(op, object, flags)) {
+#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
+                        self_->read_local_stats().settax.object_sequence_retries++;
+#endif
+                        transient = ReadLocalFallbackReason::SeqChurn;
+                        retry = true;
+                        break;
+                    }
+                } else {
+                    read_local_clear_reply(op);
+                    return {ReadLocalFallbackReason::Typed};
+                }
+                prepared.keyspace_hits++;
+                // Account only for a key this pass actually accepted, so a churned read that is
+                // about to be retried or demoted never records an access it did not serve.
+                if (!window.use_epochs && !store.read_local_validate(probe.state)) {
+                    transient = ReadLocalFallbackReason::SeqChurn;
+                    retry = true;
+                } else if (__builtin_expect(maxmemory_enabled_, false)) {
+                    note_local_read_access(op, object, flags);
+                }
+            }
+
+            // The complete reply is still private. Accept only if every participant is unchanged
+            // under its own rule since before the first value load.
+            if (!retry) {
+                transient = local_mget_window_close(
+                    window, touched, hashes, shards, key_count);
+                retry = transient != ReadLocalFallbackReason::None;
+            }
+            if (!retry) return prepared;
+            read_local_clear_reply(op);
+            if (attempt + 1 < kAttempts)
+                self_->read_local_stats().mget_generation_retries++;
+        }
+        return {local_mget_final_reason(
+            op, hashes, shards, key_count, cached_routes, transient)};
+    }
+
     PreparedLocalRead prepare_captured_local_mget(Op& op) {
         static constexpr uint32_t kAttempts = 2;
         const uint32_t key_count = op.argc() - 1;
@@ -1210,7 +1330,7 @@ private:
                     key_count - first, kReadLocalPrefetchKeys);
                 uint64_t hashes[kReadLocalPrefetchKeys];
                 int32_t shards[kReadLocalPrefetchKeys];
-                ReadLocalCaptureBuffer<kReadLocalPrefetchKeys> captures;
+                ReadLocalCaptureBuffer<true, kReadLocalPrefetchKeys> captures;
 
                 // I0 warms every home word in this bounded window. C0 then performs the complete
                 // key-verified walk and prefetches the exact object's value before E0 copies it.
@@ -1289,7 +1409,7 @@ private:
                         return {ReadLocalFallbackReason::Typed};
                     }
                     prepared.keyspace_hits++;
-                    // Account only for a key this pass accepted, before any retry or demotion.
+                    // See prepare_local_mget: accept first, then account.
                     if (!window.use_epochs && !store.read_local_validate(capture.state)) {
                         transient = ReadLocalFallbackReason::SeqChurn;
                         retry = true;
@@ -1321,28 +1441,45 @@ private:
     // keeps an overlapping younger read behind any operation that needs the owner path.
     // `op`, `store` and `mget` were resolved once by the chunk gather; a point read passes its
     // home store, an MGET passes null and takes its own multi-store path.
+    template <bool CapturePrefetch>
     PreparedLocalRead prepare_local_read(
             Op& op, FlatStore* home, bool mget,
             const FlatStore::ReadLocalPrefetchCapture* captured = nullptr) {
         if (mget) {
             if (captured) std::abort();
-            return prepare_captured_local_mget(op);
+            if constexpr (CapturePrefetch) return prepare_captured_local_mget(op);
+            else return prepare_local_mget(op);
         }
         FlatStore& store = *home;
         static constexpr uint32_t kRetries = 3;
-        ReadLocalCaptureBuffer<1> local_capture;
-        // A mixed GET/MGET chunk executes in program order. Its point reads capture here so a
-        // later GET can never retain a version older than the preceding MGET returned.
-        if (!captured) {
-            store.read_local_prefetch(op.hash);
-            local_capture.entries[0] = store.read_local_prefetch_capture(op.hash, op.key());
-            captured = &local_capture.entries[0];
+        [[maybe_unused]] ReadLocalCaptureBuffer<CapturePrefetch, 1> local_capture;
+        if constexpr (CapturePrefetch) {
+            // A mixed GET/MGET chunk executes in program order. Its point reads capture here so a
+            // later GET can never retain a version older than the preceding MGET returned.
+            if (!captured) {
+                store.read_local_prefetch(op.hash);
+                local_capture.entries[0] =
+                    store.read_local_prefetch_capture(op.hash, op.key());
+                captured = &local_capture.entries[0];
+            }
+        } else {
+            if (captured) std::abort();
         }
 
         for (uint32_t attempt = 0; attempt < kRetries; attempt++) {
-            const FlatStore::ReadLocalProbeResult result = captured->result;
-            const KvObj* object = captured->object;
-            const uint64_t probe_state = captured->state;
+            FlatStore::ReadLocalProbeResult result;
+            const KvObj* object = nullptr;
+            uint64_t probe_state = 0;
+            if constexpr (CapturePrefetch) {
+                result = captured->result;
+                object = captured->object;
+                probe_state = captured->state;
+            } else {
+                const FlatStore::ReadLocalProbe probe = store.read_local_probe(op.hash, op.key());
+                result = probe.result;
+                object = probe.object;
+                probe_state = probe.state;
+            }
             if (result == FlatStore::ReadLocalProbeResult::AtomicPending) {
                 read_local_clear_reply(op);
                 return {ReadLocalFallbackReason::AtomicPending};
@@ -1351,12 +1488,17 @@ private:
                 read_local_clear_reply(op);
                 return {ReadLocalFallbackReason::Missing};
             }
-            if (result == FlatStore::ReadLocalProbeResult::Churn) break;
+            if (result == FlatStore::ReadLocalProbeResult::Churn) {
+                if constexpr (CapturePrefetch) break;
+                else continue;
+            }
 
             if (!object) std::abort();
-            // Keep the observed word's address as part of the snapshot, but consume only the
-            // decoded immutable object. Loading through slot here would chase a newer version.
-            if (!captured->slot) std::abort();
+            if constexpr (CapturePrefetch) {
+                // Keep the observed word's address as part of the snapshot, but consume only the
+                // decoded immutable object. Loading through slot here would chase a newer version.
+                if (!captured->slot) std::abort();
+            }
             const uint8_t flags = object->read_local_flags();
             if (static_cast<Type>(object->type) != Type::String) {
                 read_local_clear_reply(op);
@@ -1392,7 +1534,8 @@ private:
 
             if (!store.read_local_validate(probe_state)) {
                 read_local_clear_reply(op);
-                break;
+                if constexpr (CapturePrefetch) break;
+                else continue;
             }
             // One predicted-not-taken test on the same per-pass byte the owner path tests, after
             // the validate that makes this read final. See note_local_read_access().
@@ -1417,11 +1560,11 @@ private:
             return 0;
         } else {
             if (!read_local_enabled() || !op_budget) return 0;
-            return drain_local_reads_bounded_impl<YieldToOwner>(op_budget);
+            return drain_local_reads_bounded_impl<true, YieldToOwner>(op_budget);
         }
     }
 
-    template <bool YieldToOwner>
+    template <bool CapturePrefetch, bool YieldToOwner>
     uint32_t drain_local_reads_bounded_impl(uint32_t op_budget) {
         static_assert(Fused);
         auto& lane = read_local_impl();
@@ -1436,7 +1579,8 @@ private:
             ReadLocalFallbackReason fallbacks[kReadLocalDrainChunkOps];
         } chunk;
         static_assert(kReadLocalDrainChunkOps <= 32, "mget_mask is one 32-bit word");
-        ReadLocalCaptureBuffer<kReadLocalDrainChunkOps> captures;
+        [[maybe_unused]] ReadLocalCaptureBuffer<
+            CapturePrefetch, kReadLocalDrainChunkOps> captures;
         const uint32_t nshards = srv_->nshards();
         ReadLocalStats& stats = self_->read_local_stats();
         uint32_t work = 0;
@@ -1501,17 +1645,26 @@ private:
             // Pure point chunks retain the widest I0/C0/E0 overlap. A mixed chunk captures and
             // consumes each command in program order below: MGET may retry and recapture, so
             // pre-capturing a following GET could otherwise let that later command regress.
-            const bool point_capture_batch = mget_mask == 0;
-            if (point_capture_batch) {
-                // I0 retains the old whole-batch home-slot overlap. C0 consumes those warm
-                // words, records their decoded objects, and hints object/value bytes for E0.
-                for (uint32_t i = 0; i < count; i++)
-                    chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
-                for (uint32_t i = 0; i < count; i++) {
-                    const Op& op = *chunk.ops[i];
-                    captures.entries[i] =
-                        chunk.stores[i]->read_local_prefetch_capture(op.hash, op.key());
+            [[maybe_unused]] const bool point_capture_batch = CapturePrefetch && mget_mask == 0;
+
+            if constexpr (CapturePrefetch) {
+                if (point_capture_batch) {
+                    // I0 retains the old whole-batch home-slot overlap. C0 consumes those warm
+                    // words, records their decoded objects, and hints object/value bytes for E0.
+                    for (uint32_t i = 0; i < count; i++)
+                        chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
+                    for (uint32_t i = 0; i < count; i++) {
+                        const Op& op = *chunk.ops[i];
+                        captures.entries[i] =
+                            chunk.stores[i]->read_local_prefetch_capture(op.hash, op.key());
+                    }
                 }
+            } else {
+                // Selector 0 is the original hint-only path, including MGET's established bounded
+                // prefetch inside prepare_local_mget().
+                for (uint32_t i = 0; i < count; i++)
+                    if (!((mget_mask >> i) & 1u))
+                        chunk.stores[i]->read_local_prefetch(chunk.ops[i]->hash);
             }
 
             // E0. The owner-map recheck is decided once per chunk: only this thread's parser and
@@ -1545,11 +1698,15 @@ private:
                 }
                 if (chunk.fallbacks[i] == ReadLocalFallbackReason::None) {
                     PreparedLocalRead prepared;
-                    if (point_capture_batch) {
-                        prepared = prepare_local_read(
-                            op, chunk.stores[i], false, &captures.entries[i]);
+                    if constexpr (CapturePrefetch) {
+                        if (point_capture_batch) {
+                            prepared = prepare_local_read<true>(
+                                op, chunk.stores[i], false, &captures.entries[i]);
+                        } else {
+                            prepared = prepare_local_read<true>(op, chunk.stores[i], mget);
+                        }
                     } else {
-                        prepared = prepare_local_read(op, chunk.stores[i], mget);
+                        prepared = prepare_local_read<false>(op, chunk.stores[i], mget);
                     }
                     chunk.fallbacks[i] = prepared.fallback;
                     if (first_fallback == count &&
@@ -1649,28 +1806,6 @@ private:
         return true;
     }
 
-    uint32_t owner_control_tail() {
-        // A stage may start after the loop's initial freeze sample. Finish EVERY
-        // owner access before a control pass can acknowledge ExDrain: the coordinator
-        // may transfer shards and rewrite this vector immediately after that store.
-        uint32_t work = 0;
-        // Busy owners must get the same maintenance as idle sweeps. Reuse the pass's cached
-        // clock, at most once per distinct millisecond (a clock adjustment cannot postpone it).
-        const uint32_t now = static_cast<uint32_t>(cached_now_ms_);
-        if (now != expire_beat_ms_) {
-            expire_beat_ms_ = now;
-            work += active_expire_cycle();
-        }
-        if constexpr (Fused)
-            if (read_local_enabled() && read_local_impl().deferred.resize_pending()) work++;
-        work += drain_notify_keyless(self_->sig());
-        lb_bucket_bytes_pass();
-        work += lb_control_pass();
-        if constexpr (!Fused) work += flip_control_pass();
-        else if (srv_->thread_mode() == ThreadMode::Split) work += flip_control_pass();
-        return work;
-    }
-
     uint32_t flip_control_pass() {
         const FlipStage stage = srv_->flip_stage();
         if (stage == FlipStage::IoPrepare &&
@@ -1686,9 +1821,6 @@ private:
         if (stage == FlipStage::ExDrain && !srv_->flip_acked(self_->id(), stage) &&
             flip_quiesced()) {
             srv_->flip_ack(self_->id(), stage);
-#ifdef TOMO_CORE_CONCURRENCY_TEST
-            if (test_after_drain_ack_) test_after_drain_ack_();
-#endif
             return 1;
         }
         if (stage == FlipStage::ExInstall && !srv_->flip_acked(self_->id(), stage)) {
@@ -1745,34 +1877,27 @@ private:
         if (srv_->lb_acked(self_->id())) return 0;
         if (!flip_quiesced()) return 0;
         srv_->lb_ack(self_->id());
-#ifdef TOMO_CORE_CONCURRENCY_TEST
-        if (test_after_drain_ack_) test_after_drain_ack_();
-#endif
         lb_ack_wake_pending_ = true;
         lb_rebind_pending_ = true;   // membership may change before the stage ends; rebind after
         return wake_coordinator();
     }
 
-    template <bool OwnsShards = true>
     void refresh_live_config() {
         LiveConfigSnapshot snapshot;
-        if (!srv_->live_config_snapshot_if_changed(
-                self_->id(), live_config_version_, snapshot)) return;
+        if (!srv_->live_config_snapshot_if_changed(live_config_version_, snapshot)) return;
         const bool enabled = snapshot.maxmemory != 0;
-        if constexpr (OwnsShards) {
-            const uint64_t shard_limit = snapshot.maxmemory / srv_->nshards();
-            for (Shard* sh : self_->shards()) {
-                sh->configure_maxmemory(enabled, shard_limit, snapshot.policy, snapshot.samples);
-                // CLIENT TRACKING and periodic SAVE need the same per-write observation points as
-                // keyspace notifications, so they ride the shard mask as synthetic observer bits.
-                // notify_record expands those observers over NOTIFY_ALL without adding those class
-                // bits here: the operator's configured pub/sub classes therefore remain independent.
-                // NOTIFY_NEW and NOTIFY_KEY_MISS stay outside the observer surface: `new` would count
-                // or invalidate a mutation twice, and a key miss is not a value change.
-                sh->set_notify_mask(snapshot.notify_events |
-                                    (snapshot.tracking_armed ? NOTIFY_TRACKING : 0u) |
-                                    (snapshot.save_armed ? NOTIFY_SAVE : 0u));
-            }
+        const uint64_t shard_limit = snapshot.maxmemory / srv_->nshards();
+        for (Shard* sh : self_->shards()) {
+            sh->configure_maxmemory(enabled, shard_limit, snapshot.policy, snapshot.samples);
+            // CLIENT TRACKING and periodic SAVE need the same per-write observation points as
+            // keyspace notifications, so they ride the shard mask as synthetic observer bits.
+            // notify_record expands those observers over NOTIFY_ALL without adding those class
+            // bits here: the operator's configured pub/sub classes therefore remain independent.
+            // NOTIFY_NEW and NOTIFY_KEY_MISS stay outside the observer surface: `new` would count
+            // or invalidate a mutation twice, and a key miss is not a value change.
+            sh->set_notify_mask(snapshot.notify_events |
+                                (snapshot.tracking_armed ? NOTIFY_TRACKING : 0u) |
+                                (snapshot.save_armed ? NOTIFY_SAVE : 0u));
         }
         maxmemory_enabled_ = enabled;
         foreign_touch_policy_ =
@@ -1811,7 +1936,6 @@ private:
     template <uint32_t BatchOps = kGenthreadExBatchOps, bool ConsumeTasks = true,
               bool IofusedPrivateQueue = false, bool InterleaveLocalReads = false>
     uint32_t sweep() {
-        Server::ClientWorkScope client_work(*srv_, self_->id());
         [[maybe_unused]] bool owner_work_remains = false;
         uint32_t n = snapshot_control_pass<BatchOps, IofusedPrivateQueue>() +
                      service_stale_forwards<BatchOps, IofusedPrivateQueue>() +
@@ -1846,10 +1970,6 @@ private:
         if (__builtin_expect(srv_->blocking_waiters() != 0, false))
             n += blocking_owner_cycle(*srv_, *self_, ring_, cached_now_ms_, true);
         n += aof_flush_pass();
-        // Normally flush_xshard_commits empties the queue synchronously. The DEBUG hold can
-        // retain it across passes; both split and fused idle paths consult this sweep before
-        // parking, so keep polling until the control connection releases the latch.
-        if (__builtin_expect(xshard_commit_pending_, false)) n++;
         return n;
     }
 
@@ -1889,12 +2009,6 @@ private:
             if (n) sh->publish_size();
             removed += n;
         }
-        // With more shards than this pass's visit budget, the last busy command may have
-        // started a resize outside the sampled slice. Do not let an otherwise empty sweep
-        // park before the round-robin cursor reaches that shard.
-        if (!removed && visits < shards.size())
-            for (Shard* shard : shards)
-                if (shard->store().rehashing() && !shard->store().snapshot_active()) return 1;
         return removed;
     }
 
@@ -2007,9 +2121,8 @@ private:
         auto execute_batch = [&] {
             if (!held) return;
             if (!filler_used && xshard_retries_.empty()) {
-                if (__builtin_expect(reorder_enabled_, false))
-                    srv_->mode_schedule_stats(self_->id()).note_reorder(
-                        held, ex_schedule_batch(batch, held));
+                if (__builtin_expect(ex_sched_enabled_, false))
+                    ex_schedule_batch(batch, held);
                 prefetch_exec_batch(batch, held);
                 filler();
                 filler_used = true;
@@ -2029,6 +2142,179 @@ private:
         execute_batch();
         self_->sig().ops += n;
         return n;
+    }
+
+    // Only the ordinary one-owner path participates. Every existing special mechanism is a hard
+    // barrier in the gathered sequence: eligible work on either side cannot move across it.
+    bool ex_sched_candidate(const Task& task, uint8_t& length) const {
+        if (!task.client || task.scatter) return false;
+        const Op& op = task.client->rob().at(task.op_id);
+        if (!op.spec || op.has_blocking_state()) return false;
+        constexpr uint32_t kSpecial =
+            CmdFlags::Admin | CmdFlags::ConnLocal | CmdFlags::AllShards | CmdFlags::RandomShard |
+            CmdFlags::CursorShard | CmdFlags::ConfigRoute | CmdFlags::ScriptRoute |
+            CmdFlags::PubSub | CmdFlags::Blocking | CmdFlags::Transaction |
+            CmdFlags::StreamRoute | CmdFlags::SubcmdRoute | CmdFlags::FlipAsync;
+        // MultiShard is deliberately absent: a same-owner MGET/MSET local-fast task is ordinary
+        // here. A real scatter has task.scatter set and returned above.
+        if (op.spec->flags & kSpecial) return false;
+        length = static_cast<uint8_t>(command_length_class(*op.spec));
+        if (__builtin_expect(length >= kExSchedClasses, false)) return false;
+        // There is no O(1) class pointer from an op to an exact parked atomic predecessor. The
+        // immutable publish-time hazard bit says an older own atomic group existed; Long is the
+        // safe upper bound without a deque scan or persistent scheduler state.
+        if (op.atomic_hazard()) length = static_cast<uint8_t>(CommandLengthClass::Long);
+        return true;
+    }
+
+    struct ExScheduleKey {
+        uint8_t rank = 0;
+        uint8_t length = 0;
+    };
+
+    void ex_schedule_run(Task* tasks, const uint8_t* base_lengths, uint32_t n) {
+        if (n < 2) return;
+        Client* const only_client = tasks[0].client;
+        uint32_t distinct_at = 1;
+        while (distinct_at < n && tasks[distinct_at].client == only_client) distinct_at++;
+        // Absolute per-connection order leaves no legal permutation in a one-client run.
+        if (distinct_at == n) return;
+
+        ExScheduleKey keys[kExecBatch];
+        uint8_t min_rank = UINT8_MAX;
+        uint8_t max_rank = 0;
+        uint8_t first_length = 0;
+        bool one_length = true;
+
+        // The gather contract presents each connection's Tasks in increasing op_id order. Sample
+        // newest-to-oldest: flush_id only advances, so an older task still receives a strictly
+        // lower rank even if IO retires a completed prefix between samples. Adjacent tasks from
+        // one connection reuse the head load without any per-connection table. The slow path
+        // verifies the contract before reordering; every earlier exit retains FIFO.
+        Client* sampled_client = nullptr;
+        uint64_t sampled_head = 0;
+        for (uint32_t i = n; i-- > 0;) {
+            const Task& task = tasks[i];
+            if (task.client != sampled_client) {
+                sampled_client = task.client;
+                sampled_head = sampled_client->rob().flush_id();
+            }
+            const uint64_t distance = task.op_id - sampled_head;
+            // A fresh unfinished task is always in the 64-slot live ROB window. If that invariant
+            // is ever broken, preserve today's FIFO instead of collapsing ranks and risking order.
+            if (__builtin_expect(distance >= kRobWindow, false)) return;
+            keys[i] = ExScheduleKey{static_cast<uint8_t>(distance), base_lengths[i]};
+            min_rank = std::min(min_rank, keys[i].rank);
+            max_rank = std::max(max_rank, keys[i].rank);
+            if (i == n - 1) first_length = keys[i].length;
+            else one_length &= keys[i].length == first_length;
+        }
+
+        // The measured-law escape is defined on the directly available gathered classes and runs
+        // before conservative widening for an invisible predecessor. This is what keeps homogeneous
+        // rank-adjacent traffic off the dependency and bucket paths.
+        if (one_length && max_rank - min_rank <= 1) return;
+
+        // Effective class is the prefix maximum for each connection in this gathered run. A rank
+        // before the first represented task, or a gap in its ids, means an unrepresented blocker;
+        // its slot cannot safely be read while IO may recycle it, so Long is the no-state upper
+        // bound. Open addressing is at most half full and is reached only after degeneration.
+        static constexpr uint32_t kChainSlots = kExecBatch * 2;
+        Client* chain_client[kChainSlots];
+        uint8_t chain_last[kChainSlots];
+        uint64_t chain_occupied = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            Client* client = tasks[i].client;
+            uint64_t hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(client));
+            hash ^= hash >> 33;
+            hash *= uint64_t{0xff51afd7ed558ccdull};
+            hash ^= hash >> 33;
+            uint32_t slot = static_cast<uint32_t>(hash) & (kChainSlots - 1);
+            uint64_t bit = uint64_t{1} << slot;
+            while ((chain_occupied & bit) && chain_client[slot] != client) {
+                slot = (slot + 1) & (kChainSlots - 1);
+                bit = uint64_t{1} << slot;
+            }
+            if (!(chain_occupied & bit)) {
+                chain_occupied |= bit;
+                chain_client[slot] = client;
+                if (keys[i].rank != 0)
+                    keys[i].length = static_cast<uint8_t>(CommandLengthClass::Long);
+            } else {
+                const uint8_t previous = chain_last[slot];
+                // Preserve the existing FIFO if a producer-lane bug ever violates the gather
+                // contract. The scheduler must never create a same-connection inversion.
+                if (tasks[i].op_id <= tasks[previous].op_id) return;
+                keys[i].length = std::max(keys[i].length, keys[previous].length);
+                if (tasks[i].op_id != tasks[previous].op_id + 1)
+                    keys[i].length = static_cast<uint8_t>(CommandLengthClass::Long);
+            }
+            chain_last[slot] = static_cast<uint8_t>(i);
+        }
+        one_length = true;
+        for (uint32_t i = 1; i < n; i++) one_length &= keys[i].length == keys[0].length;
+        if (one_length && max_rank - min_rank <= 1) return;
+
+        // Stable gather order often already matches the selected bucket order. Avoid scratch
+        // setup and two Task copies when the policy would be an identity permutation.
+        bool already_ordered = true;
+        uint32_t previous_bucket = keys[0].rank * kExSchedClasses + keys[0].length;
+        for (uint32_t i = 1; i < n; i++) {
+            const uint32_t bucket = keys[i].rank * kExSchedClasses + keys[i].length;
+            already_ordered &= bucket >= previous_bucket;
+            previous_bucket = bucket;
+        }
+        if (already_ordered) return;
+
+        uint8_t counts[kExSchedBuckets];
+        uint8_t cursors[kExSchedBuckets];
+        uint64_t occupied[kExSchedBucketWords] = {};
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t bucket = keys[i].rank * kExSchedClasses + keys[i].length;
+            const uint32_t word = bucket >> 6;
+            const uint64_t bit = uint64_t{1} << (bucket & 63);
+            if (!(occupied[word] & bit)) {
+                occupied[word] |= bit;
+                counts[bucket] = 0;
+            }
+            counts[bucket]++;
+        }
+
+        uint8_t out = 0;
+        for (uint32_t word = 0; word < kExSchedBucketWords; word++) {
+            uint64_t bits = occupied[word];
+            while (bits) {
+                const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(bits));
+                bits &= bits - 1;
+                const uint32_t bucket = word * 64 + bit;
+                cursors[bucket] = out;
+                out = static_cast<uint8_t>(out + counts[bucket]);
+            }
+        }
+
+        Task ordered[kExecBatch];
+        for (uint32_t i = 0; i < n; i++) {
+            const uint32_t bucket = keys[i].rank * kExSchedClasses + keys[i].length;
+            ordered[cursors[bucket]++] = tasks[i];
+        }
+        for (uint32_t i = 0; i < n; i++) tasks[i] = ordered[i];
+    }
+
+    void ex_schedule_batch(Task* tasks, uint32_t n) {
+        uint8_t base_lengths[kExecBatch];
+        uint32_t begin = 0;
+        while (begin < n) {
+            if (!ex_sched_candidate(tasks[begin], base_lengths[begin])) {
+                begin++;
+                continue;
+            }
+            uint32_t end = begin + 1;
+            while (end < n && ex_sched_candidate(tasks[end], base_lengths[end])) end++;
+            ex_schedule_run(tasks + begin, base_lengths + begin, end - begin);
+            // The failed candidate at end is a known barrier; consume it without reading its Op a
+            // second time, then find the next eligible run.
+            begin = end + (end < n);
+        }
     }
 
     enum class SnapshotOwnerState : uint8_t {
@@ -2207,9 +2493,6 @@ private:
 
     template <bool IofusedPrivateQueue = false>
     bool execute_snapshot_task(const Task& task, bool capture_writes) {
-        // Pre-image preparation and backlog ownership belong to the current owner too.
-        // execute()'s forwarding guard runs too late for this wrapper.
-        if (forward_stale_task<IofusedPrivateQueue>(task)) return true;
         // MULTI's tagged task owns its command images outside the public ROB and performs the
         // snapshot pre-image gate per installed transaction key.  Never decode it as a normal op.
         if (multi_task_tagged(task)) return execute<IofusedPrivateQueue>(task);
@@ -2316,7 +2599,6 @@ private:
     template <bool IofusedPrivateQueue = false>
     __attribute__((noinline, cold))
     void exec_batch_timed(const Task* batch, uint32_t n) {
-        Server::ClientWorkScope client_work(*srv_, self_->id());
         const SlowlogArm arm = slowlog_arm_;
         const int64_t now_ms = cached_now_ms_;
         slowlog_note_batch_timed();
@@ -2340,7 +2622,7 @@ private:
                 // ONE ENTRY PER COMMAND, not per participating shard. A cross-shard op is handed
                 // to every owner it touches; all but the last return with the op still Issued.
                 // Recording only the owner that published Done means a scatter is attributed to
-                // the slice that actually computed the answer.
+                // the slice that actually computed the answer -- documented in NOTES-SERVERTAIL.md.
                 if (client &&
                     client->rob().at(batch[i].op_id).state.load(std::memory_order_relaxed) ==
                         OpState::Done)
@@ -2471,23 +2753,21 @@ private:
 
     // Coarse compatibility: prefetch the whole batch and consume it without an intervening
     // micro-stage.
-    template <bool IofusedPrivateQueue = false, size_t BatchOps>
-    void exec_batch(Task (&batch)[BatchOps], uint32_t n) {
+    template <bool IofusedPrivateQueue = false>
+    void exec_batch(Task* batch, uint32_t n) {
         // Deferral first (skip wasted prefetch on the rare retry path), then the opt-in
         // reorder BEFORE prefetch so prefetch order matches execution order.
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
             return;
         }
-        if (__builtin_expect(reorder_enabled_, false))
-            srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
+        if (__builtin_expect(ex_sched_enabled_, false)) ex_schedule_batch(batch, n);
         prefetch_exec_batch(batch, n);
         exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
 
     template <bool IofusedPrivateQueue = false, bool ReadLocalNoEvict = false>
     bool execute(const Task& t) {
-        Server::ClientWorkScope client_work(*srv_, self_->id());
         // Forwarding, rather than a request epoch, resolves the route-read/enqueue race.  This check
         // must precede every shard dereference, including tagged MULTI and ownerless cleanup tasks.
         if (forward_stale_task<IofusedPrivateQueue>(t)) return true;
@@ -2523,10 +2803,9 @@ private:
                 // fragment has installed nothing yet on this owner, so parking it cannot hold a
                 // half-applied command; and the predecessor can never wait on it, because on
                 // every shard the older unit's fragment is drained first and, if it is itself
-                // parked, parked_predecessor_in() holds this younger fragment behind it. Putting
-                // the hold in prepare_write_key() deadlocked: the transaction held partial
-                // installs while waiting on an older group whose order-blind key probe then
-                // waited on those installs.
+                // parked, parked_predecessor_in() holds this younger fragment behind it. That is
+                // the acyclicity NOTES-MULTIRES.md §5(a) found missing when the same hold was
+                // attempted mid-command against an order-blind key probe.
                 if (__builtin_expect(shard.store().atomic_has_records(), false) &&
                     shard.store().atomic_has_foreign_unit_undecided(
                         t.client->id(),
@@ -2538,7 +2817,8 @@ private:
             }
             // The no-touch answer is PER TASK; a MULTI body inherits the transaction owner's.
             if (__builtin_expect(maxmemory_enabled_, false)) {
-                const bool no_touch = t.client && t.client->rob().at(t.op_id).no_touch();
+                const Op& carrier = t.client->rob().at(t.op_id);
+                const bool no_touch = carrier.no_touch();
                 shard.set_no_touch(no_touch);
                 if (no_touch) srv_->climon_note_no_touch();
             }
@@ -2696,9 +2976,6 @@ private:
         // Release pairs with the IO thread's acquire on Done: everything the handler wrote into
         // op.reply becomes visible through this one store.
         op.state.store(OpState::Done, std::memory_order_release);
-#ifdef TOMO_CORE_CONCURRENCY_TEST
-        if (test_after_done_) test_after_done_(t.client);
-#endif
 
         // Notify the connection's io thread; the claim flag dedupes a burst into one post.
         // EXECUTOR-ISSUED SENDS ARE A CLOSED DOOR: the exwb mode (executor
@@ -2917,10 +3194,6 @@ private:
     }
     void flush_xshard_commits() {
         if (__builtin_expect(!xshard_commit_pending_, true)) return;
-        // Keep both the queue and its pending-work bit armed. The owner continues servicing
-        // CONFIG and foreign work, and cannot park while the test holds these decisions open.
-        if (__builtin_expect(srv_->debug_atomic_commit_hold(), false)) return;
-        Server::ClientWorkScope client_work(*srv_, self_->id());
         xshard_flush_commits(
             *srv_, *self_, ring_, this,
             [](void* context, Client* client) {
@@ -2950,8 +3223,8 @@ private:
         const uint32_t slot = c->wb_slot();
         if (slot != Client::kNoWbSlot) {
             // INSIDE AN EXECUTOR BATCH: record and return. The fence, the read-first set and the
-            // wake decision are paid once per batch in flush_notify_batch(). A batch of one op
-            // degrades to exactly the sequence below it.
+            // wake decision are paid once per batch in flush_notify_batch() (DESIGN-NOTIFY.md
+            // §2, §4). A batch of one op degrades to exactly the sequence below it.
             if (__builtin_expect(notify_batch_open_, true)) {
                 if (__builtin_expect(notify_batch_n_ == kNotifyBatchMax, false))
                     flush_notify_batch();
@@ -2970,8 +3243,8 @@ private:
                 snd.wake_if_parked(handoff_ring(), self_->sig());
             return;
         }
-        // No ready slot: use the claimed channel post. This remains the completion route
-        // for a connection while the sender's ready-slot table is full.
+        // No slot yet: first contact. The claimed post carries the pointer to the sender, which
+        // adopts on receipt. Runs once per connection. (An executor is never its own sender.)
         notify_sender_to(c, target);
     }
 
@@ -2994,7 +3267,7 @@ private:
     // decision per io that saw an empty->flagged edge. Deciding the wake once per io AFTER all of
     // its RMWs is equivalent to deciding it per edge: every RMW is a full barrier ahead of the
     // parked_ load, so the Dekker pair with ThreadCtx::arm_blocked closes for each edge on its
-    // own. The wake is never memoised across flushes -- a cached "already
+    // own (DESIGN-NOTIFY.md §4.4). The wake is never memoised across flushes -- a cached "already
     // woke this io" could straddle a park/unpark cycle of the consumer and miss its second park.
     void flush_notify_batch() {
         const uint32_t n = notify_batch_n_;
@@ -3052,6 +3325,7 @@ private:
     Server*    srv_  = nullptr;
     ThreadCtx* self_ = nullptr;
     Ring       ring_;
+    WbEngine   wb_;    // never serves here; kept so the stats plumbing stays uniform across loops
     int64_t    cached_now_ms_ = 0;
     int64_t    blocking_beat_ms_ = 0;
     size_t     expire_shard_cursor_ = 0;
@@ -3059,7 +3333,7 @@ private:
     uint64_t   live_config_version_ = UINT64_MAX;
     AofManager* aof_manager_ = nullptr;
     bool       maxmemory_enabled_ = false;
-    bool       reorder_enabled_ = false;
+    bool       ex_sched_enabled_ = false;
     uint8_t    cached_lru_clock_ = 0;
     uint32_t   lb_sample_rate_ = 0;
     uint32_t   lb_sample_countdown_ = 0;
@@ -3083,7 +3357,6 @@ private:
     uint64_t   foreign_touch_random_ = 0x9e3779b97f4a7c15ULL;
     SnapshotManager* snapshot_manager_ = nullptr;
     SnapshotOwnerState snapshot_owner_state_ = SnapshotOwnerState::None;
-    uint32_t expire_beat_ms_ = 0; // existing alignment padding before snapshot_epoch_
     uint64_t snapshot_epoch_ = 0;
     bool snapshot_was_cancelled_ = false;
     size_t snapshot_prepare_cursor_ = 0;
@@ -3119,7 +3392,7 @@ private:
     // commands pay one predicted-true test at an executor boundary and never touch the TLS
     // commit list.
     bool xshard_commit_pending_ = false;
-    // Per-batch completion notification. While a batch is open, the slot
+    // Per-batch completion notification (DESIGN-NOTIFY.md §2). While a batch is open, the slot
     // path of notify_sender records (io, slot) here instead of fencing and setting per op; the
     // batch end pays ONE seq_cst fence, one ReadyMask::set per recorded client run and one wake
     // decision per io that saw an empty->flagged edge. Sized to this loop's largest batch; the
@@ -3137,17 +3410,15 @@ private:
 };
 
 using ExLoop = ExLoopT<false>;
-template <> uint32_t ExLoopT<true>::split_read_local_pass();
 using FusedExLoop = ExLoopT<true>;
 
 // Disabled split executors retain the exact pre-read-local allocation stride plus the 264-byte
-// per-batch notification record: 5848 + 8 + 32 * sizeof(NotifyEntry).
+// per-batch notification record (DESIGN-NOTIFY.md §2): 5848 + 8 + 32 * sizeof(NotifyEntry).
 // 6104 -> 6112: read-local eviction accounting adds exactly ONE word, the per-thread LFU dice
 // (foreign_touch_random_). Its two companions -- the latched policy byte and the fan-out defer
 // hook -- went into padding the lb bool run already carried and cost nothing. This is a per-
 // EXECUTOR object, one per thread, not a per-op or per-connection footprint: Op, Client,
 // ThreadCtx, Shard and Config are the locks that may not move, and none of them did.
-// VESTCUT: removing the never-serving 256-byte WbEngine reduces 6112 to 5856 bytes.
-static_assert(sizeof(ExLoop) == 5856);
+static_assert(sizeof(ExLoop) == 6112);
 
 }  // namespace tomo

@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include "read_local_settax.h"
-#include "resize_retirement.h"
 
 namespace tomo {
 
@@ -22,7 +21,8 @@ struct KvBlockCache;
 inline constexpr uint32_t kReadLocalRetireRingCapacity = 4096;
 
 struct ReadLocalRetireSink {
-    using ReclaimFn = void (*)(void* owner, void* payload, size_t auxiliary);
+    using ReclaimFn = void (*)(const ReadLocalRetireSink& sink, void* owner,
+                               void* payload, size_t auxiliary);
     using DeferFn = void (*)(void* context, void* owner, void* payload,
                             size_t auxiliary, ReclaimFn reclaim);
 
@@ -30,13 +30,9 @@ struct ReadLocalRetireSink {
     DeferFn defer = nullptr;
     // The owner's post-grace block cache (src/store/kv_block_cache.h). A DIRECT pointer, not a
     // third function pointer: the armed write path calls into it on every SET, and an indirect
-    // call there would hand back part of the allocator call it exists to remove. Every armed
-    // owner supplies its cache; null is only the unconfigured/off state.
+    // call there would hand back part of the allocator call it exists to remove. Null means the
+    // owner has no cache and every write allocates, which is the pre-cache behaviour.
     KvBlockCache* block_cache = nullptr;
-    // Cold maintenance/lazy-expiry preflight and preallocated resize handoff. A null pair is
-    // reserved for synchronous, serverless test sinks; real owners always bind both.
-    bool (*available)(void* context) = nullptr;
-    void (*defer_resize)(void* context, ResizeRetirement* record, uint64_t* table) = nullptr;
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
     ReadLocalSetTaxStats* settax_stats = nullptr;
 #endif
@@ -62,8 +58,8 @@ struct ReadLocalRetireSink {
 };
 
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
-static_assert(sizeof(ReadLocalRetireSink) == 5 * sizeof(void*),
-              "retire sink plus cold capacity/resize hooks; no FlatStore/ThreadCtx layout change");
+static_assert(sizeof(ReadLocalRetireSink) == 3 * sizeof(void*),
+              "the shipped retire sink is context + defer + block cache and nothing else");
 #endif
 
 }  // namespace tomo

@@ -37,46 +37,28 @@ nic_assert_link(){
 }
 
 nic_kill_srv(){
-    local port=$1 p ticks current t0 owned="$BL_LOGDIR/owned-$1.pid"
-    # run_cell is captured with $(...), so shell variables cannot carry its child ownership
-    # into the next cell. The private run directory carries the PID and /proc start time instead.
-    # A listening socket is only a guard: it never grants permission to signal that process.
-    if [ ! -f "$owned" ]; then
-        p=$(nsrv_root ss -tlnpH "sport = :$port" 2>/dev/null)
-        [ -z "$p" ] || { nic_say "   PORT-GUARD-FAIL unowned listener on $port"; return 1; }
-        return 0
-    fi
-    read -r p ticks <"$owned"
-    [[ "$p" =~ ^[0-9]+$ && "$ticks" =~ ^[0-9]+$ ]] \
-        || { nic_say "   OWNERSHIP-FAIL invalid PID record $owned"; return 1; }
+    local port=$1 p t0
     t0=$(date +%s)
     while :; do
-        current=$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null || true)
-        if [ "$current" != "$ticks" ]; then
-            rm -f "$owned"
-            [ -z "$(nsrv_root ss -tlnpH "sport = :$port" 2>/dev/null)" ] \
-                || { nic_say "   PORT-GUARD-FAIL listener remains after owned pid $p exited"; return 1; }
-            return 0
-        fi
+        p=$(nsrv_root ss -tlnpH "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+        [ -z "$p" ] && return 0
         [ $(( $(date +%s) - t0 )) -ge 60 ] \
             && { nic_say "   nic_kill_srv GAVE UP pids=$p"; return 1; }
-        kill -9 "$p" 2>/dev/null || sudo -n ip netns exec $NIC_SRV_NS kill -9 "$p" 2>/dev/null
+        for x in $p; do
+            kill -9 "$x" 2>/dev/null || sudo -n ip netns exec $NIC_SRV_NS kill -9 "$x" 2>/dev/null
+        done
         sleep 1
     done
 }
 
 nic_boot(){
     local tag=$1; shift
-    local bin=$1 pids count answering exe t0 owned="$BL_LOGDIR/owned-$NIC_PORT.pid" pid ticks
+    local bin=$1 pids count answering exe t0
     pids=$(nsrv_root ss -tlnpH "sport = :$NIC_PORT" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
     [ -z "$pids" ] \
         || { nic_say "   PORT-GUARD-FAIL $tag pids=$pids on port $NIC_PORT"; return 1; }
 
-    # The namespace wrappers may fork. Record the final exec-ing shell's PID rather than $!,
-    # which names a wrapper, and check that exact PID through INFO before sending any workload.
-    nsrv sh -c 'owned=$1; shift; ticks=$(awk "{print \$22}" "/proc/$$/stat");
-        printf "%s %s\n" "$$" "$ticks" >"$owned"; exec "$@"' _ "$owned" \
-        taskset -c "$NIC_SRV_CORES" "$@" > "$BL_LOGDIR/srv_$tag.log" 2>&1 &
+    nsrv taskset -c "$NIC_SRV_CORES" "$@" > "$BL_LOGDIR/srv_$tag.log" 2>&1 &
     t0=$(date +%s)
     while :; do
         if ncli "$NIC_CLI_BIN" -h $NIC_SRV_IP -p "$NIC_PORT" ping 2>/dev/null | grep -q PONG; then
@@ -86,9 +68,6 @@ nic_boot(){
                 tr -d '\r' | sed -n 's/^process_id:\([0-9][0-9]*\)$/\1/p')
             [ "$count" = 1 ] \
                 || { nic_say "   IDENTITY-FAIL $tag $count distinct pids on port $NIC_PORT"; return 1; }
-            read -r pid ticks <"$owned"
-            [ "$answering" = "$pid" ] \
-                || { nic_say "   IDENTITY-FAIL $tag answering=${answering:-none}, owned=$pid"; return 1; }
             exe=$(nsrv_root readlink -f "/proc/${answering:-0}/exe" 2>/dev/null)
             [ "$exe" = "$(readlink -f "$bin")" ] \
                 || { nic_say "   IDENTITY-FAIL $tag answering=${answering:-none} runs ${exe:-none}, not $bin"; return 1; }

@@ -80,7 +80,7 @@ boot --dir "$SNAP" --dbfilename edgetime.tomo
 seed
 "$CLI" -p "$PORT" SAVE >/dev/null || exit 1
 stop
-boot --dir "$SNAP" --dbfilename edgetime.tomo
+boot --dir "$SNAP" --load "$SNAP/edgetime.tomo"
 check_state "$DEADLINE"
 stop
 

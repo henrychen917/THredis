@@ -61,10 +61,14 @@ void multi_session_destroy(MultiSession* session);
 // kRobWindow is defined by net/rob.h (included above), beside the ring that is sized from it.
 inline constexpr size_t   kRbufInitial  = 16 * 1024;
 inline constexpr size_t   kRbufSoftCap  = 1 * 1024 * 1024;  // stop BUFFERING BACKLOG past this
-// The soft cap bounds buffered backlog. One incomplete command can contain several individually
-// legal bulks and may grow to the 32-bit receive cursor's bound. Growth requires ROB quiescence,
-// and the buffer is shed after the command completes.
-inline constexpr size_t   kRbufHardCap = UINT32_MAX;
+// The parser accepts redis-compatible bulks (512MB). A single command must therefore be allowed to
+// exceed the soft cap, or a 2MB SET stalls its connection forever: the parser reports Incomplete,
+// read_space refuses to grow, and neither side can ever make progress -- a silent wedge with no
+// error, found by the perfected-checkpoint audit. The soft cap bounds BACKLOG (many buffered
+// commands); one oversized in-flight command may grow to the protocol bound. Memory tracks bytes
+// actually received, and reset_rbuf_at_quiescence sheds the growth after the command completes.
+inline constexpr size_t   kRbufFrameSlack = 64 * 1024;
+inline constexpr size_t   kRbufHardCap  = 512ull * 1024 * 1024 + kRbufFrameSlack;
 // Item 4: 512B inline, heap beyond. Two 16KB inline buffers made every connection carry 32KB of
 // worst-case staging whether it ever pipelined or not; SmallBuf grows on demand and clear() keeps
 // the allocation, so a busy connection pays ONE grow to its working size and idles at 1KB + that.
@@ -83,11 +87,10 @@ struct Session {
 
 // WHO IS HOLDING THE PARSE BARRIER. Six independent mechanisms park a connection's parse pass, and
 // they used to share ONE bool -- so any one of them could clear a barrier another one still needed.
-// No reachable interleaving overlapped two owners: a blocking op waits for an empty ROB, then sets
-// the barrier and ends parsing, so it has neither older nor younger neighbours; every other owner
-// also ends the parse pass on the spot. That is exactly why the bool survived: the hazard is one
-// relaxed guard away, not present. Owner bits make the release symmetric with the acquire --
-// whoever set it is the one whose release can drop it --
+// No reachable interleaving overlapped two owners (see NOTES-BARRIER.md section 2: a blocking op is
+// provably alone in its ROB, and every other owner ends the parse pass on the spot), which is
+// exactly why the bool survived: the hazard is one relaxed guard away, not present. Owner bits make
+// the release symmetric with the acquire -- whoever set it is the one whose release can drop it --
 // and cost nothing: the byte was already there, and "is any owner holding" is still one byte test.
 //
 // Adding an owner? Add a bit here and acquire it at the site that parks the connection. Do NOT
@@ -121,9 +124,8 @@ struct ReplySegment {
 // Metadata stays inline for the common [header, value, CRLF] case. BUF payloads own independent
 // blocks because queue growth and continued retirement must never move bytes named by an in-flight
 // sendmsg. BORROW and STATIC payloads are non-owning under their respective lifetime protocols.
-template <uint32_t Inline, size_t MaxSegmentBytes = UINT32_MAX>
+template <uint32_t Inline>
 class SegmentQueue {
-    static_assert(MaxSegmentBytes > 0 && MaxSegmentBytes <= UINT32_MAX);
 public:
     SegmentQueue() = default;
     ~SegmentQueue() { clear_without_releases(); if (segs_ != inline_) std::free(segs_); }
@@ -143,7 +145,7 @@ public:
 
     void append_buf(const char* ptr, size_t len) {
         while (len) {
-            const size_t take = std::min(len, MaxSegmentBytes);
+            const size_t take = std::min(len, static_cast<size_t>(std::numeric_limits<uint32_t>::max()));
             char* copy = static_cast<char*>(std::malloc(take));
             std::memcpy(copy, ptr, take);
             push(ReplySegment{SegmentKind::Buf, copy, static_cast<uint32_t>(take), -1});
@@ -153,12 +155,6 @@ public:
     }
 
     void append_buf(const char* a, size_t an, const char* b, size_t bn) {
-        // Each segment has a 32-bit length, even when a whole collection reply is larger.
-        if (an > MaxSegmentBytes || bn > MaxSegmentBytes - an) {
-            append_buf(a, an);
-            append_buf(b, bn);
-            return;
-        }
         const size_t total = an + bn;
         if (!total) return;
         char* copy = static_cast<char*>(std::malloc(total));
@@ -329,10 +325,7 @@ public:
         // Past the soft cap, growth continues ONLY while the entire buffer is one incomplete
         // command (rpos_ == 0 after the quiescence reset: nothing parsed, nothing in flight --
         // which is also what makes may_grow true). Backlog never grows past the soft cap.
-        // The parser enforces the limit PER BULK. A complete MSET can contain many legal bulks.
-        // The receive cursor's representation, not one argument's limit, bounds this buffer.
-        (void)proto_max_bulk_len;
-        const size_t hard_cap = kRbufHardCap;
+        const size_t hard_cap = static_cast<size_t>(proto_max_bulk_len) + kRbufFrameSlack;
         const size_t cap = (rpos_ == 0) ? hard_cap : kRbufSoftCap;
         if (avail < want && may_grow && rcap_ < cap) {
             size_t ncap = rcap_ * 2;
@@ -341,7 +334,7 @@ public:
             char* n = static_cast<char*>(std::realloc(rbuf_, ncap));
             if (n) { rbuf_ = n; rcap_ = ncap; avail = rcap_ - rlen_; }
         }
-        if (avail < kMinRecv && rcap_ != hard_cap) { out_avail = 0; return nullptr; }
+        if (avail < kMinRecv) { out_avail = 0; return nullptr; }
         out_avail = avail;
         return rbuf_ + rlen_;
     }
@@ -632,6 +625,14 @@ public:
         if (v) parse_backpressure_ |= kFlipBackpressure;
         else parse_backpressure_ &= static_cast<uint8_t>(~kFlipBackpressure);
     }
+    // A streams IFID context may own one decoded, unpublished Op whose argv slices still name the
+    // read buffer. This owner-local bit is both the parse stop and the prepared==0 lifetime gate;
+    // it consumes an unused bit in the existing mask, so Client's signed footprint is unchanged.
+    bool pipeline_prepared() const { return parse_backpressure_ & kPipelinePrepared; }
+    void set_pipeline_prepared(bool value) {
+        if (value) parse_backpressure_ |= kPipelinePrepared;
+        else parse_backpressure_ &= static_cast<uint8_t>(~kPipelinePrepared);
+    }
     bool subscriber_mode() const { return subscriber_mode_; }
     void set_subscriber_mode(bool v) { subscriber_mode_ = v; }
     bool blocked() const { return connection_flags_ & kBlocked; }
@@ -711,13 +712,15 @@ public:
     // race-free.
     bool safe_to_release() {
         return rob_.quiesced() &&
+               !pipeline_prepared() &&
                !recv_armed_ && !send_inflight_ &&        // the KERNEL holds no pointer into us
                !retire_queued_.load(std::memory_order_acquire) &&
                watched_refs_.load(std::memory_order_acquire) == 0;
     }
     bool migration_protocol_idle() const {
-        // Ordinary unread input and admission/FLIP backpressure move with the Client.
-        return rob_.quiesced() &&
+        // Ordinary unread input and admission/FLIP backpressure move with the Client. A streams
+        // prepared frame is different: its unpublished Op is owner-local, so it blocks migration.
+        return rob_.quiesced() && !pipeline_prepared() &&
                !send_inflight_ && !serve_pending_ &&
                !retire_queued_.load(std::memory_order_acquire) &&
                watched_refs_.load(std::memory_order_acquire) == 0 &&
@@ -728,7 +731,7 @@ public:
         // Global dispatch is paused, but connections which remain on this IO may retain durable
         // owner-local modes (subscriptions, WATCH/MULTI session metadata, tracking). Only work
         // which can still touch an executor, ROB pointer, output borrow, or barrier must drain.
-        return rob_.quiesced() &&
+        return rob_.quiesced() && !pipeline_prepared() &&
                !send_inflight_ && !serve_pending_ &&
                !retire_queued_.load(std::memory_order_acquire) &&
                barrier_owners_ == 0 && atomic_groups_io_ == 0 && !blocked() &&
@@ -805,6 +808,7 @@ private:
     uint8_t   barrier_owners_ = 0;
     static constexpr uint8_t kAtomicBackpressure = 1u << 0;
     static constexpr uint8_t kFlipBackpressure = 1u << 1;
+    static constexpr uint8_t kPipelinePrepared = 1u << 2;
     uint8_t   parse_backpressure_ = 0;
     bool      subscriber_mode_ = false;  // IO-owned; consumes existing alignment padding
     // The former blocked_ bool is a one-byte flag cell. RESP3 shares it instead of extending the

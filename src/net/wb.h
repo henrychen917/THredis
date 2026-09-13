@@ -121,13 +121,11 @@ public:
     using RetireFn = void (*)(void*, Client&, Op&);
     using LimitFn = bool (*)(void*, Client&);
 
-    void bind(Ring* ring, void* release_ctx, ReleaseFn release_fn,
-              void* retire_ctx, RetireFn retire_fn,
-              const std::atomic<bool>* limit_armed,
-              void* limit_ctx, LimitFn limit_fn,
-              const uint32_t* cached_now_s, LoopSignals* tls_signals) {
-        if (!ring || !release_fn || !retire_fn || !limit_armed || !limit_fn ||
-            !cached_now_s || !tls_signals) std::abort();
+    void bind(Ring* ring, void* release_ctx = nullptr, ReleaseFn release_fn = nullptr,
+              void* retire_ctx = nullptr, RetireFn retire_fn = nullptr,
+              const std::atomic<bool>* limit_armed = nullptr,
+              void* limit_ctx = nullptr, LimitFn limit_fn = nullptr,
+              const uint32_t* cached_now_s = nullptr, LoopSignals* tls_signals = nullptr) {
         epoll_ = g_ring_epoll_mode;
         ring_ = ring;
         release_ctx_ = release_ctx;
@@ -186,14 +184,6 @@ public:
         return true;
     }
 
-    uint64_t deferred_output_bytes(const Client& c) const {
-        const auto found = oob_defer_.find(const_cast<Client*>(&c));
-        if (found == oob_defer_.end()) return 0;
-        uint64_t bytes = 0;
-        for (const auto& frame : found->second) bytes += frame.bytes.size();
-        return bytes;
-    }
-
     // THE WHOLE REPLY SIDE, in one call: retire completed ops IN ORDER, stage their bytes, and
     // write. All three belong together and all three belong to the sender -- if the io thread
     // retired and merely handed bytes over, only the send syscall would move between modes, and
@@ -204,7 +194,8 @@ public:
     // progress from an empty poll.
     template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
     bool serve(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, false, kEp, true, ClassifySend, Coded>(c);
         return serve_impl<false, false, kEp, true, ClassifySend, Coded>(c);
     }
@@ -214,7 +205,8 @@ public:
     template <bool kEp = false, bool Coded = false>
     bool prepare(Client& c, bool& submit_allowed) {
         submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, false, kEp, false, false, Coded>(c, &submit_allowed);
         return serve_impl<false, false, kEp, false, false, Coded>(c, &submit_allowed);
     }
@@ -224,7 +216,8 @@ public:
     // every ordinary reply while leaving the established split-pipeline prepare API untouched.
     template <bool kEp = false, bool Coded = false>
     bool prepare_pipeline(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, false, kEp, false, false, Coded>(c);
         return serve_impl<false, false, kEp, false, false, Coded>(c);
     }
@@ -233,7 +226,8 @@ public:
     // enforces/counts the pre-existing TLS no-borrow contract; plaintext clients pay no mode test.
     template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
     bool serve_ktls(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, true, kEp, true, ClassifySend, Coded>(c);
         return serve_impl<false, true, kEp, true, ClassifySend, Coded>(c);
     }
@@ -241,14 +235,16 @@ public:
     template <bool kEp = false, bool Coded = false>
     bool prepare_ktls(Client& c, bool& submit_allowed) {
         submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, true, kEp, false, false, Coded>(c, &submit_allowed);
         return serve_impl<false, true, kEp, false, false, Coded>(c, &submit_allowed);
     }
 
     template <bool kEp = false, bool Coded = false>
     bool prepare_pipeline_ktls(Client& c) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_impl<true, true, kEp, false, false, Coded>(c);
         return serve_impl<false, true, kEp, false, false, Coded>(c);
     }
@@ -257,7 +253,8 @@ public:
     // remain untouched and are the only instantiated path when tls-port is zero.
     template <bool kEp = false, bool ClassifySend = false, bool Coded = false>
     bool serve_tls(Client& c, TlsConn& tls) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_tls_impl<true, kEp, true, ClassifySend, Coded>(c, tls);
         return serve_tls_impl<false, kEp, true, ClassifySend, Coded>(c, tls);
     }
@@ -265,14 +262,16 @@ public:
     template <bool kEp = false, bool Coded = false>
     bool prepare_tls(Client& c, TlsConn& tls, bool& submit_allowed) {
         submit_allowed = true;
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_tls_impl<true, kEp, false, false, Coded>(c, tls, &submit_allowed);
         return serve_tls_impl<false, kEp, false, false, Coded>(c, tls, &submit_allowed);
     }
 
     template <bool kEp = false, bool Coded = false>
     bool prepare_pipeline_tls(Client& c, TlsConn& tls) {
-        if (__builtin_expect(limit_armed_->load(std::memory_order_relaxed), false))
+        if (__builtin_expect(limit_armed_ &&
+                             limit_armed_->load(std::memory_order_relaxed), false))
             return serve_tls_impl<true, kEp, false, false, Coded>(c, tls);
         return serve_tls_impl<false, kEp, false, false, Coded>(c, tls);
     }
@@ -331,7 +330,9 @@ private:
             // a suppressed op can take exactly those back instead of leaking a partial array.
             const uint32_t segments_before = conn.output_list_length();
             const bool fill_was_staged = conn.has_pending_fill();
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr) {
+                if (retire_fn_) retire_fn_(retire_ctx_, conn, op);
+            }
             if (op.reply_skip()) {
                 if (op.zc_ptr && op.zc_shard >= 0) release(op.zc_shard, op.zc_ptr);
                 // Everything past the frontier is this op's reply -- except the seal, which moved
@@ -370,7 +371,7 @@ private:
         draining_ = nullptr;
         bool did = retired != 0;
         did |= flush_deferred_oob(conn);
-        if (limit_fn_(limit_ctx_, c)) {
+        if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
             if (submit_allowed) *submit_allowed = false;
             stats_.retired += retired;
             return true;
@@ -473,7 +474,7 @@ public:
                 stats_.bytes_sent += static_cast<uint64_t>(n);
                 if (static_cast<uint32_t>(n) < total) stats_.short_writes++;
                 else stats_.sends_completed++;
-                c.set_last_interaction_s(*cached_now_s_);
+                if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
                 did = true;
                 continue;
             }
@@ -557,11 +558,11 @@ public:
             } else {
                 conn.commit_write(plain_accepted);
             }
-            tls_signals_->tls_plaintext_output_bytes += plain_accepted;
+            if (tls_signals_) tls_signals_->tls_plaintext_output_bytes += plain_accepted;
         } else if (encrypted.op == TlsOp::WantWrite) {
-            tls_signals_->tls_want_write++;
+            if (tls_signals_) tls_signals_->tls_want_write++;
         } else if (encrypted.op == TlsOp::WantRead) {
-            tls_signals_->tls_want_read++;
+            if (tls_signals_) tls_signals_->tls_want_read++;
         }
         if (tls.failed()) {
             if (!tls.last_error().empty())
@@ -608,8 +609,8 @@ public:
                     conn.commit_write(static_cast<uint32_t>(res));
                 }
                 stats_.bytes_sent += static_cast<uint64_t>(res);
-                tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
-                c.set_last_interaction_s(*cached_now_s_);
+                if (tls_signals_) tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
+                if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
                 if (static_cast<uint32_t>(res) < conn.send_requested()) stats_.short_writes++;
                 const bool drained = conn.segmented_send()
                     ? !conn.has_pending_segments()
@@ -668,9 +669,11 @@ public:
                 return false;
             }
             stats_.bytes_sent += cipher_sent;
-            tls_signals_->net_output_bytes += cipher_sent;
-            tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
-            c.set_last_interaction_s(*cached_now_s_);
+            if (tls_signals_) {
+                tls_signals_->net_output_bytes += cipher_sent;
+                tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+            }
+            if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
             if (cipher_sent < c.send_requested()) stats_.short_writes++;
             else stats_.sends_completed++;
             resubmit = true;
@@ -707,7 +710,7 @@ public:
                 c.commit_write(static_cast<uint32_t>(res));
             }
             stats_.bytes_sent += static_cast<uint64_t>(res);
-            tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
+            if (tls_signals_) tls_signals_->net_output_bytes += static_cast<uint64_t>(res);
         }
         teardown(c);
     }
@@ -718,8 +721,10 @@ public:
             const uint32_t cipher_sent = static_cast<uint32_t>(res);
             if (tls.consume_output(cipher_sent)) {
                 stats_.bytes_sent += cipher_sent;
-                tls_signals_->net_output_bytes += cipher_sent;
-                tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+                if (tls_signals_) {
+                    tls_signals_->net_output_bytes += cipher_sent;
+                    tls_signals_->tls_ciphertext_output_bytes += cipher_sent;
+                }
             }
         }
         teardown(c);
@@ -743,7 +748,7 @@ public:
     Stats& stats() { return stats_; }
     const Stats& stats() const { return stats_; }
     void note_zc_suppressed_tls() {
-        tls_signals_->tls_zc_suppressed++;
+        if (tls_signals_) tls_signals_->tls_zc_suppressed++;
     }
 
 private:
@@ -777,7 +782,8 @@ private:
     //                            path BOTH modes take -> passes Fused
     //   wb_serve_natural         split-only: run_loop reaches pipeline_pass under
     //   wb_retire_prepare        constexpr IoPipe = !Fused && Pipeline == 1  -> pass false
-    //   genthread_*              fused-only: run_loop reaches run_fused_iofused_loop
+    //   genthread_*              fused-only: run_loop reaches run_fused_iofused_loop and
+    //   run_fused_streams_loop   run_fused_streams_loop under if constexpr (Fused && ...) -> true
     // With Coded=false every coded block below is deleted by `if constexpr`, so a 2s instantiation
     // is the pre-reply-code function, not a variant of it.
     template <bool TrackOutput, bool TlsNoBorrow, bool kEp, bool Submit, bool ClassifySend,
@@ -787,7 +793,6 @@ private:
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
-        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if constexpr (TlsNoBorrow) {
@@ -799,7 +804,9 @@ private:
             // Plain commands have no sidecar and take exactly the pre-notify zc_ptr branch. Special
             // command state, borrowed values, and armed notification batches all already use this
             // field, so their retirement hook nests behind that existing test.
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr) {
+                if (retire_fn_) retire_fn_(retire_ctx_, conn, op);
+            }
             if (op.zc_ptr) {
                 // Anything already staged is older than this op. Once sealed, every subsequent
                 // reply uses segments until the queue drains, so no fill-buffer append can jump a
@@ -858,7 +865,7 @@ private:
         bool did = retired != 0;
         did |= flush_deferred_oob(conn);
         if constexpr (TrackOutput) {
-            if (limit_fn_(limit_ctx_, c)) {
+            if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
                 if (submit_allowed) *submit_allowed = false;
                 stats_.retired += retired;
                 if (!retired) stats_.serves_empty++;
@@ -880,11 +887,10 @@ private:
         stats_.serves++;
         Client& conn = c;
         if constexpr (TrackOutput) conn.start_obuf_tracking();
-        else conn.stop_obuf_tracking();
         draining_ = &c;
         const uint32_t retired = c.rob().drain([&](Op& op) {
             if (op.no_borrow()) note_zc_suppressed_tls();
-            if (op.zc_ptr) retire_fn_(retire_ctx_, conn, op);
+            if (op.zc_ptr && retire_fn_) retire_fn_(retire_ctx_, conn, op);
             if (op.zc_ptr) {
                 conn.seal_fill_segment();
                 if constexpr (Coded) if (op.reply_code_) op_materialise_code(op);
@@ -932,7 +938,7 @@ private:
         bool did = retired != 0;
         did |= flush_deferred_oob(conn);
         if constexpr (TrackOutput) {
-            if (limit_fn_(limit_ctx_, c)) {
+            if (limit_fn_ && limit_fn_(limit_ctx_, c)) {
                 if (submit_allowed) *submit_allowed = false;
                 stats_.retired += retired;
                 if (!retired) stats_.serves_empty++;
@@ -979,7 +985,7 @@ private:
         stats_.bytes_sent += static_cast<uint64_t>(n);
         if (static_cast<size_t>(n) < request) stats_.short_writes++;
         else if (c.write_drained()) stats_.sends_completed++;
-        c.set_last_interaction_s(*cached_now_s_);
+        if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
         did = true;
         return true;
     }
@@ -1015,8 +1021,8 @@ private:
             const uint32_t sent = static_cast<uint32_t>(n);
             if (!tls.consume_output(sent)) { send_failed_ = true; return did; }
             stats_.bytes_sent += sent;
-            tls_signals_->tls_ciphertext_output_bytes += sent;
-            c.set_last_interaction_s(*cached_now_s_);
+            if (tls_signals_) tls_signals_->tls_ciphertext_output_bytes += sent;
+            if (cached_now_s_) c.set_last_interaction_s(*cached_now_s_);
             did = true;
             if (sent < remaining) stats_.short_writes++;
             else stats_.sends_completed++;
@@ -1042,7 +1048,7 @@ private:
 
     void release(int32_t shard, const char* ptr) {
         stats_.zc_releases++;
-        release_fn_(release_ctx_, shard, ptr);
+        if (release_fn_) release_fn_(release_ctx_, shard, ptr);
     }
 
     inline static constexpr char kCrlf[2] = {'\r', '\n'};

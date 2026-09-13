@@ -451,10 +451,6 @@ AddResult add_to_table(CollectionRef& set, Slice member) {
     return AddResult::Added;
 }
 
-// Integer encoding has its own Redis control, set-max-intset-entries. That control is
-// still missing here; preserve its incoming 128-entry behavior independently of listpack knobs.
-constexpr uint32_t kIntsetMaxEntries = 128;
-
 AddResult add_member(CollectionRef& set, Slice member, const CompactLimit& limit) {
     if (set.encoding() == CollectionEncoding::Hashtable) return add_to_table(set, member);
     if (set.entries() == std::numeric_limits<uint32_t>::max()) return AddResult::Oom;
@@ -465,7 +461,7 @@ AddResult add_member(CollectionRef& set, Slice member, const CompactLimit& limit
             uint32_t position = 0;
             if (integer_search(set, integer, position)) return AddResult::Exists;
             const uint32_t resulting = set.entries() + 1;
-            if (resulting > kIntsetMaxEntries) {
+            if (!set.compact_fits(limit, resulting, integer_text_length(integer))) {
                 if (!promote_to_table(set, resulting)) return AddResult::Oom;
                 return add_to_table(set, member);
             }
@@ -689,11 +685,8 @@ bool ensure_set_add_capacity(Shard& shard, Op& op, KvObj*& object) {
     // external form can complete.
     if (set.embedded_bytes_fit(projected_encoded) &&
         set.embedded_bytes_fit(transient_integer_encoded) &&
-        static_cast<uint64_t>(set.entries()) + hint <=
-            (generic ? limit.max_entries : kIntsetMaxEntries) &&
-        (!generic || incoming_max <= limit.max_value) &&
-        (set_small_encoding(set) != SetSmallEncoding::Integer ||
-         static_cast<uint64_t>(set.entries()) + integer_prefix <= kIntsetMaxEntries))
+        static_cast<uint64_t>(set.entries()) + hint <= limit.max_entries &&
+        incoming_max <= limit.max_value)
         return true;
     return externalize_set<kNotify>(shard, op, object);
 }
@@ -729,7 +722,7 @@ void cmd_sadd(Shard& shard, Op& op) {
                 }
                 owned->finish_table_promotion(0);
             }
-        } else if (hint > kIntsetMaxEntries) {
+        } else if (hint > limit.max_entries) {
             if (!owned->table.reserve(hint)) {
                 delete owned;
                 reply_err(op.sink(), "ERR out of memory");
@@ -737,9 +730,7 @@ void cmd_sadd(Shard& shard, Op& op) {
             }
             owned->finish_table_promotion(0);
         }
-    } else if (set.encoding() == CollectionEncoding::Compact &&
-               hint > (set_small_encoding(set) == SetSmallEncoding::Integer
-                       ? kIntsetMaxEntries : limit.max_entries)) {
+    } else if (set.encoding() == CollectionEncoding::Compact && hint > limit.max_entries) {
         // Redis/Valkey apply the multi-add size hint before looking for duplicates. Preserve that
         // observable upgrade rule while keeping the decision O(1).
         if (!promote_to_table(set, std::max(set.entries(), hint))) {
@@ -1216,6 +1207,12 @@ XshardElementResult xshard_insert_set_element_impl(Shard& shard, Slice key, uint
                 }
                 owned->finish_table_promotion(0);
             }
+        } else if (limit.max_entries == 0) {
+            if (!owned->table.reserve(1)) {
+                delete owned;
+                return XshardElementResult::Oom;
+            }
+            owned->finish_table_promotion(0);
         }
     }
 

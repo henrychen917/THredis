@@ -1428,9 +1428,10 @@ void cmd_zrem(Shard& shard, Op& op) {
     reply_int(op.sink(), static_cast<long long>(removed));
 }
 
-RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop,
-                                 const CompactItems& items) {
+RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
     RemovalResult result;
+    CompactItems items;
+    if (!items.load(value)) return result;
     const int64_t length = static_cast<int64_t>(items.entries.size());
     if (start < 0) start += length;
     if (stop < 0) stop += length;
@@ -1444,12 +1445,6 @@ RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t st
     result.count = static_cast<uint32_t>(stop - start + 1);
     if (!value.erase_range(value.compact().logical(first), end)) return {};
     return result;
-}
-
-RemovalResult compact_erase_rank(CollectionRef& value, int64_t start, int64_t stop) {
-    CompactItems items;
-    if (!items.load(value)) return {};
-    return compact_erase_rank(value, start, stop, items);
 }
 
 RemovalResult compact_erase_score(CollectionRef& value, const ScoreRange& range) {
@@ -1702,7 +1697,8 @@ void emit_rank_range(Op& op, const CollectionRef& value, int64_t start, int64_t 
 
 void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& range,
                       const RangeOptions& options) {
-    // Both encodings use the same LIMIT-offset rule; negative rank indices are separate.
+    // A negative LIMIT offset is NOT rejected here: it counts back from the end of the matched
+    // range on the expanded encoding. See zset_resolve_limit_offset in t_zset.h.
     if (score_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;
@@ -1775,7 +1771,7 @@ void emit_score_range(Op& op, const CollectionRef& value, const ScoreRange& rang
 
 void emit_lex_range(Op& op, const CollectionRef& value, const LexRange& range,
                     const RangeOptions& options) {
-    // As in emit_score_range, LIMIT offsets have the same rule in both encodings.
+    // As in emit_score_range: a negative LIMIT offset is resolved per encoding, not rejected.
     if (lex_range_empty(range) || options.limit == 0) {
         reply_array_header(op.sink(), 0);
         return;
@@ -1958,7 +1954,7 @@ void cmd_zpop_generic(Shard& shard, Op& op, bool maximum) {
         const int64_t first = maximum ? static_cast<int64_t>(items.entries.size() - take) : 0;
         const int64_t last = maximum ? static_cast<int64_t>(items.entries.size() - 1)
                                      : static_cast<int64_t>(take - 1);
-        removed = compact_erase_rank(value, first, last, items);
+        removed = compact_erase_rank(value, first, last);
     } else {
         const uint64_t start_rank = maximum ? value.entries() : 1;
         ZsetNode* node = zset_expanded(value)->by_rank(start_rank);

@@ -62,12 +62,15 @@ static_assert(kInboxSlots <= UINT16_MAX, "lane_admit_cap is a uint16");
 
 enum class Role : uint8_t { Idle = 0, Ifid = 1, Ex = 2 };
 
-// Active groups on this connection-owning thread: one writer, independent of shard ownership.
-// The first/last group arms/disarms atomic_activity_. Keep the former lease's cache-line footprint.
-struct alignas(64) AtomicAdmissionState {
+// Admission credits are leased to the connection-owning IO. Plain fields have exactly one writer;
+// CONFIG/INFO consult only the published mirrors. No field names a shard or shard-side structure.
+struct alignas(64) AtomicAdmissionLease {
+    uint64_t generation = 0;
+    uint32_t available = 0;
     uint32_t active = 0;
+    std::atomic<uint32_t> published_active{0};
+    std::atomic<uint32_t> reconfig_carry{0};
 };
-static_assert(sizeof(AtomicAdmissionState) == 64);
 
 // What travels on task_in_. A handle rather than a raw Op*: the worker resolves it through the
 // client's ROB, so a recycled slot cannot be reached through a stale pointer. The client itself
@@ -118,7 +121,7 @@ enum class ReadLocalFallbackReason : uint8_t {
     ContextRoute,           // scatter/script/all-shard or conservative broad-owner route
     ContextKeymissNotify,   // MGET miss must retain owner-side notification behavior
     InflightWrite,
-    ArmTransient,           // pre-arming writes still in flight
+    ArmTransient,           // pre-arming writes still in flight (DESIGN-RINGDIET.md)
     AtomicPending,
     Missing,
     Typed,
@@ -151,7 +154,7 @@ struct ReadLocalStats {
     // ARM-ON-DEMAND TRANSIENT. Reads demoted because the connection carried writes published
     // BEFORE a local read armed it -- writes the RYOW ring deliberately never recorded. Bounded
     // per connection by one ROB drain and reported separately from the steady-state key conflict
-    // above so that the two can never be confused in a bench.
+    // above so that the two can never be confused in a bench (DESIGN-RINGDIET.md).
     uint64_t fallback_arm_transient = 0;
     uint64_t fallback_atomic_pending = 0;
     uint64_t fallback_missing = 0;
@@ -160,7 +163,7 @@ struct ReadLocalStats {
     uint64_t fallback_seq_churn = 0;
     uint64_t fallback_generation = 0;
     uint64_t fallback_lane_full = 0;
-    // Lane ADMISSION deferrals. Frames the armed parser left unconsumed at rpos, to be
+    // Lane ADMISSION deferrals (P128.md). Frames the armed parser left unconsumed at rpos, to be
     // re-parsed by a later pass of the same thread, because the local-read lane had no room
     // (defer_lane_full) or because the connection already held its fair share of a lane under
     // pressure (defer_quota). Neither is a fallback: the read still completes locally, and no
@@ -289,22 +292,13 @@ struct ReadLocalStats {
     }
 };
 
-// Read-local publication and telemetry are absent from baseline ThreadCtx allocations. The
+// Fused read-local publication and telemetry are absent from baseline ThreadCtx allocations. The
 // lone owning pointer is placed in ThreadCtx's established tail padding below.
 struct ReadLocalThreadState {
     std::atomic<uint64_t> tick{0};
     ReadLocalRetireSink retire_sink{};
     ReadLocalStats stats{};
-    // Published only on actual reader-loop entry/exit, including FLIP. INFO must distinguish
-    // an enabled boot knob from a live parser/executor lane. No per-operation publication.
-    std::atomic<bool> lane_active{false};
 };
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
-static_assert(offsetof(ReadLocalThreadState, lane_active) == 376,
-              "resize retirement adds two cold sink hooks to the optional sidecar");
-static_assert(sizeof(ReadLocalThreadState) == 384,
-              "resize retirement grows only the armed sidecar by 16 bytes, never ThreadCtx");
-#endif
 
 class ThreadCtx {
 public:
@@ -462,8 +456,8 @@ public:
     // for the scan-ordering fix, so it must be observable rather than merely believed.
     void note_atomic_scan_hold() { atomic_scan_holds_++; }
     uint64_t atomic_scan_holds() const { return atomic_scan_holds_; }
-    AtomicAdmissionState& atomic_admission_state() { return atomic_admission_state_; }
-    const AtomicAdmissionState& atomic_admission_state() const { return atomic_admission_state_; }
+    AtomicAdmissionLease& atomic_admission_lease() { return atomic_admission_lease_; }
+    const AtomicAdmissionLease& atomic_admission_lease() const { return atomic_admission_lease_; }
 
     // ---- posting (producer side) ---------------------------------------------------------------
     // Push AND flag, in that order. Flagging before the push would let the consumer take the bit,
@@ -846,7 +840,7 @@ public:
 
     // IO-only INFO surface. Published for each IO tenure when IoLoop binds its send engine; INFO then
     // sums the engine's single-writer counters with the same exceptional cross-thread read shape
-    // used for sig(). Executor threads leave this null because they do not send.
+    // used for sig(). Executor threads leave this null because their WbEngine never sends.
     void set_wb_engine(WbEngine* engine) {
         wb_engine_.store(engine, std::memory_order_release);
     }
@@ -925,7 +919,7 @@ public:
     }
     bool parked() const { return parked_.load(std::memory_order_acquire); }
 
-    // Read-local QSBR publication. A reader publishes once at the coarse rotation boundary,
+    // Fused read-local QSBR publication. A reader publishes once at the coarse rotation boundary,
     // never per operation. Parked shares this word with the tick so a grace scan cannot accept a
     // stale separate parked=true after the thread has resumed probing foreign stores. Sequential
     // consistency orders the park/resume edge with that scan; it is paid only at rotation/park.
@@ -959,14 +953,6 @@ public:
         if (!read_local_state_) std::abort();
         return read_local_state_->tick.load(std::memory_order_seq_cst);
     }
-    void set_read_local_lane_active(bool active) {
-        if (!read_local_state_ || !read_local_state_->retire_sink.defer) std::abort();
-        read_local_state_->lane_active.store(active, std::memory_order_release);
-    }
-    bool read_local_lane_active() const {
-        return read_local_state_ &&
-               read_local_state_->lane_active.load(std::memory_order_acquire);
-    }
     static bool read_local_publication_parked(uint64_t publication) {
         return (publication & kReadLocalParkedBit) != 0;
     }
@@ -982,8 +968,8 @@ public:
         if (!read_local_state_ || !read_local_state_->retire_sink.defer) std::abort();
         return read_local_state_->retire_sink;
     }
-    // The nullable form, for the shard-ownership edge in Server. A thread has no sink with the
-    // lane disarmed; the edge must be able to ask without
+    // The nullable form, for the shard-ownership edge in Server. A thread has no sink in split
+    // mode and on a fused boot with the lane disarmed; the edge must be able to ask without
     // knowing which, and must be able to tell "disarmed" from "armed but unbound" -- the latter is
     // a boot-order defect, and the caller aborts on it rather than moving a shard to an owner that
     // cannot retire for it.
@@ -1168,7 +1154,7 @@ private:
     uint64_t atomic_groups_ = 0;
     uint64_t atomic_localfast_ = 0;
     uint64_t atomic_scan_holds_ = 0;
-    AtomicAdmissionState atomic_admission_state_;
+    AtomicAdmissionLease atomic_admission_lease_;
     ReadyMask  ready_;                     // as a sender: which of my clients completed work
     std::vector<Client*>  slots_;          // slot -> client, sender-owned
     std::vector<uint32_t> free_slots_;

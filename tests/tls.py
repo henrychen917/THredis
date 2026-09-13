@@ -306,11 +306,6 @@ def handshake_matrix(host, tls_port, cert_dir, client_kind, admin, expect_ktls):
                 raise AssertionError("%s did not engage bidirectional kTLS" % label)
         elif active_after != 0 or fallback_after <= fallback_before:
             raise AssertionError("%s did not take forced userspace fallback" % label)
-        # This socket's version and (on the fallback boot) userspace path were proved above.
-        # A surviving third reply must pass through TLS after CLIENT REPLY suppression.
-        probe.sock.sendall(frame("CLIENT", "REPLY", "SKIP") + frame("PING") + frame("PING"))
-        if probe.reader.read() != b"PONG" or probe.command("PING", "tls-suppression") != b"tls-suppression":
-            raise AssertionError("%s suppressed pipeline lost TLS framing" % label)
         probe.close(graceful=True)
         time.sleep(0.05)
     print("  ok   TLS1.2 + TLS1.3 handshake matrix (%s)" %

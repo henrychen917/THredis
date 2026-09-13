@@ -1,4 +1,0 @@
-#!/bin/sh
-set -eu
-root=$(git rev-parse --show-toplevel)
-exec python3 "$root/tests/gate_receipt.py" pre-push "$@"

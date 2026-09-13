@@ -303,15 +303,6 @@ MultiBlockingPop multi_blocking_pop(const MultiQueuedCommand& queued) {
 
 void command_key_args(const MultiQueuedCommand& queued, std::vector<uint32_t>& args) {
     const CommandSpec& spec = *queued.spec;
-    // Script metadata extends through ARGV; only the declared KEYS can own an AOF fragment.
-    if (spec.flags & CmdFlags::ScriptRoute) {
-        int64_t count = 0;
-        if (queued.argv.size() < 3 ||
-            !parse_i64(Slice(queued.argv[2].data(), queued.argv[2].size()), count) ||
-            count < 0 || static_cast<uint64_t>(count) > queued.argv.size() - 3) return;
-        for (uint32_t i = 0; i < static_cast<uint32_t>(count); i++) args.push_back(3 + i);
-        return;
-    }
     if (spec.flags & CmdFlags::StreamRoute) {
         uint32_t streams = 1;
         while (streams < queued.argv.size() &&
@@ -603,16 +594,6 @@ bool prepare_commands(Server& server, MultiExecState& state,
                     return false;
                 }
             }
-            if (command->kind != MultiCommandKind::Prebuilt &&
-                (has_name(command->queued, "mset") || has_name(command->queued, "msetnx")) &&
-                (command->queued.argv.size() & 1u) == 0) {
-                reply_err(command->op->sink(), has_name(command->queued, "mset")
-                    ? "ERR wrong number of arguments for 'mset' command"
-                    : "ERR wrong number of arguments for 'msetnx' command");
-                command->kind = MultiCommandKind::Prebuilt;
-                command->key_args.clear();
-                command->key_shards.clear();
-            }
             if (state.client->resp3()) command->op->mark_resp3();
             if (command->kind == MultiCommandKind::Scan &&
                 !command_prepare_scan_route(server, *command->op))
@@ -627,7 +608,7 @@ bool prepare_commands(Server& server, MultiExecState& state,
                 if (prepared == ScatterPrepare::Ready) {
                     command->kind = MultiCommandKind::Xshard;
                     command->scatter = child_dispatch.state;
-                    xshard_multi_child_bind(*command->scatter, &state);
+                    xshard_multi_child_bind(*command->scatter);
                     xshard_multi_child_capture_groups(
                         *command->scatter, command->xshard_stage_groups[0]);
                     for (uint32_t i = 0; i < child_dispatch.nshards; i++)
@@ -904,7 +885,7 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     // The park is supposed to foreclose it completely, because only this owner thread may publish
     // into this owner's pending list, so nothing can appear between the dispatch check and these
     // installs. A non-zero reading is therefore not a statistic: it is proof that the park's
-    // safety argument is false on this build, and that a transaction could
+    // safety argument (NOTES-MULTIRACE.md §5) is false on this build, and that a transaction could
     // again clone a withdrawable candidate into an acknowledged write.
     //
     // It counts into its OWN counter, deliberately. Sharing atomic_exec_order_holds with the park
@@ -915,10 +896,9 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
     // Not a Shard::Stats field because Shard's layout is locked at 1440 bytes; a namespace-scope
     // atomic costs nothing here, since the increment is on a path that is never taken.
     //
-    // Holding the transaction HERE deadlocked with one connection and no WATCH (0 rounds versus
-    // 300 on base): the older group could wait on the transaction's partial installs while the
-    // transaction waited on that group. The dispatch-time park is safe because the fragment has
-    // installed nothing on this owner, so it cannot give the older group a reason to wait here.
+    // Holding the transaction HERE instead of counting was tried and is WRONG -- it deadlocks,
+    // NOTES-MULTIRES.md §5(a); the park is safe only because it happens before the fragment has
+    // installed anything on this owner.
     // The exclusion is BY EPOCH WORD and must cover the transaction's lowered children as well as
     // its own: a cross-shard child installs through the scatter path with its own ScatterState,
     // and counting that would report a violation every time a transaction merely met its own
@@ -930,7 +910,7 @@ MultiPrepareWrite prepare_write_key(Server& server, MultiExecState& state, Shard
                 return multi_state_owns_epoch(state, group_epoch);
             }))
         g_exec_order_late.fetch_add(1, std::memory_order_relaxed);
-    if (!shard.watch_write_ready(key, &state)) return MultiPrepareWrite::Retry;
+    if (!shard.watch_write_ready(key, watch_token)) return MultiPrepareWrite::Retry;
     shard.watch_reserve_write(key, state.client, state.watch_generation, watch_token,
                               &state.epoch, &state.aborted, watch_refs);
     const auto snapshot = shard.store().snapshot_prepare_write(hash, key);
@@ -1373,7 +1353,6 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
         MultiExecState* state = allocate_state(server, client, owner_io, MultiStateKind::WatchAdd);
         if (!state) { reply_err(op.sink(), "ERR out of memory"); return MultiIoAction::LocalDone; }
         state->final_reply = MultiFinalReply::Ok;
-        const size_t watched_before = session->watched.size();
         try {
             for (uint32_t i = 1; i < op.argc(); i++) {
                 const std::string key(op.arg(i).p, op.arg(i).n);
@@ -1388,7 +1367,6 @@ MultiIoAction multi_handle_io(Server& server, Client& client, Op& op, uint32_t o
             }
             for (const MultiWatchedKey& key : state->watched) add_shard(state->shards, key.shard);
         } catch (const std::bad_alloc&) {
-            session->watched.resize(watched_before);
             destroy_multi_state(state);
             reply_err(op.sink(), "ERR out of memory");
             return MultiIoAction::LocalDone;
@@ -2291,11 +2269,8 @@ bool Shard::watch_validate_and_reserve(Slice key, Client* client, uint64_t gener
                 reservation.mutates |= mutates;
                 return true;
             }
-    watch_finalize_reservation(owned);
-    // Read-only validation claims can coexist. A conflicting writer instead makes this EXEC
-    // abort, including when it holds a blocking validation claim: waiting here permits cycles
-    // between transactions that already reserved different keys on different owners.
-    // Everything still on this key is an UNDECIDED reservation, and this transaction no
+    if (!watch_finalize_reservation(owned)) return false;
+    // Everything still on this key is now an UNDECIDED atomic-group write, and this transaction no
     // longer waits for it. Waiting was one half of the wait-for cycle, and it buys nothing that is
     // not already available here: a group holding a reservation on this key is a write to a key
     // this client watched, and "the group lands first" is a realizable serialization. Take it, and
@@ -2304,8 +2279,7 @@ bool Shard::watch_validate_and_reserve(Slice key, Client* client, uint64_t gener
     // waiting on this transaction.
     if (auto pending = watch_reservations_.find(owned); pending != watch_reservations_.end())
         for (const WatchReservation& reservation : pending->second)
-            if (reservation.token != token &&
-                (reservation.mutates || (reservation.blocking && mutates))) {
+            if (reservation.token != token && reservation.mutates) {
                 client->set_watch_dirty();
                 stats_.watch_reservation_precommit_aborts++;
                 break;

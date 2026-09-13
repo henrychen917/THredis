@@ -1,9 +1,12 @@
 // lbsignals.h — the READ side of the signal system: capture, derive, export.
 //
-// signal.h makes every loop report LoopSignals in the same units (ops, nanoseconds, entries)
-// and every shard report locality (foreign_ops). This interface captures those signals and
-// derives the quantities exported by INFO's # LB section and DEBUG LBSIGNALS. Placement and
-// role controllers also consume the underlying signals.
+// signal.h already makes every loop report LoopSignals in one set of units (ops, nanoseconds,
+// entries) and every shard report locality (foreign_ops). What was missing is the consumer: a
+// coherent capture of all of it, and the derived quantities a balancer actually steers on. This
+// file is that consumer, and it is the ONLY one — the future LB controller, INFO's # LB section
+// and DEBUG LBSIGNALS all read through the same capture/derive path, so the number the operator
+// sees is the number the controller acts on. The fork's balancer defects all started as private
+// derivations that drifted from each other.
 //
 // COST: zero on the hot path. Everything here runs on the cold command path (DEBUG/INFO) or in a
 // controller beat. Writers keep their plain single-owner stores; capture reads each counter with

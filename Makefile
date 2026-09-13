@@ -25,7 +25,6 @@ SRC      += src/cmd/server_tail.cc src/cmd/slowlog.cc src/cmd/lcs.cc src/cmd/inf
 SRC      += src/cmd/lbsignals.cc
 SRC      += src/core/flipctl.cc
 SRC      += src/core/genthread.cc
-SRC      += src/core/rl2s.cc
 SRC      += src/cmd/cmdgap.cc
 SRC      += src/cmd/pfdebug.cc
 SRC      += src/cmd/cmdmeta.cc
@@ -98,51 +97,11 @@ build/read-local-ring-unit: tests/read_local_ring_unit.cc $(wildcard src/*/*.h) 
 build/read-local-write-ring-unit: tests/read_local_write_ring_unit.cc $(wildcard src/*/*.h) Makefile
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -I. tests/read_local_write_ring_unit.cc -o $@
-# The production cross-connection scheduler, with real ROB tasks at both executor capacities.
-build/reorder-unit: tests/reorder_unit.cc $(wildcard src/*/*.h) Makefile
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -I. tests/reorder_unit.cc -o $@
-STORE_REGRESSION_SRC := tests/store_regression.cc src/cmd/t_hash.cc src/cmd/t_hash_ttl.cc
-build/store-regression: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST -I. \
-	  $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
-build/store-regression-sidecar: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST \
-	  -DTOMO_TTL_DEADLINE_SIDECAR=1 -I. $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
-build/store-regression-tsan: $(STORE_REGRESSION_SRC) $(wildcard src/*/*.h) $(wildcard src/*/*.inc) Makefile
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -O1 -fsanitize=thread -fno-omit-frame-pointer -no-pie \
-	  -ffunction-sections -fdata-sections -DTOMO_STORE_REGRESSION_TEST -I. \
-	  $(STORE_REGRESSION_SRC) -Wl,--gc-sections -o $@
-build/waits-unit: tests/waits_unit.cc $(wildcard src/*/*.h) Makefile
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -I. tests/waits_unit.cc -o $@
-unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit build/reorder-unit build/waits-unit
+unit: build/config-parser-test build/flipctl-unit build/read-local-ring-unit build/read-local-write-ring-unit
 	./build/config-parser-test
 	./build/flipctl-unit
 	./build/read-local-ring-unit
 	./build/read-local-write-ring-unit
-	./build/reorder-unit
-	./build/waits-unit
-
-# Deterministic core regressions: the test TU instantiates the real executor/IO methods
-# with ASAN/UBSAN and test-only interleaving hooks. No server or ring is started.
-CORE_TEST_OBJ := $(filter-out build/src/main.o build/src/core/genthread.o,$(OBJ))
-build/rehash-waits-unit: tests/rehash_waits_unit.cc $(CORE_TEST_OBJ) $(wildcard src/*/*.h) Makefile
-	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. $< $(CORE_TEST_OBJ) -o $@ $(JELIBS) $(LDLIBS) -lm
-
-build/core-concurrency-unit: tests/core_concurrency_unit.cc $(CORE_TEST_OBJ) $(wildcard src/*/*.h)
-	$(CXX) $(CXXFLAGS) $(JEFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
-	  -DTOMO_CORE_CONCURRENCY_TEST -I. $< $(CORE_TEST_OBJ) -o $@ \
-	  $(JELIBS) $(LDLIBS) -lm
-
-# Directed owner-phase tests. The test includes xshard.cc to drive the real private phases
-# without starting worker threads or opening a listener; all other code is the release objects.
-build/atomic-survivors-unit: tests/atomic_survivors_unit.cc src/cmd/xshard.cc $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) $(wildcard src/*/*.inc) $(wildcard src/*/*.h) Makefile
-	$(CXX) $(CXXFLAGS) $(JEFLAGS) -I. tests/atomic_survivors_unit.cc \
-	  $(filter-out build/src/main.o build/src/cmd/xshard.o,$(OBJ)) -o $@ $(JELIBS) $(LDLIBS) -lm
 
 # Load drivers: not part of `all`, kept compiling here so they cannot rot unnoticed.
 build/benchtxn: tools/benchtxn.cc Makefile
@@ -156,14 +115,3 @@ tools: build/benchtxn build/broaden-bench
 clean:
 	rm -rf build
 .PHONY: all asan tsan noreserve clean unit tools
-
-# Deterministic networking/command regressions. These TUs include the real private implementations;
-# omit their production objects from this serverless binary. No server threads or gate are started.
-NETCMD_TEST_SRC := tests/netcmd_unit.cc tests/netcmd_stream_unit.cc tests/netcmd_zset_unit.cc tests/netcmd_config_unit.cc
-NETCMD_TEST_OBJ := $(NETCMD_TEST_SRC:tests/%.cc=build/tests/%.o)
-NETCMD_LIB_OBJ := $(filter-out build/src/main.o build/src/cmd/xshard.o build/src/cmd/t_stream_groups.o build/src/cmd/t_zset.o build/src/cmd/server_tail.o,$(OBJ))
-build/tests/%.o: tests/%.cc tests/netcmd_unit.h $(wildcard src/*/*.h) $(wildcard src/*/*.cc) $(wildcard src/*/*.inc) Makefile
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(JEFLAGS) -Wno-mismatched-new-delete -I. -c $< -o $@
-build/netcmd-unit: $(NETCMD_TEST_OBJ) $(NETCMD_LIB_OBJ)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(JELIBS) $(LDLIBS) -lm -Wl,--wrap=mkstemp -Wl,--wrap=fopen

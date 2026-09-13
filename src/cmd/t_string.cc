@@ -57,6 +57,7 @@ bool eq_icase(Slice s, const char* lit) {
     return true;
 }
 
+inline constexpr uint64_t kProtoMaxBulkLen = 512ull * 1024 * 1024;
 
 bool parse_i64(Slice s, int64_t& out) {
     // Redis's string2ll accepts only the representation that formatting the resulting integer
@@ -700,7 +701,7 @@ void cmd_append(Shard& sh, Op& op) {
         reply_int(op.sink(), old.n); return;
     }
     const uint64_t total = static_cast<uint64_t>(old.n) + op.arg(2).n;
-    if (total > command_proto_max_bulk_len()) {
+    if (total > kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
         return;
     }
@@ -783,7 +784,7 @@ void cmd_setrange(Shard& sh, Op& op) {
     }
 
     const uint64_t write_end = static_cast<uint64_t>(offset) + op.arg(3).n;
-    if (write_end > command_proto_max_bulk_len()) {
+    if (write_end > kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR string exceeds maximum allowed size (proto-max-bulk-len)");
         return;
     }
@@ -810,7 +811,7 @@ void cmd_setrange(Shard& sh, Op& op) {
 bool parse_bit_offset(Op& op, Slice argument, uint64_t& offset) {
     int64_t parsed = 0;
     if (!parse_i64(argument, parsed) || parsed < 0 ||
-        (static_cast<uint64_t>(parsed) >> 3) >= command_proto_max_bulk_len()) {
+        (static_cast<uint64_t>(parsed) >> 3) >= kProtoMaxBulkLen) {
         reply_err(op.sink(), "ERR bit offset is not an integer or out of range");
         return false;
     }

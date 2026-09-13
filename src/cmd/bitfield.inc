@@ -5,6 +5,7 @@
 namespace tomo {
 namespace {
 
+inline constexpr uint64_t kBitfieldMaxBulkLen = 512ull * 1024 * 1024;
 
 bool bitfield_parse_i64(Slice input, int64_t& output) {
     if (input.n == 0 || input.n >= 32) return false;
@@ -121,7 +122,7 @@ bool parse_bitfield_offset(Op& op, Slice argument, uint8_t bits, uint64_t& offse
     }
     uint64_t result = static_cast<uint64_t>(parsed);
     if (indexed) result *= bits;
-    if (((result + bits - 1) >> 3) >= command_proto_max_bulk_len()) {
+    if ((result >> 3) >= kBitfieldMaxBulkLen) {
         reply_err(op.sink(), "ERR bit offset is not an integer or out of range");
         return false;
     }

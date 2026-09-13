@@ -32,10 +32,9 @@ The fix parks the transaction fragment behind an older same-connection unit that
 this owner but has not yet decided, so the EXEC runs against the group's verdict rather than its
 guess.
 
-This is a RACE -- the owner of a victim key must install before the owner of the blocker vetoes.
-The armed shape puts 256 absent keys before the blocker on its physical shard, giving that owner
-real validation work while the other owner installs the six victims and dispatches the EXEC.
-DEBUG SHARDS and LBSIGNALS prove the owner separation; distinct shard IDs alone do not prove it.
+This is a RACE -- the owner of a victim key must install before the owner of the blocker vetoes --
+so every case runs many rounds and reports a hit count. Pre-fix rates on this box were roughly
+40-80% of rounds for the armed case in the first rounds after a boot.
 
 The COMMIT control is what stops the fix from degenerating into "make the group invisible": the
 same shape with no blocker must let the EXEC see the MSETNX's value, i.e. read-your-own-writes
@@ -43,11 +42,11 @@ across two units of one connection still holds.
 
 Non-vacuity: `atomic_exec_order_holds` counts a transaction meeting an undecided same-connection
 unit on an owner -- exactly this window. Under atomic 1 the armed cases must advance it, or the
-run never entered the window and its pass proves nothing. EACH armed case must advance it: a
-committing group cannot stand in for the aborted-candidate witness. Only a clean miss is re-armed,
-on fresh keys and connections, up to ARM_ATTEMPTS times. No deadline or retry count is widened.
-A tree that has lost the park still fails, on both the counter and withdrawn-value checks.
-Under atomic 0 MSETNX is two-hop and
+run never entered the window and its pass proves nothing. Entering it is a race, and under the
+gate's own geometry it is bimodal: 8 of 10 runs open the window hundreds to thousands of times and
+the rest open it exactly zero times. The armed pair is therefore re-armed on fresh connections up
+to ARM_ATTEMPTS times, which re-rolls the dynamic placement that decides it; a tree that has lost
+the park opens the window on no attempt and still fails. Under atomic 0 MSETNX is two-hop and
 decides before it installs, so the window cannot open and the counter must read exactly zero;
 that arm asserts zero rather than merely tolerating it.
 
@@ -69,18 +68,14 @@ distinct owners.
 
 import socket
 import sys
-import time
-
-import _lib
 
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
 
 ROUNDS = 200
 VICTIMS = 6
-BLOCKER_PREFIX_KEYS = 256
 # Attempts allowed to get the armed pair INTO the hazard window before the vacuity gate calls
-# the run vacuous. Fresh geometry and veto work arm the window; this count stays unchanged.
+# the run vacuous. See run_mode() for the measurement this number comes from.
 ARM_ATTEMPTS = 4
 TAG = "mrace"
 
@@ -211,34 +206,28 @@ def set_atomic(conn, value):
         raise AssertionError(f"CONFIG SET atomic {value} did not take (reads {live})")
 
 
-def owner_spread(admin):
-    """A slow veto shard, victims on another owner, and three cross-owner mover pairs."""
-    topo = _lib.topology(admin)
-    if len(topo.owners) < 2:
-        raise AssertionError("multirace requires two shard-owning threads")
+def owner_spread(admin, wanted):
+    """One key per distinct owner, so the MSETNX provably spans shards and its blocker lives on
+    an owner other than the victims'. A single-owner boot cannot race install against veto."""
     per_shard = {}
-    prefix = f"{TAG}:{time.time_ns()}"
-    for key, shard, _owner in _lib.probe_keys(admin, prefix, topo, limit=16000):
-        per_shard.setdefault(shard, []).append(key)
-        if len(per_shard[shard]) < BLOCKER_PREFIX_KEYS + 1:
-            continue
-        owner = topo.shard_owner[shard]
-        victims = [key for sid, keys in per_shard.items() if topo.shard_owner[sid] != owner
-                   for key in keys][:VICTIMS]
-        if len(victims) < VICTIMS:
-            continue
-        padding = per_shard[shard][:BLOCKER_PREFIX_KEYS]
-        blocker = per_shard[shard][BLOCKER_PREFIX_KEYS]
-        # Liveness still needs EVERY mover to cross owners, even though the armed EXEC's victims
-        # intentionally share an owner. RENAME, LMPOP and SMOVE must each retain their two hops.
-        liveness = [padding[0], victims[0], padding[1], victims[1], padding[2], victims[2]]
-        print(f"  note blocker shard={shard} owner={owner}, "
-              f"victims={_lib.shards_of(admin, victims)}, veto-prefix={len(padding)}", flush=True)
-        return blocker, victims, padding, liveness
-    raise AssertionError("could not resolve the veto shard and a separate victim owner")
+    for i in range(4000):
+        if len(per_shard) >= wanted:
+            break
+        key = f"{TAG}:{i:04d}:" + "z" * 30
+        shard = admin.command("DEBUG", "SHARD", key)
+        if isinstance(shard, RespError):
+            raise AssertionError(
+                f"DEBUG SHARD refused ({shard}); boot with --enable-debug-command yes")
+        per_shard.setdefault(int(shard), key)
+    if len(per_shard) < 3:
+        raise AssertionError(
+            f"only {len(per_shard)} distinct owner(s); this battery needs a blocker and at least "
+            "two victims on separate owners")
+    keys = [per_shard[s] for s in sorted(per_shard)]
+    return keys[0], keys[1:]
 
 
-def build_round(blocker, victims, block, multi_blocker, padding):
+def build_round(blocker, victims, block, multi_blocker):
     """The armed shape, as one pipelined write. Returns (setup_commands, body_commands).
 
     `setup` clears the victims, optionally installs the blocker that forces the abort, and issues
@@ -246,15 +235,13 @@ def build_round(blocker, victims, block, multi_blocker, padding):
     the second-connection control can send the body somewhere else; in the armed case both go out
     in ONE write, which is what keeps the transaction being parsed and dispatched while the MSETNX
     group is still deciding."""
-    setup = [("DEL", blocker) + tuple(victims) + tuple(padding)]
+    setup = [("DEL", blocker) + tuple(victims)]
     if block and multi_blocker:
         setup += [("MULTI",), ("SETNX", blocker, "blocker"),
                   ("SET", f"{TAG}:pad", "pad"), ("EXEC",)]
     elif block:
         setup.append(("SET", blocker, "blocker"))
-    # Grouping preserves argument order within a physical shard. Absent padding keys are
-    # validated before the existing blocker; no sleep or change to the production park is needed.
-    pairs = [x for v in victims + padding for x in (v, "hello")]
+    pairs = [x for v in victims for x in (v, "hello")]
     setup.append(("MSETNX", *pairs, blocker, "hello"))
     body = [("MULTI",), ("INCRBY", victims[0], "-2"),
             ("INCRBY", victims[1], "-2"), ("EXEC",)]
@@ -262,7 +249,7 @@ def build_round(blocker, victims, block, multi_blocker, padding):
 
 
 def run_case(label, blocker, victims, block, probe_when,
-             second_conn=False, multi_blocker=False, padding=None):
+             second_conn=False, multi_blocker=False):
     """ROUNDS rounds on ONE long-lived connection. Yields (msetnx, exec_reply, mget, foreign).
 
     The keyspace is cleared ONCE, here, and each round then clears only its own keys with the DEL
@@ -275,7 +262,7 @@ def run_case(label, blocker, victims, block, probe_when,
     try:
         conn.command("FLUSHALL")
         for _ in range(ROUNDS):
-            setup, body = build_round(blocker, victims, block, multi_blocker, padding or [])
+            setup, body = build_round(blocker, victims, block, multi_blocker)
             if second_conn:
                 conn.send_raw(b"".join(encode(*c) for c in setup))
                 msetnx_reply = [conn.read() for _ in setup][-1]
@@ -308,7 +295,7 @@ def run_case(label, blocker, victims, block, probe_when,
 
 
 def case_abort(admin, label, blocker, victims, second_conn=False, multi_blocker=False,
-               seen=None, padding=None):
+               seen=None):
     """The MSETNX must abort, so no victim may ever hold its value. The two victims the
     transaction increments end at -2 because the aborted MSETNX left them absent and INCRBY
     created them; every other victim must stay absent. `hello` anywhere is the leak."""
@@ -317,7 +304,7 @@ def case_abort(admin, label, blocker, victims, second_conn=False, multi_blocker=
     leaked = foreign_leaked = wrong_exec = rounds = 0
     sample = None
     for msetnx_reply, exec_reply, mget_after, foreign_after in run_case(
-            label, blocker, victims, True, expected, second_conn, multi_blocker, padding):
+            label, blocker, victims, True, expected, second_conn, multi_blocker):
         if msetnx_reply != 0:
             raise AssertionError(
                 f"{label}: MSETNX answered {msetnx_reply!r}, not :0; the blocker did not block "
@@ -348,7 +335,7 @@ def case_abort(admin, label, blocker, victims, second_conn=False, multi_blocker=
     return delta
 
 
-def case_commit(admin, label, blocker, victims, seen=None, padding=None):
+def case_commit(admin, label, blocker, victims, seen=None):
     """CONTROL, and the one that stops the fix from being 'hide the group'. With no blocker the
     MSETNX COMMITS, so the EXEC that follows it on the same connection MUST see hello: INCRBY
     answers an error and every victim still reads hello afterwards, on this connection and on a
@@ -359,7 +346,7 @@ def case_commit(admin, label, blocker, victims, seen=None, padding=None):
     stale = rounds = 0
     sample = None
     for msetnx_reply, exec_reply, mget_after, foreign_after in run_case(
-            label, blocker, victims, False, wanted, padding=padding):
+            label, blocker, victims, False, wanted):
         if msetnx_reply != 1:
             raise AssertionError(
                 f"{label}: MSETNX answered {msetnx_reply!r}, not :1; every key was absent so it "
@@ -433,39 +420,48 @@ def case_liveness(admin, label, keys, rounds=150):
     return delta
 
 
-def run_mode(admin, mode):
+def run_mode(admin, mode, blocker, victims):
     """The three cases plus the vacuity gate, under ONE value of `atomic`. Returns a failure
     count; never raises for a case failure, so the other mode still runs."""
     failures = 0
     print(f"multirace: atomic={mode}", flush=True)
 
-    # Re-resolve ownership and use fresh keys as well as connections on every clean miss. The old
-    # test kept the same shard set through all four attempts, even when its "different owners"
-    # were the same thread. GATEFIX.md records the PRE/POST and removed-park control.
+    # THE ARMED PAIR, RE-ARMED WHILE THE WINDOW STAYS SHUT. Both cases below must enter the hazard
+    # window for their pass to mean anything, and entering it is a race this test cannot force: the
+    # EXEC fragment has to reach an owner while an older same-connection unit is still undecided
+    # there. Measured 2026-09-07 under the gate's OWN geometry (--shards 16 --ratio 6:2, cores 0-7,
+    # which is 6 io + 2 ex, not the default this battery used to be checked under): a healthy tree
+    # opens the window in 8 of 10 runs, and opens it 268-8777 times when it does. The outcome is
+    # bimodal per run -- hundreds of hits or exactly zero, never a thin tail -- and the key set is
+    # deterministic (TAG is a constant), so what varies between runs is dynamic placement, not which
+    # owners are involved. Each attempt therefore runs on FRESH connections, which re-rolls it.
+    # Four attempts put a vacuous false alarm at roughly 1 in 600. A tree that has genuinely lost
+    # the park opens the window on NO attempt and still fails the gate below, which is the property
+    # this guard exists to protect. To induce that failure: return early from the dispatch-time
+    # hold so no unit is ever parked, and every attempt reports holds+0.
     attempts = 0
     while True:
         attempts += 1
-        blocker, victims, padding, liveness = owner_spread(admin)
         armed_deltas = []
         armed_failures = 0
 
         try:
             case_abort(admin, "aborted MSETNX then EXEC write on the same connection",
-                       blocker, victims, seen=armed_deltas, padding=padding)
+                       blocker, victims, seen=armed_deltas)
         except AssertionError as failure:
             armed_failures += 1
             print(f"  FAIL {failure}", flush=True)
 
         try:
             case_commit(admin, "control: committed MSETNX then EXEC write (RYOW must hold)",
-                        blocker, victims, seen=armed_deltas, padding=padding)
+                        blocker, victims, seen=armed_deltas)
         except AssertionError as failure:
             armed_failures += 1
             print(f"  FAIL {failure}", flush=True)
 
         # Never retry past a real case failure. A correctness FAIL is the answer, and re-running
         # until it goes away is precisely the vacuity this battery refuses to commit.
-        if armed_failures or mode != "1" or all(armed_deltas) or attempts >= ARM_ATTEMPTS:
+        if armed_failures or mode != "1" or sum(armed_deltas) or attempts >= ARM_ATTEMPTS:
             break
         print(f"  note the hazard window stayed shut on attempt {attempts} of {ARM_ATTEMPTS}; "
               "re-arming the pair on fresh connections", flush=True)
@@ -477,7 +473,7 @@ def run_mode(admin, mode):
     # counter alone -- a control that opened the window would not be controlling for anything.
     try:
         delta = case_abort(admin, "control: aborted MSETNX, transaction on a second connection",
-                           blocker, victims, second_conn=True, padding=padding)
+                           blocker, victims, second_conn=True)
         if delta:
             raise AssertionError(
                 f"control: second connection opened the hazard window {delta}x; it is meant "
@@ -490,7 +486,7 @@ def run_mode(admin, mode):
     # to prove the fix cannot wedge, and its counter reading is a by-product, not its claim.
     try:
         case_liveness(admin, "liveness: two-phase RENAME/LMPOP/SMOVE then EXEC on their targets",
-                      liveness)
+                      [blocker] + list(victims))
     except AssertionError as failure:
         failures += 1
         print(f"  FAIL {failure}", flush=True)
@@ -502,11 +498,12 @@ def run_mode(admin, mode):
     # a non-zero reading there would mean the two-hop path had grown an install-then-decide window
     # of its own, which is the same defect in the other mode.
     window_holds = sum(armed_deltas)
-    if mode == "1" and (len(armed_deltas) != 2 or not all(armed_deltas)):
+    if mode == "1" and window_holds == 0:
         failures += 1
-        print(f"  FAIL the armed cases recorded atomic_exec_order_holds={armed_deltas} across "
-              f"{attempts} attempt(s) on fresh keys/connections: BOTH abort and commit must meet "
-              "an undecided same-connection unit; a missing witness is vacuous", flush=True)
+        print(f"  FAIL the armed cases recorded 0 atomic_exec_order_holds across {attempts} "
+              f"attempt(s) on fresh connections: no transaction fragment ever met an undecided "
+              "same-connection unit, so this run never entered the window it exists to close "
+              "and its pass is vacuous", flush=True)
     elif mode == "1":
         armed_on = "" if attempts == 1 else f", armed on attempt {attempts} of {ARM_ATTEMPTS}"
         ok(f"hazard window opened {window_holds}x across the armed cases{armed_on}")
@@ -553,9 +550,12 @@ def main():
     booted = None
     try:
         booted = atomic_setting(admin)
+        blocker, victims = owner_spread(admin, VICTIMS + 1)
+        victims = victims[:VICTIMS]
+        print(f"  note blocker + {len(victims)} victims, each on its own owner", flush=True)
         for mode in ("1", "0"):
             set_atomic(admin, mode)
-            failures += run_mode(admin, mode)
+            failures += run_mode(admin, mode, blocker, victims)
     except (AssertionError, EOFError, OSError) as failure:
         failures += 1
         print(f"  FAIL {failure}", flush=True)

@@ -264,26 +264,6 @@ public:
         // Every store this owner drives shares ONE cache: a single head array that stays hot in
         // L1 for every armed write, whatever shard the key lands on. See kv_block_cache.h.
         sink_.block_cache = &block_cache_;
-        sink_.available = [](void* context) {
-            return !static_cast<ReadLocalDeferredQueue*>(context)->ring_.full();
-        };
-        sink_.defer_resize = [](void* context, ResizeRetirement* record, uint64_t* table) {
-            auto* queue = static_cast<ReadLocalDeferredQueue*>(context);
-#ifdef TOMO_RL_CACHE_DEBUG
-            queue->dbg_check_owner("defer_resize");
-#endif
-            // The table is already unreachable. Stamp AFTER that publication, just as sealing
-            // the ordinary ring stamps its unlinked suffix. No store callback survives handoff.
-            queue->resizes_.push(record, table, queue->server_->advance_read_local_epoch());
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            auto& stats = queue->settax_stats();
-            stats.qsbr_deferrals++;
-            stats.qsbr_table_deferrals++;
-            stats.qsbr_depth = queue->size();
-            stats.qsbr_max_owner_depth = std::max<uint64_t>(stats.qsbr_max_owner_depth,
-                                                          queue->size());
-#endif
-        };
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         sink_.bind_settax_stats(&owner_->read_local_stats().settax);
 #endif
@@ -291,9 +271,8 @@ public:
     }
 
     ReadLocalRetireSink* sink() { return entries_ ? &sink_ : nullptr; }
-    bool empty() const { return ring_.empty() && resizes_.empty(); }
-    uint32_t size() const { return ring_.count + resizes_.size(); }
-    bool resize_pending() const { return !resizes_.empty(); }
+    bool empty() const { return ring_.empty(); }
+    uint32_t size() const { return ring_.count; }
 
     // Called only by this owner thread, after the object/table is no longer store-reachable.
     // Arguments are not re-validated: the sink is handed out only once entries_ exists (sink()),
@@ -330,16 +309,16 @@ public:
         stats.qsbr_deferrals++;
         if (auxiliary) stats.qsbr_object_deferrals++;
         else stats.qsbr_table_deferrals++;
-        stats.qsbr_depth = size();
+        stats.qsbr_depth = ring_.count;
         stats.qsbr_max_owner_depth = std::max<uint64_t>(
-            stats.qsbr_max_owner_depth, size());
+            stats.qsbr_max_owner_depth, ring_.count);
         stats.qsbr_depth_samples++;
-        stats.qsbr_depth_sum += size();
+        stats.qsbr_depth_sum += ring_.count;
 #endif
     }
 
     uint32_t drain_ready() {
-        if (empty()) return 0;
+        if (ring_.empty()) return 0;
         seal_pending();
         // One participant scan per owner pass, not per retired allocation. Stamps are FIFO and
         // strictly below the returned floor only after every active tick has crossed them; parked
@@ -351,19 +330,16 @@ public:
 #endif
         // Ask only whether the OLDEST sealed stamp has been crossed. Nothing is releasable until it
         // has, so the scan may stop at the first participant still below it (and re-test that one
-        // first next pass) instead of loading every participant's tick line each pass. Every
-        // non-empty ring has a sealed batch here. Preallocated resize records carry the stamp
-        // of their unlink instead; the same participant scan covers both FIFOs.
-        const uint64_t oldest = std::min(ring_.empty() ? UINT64_MAX : ring_.head_stamp(),
-                                        resizes_.empty() ? UINT64_MAX : resizes_.head_stamp());
-        const uint64_t grace_floor = server_->read_local_grace_floor(oldest, grace_hint_);
+        // first next pass) instead of loading every participant's tick line each pass. The ring is
+        // non-empty here and seal_pending() just ran, so a sealed batch exists.
+        const uint64_t grace_floor =
+            server_->read_local_grace_floor(ring_.head_stamp(), grace_hint_);
         const uint32_t drained = ring_.drain_below(
-            grace_floor, [this](uint32_t slot) { reclaim_entry(entries_[slot]); }) +
-            resizes_.drain_below(grace_floor);
+            grace_floor, [this](uint32_t slot) { reclaim_entry(entries_[slot]); });
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         stats.qsbr_reclaims += drained;
         if (!drained) stats.qsbr_zero_progress_scans++;
-        stats.qsbr_depth = size();
+        stats.qsbr_depth = ring_.count;
 #endif
         return drained;
     }
@@ -379,7 +355,7 @@ public:
         block_cache_.dbg_owner_tid = dbg_owner_tid_;
 #endif
         const uint32_t drained = ring_.drain_all(
-            [this](uint32_t slot) { reclaim_entry(entries_[slot]); }) + resizes_.drain_all();
+            [this](uint32_t slot) { reclaim_entry(entries_[slot]); });
 #if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
         ReadLocalSetTaxStats& stats = settax_stats();
         stats.qsbr_reclaims += drained;
@@ -392,7 +368,6 @@ public:
     }
 
 private:
-    ResizeRetireQueue resizes_;
     // 32 bytes: two entries per cache line. No stamp here -- it belongs to the ring's sealed batch.
     struct Entry {
         void* owner = nullptr;
@@ -421,7 +396,7 @@ private:
             std::abort();
         }
 #endif
-        entry.reclaim(entry.owner, entry.payload, entry.auxiliary);
+        entry.reclaim(sink_, entry.owner, entry.payload, entry.auxiliary);
     }
 
     void seal_pending() {

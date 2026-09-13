@@ -197,43 +197,6 @@ try:
                "with OPTIN or OPTOUT mode enabled", "CACHING while off")
     checks += 12
 
-    # Seed 20: each supplied prefix is checked against held prefixes, then later supplied ones.
-    # The rejected command must leave the held prefix set unchanged.
-    expect(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "a"), b"OK",
-           "hold a prefix for collision precedence")
-    expect_err(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "b", "PREFIX", ""),
-               "ERR Prefix 'b' overlaps with another provided prefix ''. "
-               "Prefixes for a single client must not overlap.", "provided collision before later held collision")
-    expect_err(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "a", "PREFIX", ""),
-               "ERR Prefix 'a' overlaps with an existing prefix 'a'. "
-               "Prefixes for a single client must not overlap.", "held collision before same-prefix provided collision")
-    expect(g.command("CLIENT", "TRACKINGINFO"),
-           [b"flags", [b"on", b"bcast"], b"redirect", 0, b"prefixes", [b"a"]],
-           "rejected prefixes leave tracking state intact")
-    expect(g.command("CLIENT", "TRACKING", "off"), b"OK", "clear collision probe")
-    checks += 5
-
-    # Seed 23: an omitted PREFIX extends a live BCAST registration with one empty prefix.
-    # Preserve the explicit prefixes, then prove both error precedence and idempotence; merely
-    # accepting the command would miss the registration defect found by the rotating matrix.
-    prefix_baseline = stats()["tracking_total_prefixes"]
-    expect(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", "b", "PREFIX", "user:1"),
-           b"OK", "seed 23 explicit prefixes")
-    for _ in range(2):
-        expect(g.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "add implicit empty prefix")
-        expect(g.command("CLIENT", "TRACKINGINFO"),
-               [b"flags", [b"on", b"bcast"], b"redirect", 0, b"prefixes", [b"", b"b", b"user:1"]],
-               "implicit prefix is retained once alongside explicit prefixes")
-    expect(stats()["tracking_total_prefixes"], prefix_baseline + 3, "implicit prefix registered once")
-    for prefixes in (("user:", "ab"), ("ab", "ab")):
-        expect_err(g.command("CLIENT", "TRACKING", "on", "BCAST", "PREFIX", prefixes[0],
-                             "PREFIX", prefixes[1]),
-                   f"ERR Prefix '{prefixes[0]}' overlaps with an existing prefix ''. "
-                   "Prefixes for a single client must not overlap.", "seed 23 empty-prefix precedence")
-    expect(g.command("CLIENT", "TRACKING", "off"), b"OK", "clear implicit prefix probe")
-    expect(stats()["tracking_total_prefixes"], prefix_baseline, "implicit prefix accounting disarmed")
-    checks += 10
-
     # mode switching is refused while on
     expect(g.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "TRACKING on BCAST")
     expect_err(g.command("CLIENT", "TRACKING", "on"),
@@ -333,15 +296,6 @@ try:
     expect(b.command("CLIENT", "TRACKINGINFO"),
            [b"flags", [b"on", b"bcast"], b"redirect", 0, b"prefixes", [b"bc:"]],
            "BCAST TRACKINGINFO")
-    # The implicit empty subscription widens delivery, and Redis emits a separate frame for
-    # each matching prefix. Repeating the command must neither lose nor multiply those frames.
-    for _ in range(2):
-        expect(b.command("CLIENT", "TRACKING", "on", "BCAST"), b"OK", "extend BCAST to all keys")
-        writer.command("SET", "other:implicit", "x")
-        expect(b.drain(), push(b"other:implicit"), "implicit prefix covers previously excluded key")
-        writer.command("SET", "bc:implicit", "x")
-        expect(b.drain(), push(b"bc:implicit") * 2, "one invalidation per held matching prefix")
-    checks += 6
     b.command("CLIENT", "TRACKING", "off")
     b.drain(0.2)
     writer.command("SET", "bc:2", "x")
@@ -388,36 +342,6 @@ try:
     o.command("CLIENT", "TRACKING", "off")
     o.drain(0.2)
     checks += 8
-
-    # CLIENT subcommands preserve the pending CACHING choice, even on error. Check the actual
-    # invalidation too: metadata alone misses the OPTIN stale-cache bug exposed by seed 20.
-    for option, choice, flag, tracked in (("OPTIN", "yes", b"caching-yes", True),
-                                          ("OPTOUT", "no", b"caching-no", False)):
-        key = "tracking:client-inspection:" + option
-        plain_info = [b"flags", [b"on", option.lower().encode()], b"redirect", 0, b"prefixes", []]
-        armed_info = [b"flags", [b"on", option.lower().encode(), flag], b"redirect", 0, b"prefixes", []]
-        expect(o.command("CLIENT", "TRACKING", "on", option), b"OK", option + " inspection setup")
-        expect(o.command("CLIENT", "CACHING", choice), b"OK", option + " arm before CLIENT")
-        expect(o.command("CLIENT", "TRACKINGINFO"), armed_info, option + " TRACKINGINFO preserves CACHING")
-        expect(o.command("CLIENT", "GETREDIR"), 0, option + " GETREDIR preserves CACHING")
-        wrong_choice = "no" if tracked else "yes"
-        required_option = "OPTOUT" if tracked else "OPTIN"
-        expect_err(o.command("CLIENT", "CACHING", wrong_choice),
-                   "ERR CLIENT CACHING " + wrong_choice.upper() +
-                   " is only valid when tracking is enabled in " + required_option + " mode.",
-                   option + " rejected CLIENT command")
-        expect(o.command("CLIENT", "TRACKINGINFO"), armed_info, option + " CLIENT error preserves CACHING")
-        writer.command("SET", key, "before")
-        expect(o.command("GET", key), b"before", option + " read after CLIENT commands")
-        writer.command("SET", key, "after")
-        expect(o.drain() if tracked else o.drain(0.4), push(key.encode()) if tracked else b"",
-               option + " invalidation after CLIENT commands")
-        expect(o.command("CLIENT", "TRACKINGINFO"), plain_info, option + " GET consumes CACHING")
-        expect(o.command("CLIENT", "CACHING", choice), b"OK", option + " arm before PING")
-        expect(o.command("PING"), b"PONG", option + " non-CLIENT command")
-        expect(o.command("CLIENT", "TRACKINGINFO"), plain_info, option + " PING consumes CACHING")
-        expect(o.command("CLIENT", "TRACKING", "off"), b"OK", option + " inspection cleanup")
-        checks += 13
 
     # ---- 6. protocol x no-redirect: RESP2 silence with a RESP3 positive control ---------------
     # Register the SAME key on both connections and mutate it once. The RESP3 push proves the

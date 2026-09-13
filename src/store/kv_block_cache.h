@@ -67,9 +67,8 @@ struct KvBlockCache {
     //
     //  * kMaxNodesPerClass — one grace drain's worth. A drain releases at most one retire ring of
     //    objects, so a class that refuses blocks below that number is refusing memory the very
-    //    next owner pass will ask for again. Measured on one fused owner at 64 shards, a 32-node
-    //    cap left 0.5001/0.3750 mallocx calls per op at pipeline 64/256; the 4096-node cap left
-    //    zero in both cells for only 2-4 KiB more cached memory.
+    //    next owner pass will ask for again. Measured: with a 32-node cap the reuse rate collapses
+    //    to a few percent and the whole mechanism stops paying (see NOTES-RECYCLE.md).
     //  * kMaxBytes — one grace drain of maximum-inline-value objects. The retire ring ALREADY
     //    permits kReadLocalRetireRingCapacity retired-but-unreclaimed objects per owner to be
     //    resident, and kEmbedThreshold is the largest value an eligible block can carry, so this

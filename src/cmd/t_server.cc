@@ -14,7 +14,6 @@
 #include "server_tail.h"
 #include "slowlog.h"
 #include "../base/alloc.h"
-#include "../core/genthread.h"
 #include "../core/server.h"
 #include "../core/lbsignals.h"
 #include "../core/pubsub_event.h"
@@ -285,7 +284,7 @@ enum class ConfigKind : uint8_t {
     String, Bool, Unsigned, Bytes, Enum, Policy, ClientOutputBufferLimit, NotifyFlags, Save,
     // slowlog-log-slower-than is the tree's first genuinely signed knob: redis's grammar accepts
     // and reports -1, so an unsigned representation would not round-trip.
-    Signed, Encoding
+    Signed
 };
 struct ConfigValue {
     const char* name;
@@ -297,7 +296,6 @@ struct ConfigValue {
 std::mutex g_config_mu;
 std::vector<ConfigValue> g_config;
 ClientOutputBufferLimits g_client_obuf_limits;
-std::atomic<uint64_t> g_proto_max_bulk_len{512ull * 1024 * 1024};
 
 void add_config(const char* name, ConfigKind kind, uint64_t value) {
     g_config.push_back(ConfigValue{name, kind, std::to_string(value)});
@@ -306,7 +304,6 @@ void add_config(const char* name, ConfigKind kind, uint64_t value) {
 void init_config(const Config& cfg) {
     std::lock_guard<std::mutex> lock(g_config_mu);
     g_config.clear();
-    g_proto_max_bulk_len.store(cfg.proto_max_bulk_len, std::memory_order_relaxed);
     g_config.push_back({"save", ConfigKind::Save, cfg_save_schedule_string(cfg.save)});
     g_config.push_back({"dir", ConfigKind::String, (cfg.dir && *cfg.dir) ? cfg.dir : "."});
     g_config.push_back({"dbfilename", ConfigKind::String,
@@ -321,16 +318,17 @@ void init_config(const Config& cfg) {
                         cfg.net_io == NetIoEngine::Epoll ? "epoll" : "uring", true});
     g_config.push_back({"thread-mode", ConfigKind::Enum,
                         cfg.thread_mode == ThreadMode::Fused ? "1s" : "2s", true});
-    g_config.push_back({"overlap", ConfigKind::Unsigned,
+    g_config.push_back({"x-overlap", ConfigKind::Unsigned,
                         std::to_string(cfg.overlap), true});
     g_config.push_back({"read-local", ConfigKind::Unsigned,
                         std::to_string(cfg.read_local), true});
-    g_config.push_back({"reorder", ConfigKind::Unsigned,
-                        std::to_string(cfg.reorder), true});
-    g_config.push_back({"key-lb", ConfigKind::Unsigned, std::to_string(cfg.key_lb), true});
-    g_config.push_back({"client-lb", ConfigKind::Unsigned, std::to_string(cfg.client_lb), true});
+    g_config.push_back({"x-ex-sched", ConfigKind::Unsigned,
+                        std::to_string(cfg.ex_sched), true});
+    g_config.push_back({"lb", ConfigKind::Unsigned, std::to_string(cfg.lb), true});
     g_config.push_back({"flip-auto", ConfigKind::Unsigned,
                         std::to_string(cfg.flip_auto), true});
+    g_config.push_back({"flip-work-window", ConfigKind::Unsigned,
+                        std::to_string(cfg.flip_work_window), true});
     g_config.push_back({"appendfilename", ConfigKind::String, cfg.appendfilename, true});
     g_config.push_back({"appenddirname", ConfigKind::String, cfg.appenddirname, true});
     add_config("auto-aof-rewrite-percentage", ConfigKind::Unsigned,
@@ -344,6 +342,8 @@ void init_config(const Config& cfg) {
     g_config.push_back({"maxmemory-policy", ConfigKind::Policy,
                         maxmemory_policy_name(cfg.maxmemory_policy)});
     add_config("maxmemory-samples", ConfigKind::Unsigned, cfg.maxmemory_samples);
+    g_config.push_back({"script-instruction-limit", ConfigKind::Unsigned,
+                        std::to_string(cfg.script_instruction_limit), true});
     add_config("maxclients", ConfigKind::Unsigned, cfg.maxclients);
     add_config("timeout", ConfigKind::Unsigned, cfg.timeout);
     add_config("tcp-keepalive", ConfigKind::Unsigned, cfg.tcp_keepalive);
@@ -374,16 +374,21 @@ void init_config(const Config& cfg) {
     g_config.push_back({"notify-keyspace-events", ConfigKind::NotifyFlags,
                         serialize_notify_flags(cfg.notify_events)});
     // Boot-latched: the io owners read the bound directly out of Config, so it is reported but
-    // not live-settable (redis allows CONFIG SET).
+    // not live-settable (redis allows CONFIG SET; see NOTES-CLIMON2.md).
     g_config.push_back({"tracking-table-max-keys", ConfigKind::Unsigned,
                         std::to_string(cfg.tracking_table_max_keys), true});
     add_config("databases", ConfigKind::Unsigned, cfg.databases);
     add_config("proto-max-bulk-len", ConfigKind::Bytes, cfg.proto_max_bulk_len);
     add_config("zc-min", ConfigKind::Unsigned, cfg.zc_min);
     add_config("atomic", ConfigKind::Unsigned, cfg.atomic);
-    for (uint32_t i = 0; i < EncodingConfig::Count; i++)
-        g_config.push_back({EncodingConfig::settings[i].name, ConfigKind::Encoding,
-                            std::to_string(cfg.encodings.values[i])});
+    add_config("hash-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.hash.max_entries);
+    add_config("hash-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.hash.max_value);
+    add_config("list-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.list.max_entries);
+    add_config("list-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.list.max_value);
+    add_config("set-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.set.max_entries);
+    add_config("set-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.set.max_value);
+    add_config("zset-max-compact-entries", ConfigKind::Unsigned, cfg.type_limits.zset.max_entries);
+    add_config("zset-max-compact-value", ConfigKind::Unsigned, cfg.type_limits.zset.max_value);
     add_config("stream-node-max-bytes", ConfigKind::Unsigned,
                cfg.stream_limits.node_max_bytes);
     add_config("stream-node-max-entries", ConfigKind::Unsigned,
@@ -411,11 +416,6 @@ void init_config(const Config& cfg) {
 }
 
 ConfigValue* find_config(Slice name) {
-    const int encoding = EncodingConfig::find(name);
-    if (encoding >= 0) {
-        const char* canonical = EncodingConfig::settings[encoding].name;
-        name = Slice(canonical, std::strlen(canonical));
-    }
     for (ConfigValue& item : g_config)
         if (eq_icase(name, item.name)) return &item;
     return nullptr;
@@ -462,13 +462,6 @@ bool parse_client_output_buffer_limit_slice(Slice input,
 
 bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
     switch (entry.kind) {
-        case ConfigKind::Encoding: {
-            int64_t value = 0;
-            const int key = EncodingConfig::find(Slice(entry.name, std::strlen(entry.name)));
-            if (key < 0 || !EncodingConfig::parse(key, input, value)) return false;
-            out = std::to_string(value);
-            return true;
-        }
         case ConfigKind::String:
             if (!std::strcmp(entry.name, "acl-pubsub-default")) {
                 if (eq_icase(input, "allchannels")) out = "allchannels";
@@ -487,7 +480,7 @@ bool normalize_config(const ConfigValue& entry, Slice input, std::string& out) {
         case ConfigKind::Unsigned: {
             uint64_t value = 0;
             if (!parse_u64(input, value)) return false;
-            if (!std::strcmp(entry.name, "zc-min") &&
+            if ((std::strstr(entry.name, "compact") || !std::strcmp(entry.name, "zc-min")) &&
                 value > UINT32_MAX) return false;
             if (!std::strcmp(entry.name, "maxmemory-samples") && (value == 0 || value > 64))
                 return false;
@@ -569,13 +562,6 @@ bool collect_config_updates(Op& op,
             std::string msg = "ERR Unknown option or number of arguments for CONFIG SET - '";
             msg.append(op.arg(i).p, op.arg(i).n); msg.push_back('\'');
             reply_err(op.sink(), msg.c_str()); return false;
-        }
-        if (item->kind == ConfigKind::Encoding) {
-            for (const auto& previous : updates) {
-                if (previous.first != item) continue;
-                reply_err(op.sink(), "ERR duplicate configuration parameter");
-                return false;
-            }
         }
         if (!std::strcmp(item->name, "aof-use-rdb-preamble")) {
             if (!eq_icase(op.arg(i + 1), "yes")) {
@@ -766,27 +752,8 @@ void cmd_reset(Shard&, Op& op) {
     reply_simple(op.sink(), "RESET");
 }
 
-void cmd_debug_impl(Shard& shard, Op& op) {
+void cmd_debug_impl(Shard&, Op& op) {
     const Slice subcommand = op.arg(1);
-    // REHASH-STATE is explicitly queued to shard 0 by IoLoop, unlike ordinary ConfigRoute
-    // commands (which are IO-local). Reject an unrouted call before touching owner-only state.
-    if (eq_icase(subcommand, "rehash-state") && op.argc() == 2) {
-        if (op.shard != 0 || shard.id() != 0) {
-            reply_err(op.sink(), "ERR REHASH-STATE requires shard-owner dispatch");
-            return;
-        }
-        const auto progress = shard.store().rehash_progress();
-        auto sink = op.sink();
-        reply_array_header(sink, 7);
-        reply_int(sink, shard.id());
-        reply_int(sink, shard.stats().rehashes);
-        reply_int(sink, progress.current_capacity);
-        reply_int(sink, progress.old_capacity);
-        reply_int(sink, progress.cursor);
-        reply_int(sink, progress.old_live);
-        reply_int(sink, shard.store().size());
-        return;
-    }
     // Directed transport tests use this cold hook to prove that their retained sockets cover every
     // live IO producer before a 63:1 -> 1:63 flip. Returning the connection owner is observational;
     // it does not alter placement and is available only behind the existing DEBUG permission gate.
@@ -932,7 +899,7 @@ void cmd_debug_impl(Shard& shard, Op& op) {
     // connection pipelining more than the cap in one parse pass oversubscribes the lane inside
     // that pass. That is what makes the battery's anti-vacuity checks deterministic at gate scale
     // instead of a rate race against the drain that only a saturated rig can win. 0 restores the
-    // derived value, which is what production always runs.
+    // derived value, which is what production always runs. See P128.md section 8.
     if (eq_icase(subcommand, "read-local-lane-cap") && op.argc() == 3) {
         uint64_t cap = 0;
         if (!parse_u64(op.arg(2), cap) || cap > kInboxSlots) {
@@ -946,11 +913,10 @@ void cmd_debug_impl(Shard& shard, Op& op) {
     }
     // GEOMETRY INJECTOR for the parse-barrier ownership regression. While armed, every blocking
     // dispatch pins a SECOND owner on its connection's parse barrier, so the blocking command's
-    // retirement releases a barrier it does not solely own. Production blocking dispatch requires
-    // an empty ROB and then bars younger parsing, so the blocking op is alone and cannot meet a
-    // second owner. That is why the overlap must be injected rather than provoked, and why a
-    // battery that only replays real command sequences proves nothing about this code.
-    // Production default is 0.
+    // retirement releases a barrier it does not solely own. That two-owner state is unreachable on
+    // any production sequence (NOTES-BARRIER.md section 2) -- which is why it must be injected
+    // rather than provoked, and why a battery that only replays real command sequences proves
+    // nothing about this code. Production default is 0.
     //
     // Observable while armed: a frame pipelined BEHIND a blocking command stays unparsed after the
     // blocking reply retires, instead of being answered in the same flush pass. Clearing the latch
@@ -1022,19 +988,6 @@ void cmd_debug_impl(Shard& shard, Op& op) {
     if (eq_icase(subcommand, "atomic-filter-cell") && op.argc() == 3) {
         const uint64_t hash = FlatStore::hash_key(op.arg(2));
         reply_int(op.sink(), FlatStore::foreign_read_filter_index(hash));
-        return;
-    }
-    // Nonblocking admission witness: unlike COMMIT-DELAY, this latch leaves both executors
-    // available for CONFIG. It retains the existing commit queue until explicitly released.
-    if (eq_icase(subcommand, "atomic-commit-hold") && op.argc() == 3) {
-        uint64_t held = 0;
-        if (!parse_u64(op.arg(2), held) || held > 1) {
-            reply_err(op.sink(), "ERR value is not an integer or out of range");
-            return;
-        }
-        if (!g_server) { reply_err(op.sink(), "ERR no server context"); return; }
-        g_server->set_debug_atomic_commit_hold(held != 0);
-        reply_ok(op.sink());
         return;
     }
     // One shared DEBUG delay word, with names for its two mode-specific boundaries. Atomic ON
@@ -1351,20 +1304,11 @@ void cmd_config(Shard& sh, Op& op) {
         {
             std::lock_guard<std::mutex> lock(g_config_mu);
             for (const ConfigValue& item : g_config) {
-                auto match = [&](const char* spelling) {
-                    const Slice name(spelling, std::strlen(spelling));
-                    for (uint32_t i = 2; i < op.argc(); i++) {
-                        if (!command_glob_match(op.arg(i), name, true)) continue;
-                        matches.emplace_back(spelling, item.value);
-                        break;
-                    }
-                };
-                match(item.name);
-                if (item.kind == ConfigKind::Encoding) {
-                    const int key = EncodingConfig::find(Slice(item.name, std::strlen(item.name)));
-                    if (key >= 0 && EncodingConfig::settings[key].alias)
-                        match(EncodingConfig::settings[key].alias);
-                }
+                Slice name(item.name, std::strlen(item.name));
+                bool matched = false;
+                for (uint32_t i = 2; i < op.argc() && !matched; i++)
+                    matched = command_glob_match(op.arg(i), name, true);
+                if (matched) matches.emplace_back(item.name, item.value);
             }
         }
         auto sink = op.sink();
@@ -1415,7 +1359,7 @@ void cmd_config(Shard& sh, Op& op) {
                                (save_armed ? NOTIFY_SAVE : 0u));
         }
 
-        // Eviction config is process-global (committed mailbox copies read each pass); publish
+        // Eviction config is process-global (odd/even snapshot read by owners each pass); publish
         // it once from shard 0's task rather than per shard.
         if (sh.id() == 0 && g_server) {
             for (const auto& update : updates) {
@@ -1429,11 +1373,9 @@ void cmd_config(Shard& sh, Op& op) {
                     if (!parse_u64(Slice(update.second.data(), update.second.size()), value))
                         std::abort();
                     g_server->set_proto_max_bulk_len(value);
-                    g_proto_max_bulk_len.store(value, std::memory_order_relaxed);
                 }
             }
-            LiveConfigSnapshot desired =
-                g_server->live_config_snapshot(g_server->worker_of_shard(sh.id()));
+            LiveConfigSnapshot desired = g_server->live_config_snapshot();
             bool set_memory = false, set_policy = false, set_samples = false;
             for (const auto& update : updates) {
                 const Slice text(update.second.data(),
@@ -1546,18 +1488,18 @@ void cmd_config(Shard& sh, Op& op) {
         TypeLimits limits = sh.type_limits();
         StreamLimits stream_limits = sh.stream_limits();
         for (const auto& update : updates) {
-            if (update.first->kind == ConfigKind::Encoding) {
-                const char* name = update.first->name;
-                const int key = EncodingConfig::find(Slice(name, std::strlen(name)));
-                int64_t value = 0;
-                if (key < 0 || !cfg_parse_i64(update.second.c_str(), value)) std::abort();
-                EncodingConfig::apply(limits, key, value);
-                continue;
-            }
             uint64_t value = 0;
             if (!parse_u64(Slice(update.second.data(), update.second.size()), value)) continue;
             const uint32_t v = static_cast<uint32_t>(value);
             if (!std::strcmp(update.first->name, "zc-min")) sh.set_zc_min(v);
+            else if (!std::strcmp(update.first->name, "hash-max-compact-entries")) limits.hash.max_entries = v;
+            else if (!std::strcmp(update.first->name, "hash-max-compact-value")) limits.hash.max_value = v;
+            else if (!std::strcmp(update.first->name, "list-max-compact-entries")) limits.list.max_entries = v;
+            else if (!std::strcmp(update.first->name, "list-max-compact-value")) limits.list.max_value = v;
+            else if (!std::strcmp(update.first->name, "set-max-compact-entries")) limits.set.max_entries = v;
+            else if (!std::strcmp(update.first->name, "set-max-compact-value")) limits.set.max_value = v;
+            else if (!std::strcmp(update.first->name, "zset-max-compact-entries")) limits.zset.max_entries = v;
+            else if (!std::strcmp(update.first->name, "zset-max-compact-value")) limits.zset.max_value = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-bytes")) stream_limits.node_max_bytes = v;
             else if (!std::strcmp(update.first->name, "stream-node-max-entries")) stream_limits.node_max_entries = v;
         }
@@ -1989,70 +1931,26 @@ void cmd_info(Shard&, Op& op) {
 
     if (info_section(op, "SERVER")) {
         const uint64_t uptime = g_started_monotonic_ns ? (now_ns() - g_started_monotonic_ns) / 1000000000ull : 0;
-        // zc-min is live: cfg() is only the boot request. Read the same synchronized value as
-        // CONFIG GET, after which a benchmark can verify a completed CONFIG SET of either arm.
-        std::string zc_min;
-        {
-            std::lock_guard<std::mutex> lock(g_config_mu);
-            for (const ConfigValue& item : g_config)
-                if (!std::strcmp(item.name, "zc-min")) { zc_min = item.value; break; }
-        }
         // process_id and tcp_port are plain facts about this process, not telemetry that could be
         // stale -- and tooling depends on them. The NIC bench harness identifies the server it just
         // booted by reading process_id out of INFO, so its absence made every NIC cell fail with an
         // opaque "boot/cell FAIL" long before any measurement was taken.
-        // read_local is the effective boot state. Actual loop entry and successful completions
-        // are separate observations: a configured but unreachable lane must be visible in INFO.
+        // read_local is the EFFECTIVE lane state (fused, overlap 0, knob on) -- what a gate row
+        // must assert. CONFIG GET read-local echoes the knob even on a split boot where it is inert.
         appendf(body, "# Server\r\nredis_version:%s\r\ntomokv_version:%s\r\nredis_mode:standalone\r\n"
-                      "thread_mode:%s\r\nshards:%u\r\noverlap:%u\r\nreorder:%u\r\nread_local:%u\r\natomic:%u\r\n"
-                      "arch_bits:%zu\r\nmultiplexing_api:%s\r\nprocess_id:%lld\r\n"
+                      "thread_mode:%s\r\nshards:%u\r\nx_overlap:%u\r\nread_local:%u\r\natomic:%u\r\n"
+                      "arch_bits:%zu\r\nmultiplexing_api:io_uring\r\nprocess_id:%lld\r\n"
                       "tcp_port:%u\r\nuptime_in_seconds:%llu\r\nuptime_in_days:%llu\r\n",
                 kVersion, kVersion, g_server ? g_server->thread_mode_name() : "2s",
                 g_server ? g_server->nshards() : 0u,
                 g_server ? g_server->cfg().overlap : 0u,
-                g_server ? g_server->cfg().reorder : 0u,
                 g_server && g_server->read_local_enabled() ? 1u : 0u,
                 g_server && g_server->atomic_enabled() ? 1u : 0u,
                 sizeof(void*) * 8,
-                g_ring_epoll_mode ? "epoll" : "io_uring",
                 static_cast<long long>(::getpid()),
                 static_cast<unsigned>(g_server ? g_server->cfg().port : 0),
                 static_cast<unsigned long long>(uptime),
                 static_cast<unsigned long long>(uptime / 86400));
-        appendf(body, "key_lb:%u\r\nclient_lb:%u\r\nflip_auto:%u\r\n"
-                      "flip_fingerprint_window:%u\r\nnet_io:%s\r\nhash:%s\r\nzc_min:%s\r\n"
-                      "pin_threads:%u\r\n",
-                g_server && g_server->key_lb_signals_enabled() ? 1u : 0u,
-                g_server && g_server->client_lb_signals_enabled() ? 1u : 0u,
-                g_server && g_server->flipctl_enabled() ? 1u : 0u,
-                flip_fingerprint_window(g_server && g_server->flipctl_enabled()),
-                g_ring_epoll_mode ? "epoll" : "uring",
-                g_hash_kind == HashKind::SipHash12 ? "siphash" : "mix64",
-                zc_min.c_str(), g_server && g_server->cfg().pin_threads ? 1u : 0u);
-        if (g_server) {
-            // Boot homes stay immutable through FLIP/LB. Current owners come from dispatch's
-            // authoritative acquire loads, so INFO never echoes a requested but unused map.
-            // Append each entry separately: a full 256-shard map exceeds appendf's scratch buffer.
-            body += "shard_home:";
-            for (uint32_t sid = 0; sid < g_server->nshards(); sid++)
-                appendf(body, "%s%u:%u", sid ? "," : "", sid,
-                        g_server->placement().shard_home(sid));
-            body += "\r\nshard_owners:";
-            for (uint32_t sid = 0; sid < g_server->nshards(); sid++)
-                appendf(body, "%s%u:%u", sid ? "," : "", sid,
-                        g_server->worker_of_shard(static_cast<int32_t>(sid)));
-            body += "\r\nthread_cpus:";
-            for (uint32_t tid = 0; tid < g_server->nthreads(); tid++)
-                appendf(body, "%s%u:%d", tid ? "," : "", tid,
-                        g_server->placement().thread(tid).cpu);
-            body += "\r\n";
-        }
-        // Guard the CALL, including all argument evaluation. The cold non-inlined helper owns
-        // its scratch buffers so the disabled INFO path keeps its old output without those arrays.
-        if (g_server && g_server->read_local_enabled())
-            append_read_local_thread_info(body, *g_server);
-        if (g_server && g_server->mode_schedule_stats())
-            append_mode_schedule_info(body, g_server->mode_schedule_stats(), g_server->nthreads());
         if (g_server && g_server->thread_mode() == ThreadMode::Fused) {
             appendf(body,
                     "fused_threads:%u\r\nclient_threads:%u\r\nowner_threads:%u\r\n"
@@ -2487,11 +2385,10 @@ void cmd_info(Shard&, Op& op) {
                 // reached the non-quiesced / mid-drain geometry it is there to cover.
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_segmented() : 0),
                 static_cast<unsigned long long>(g_server ? g_server->oob_frames_deferred() : 0),
-                // barrier_owner_overlaps must read 0 on any production run: blocking dispatch
-                // requires an empty ROB and bars younger parsing, excluding a second owner.
-                // barrier_releases_held is the fired-mechanism proof for DEBUG BARRIER-HOLD --
-                // a barrier-ownership test that leaves it at 0 never reached its geometry and
-                // must fail, not pass.
+                // barrier_owner_overlaps must read 0 on any production run: it is the live
+                // assertion behind NOTES-BARRIER.md's reachability verdict. barrier_releases_held
+                // is the fired-mechanism proof for DEBUG BARRIER-HOLD -- a barrier-ownership test
+                // that leaves it at 0 never reached its geometry and must fail, not pass.
                 static_cast<unsigned long long>(
                     g_server ? g_server->barrier_owner_overlaps() : 0),
                 static_cast<unsigned long long>(
@@ -3031,9 +2928,6 @@ bool command_parse_scan_cursor(Slice text, uint64_t& cursor) {
 }
 
 Server* command_server() { return g_server; }
-uint64_t command_proto_max_bulk_len() {
-    return g_proto_max_bulk_len.load(std::memory_order_relaxed);
-}
 ThreadCtx* command_local_thread() { return g_thread; }
 
 void command_config_snapshot(std::vector<std::pair<std::string, std::string>>& out) {

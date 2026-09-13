@@ -7,8 +7,8 @@ import threading
 import time
 
 
-# --no-rate-assertions drops the ONE measurement/claim in this file that is about speed rather
-# than a mechanism (see the overlap section). Every correctness check still runs. The gate
+# --no-rate-assertions drops the ONE claim in this file that is about speed rather than about a
+# mechanism (see the overlap section near the end). Every correctness check still runs. The gate
 # passes it on the ASAN tier, where the sanitizer's ~5x slowdown does not slow the pipelined and
 # the serial arm by the same factor and inverts the ratio: the full gate measured pipe 21,005/s
 # against serial 24,202/s and reddened the row while every correctness check in that same run
@@ -34,7 +34,8 @@ def note(name, ok, extra=""):
 
 
 def skip(name, reason):
-    """A claim deliberately not made on this tier, printed explicitly."""
+    """A claim deliberately not made on this tier. Never a failure -- but always printed, with the
+    numbers it would have judged, so the log still carries the measurement."""
     print("  SKIP " + name + " -- " + reason, flush=True)
 
 
@@ -229,31 +230,32 @@ burst_count = 24
 burst = bytearray()
 for seq in range(burst_count):
     burst += frame(*mset_args(["ary:overlap:%d:%d" % (seq, i) for i in range(8)], str(seq)))
-started = time.perf_counter() if RATE_ASSERTIONS else None
+started = time.perf_counter()
 c.sock.sendall(burst)
 overlap_ok = all(c.read() == b"OK" for _ in range(burst_count))
-pipelined_elapsed = time.perf_counter() - started if RATE_ASSERTIONS else None
+pipelined_elapsed = time.perf_counter() - started
 c.close()
-note("unheld pipelined groups completed", overlap_ok)
+
+c = Resp()
+started = time.perf_counter()
+for seq in range(burst_count):
+    c.cmd(*mset_args(["ary:serial:%d:%d" % (seq, i) for i in range(8)], str(seq)))
+serial_elapsed = time.perf_counter() - started
+c.close()
+pipe_rate = burst_count / max(pipelined_elapsed, 1e-9)
+serial_rate = burst_count / max(serial_elapsed, 1e-9)
+rates = "pipe=%.0f/s serial=%.0f/s ratio=%.2f" % (
+    pipe_rate, serial_rate, pipe_rate / max(serial_rate, 1e-9))
+note("unheld pipelined groups completed", overlap_ok, rates)
 # The RATE half: with the barrier gone, pipelining 24 groups must also beat 24 serial round trips.
 # It is a performance claim -- true only on a machine that is not being slowed unevenly -- so it is
-# measured and asserted on the release tier only.
+# made on the release tier and skipped, with its numbers, everywhere else.
 if RATE_ASSERTIONS:
-    c = Resp()
-    started = time.perf_counter()
-    for seq in range(burst_count):
-        c.cmd(*mset_args(["ary:serial:%d:%d" % (seq, i) for i in range(8)], str(seq)))
-    serial_elapsed = time.perf_counter() - started
-    c.close()
-    pipe_rate = burst_count / max(pipelined_elapsed, 1e-9)
-    serial_rate = burst_count / max(serial_elapsed, 1e-9)
-    rates = "pipe=%.0f/s serial=%.0f/s ratio=%.2f" % (
-        pipe_rate, serial_rate, pipe_rate / max(serial_rate, 1e-9))
     note("pipelined atomic groups beat the serial round-trip rate", pipe_rate > serial_rate * 1.10,
          rates)
 else:
     skip("pipelined atomic groups beat the serial round-trip rate",
-         "rate comparison disabled by --no-rate-assertions")
+         "rate assertions disabled by --no-rate-assertions; " + rates)
 
 
 def consistent_or_absent(values):

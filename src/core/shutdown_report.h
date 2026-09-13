@@ -142,14 +142,15 @@ private:
     Epoll epoll_{};
     Accept accept_{};
 
-    template <class IoLoops>
-    friend ShutdownReport collect_shutdown_report(Server&, IoLoops&);
+    template <class IoLoops, class ExecutionLoops>
+    friend ShutdownReport collect_shutdown_report(Server&, IoLoops&, ExecutionLoops&);
     friend void print_shutdown_report_human(const ShutdownReport&);
     friend void print_shutdown_report_json(const ShutdownReport&);
 };
 
-template <class IoLoops>
-ShutdownReport collect_shutdown_report(Server& server, IoLoops& io_loops) {
+template <class IoLoops, class ExecutionLoops>
+ShutdownReport collect_shutdown_report(Server& server, IoLoops& io_loops,
+                                        ExecutionLoops& execution_loops) {
     ShutdownReport report;
     report.mode_ = server.thread_mode() == ThreadMode::Fused
         ? ShutdownReport::Mode::Fused : ShutdownReport::Mode::Split;
@@ -206,22 +207,26 @@ ShutdownReport collect_shutdown_report(Server& server, IoLoops& io_loops) {
         report.epoll_.recvs += signals.epoll_recvs;
     }
 
-    for (auto& loop : io_loops) {
-        const auto& stats = loop.engine().stats();
-        report.wb_.sends_submitted += stats.sends_submitted;
-        report.wb_.sends_completed += stats.sends_completed;
-        report.wb_.short_writes += stats.short_writes;
-        report.wb_.send_errors += stats.send_errors;
-        report.wb_.peer_aborts += stats.peer_aborts;
-        report.wb_.serves += stats.serves;
-        report.wb_.serves_empty += stats.serves_empty;
-        report.wb_.bytes_sent += stats.bytes_sent;
-        report.wb_.retired += stats.retired;
-        report.wb_.direct += stats.direct;
-        report.wb_.zc_sends += stats.zc_sends;
-        report.wb_.zc_bytes += stats.zc_bytes;
-        report.wb_.zc_releases += stats.zc_releases;
-    }
+    auto accumulate_wb = [&](auto& loops) {
+        for (auto& loop : loops) {
+            const auto& stats = loop.engine().stats();
+            report.wb_.sends_submitted += stats.sends_submitted;
+            report.wb_.sends_completed += stats.sends_completed;
+            report.wb_.short_writes += stats.short_writes;
+            report.wb_.send_errors += stats.send_errors;
+            report.wb_.peer_aborts += stats.peer_aborts;
+            report.wb_.serves += stats.serves;
+            report.wb_.serves_empty += stats.serves_empty;
+            report.wb_.bytes_sent += stats.bytes_sent;
+            report.wb_.retired += stats.retired;
+            report.wb_.direct += stats.direct;
+            report.wb_.zc_sends += stats.zc_sends;
+            report.wb_.zc_bytes += stats.zc_bytes;
+            report.wb_.zc_releases += stats.zc_releases;
+        }
+    };
+    accumulate_wb(io_loops);
+    accumulate_wb(execution_loops);
 
     for (uint32_t tid = 0; tid < server.nthreads(); tid++) {
         for (Client* client : server.thread(tid).clients()) {

@@ -240,9 +240,8 @@
     // unit publishes through, not just one: an EXEC's plain per-key installs use the transaction's
     // epoch, while each cross-shard child command lowered inside that EXEC keeps its own
     // ScatterState and therefore its own. Answering with only the transaction's word makes a
-    // transaction hold against its own RENAME/LMPOP child and hang. Testing group pointers instead
-    // also deadlocked: an EXEC child's scatter record names a group, while the same EXEC's plain
-    // installs do not. Plain single-command pseudo-entries
+    // transaction hold against its own RENAME/LMPOP child and hang -- the same self-hold
+    // NOTES-MULTIRES.md §5(a) hit from the other direction. Plain single-command pseudo-entries
     // carry no group_epoch at all: they draw their ticket in the same owner turn that installs
     // them, so they are never undecided and are skipped here.
     template <typename IsOwnUnit>
@@ -358,8 +357,6 @@
         KvObj* old = atomic_exchange_physical(hash, key, value);
         entry->parked()[index] = old;
         entry->count = index + 1;
-        atomic_pending_->group_installing = true;
-        if (value) note_loaded_object(hash, value);
         return old;
     }
 
@@ -392,7 +389,6 @@
         auto* entry = static_cast<AtomicEntry*>(opaque);
         if (!entry || !entry->count || entry->linked) std::abort();
         atomic_link_entry(*entry);
-        atomic_pending_->group_installing = false;
     }
 
 
@@ -403,22 +399,20 @@
     // and DELETE passes attach nothing, so without a reclaiming trigger on every pass (this is
     // called for deletes too, unlike the old value-writes-only reserve) tombstones fill the table.
     // Once it returns true, the group's physical install pass cannot hit a capacity
-    // failure. A busy rehash can refuse a pass until bounded progress frees the old table.
+    // failure. Returns false only on real OOM (calloc) or a locked snapshot with no raw room.
     bool atomic_prepare_capacity(uint32_t additional) {
         if (__builtin_expect(read_local_enabled_, false))
             return atomic_prepare_capacity_read_local(additional);
         if (rehashing()) {
             if (!snapshot_active_) {
-                // Match ordinary insert's eight old slots PER new key. Advancing only one slot
-                // per new key lets an empty old prefix consume the budget while table 0 fills.
-                uint64_t steps = static_cast<uint64_t>(additional) + 1;
+                // Keep drain ahead of fill: advance at least `additional` keys' worth of slots so
+                // table 0 cannot fill before this rehash finishes (mirrors insert()'s 1-key : 8-slot
+                // ratio, generalised to a whole install pass).
+                uint32_t steps = additional / kRehashSlotsPerOp + 1;
                 while (steps-- && rehashing()) rehash_step();
             }
-            if (rehashing()) {
-                const uint64_t need = static_cast<uint64_t>(live_[0]) + tombs_[0] +
-                                      live_[1] + additional;
-                return need < cap_[0];
-            }
+            if (rehashing())
+                return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
             // fell through: rehash completed, re-evaluate against the merged table below.
         }
         if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + additional) * 100 <
@@ -458,9 +452,6 @@
         };
         if (fits()) { atomic_version_bytes_ += bytes; return true; }
         if (maxmemory_policy_ == MaxmemoryPolicy::NoEviction) return false;
-        // Earlier candidates in this owner pass are absent from the pending list. Refuse further
-        // growth under pressure until the whole installed prefix is published (also on abort).
-        if (atomic_pending_ && atomic_pending_->group_installing) return false;
         uint32_t budget = kEvictionsPerOp;
         while (budget-- && !fits()) {
             KvObj* victim = choose_victim(protected_key);
@@ -470,7 +461,6 @@
             // A key an in-flight group or a staged cross-owner script depends on is not a legal
             // victim: evicting it would destroy the predecessor those readers resolve against.
             if (atomic_needs_version(hash, key)) continue;
-            (void)aof_.record_delete(key);
             const uint32_t before = size();
             const bool live = erase(hash, key);
             if (size() == before) return false;
@@ -605,10 +595,11 @@
         return atomic_resolve_internal(hash, key, snapshot, true).value;
     }
 
-    // A scatter owner hoists atomic_has_records() once before its per-key read loop. Like find(),
-    // this direct lookup must not retire a rehash table; it only avoids reloading and retesting the
-    // pending-list pointer for every key in the group.
+    // A scatter owner hoists atomic_has_records() once before its per-key read loop. This direct arm
+    // retains find()'s bounded rehash progress but avoids reloading and retesting the pending-list
+    // pointer for every key in the group.
     KvObj* atomic_find_tracked(uint64_t hash, Slice key) {
+        if (rehashing() && !snapshot_active_) rehash_step();
         KvObj* found = atomic_resolve(hash, key, atomic_read_epoch_);
         if (__builtin_expect(maxmemory_enabled_, false) && found) touch(found);
         return found;
@@ -786,14 +777,11 @@ private:
     bool atomic_prepare_capacity_read_local(uint32_t additional) {
         if (rehashing()) {
             if (!snapshot_active_) {
-                uint64_t steps = static_cast<uint64_t>(additional) + 1;
+                uint32_t steps = additional / kRehashSlotsPerOp + 1;
                 while (steps-- && rehashing()) rehash_step_read_local();
             }
-            if (rehashing()) {
-                const uint64_t need = static_cast<uint64_t>(live_[0]) + tombs_[0] +
-                                      live_[1] + additional;
-                return need < cap_[0];
-            }
+            if (rehashing())
+                return static_cast<uint64_t>(live_[0]) + tombs_[0] + additional < cap_[0];
         }
         if ((static_cast<uint64_t>(live_[0]) + tombs_[0] + additional) * 100 <
             static_cast<uint64_t>(cap_[0]) * kLoadPct)
@@ -1430,7 +1418,7 @@ private:
         return true;
     }
 
-    // ---- armed-write block cache (src/store/kv_block_cache.h) ---------------
+    // ---- armed-write block cache (src/store/kv_block_cache.h, NOTES-RECYCLE.md) ---------------
     //
     // The cache itself belongs to the fused OWNER and is reached through the retire sink this store
     // is already bound to; the store contributes only the eligibility a shard can judge (object
@@ -1441,6 +1429,7 @@ private:
     // was requested at. Returns false when the block was not cached and the caller must free it.
     bool read_local_cache_put(KvObj* object, size_t capacity) {
         KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache;
+        if (!cache) return false;
         // Only inline String blocks take part. An Extern object owns a second allocation whose
         // class is independent of this one, and a collection's block is not what a SET builds.
         if (static_cast<Type>(object->type) != Type::String) return false;
@@ -1461,7 +1450,7 @@ private:
     // Armed write path. `allocation` is already good_size()-rounded.
     void* read_local_cache_take(size_t allocation) {
         KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache;
-        return cache->take(allocation);
+        return cache ? cache->take(allocation) : nullptr;
     }
 
     // Hand every cached block back to the allocator: maxmemory pressure (return cached memory
@@ -1470,7 +1459,8 @@ private:
     // contributed; that is correct for both callers, which are whole-server events.
     void read_local_cache_release_all() {
         if (!read_local_enabled_) return;
-        read_local_store_state_armed().retire_sink.block_cache->release_all();
+        if (KvBlockCache* cache = read_local_store_state_armed().retire_sink.block_cache)
+            cache->release_all();
     }
 
     void read_local_cache_trim_on_pressure() { read_local_cache_release_all(); }
@@ -1496,22 +1486,6 @@ private:
             return;
         }
         kvobj_free(object);
-    }
-
-    bool atomic_prepare_rollback_capacity(AtomicEntry* end) {
-        uint64_t restore = 0;
-        for (AtomicEntry* entry = atomic_pending_->head; entry != end; entry = entry->next) {
-            if (!entry->group_epoch || !entry->group_aborted ||
-                !entry->group_aborted->load(std::memory_order_acquire)) continue;
-            for (uint32_t i = 0; i < entry->count; i++) {
-                if (atomic_live_value(entry->parked()[i]) &&
-                    !atomic_find_physical(atomic_entry_hash(*entry, i), atomic_entry_key(*entry, i)))
-                    restore++;
-            }
-        }
-        // A later boundary may retain some predecessors in the chain. Reserving for those too
-        // is conservative; no record or predecessor is released if this preflight fails.
-        return restore == 0 || (restore <= UINT32_MAX && atomic_prepare_capacity(restore));
     }
 
     bool atomic_collapse(uint64_t floor, uint64_t cleanup_cutoff) {
@@ -1646,7 +1620,6 @@ private:
             }
         }
         if (!overlap) {
-            if (!atomic_prepare_rollback_capacity(first_unselected)) return false;
             atomic_pending_->cleanup_slow += occurrences;
             uint64_t promoted = 0;
             AtomicEntry* entry = atomic_pending_->head;
@@ -1783,7 +1756,7 @@ private:
             // waiting on other shards can be overtaken at the ticket counter by a MULTI/EXEC the
             // same connection sent afterwards. Ranking those two by raw ticket then re-installed
             // the OLDER group's value over the newer transaction's, destroying a write EXEC had
-            // already acknowledged -- reproduced at 246/1120.
+            // already acknowledged -- reproduced at 246/1120 (NOTES-MULTIRES.md).
             // Repairing the epoch to be monotone per connection removes the inversion without
             // reordering anything across connections, where the ticket remains the only truth.
             if (key.prev_set && owner.origin_conn_id == key.prev_conn_id &&
@@ -2033,7 +2006,6 @@ private:
             }
         }
         if (!overlap) {
-            if (!atomic_prepare_rollback_capacity(first_unselected)) return false;
             atomic_pending_->cleanup_slow += occurrences;
             uint64_t promoted = 0;
             AtomicEntry* entry = atomic_pending_->head;
@@ -2172,7 +2144,7 @@ private:
             // waiting on other shards can be overtaken at the ticket counter by a MULTI/EXEC the
             // same connection sent afterwards. Ranking those two by raw ticket then re-installed
             // the OLDER group's value over the newer transaction's, destroying a write EXEC had
-            // already acknowledged -- reproduced at 246/1120.
+            // already acknowledged -- reproduced at 246/1120 (NOTES-MULTIRES.md).
             // Repairing the epoch to be monotone per connection removes the inversion without
             // reordering anything across connections, where the ticket remains the only truth.
             if (key.prev_set && owner.origin_conn_id == key.prev_conn_id &&

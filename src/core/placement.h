@@ -63,8 +63,8 @@ public:
     }
 
     // EVEN GLOBAL PLACEMENT. Counts are whole-server, so shapes no per-node grammar can express
-    // (15:2) are first-class. IO and EX roles spread across the L3 domains as evenly as
-    // integer division allows, with the roles interleaved within each domain.
+    // (15:2:15) are first-class. Each role is spread across the L3 domains as evenly as integer
+    // division allows and roles are interleaved within a domain, so sender pairing stays local.
     //
     // This is also the flip-era invariant in batch form: a runtime controller changing one thread's
     // role keeps these same quotas incrementally -- pick the convert candidate from the domain
@@ -172,56 +172,12 @@ public:
         return true;
     }
 
-    // A manual topology map is complete: shard IDs name dense executor thread IDs, not CPUs.
-    // Executors omitted from the map remain valid empty fillers. Runtime migration still uses
-    // the ordinary ownership transaction; this map selects only initial ownership.
-    bool assign_shard_homes(uint32_t nshards, const char* spec = nullptr) {
+    // Boot ownership is always round-robin over the resolved executor set.
+    bool assign_shard_homes(uint32_t nshards) {
         if (ex_.empty()) return false;
-        shard_home_.assign(nshards, kNoThread);
-        if (!spec) {
-            for (uint32_t sid = 0; sid < nshards; sid++)
-                shard_home_[sid] = ex_[sid % ex_.size()];
-            return true;
-        }
-        if (!*spec) {
-            std::fprintf(stderr, "--shard-home must contain shard:thread pairs\n");
-            return false;
-        }
-        std::vector<bool> seen(nshards, false);
-        const char* p = spec;
-        while (*p) {
-            uint32_t sid = 0, tid = 0;
-            if (!parse_pair(p, sid, tid)) {
-                std::fprintf(stderr, "--shard-home: expected shard:thread pairs near '%s'\n", p);
-                return false;
-            }
-            if (sid >= nshards) {
-                std::fprintf(stderr, "--shard-home: shard %u is outside 0..%u\n", sid, nshards - 1);
-                return false;
-            }
-            if (tid >= threads_.size() || !is_executor(tid)) {
-                std::fprintf(stderr, "--shard-home: thread %u is not an ex thread\n", tid);
-                return false;
-            }
-            if (seen[sid]) {
-                std::fprintf(stderr, "--shard-home: shard %u is assigned more than once\n", sid);
-                return false;
-            }
-            seen[sid] = true;
-            shard_home_[sid] = tid;
-            if (*p == '\0') break;
-            p++;
-            if (!*p) {
-                std::fprintf(stderr, "--shard-home: trailing comma\n");
-                return false;
-            }
-        }
-        for (uint32_t sid = 0; sid < nshards; sid++) {
-            if (!seen[sid]) {
-                std::fprintf(stderr, "--shard-home: shard %u has no owner (manual maps must be complete)\n", sid);
-                return false;
-            }
-        }
+        shard_home_.resize(nshards);
+        for (uint32_t sid = 0; sid < nshards; sid++)
+            shard_home_[sid] = ex_[sid % ex_.size()];
         return true;
     }
 
@@ -481,6 +437,9 @@ private:
 //
 // Skipping step 2 puts two threads in one FlatStore, which has no locks precisely because that is
 // supposed to be impossible — it would corrupt silently rather than crash.
+//
+// Written as a contract rather than an implementation because there is no LB yet and a half-built
+// migration path is worse than none.
 // ---------------------------------------------------------------------------------------------
 struct MigrationPlan {
     int32_t  shard_id    = -1;

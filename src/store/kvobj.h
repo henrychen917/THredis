@@ -69,32 +69,6 @@ struct KvObjFlags {
     static constexpr uint8_t LayoutMask = HasTtl | KeyExt | OwnsExtern;
 };
 
-// Eviction touches share this byte with layout flags. Even a layout-only owner read conflicts
-// with a foreign reader's whole-byte CAS, so make every access atomic by construction. Relaxed
-// loads suffice for immutable layout bits; publication still belongs to the table slot/QSBR.
-class KvObjFlagByte {
-    friend struct KvObj;
-    uint8_t value_;
-public:
-    KvObjFlagByte() = default;
-    KvObjFlagByte(const KvObjFlagByte&) = delete;
-    KvObjFlagByte& operator=(const KvObjFlagByte&) = delete;
-    operator uint8_t() const { return __atomic_load_n(&value_, __ATOMIC_RELAXED); }
-    KvObjFlagByte& operator=(uint8_t value) {
-        __atomic_store_n(&value_, value, __ATOMIC_RELAXED);
-        return *this;
-    }
-    KvObjFlagByte& operator&=(uint8_t mask) {
-        *this = static_cast<uint8_t>(static_cast<uint8_t>(*this) & mask);
-        return *this;
-    }
-    KvObjFlagByte& operator|=(uint8_t mask) {
-        *this = static_cast<uint8_t>(static_cast<uint8_t>(*this) | mask);
-        return *this;
-    }
-};
-static_assert(sizeof(KvObjFlagByte) == 1 && alignof(KvObjFlagByte) == 1);
-
 // Header is exactly 8 bytes. Selector 3 spends the otherwise redundant high bits of Type/Enc to
 // co-locate both in byte zero, freeing the old encoding byte for Raw's bounded (<=192) length. The
 // aligned word at offset four is then a full, non-wrapping object sequence for Raw; flags and key
@@ -106,7 +80,7 @@ struct KvObj {
     uint8_t  enc : 2;   // Enc needs 0..3
     uint8_t  type_enc_spare : 3;
     uint8_t  raw_vlen;  // Enc::Raw only; all other encodings leave this zero
-    KvObjFlagByte flags; // KvObjFlags + concurrent eviction touches
+    uint8_t  flags;     // KvObjFlags
     uint8_t  klen8;     // key length when < 255; 255 means "see the u32 after the header"
     union {
         uint32_t vlen;         // non-Raw inline/external length
@@ -115,7 +89,7 @@ struct KvObj {
 #else
     uint8_t  type;      // Type
     uint8_t  enc;       // Enc
-    KvObjFlagByte flags; // KvObjFlags + concurrent eviction touches
+    uint8_t  flags;     // KvObjFlags
     uint8_t  klen8;     // key length when < 255; 255 means "see the u32 after the header"
     uint32_t vlen;      // inline value length, or external length when Enc::Extern
 #endif
@@ -193,14 +167,14 @@ struct KvObj {
     }
     // Foreign fused readers use atomic flag loads because the owner may update the five eviction
     // bits in place. Layout bits remain immutable for a published read-local-eligible string.
-    uint8_t read_local_flags() const { return __atomic_load_n(&flags.value_, __ATOMIC_ACQUIRE); }
+    uint8_t read_local_flags() const { return __atomic_load_n(&flags, __ATOMIC_ACQUIRE); }
     void set_eviction_meta_atomic(uint8_t meta) {
-        const uint8_t current = __atomic_load_n(&flags.value_, __ATOMIC_RELAXED);
+        const uint8_t current = __atomic_load_n(&flags, __ATOMIC_RELAXED);
         const uint8_t updated = static_cast<uint8_t>(
             (current & KvObjFlags::LayoutMask) | ((meta & 0x1f) << 3));
-        __atomic_store_n(&flags.value_, updated, __ATOMIC_RELEASE);
+        __atomic_store_n(&flags, updated, __ATOMIC_RELEASE);
     }
-    void store_flags_atomic(uint8_t value) { __atomic_store_n(&flags.value_, value, __ATOMIC_RELEASE); }
+    void store_flags_atomic(uint8_t value) { __atomic_store_n(&flags, value, __ATOMIC_RELEASE); }
     // Access accounting by a FOREIGN reader (the fused read-local lane): one CAS from the flags
     // byte that reader already observed. Layout bits are immutable for a published read-local
     // string, so the only concurrent writers are the owner's meta stores above and other readers'
@@ -209,7 +183,7 @@ struct KvObj {
     void touch_eviction_meta_foreign(uint8_t observed, uint8_t meta) {
         const uint8_t updated = static_cast<uint8_t>(
             (observed & KvObjFlags::LayoutMask) | ((meta & 0x1f) << 3));
-        __atomic_compare_exchange_n(&flags.value_, &observed, updated, false,
+        __atomic_compare_exchange_n(&flags, &observed, updated, false,
                                     __ATOMIC_RELEASE, __ATOMIC_RELAXED);
     }
 

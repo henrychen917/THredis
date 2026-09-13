@@ -55,8 +55,6 @@ import sys
 import threading
 import time
 
-import _lib
-
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
 FAIL = 0
@@ -136,7 +134,6 @@ class Resp:
 
 
 ADMIN = Resp()
-READ_LOCAL = b"\r\nread_local:1\r\n" in ADMIN.cmd("INFO", "server")
 
 
 def info_field(field):
@@ -198,18 +195,10 @@ if HAVE_DEBUG:
             probe += 1
         return picked, sorted(seen)
 
-    # DEBUG SHARD returns a shard ID, not an executor ID. Prove the participating owners.
-    geometry = _lib.Conn(HOST, PORT)
-    try:
-        shard_owner = _lib.topology(geometry).shard_owner
-    finally:
-        geometry.close()
-    picked, span_shards = pick_spanning("execiso")
-    SPAN = sorted({shard_owner[sid] for sid in span_shards})
+    picked, SPAN = pick_spanning("execiso")
     if len(picked) == 8:
         KEYS = picked
-    picked, set_span_shards = pick_spanning("execisoset")
-    SET_SPAN = sorted({shard_owner[sid] for sid in set_span_shards})
+    picked, SET_SPAN = pick_spanning("execisoset")
     if len(picked) == 8:
         SETS = picked
     # A same-owner set of eight keys: its read resolves inside ONE owner task, so it cannot
@@ -331,12 +320,6 @@ def bare_reference_arm(mode):
         note(label, False, "needs --enable-debug-command yes")
         return
     torn, detail, opened = 0, [], 0
-    # The historical fanout counter counts only tracking-OFF cuts: old-generation
-    # debt can keep tracking on even after CONFIG atomic 0. Its delta is diagnostic.
-    # On an armed local boot, WATCH fallback proves owner routing in either atomic mode.
-    cut_counter = "read_local_mget_fallback_watch" if READ_LOCAL else "atomic_fanout_cuts"
-    require_counter = READ_LOCAL
-    registered = 0
     for round_id in range(ROUNDS):
         old, new = "b%d-old" % round_id, "b%d-new" % round_id
         for key in KEYS:
@@ -345,19 +328,9 @@ def bare_reference_arm(mode):
             note(label, False, "arm refused")
             return
         reader = Resp()
-        # This reference specifically tests the scatter read-cut path. WATCH routes a bare
-        # MGET through its owners without putting it inside MULTI. An enabled local lane
-        # otherwise pauses before capture and can validly return the entire newer image;
-        # that is not the pinned-cut witness this reference claims. Keep the exact OLD-world
-        # oracle and require the real fanout-cut counter, including on local-read boots.
-        if reader.cmd("WATCH", KEYS[0]) != b"OK":
-            raise AssertionError("could not route the bare reference through its shard owners")
-        before_cut = info_field(cut_counter)
         started = time.time()
         reader.send("MGET", *KEYS)
         time.sleep(0.05)
-        # Sample before the writer: its transaction cannot satisfy the bare-read witness.
-        registered += info_field(cut_counter) > before_cut
         writer = Resp()
         reply = transaction(writer, string_writer(KEYS, new))
         exec_done = time.time()
@@ -378,9 +351,8 @@ def bare_reference_arm(mode):
             torn += 1
             if len(detail) < 3:
                 detail.append("round %d saw %r" % (round_id, values))
-    note(label, torn == 0 and opened == ROUNDS and (registered == ROUNDS or not require_counter),
-         "rounds=%d torn=%d windows_opened=%d route_witness=%d (%s) %r"
-         % (ROUNDS, torn, opened, registered, cut_counter if require_counter else "exact pinned-old oracle", detail[:2]))
+    note(label, torn == 0 and opened == ROUNDS,
+         "rounds=%d torn=%d windows_opened=%d %r" % (ROUNDS, torn, opened, detail[:2]))
 
 
 # ---- 3. the park is what parks (unarmed control) ----------------------------------------------

@@ -1,10 +1,18 @@
-// signal.h — cross-thread handoffs and LoopSignals in common units for the IO and EX roles.
+// signal.h — ONE cross-thread signalling mechanism, used by all three loops, reporting in ONE set
+// of units.
 //
-// Channels pair queue publication with notification, so load measurements use the same units
-// across directions. Ready-mask completion notifications share those wake and work counters.
+// WHY THIS FILE EXISTS. The three handoffs started out as three different mechanisms: IO->EX was a
+// bare queue push with no wake, EX->IO was a msg_ring poke plus a scan of every active client, and
+// the WB handoff was a queue plus a poke. A flip/LB controller reading those would be comparing
+// three incomparable things — a depth, a scan cost, and a wake rate — and would have to special-case
+// each one. Every balancer defect in the fork came from comparing mismatched quantities.
+//
+// So: every cross-thread handoff is a Channel, and every loop reports LoopSignals. Same shape, same
+// units, whatever the direction.
 //
 //   IO -> EX    MaskedChannelArray dispatch a parsed Task to the shard's owner
-//   EX -> IO    ready mask / Channel<Client*> notify the connection owner to retire and send
+//   EX -> IO    Channel<Client*>   tell the owner it has completed ops to retire
+//   IO/EX -> WB Channel<Client*>   tell the sender it has bytes to write
 //
 // UNITS, fixed here so nothing has to be converted at the point of comparison:
 //   work      operations (uint64 monotonic count)
@@ -47,7 +55,7 @@ inline uint64_t now_ns() {
 // that will be compared against a deadline must come from here and never from now_ns() above --
 // that one is CLOCK_MONOTONIC, so its "milliseconds" are milliseconds since boot and sit roughly
 // five orders of magnitude below any real deadline. A monotonic value used as an expiry cut does
-// not skew the answer, it disables expiry outright.
+// not skew the answer, it disables expiry outright; see NOTES-EXPWIDE.md defect W3.
 inline int64_t now_realtime_ms() {
     timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);

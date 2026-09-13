@@ -476,23 +476,19 @@ bool IoLoop::climon_armed_gate(Client* client, Op& op) {
     }
     if (armed & Server::kClimonMonitor) climon_monitor_feed(client, op);
     if (armed & Server::kClimonTracking) {
-        ClimonConn* state = climon_conn_find(client->id());
-        if (state && state->tracking_on) tracking_register_read(client, *state, op);
+        // A whole-keyspace flush is the one mutation with no per-key notification to ride, so it
+        // is observed here, on the command that requests it. FLUSHALL is a scatter barrier: the
+        // connection stalls behind it either way, so firing at dispatch cannot reorder anything
+        // a client can see.
+        if (__builtin_expect(op.cmd_name().eq_icase("flushall") ||
+                             op.cmd_name().eq_icase("flushdb"), false)) {
+            tracking_broadcast_flush();
+        } else {
+            ClimonConn* state = climon_conn_find(client->id());
+            if (state && state->tracking_on) tracking_register_read(client, *state, op);
+        }
     }
-    climon_mark_reply(client, op);
-    return false;
-}
-
-// All owner fragments have completed before the retire callback reaches this hook. A foreign
-// tracked read that follows the invalidation therefore cannot repopulate a value awaiting FLUSH.
-void IoLoop::climon_flush_completed(Op& op) {
-    if ((climon_armed_cached_ & Server::kClimonTracking) &&
-        (op.cmd_name().eq_icase("flushall") || op.cmd_name().eq_icase("flushdb")))
-        tracking_broadcast_flush();
-}
-
-void IoLoop::climon_mark_reply(Client* client, Op& op) {
-    if (climon_armed_cached_ & Server::kClimonReply) {
+    if (armed & Server::kClimonReply) {
         ClimonConn* state = climon_conn_find(client->id());
         if (state) {
             if (state->reply_mode == kClimonReplyOff) {
@@ -508,6 +504,7 @@ void IoLoop::climon_mark_reply(Client* client, Op& op) {
             }
         }
     }
+    return false;
 }
 
 // Mirrors pubsub_emit's ordering rule, and shares its machinery: an out-of-band frame is a WHOLE
@@ -555,20 +552,7 @@ bool IoLoop::climon_reply_suppressed(Client* client) {
 // enter it when they lift OFF with older ops in flight. It ends -- and the connection leaves the
 // lane's arming counters -- only once the ROB has quiesced after a suppressing drain.
 uint32_t IoLoop::climon_serve_suppressed(Client* client) {
-    bool did = false;
-    if (TlsConn* tls = tls_engine(client)) {
-        bool submit_allowed = true;
-        did = climon_prepare_suppressed(client, submit_allowed) != 0;
-        if (submit_allowed) {
-            did |= epoll_ ? wb_.pump_tls<true>(*client, *tls)
-                          : wb_.pump_tls<false>(*client, *tls);
-            if (tls->socket_userspace() && tls->has_pinned_plain()) {
-                if (epoll_) arm_tls_socket_poll<true>(client, tls->wanted());
-                else arm_tls_socket_poll<false>(client, tls->wanted());
-            }
-            if (tls->failed()) close_client(client, tls->output_pending() || client->send_inflight());
-        }
-    } else did = wb_.serve_suppressing(*client);
+    const bool did = wb_.serve_suppressing(*client);
     ClimonConn* state = climon_conn_find(client->id());
     if (state && state->reply_mode == kClimonReplySkipNow && client->rob().quiesced()) {
         state->reply_mode = kClimonReplyOn;
@@ -605,7 +589,7 @@ bool IoLoop::climon_pause_holds(Op& op) {
     if (cached_now_ms_ >= climon_pause_deadline_ms_) return false;
     const CommandSpec* spec = op.spec;
     if (!spec) return false;
-    // DELIBERATE DIVERGENCE FROM REDIS: redis postpones CLIENT
+    // DELIBERATE DIVERGENCE FROM REDIS, documented in NOTES-CLIMON2.md: redis postpones CLIENT
     // UNPAUSE itself under PAUSE ... ALL, so an ALL pause can only end by expiring. We exempt the
     // connection-control class (CLIENT/RESET/MONITOR, the CmdFlags::Climon rows) so UNPAUSE
     // always works. Everything else -- including PING and reads -- is held under ALL, matching

@@ -104,9 +104,6 @@ struct AtomicPendingState {
     // The discriminator consumes the pre-existing four-byte hole before cleanup_fast, so the
     // disabled allocation size and every following offset remain locked.
     bool read_local_extended = false;
-    // Owner-task-only: an install span has physical candidates but is not linked yet. Eviction
-    // cannot resolve their ownership until publication. Uses existing padding; offsets stay put.
-    bool group_installing = false;
     uint64_t cleanup_fast = 0;
     uint64_t cleanup_slow = 0;
     size_t cached_entry_bytes = 0;

@@ -40,8 +40,9 @@ struct ObjectImage {
     // Persistence/reload starts a new lifetime and does not serialize this field.
     bool reserve_ttl_slot = false;
     // Collections only: the source key was in the EXPANDED (skiplist/hashtable/deque) encoding
-    // rather than the compact one. The image interface retains source encoding independently
-    // of the encoding-free payload. `encoding` below is the SNAPSHOT type byte, 0 for zsets.
+    // rather than the compact one. Carried because ZRANGESTORE's negative-LIMIT-offset rule is
+    // encoding-selected on the oracle (see zset_resolve_limit_offset in t_zset.h) and the payload
+    // itself is encoding-free. `encoding` below is the SNAPSHOT type byte, which is 0 for zsets.
     bool expanded = false;
     Type type = Type::String;
     uint8_t encoding = 0;
@@ -452,13 +453,12 @@ struct ScatterState : SnapshotCut {
     bool script_apply_after_unpin = false;
     bool script_commit_after_unpin = false;
     bool script_has_writes = false;
-    std::atomic<bool> script_stage_limit{false};
+    bool script_stage_limit = false;
     bool script_certifier = false;
     bool runtime_loading = false;
     // Set for a child lowered inside EXEC. The child keeps its own decision words, but the parent
     // publishes their common ticket and owns the outer transaction decision.
     bool multi_child = false;
-    const void* multi_parent = nullptr;    // WATCH readiness uses the enclosing EXEC's token
     bool barrier = false;
     bool pooled = false;
     bool copy_replace = false;
@@ -2326,7 +2326,7 @@ ScriptPostResult script_post_phase(Server& server, ThreadCtx& self, Ring& ring,
         !aof_prepare_scatter_group(state)) {
         state.final_error = WorkError::Oom;
         state.aborted.store(true, std::memory_order_release);
-        // Still post the owners: they must release the write intents retained through UNPIN.
+        return ScriptPostResult::Empty;
     }
     // Script starts in phase 1, so xshard_prepare's completion setup deliberately skipped these
     // slots. APPLY is its first and only record-installing wave; construct exactly its owner slots
@@ -2384,11 +2384,11 @@ struct ScriptWorkbench {
 };
 thread_local ScriptWorkbench t_script_workbench;
 
-Shard* script_workbench(Server& server, int32_t coordinator, const TypeLimits& limits,
-                        const StreamLimits& stream_limits) {
+Shard* script_workbench(Server& server, int32_t coordinator) {
     if (!t_script_workbench.shard) {
         auto shard = std::make_unique<Shard>();
-        shard->init_private(&server, coordinator, limits, stream_limits);
+        shard->init_private(&server, coordinator, server.cfg().type_limits,
+                            server.cfg().stream_limits);
         t_script_workbench.server = &server;
         t_script_workbench.shard = std::move(shard);
     }
@@ -2397,15 +2397,11 @@ Shard* script_workbench(Server& server, int32_t coordinator, const TypeLimits& l
     // One executor can coordinate activations for different KEYS[1] owners, so re-stamp the
     // identity when it changes. Nothing in the whitelisted handler set consults shard.id() today
     // except the zero-copy borrow, which zc_min == UINT32_MAX already makes unreachable here --
-    // but a stale id is the kind of thing the next handler quietly inherits. Limits come from
-    // this task's owner-local shard, not the immutable boot Config. Refresh even when identity
-    // is unchanged so a CONFIG SET between activations reaches the reused workbench.
+    // but a stale id is the kind of thing the next handler quietly inherits. Re-stamping also
+    // picks up live CONFIG SET changes to the type/stream limits.
     if (workbench->id() != coordinator)
-        workbench->init_private(&server, coordinator, limits, stream_limits);
-    else {
-        workbench->set_type_limits(limits);
-        workbench->set_stream_limits(stream_limits);
-    }
+        workbench->init_private(&server, coordinator, server.cfg().type_limits,
+                                server.cfg().stream_limits);
     return workbench;
 }
 
@@ -2477,8 +2473,7 @@ ScatterTaskResult execute_script_phase(const Task& task, Shard& shard, Op& op) {
         }
         case ScriptPhase::Run: {
             state.server->note_script_run();
-            Shard* work = script_workbench(*state.server, state.script_coordinator_shard,
-                                           shard.type_limits(), shard.stream_limits());
+            Shard* work = script_workbench(*state.server, state.script_coordinator_shard);
             work->store().clear();
             // The workbench is a shard object of its own, so xshard_execute's cut does not reach
             // it; give it the same instant explicitly.
@@ -2544,7 +2539,6 @@ ScatterTaskResult execute_script_phase(const Task& task, Shard& shard, Op& op) {
             for (uint32_t i = 0; i < group->count; i++) {
                 const uint32_t pos = state.key_order[group->begin + i];
                 if (!state.script_pinned[pos]) continue;
-                if (state.script_apply_after_unpin && (state.status[pos] & 2u)) continue;
                 const KeyRef& key = state.keys[pos];
                 shard.store().atomic_script_unpin(key.hash, op.arg(key.arg));
                 state.server->note_script_key_released();
@@ -2600,8 +2594,7 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
         return execute_script_phase(task, shard, op);
     ShardGroup& group = *group_for(state, shard.id());
     if (xshard_owner_mutation_phase(state, op) && shard.has_watches()) {
-        const void* token = state.multi_parent ? state.multi_parent
-            : state.atomic_group ? static_cast<const void*>(&state) : nullptr;
+        const void* token = state.atomic_group ? static_cast<const void*>(&state) : nullptr;
         if (group.count == 0) {
             if (!shard.watch_all_write_ready()) return ScatterTaskResult::Retry;
         } else {
@@ -2650,9 +2643,8 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
     struct ReadEpochGuard {
         FlatStore& store;
         bool bound;
-        ReadEpochGuard(FlatStore& store_, uint64_t snapshot, uint64_t origin_conn_id,
-                       bool multi_child)
-            : store(store_), bound(snapshot != UINT64_MAX || multi_child) {
+        ReadEpochGuard(FlatStore& store_, uint64_t snapshot, uint64_t origin_conn_id)
+            : store(store_), bound(snapshot != UINT64_MAX) {
             if (bound) store.atomic_set_read_context(snapshot, origin_conn_id);
         }
         ~ReadEpochGuard() { if (bound) store.atomic_clear_read_epoch(); }
@@ -2662,33 +2654,12 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
         ? state.pop_retry_snapshot : state.snapshot;
     const bool read_latest = state.atomic_direct || (state.atomic_pop && state.phase == 2);
     ReadEpochGuard read_epoch(
-        shard.store(), read_latest ? UINT64_MAX : read_snapshot, state.origin_conn_id,
-        state.multi_child);
-    struct ScriptApplyPins {
-        ScatterState& state;
-        Shard& shard;
-        Op& op;
-        ShardGroup& group;
-        ~ScriptApplyPins() {
-            for (uint32_t i = 0; i < group.count; i++) {
-                const uint32_t pos = state.key_order[group.begin + i];
-                if (!state.script_pinned[pos]) continue;
-                const KeyRef& key = state.keys[pos];
-                shard.store().atomic_script_unpin(key.hash, op.arg(key.arg));
-                state.server->note_script_key_released();
-                state.script_pinned[pos] = 0;
-            }
-        }
-    };
+        shard.store(), read_latest ? UINT64_MAX : read_snapshot, state.origin_conn_id);
     try {
         if (state.atomic_direct)
             return execute_atomic_direct_rename(task, shard, op, owner_thread_id);
         if (state.atomic_apply && state.phase == 2) {
-            if (state.kind == Kind::Script) {
-                state.server->note_script_apply_owner();
-                ScriptApplyPins pins{state, shard, op, group};
-                return execute_atomic_apply(task, shard, op, owner_thread_id);
-            }
+            if (state.kind == Kind::Script) state.server->note_script_apply_owner();
             return execute_atomic_apply(task, shard, op, owner_thread_id);
         }
         if (state.atomic_write) {
@@ -2764,34 +2735,6 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
                         notify_record(shard, op, NOTIFY_NEW, NotifyEventId::New, key_slice);
                 }
             }
-            // Admission may evict. Complete it before installing ANY candidate: this group's
-            // entry is still unlinked, so victim selection cannot yet recognize its objects.
-            if (state.kind == Kind::Mset || state.kind == Kind::Msetnx) {
-                uint32_t admitted = 0;
-                for (; admitted < group.count; admitted++) {
-                    const uint32_t pos = state.key_order[group.begin + admitted];
-                    KeyRef& key = state.keys[pos];
-                    if (!key.key_anchor) {
-                        key.key_anchor = xshard_make_atomic_string(
-                            shard, op.arg(key.arg), op.arg(key.arg + 1));
-                        key.stable_object = key.key_anchor;
-                    }
-                    if (!key.key_anchor) { group.error = WorkError::Oom; break; }
-                    if (!shard.store().atomic_admit(op.arg(key.arg), key.key_anchor)) {
-                        group.error = WorkError::Maxmemory;
-                        break;
-                    }
-                }
-                if (admitted != group.count) {
-                    for (uint32_t i = 0; i < admitted; i++) {
-                        const uint32_t pos = state.key_order[group.begin + i];
-                        shard.store().atomic_unadmit(state.keys[pos].key_anchor);
-                    }
-                    state.aborted.store(true, std::memory_order_release);
-                    shard.store().atomic_discard_group(pending_entry);
-                    return ScatterTaskResult::Complete;
-                }
-            }
             for (uint32_t i = 0; i < group.count; i++) {
                 const uint32_t pos = state.key_order[group.begin + i];
                 KeyRef& key = state.keys[pos];
@@ -2818,12 +2761,29 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
                 }
 
                 KvObj* value = key.key_anchor;
-                if (!value || key.stable_object != value) std::abort();
+                const bool io_prebuilt = value != nullptr;
+                if (io_prebuilt && key.stable_object != value) std::abort();
+                if (!value) {
+                    value = xshard_make_atomic_string(
+                        shard, key_slice, op.arg(key.arg + 1));
+                    if (!value) {
+                        group.error = WorkError::Oom;
+                        state.aborted.store(true, std::memory_order_release);
+                        break;
+                    }
+                }
+                if (!shard.store().atomic_admit(key_slice, value)) {
+                    if (!io_prebuilt) shard.store().atomic_discard_value(value);
+                    group.error = WorkError::Maxmemory;
+                    state.aborted.store(true, std::memory_order_release);
+                    break;
+                }
+                key.stable_object = value;
                 KvObj* old = shard.store().atomic_install_group(
                     pending_entry, key.hash, key_slice, value);
                 if (old) parked_bytes += kvobj_size(old);
                 installed_bytes += kvobj_size(value);
-                key.key_anchor = nullptr;
+                if (io_prebuilt) key.key_anchor = nullptr;
                 installed++;
             }
             if (installed) {
@@ -3606,9 +3566,9 @@ ScatterFinish xshard_complete_script(Server& server, ThreadCtx& self, Ring& ring
                     driving = true;
                     continue;
                 }
-                // Release read-only intents before rebuilding the APPLY groups. Write intents
-                // survive until their owner's installation, so an intervening ordinary write
-                // draws a ticket and the final owner-side validation can reject the stale image.
+                // Drop the read intents in a separate all-owner wave before installing candidates.
+                // The reserved ticket orders every later writer after this activation, and no MVCC
+                // record yet points at the group arrays that UNPIN is about to rebuild.
                 state.script_apply_after_unpin = true;
                 state.script_commit_after_unpin = false;
                 if (!launch(ScriptPhase::Unpin)) return outcome;
@@ -3638,9 +3598,7 @@ ScatterFinish xshard_complete_script(Server& server, ThreadCtx& self, Ring& ring
                 const bool failed = script_group_error(state, error) ||
                                     state.aborted.load(std::memory_order_acquire);
                 if (failed) {
-                    const bool conflict = state.script_conflict.load(std::memory_order_acquire);
-                    if (conflict) server.note_script_giveup();
-                    else server.note_script_abort_oom();
+                    server.note_script_abort_oom();
                     state.aborted.store(true, std::memory_order_release);
                     aof_abort_scatter_group(state);
                     notify_discard_batch(state.notify.exchange(nullptr));
@@ -3652,10 +3610,7 @@ ScatterFinish xshard_complete_script(Server& server, ThreadCtx& self, Ring& ring
                         server.script_finish_certification();
                         state.script_certifier = false;
                     }
-                    if (conflict) {
-                        op.clear_reply();
-                        reply_err(op.sink(), "TRYAGAIN Cross-shard script conflicted, retry");
-                    } else script_engine_error_reply(op, state, error);
+                    script_engine_error_reply(op, state, error);
                     script_snapshot_done(server, state);
                     return ScatterFinish::Final;
                 }
@@ -3917,12 +3872,11 @@ void xshard_flush_commits(Server& server, ThreadCtx& self, Ring& ring,
 
 enum class MultiChildFinish : uint8_t { Waiting, PhaseAdvanced, Final };
 
-void xshard_multi_child_bind(ScatterState& state, const void* parent) {
+void xshard_multi_child_bind(ScatterState& state) {
     // xshard_prepare does not yet know that this state will be driven by an outer EXEC. Undo its
     // standalone phantom pins before publication; child installs retain lazy first-node accounting.
     clear_unpublished_owner_record_refs(state);
     state.multi_child = true;
-    state.multi_parent = parent;
 }
 
 void xshard_multi_child_capture_groups(ScatterState& state,

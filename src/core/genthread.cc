@@ -1,5 +1,5 @@
-// Unified generalized-thread runtime for overlap 0 and 1. rl2s.cc separately instantiates
-// the shard-less local-read IO schedules and fused-capable split owners.
+// Unified generalized-thread runtime. This translation unit is the boot-time architecture wall:
+// only it instantiates ExLoopT<true> and IoLoop's Fused=true loop methods for pipelines 0, 1, and 2.
 #include "genthread.h"
 
 #include <algorithm>
@@ -63,6 +63,7 @@ void IoLoop::run_fused() {
     switch (srv_->cfg().overlap) {
         case 0: run_pipeline(std::integral_constant<uint8_t, 0>{}); break;
         case 1: run_pipeline(std::integral_constant<uint8_t, 1>{}); break;
+        case 2: run_pipeline(std::integral_constant<uint8_t, 2>{}); break;
         default: std::abort();
     }
 }
@@ -89,7 +90,7 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
     std::vector<FusedExLoop> executors(nthreads);
     // ONE boot gate. The ad-hoc mutex/cv gate this replaced needed a separate `runners_stopped`
     // counter so a thread that saw shutdown while parked still reported at the gate (without it a
-    // SIGTERM during a long snapshot recovery hung main forever). FusedBootGate keeps that property as a
+    // SIGTERM during a long --load hung main forever). FusedBootGate keeps that property as a
     // first-class `gave_up` arrival, and every wait/advance also takes the stop edge, so the two
     // predicates cannot disagree.
     FusedBootGate boot(nthreads);
@@ -112,7 +113,7 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
         for (uint32_t sid = 0; sid < srv.nshards(); sid++)
             srv.shard(static_cast<int32_t>(sid)).store().atomic_shutdown_release_records();
         for (IoLoop& io : ios) io.reap_atomic_deferred();
-        ShutdownReport report = collect_shutdown_report(srv, ios);
+        ShutdownReport report = collect_shutdown_report(srv, ios, executors);
         print_shutdown_report_human(report);
         final_report.arm(std::move(report));
         acl_shutdown();
@@ -193,13 +194,22 @@ int run_fused_server(Server& srv, const SnapshotLoadPlan* aof_base_plan,
                         [](void* p, SnapshotManager* manager) {
                             static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
                         });
+                else if (cfg.overlap == 1)
+                    self.bind_fused_executor_hooks(
+                        &executors[tid],
+                        [](void* p) {
+                            return static_cast<FusedExLoop*>(p)->fused_coarse_pass();
+                        },
+                        [](void* p, SnapshotManager* manager) {
+                            static_cast<FusedExLoop*>(p)->fused_snapshot_start(manager);
+                        });
                 else
                     self.bind_fused_executor_hooks(
                         &executors[tid],
                         [](void* p) {
                             // Snapshot's blocking progress loop has no WB filler to interleave.
-                            // Use the private-lane coarse turn; the main overlap loop supplies
-                            // the three-way callback only at its ordinary batch seam.
+                            // Use overlap 1's private-lane coarse turn; the main overlap-2 loop
+                            // supplies the three-way callback only at its ordinary batch seam.
                             return static_cast<FusedExLoop*>(p)->fused_coarse_pass();
                         },
                         [](void* p, SnapshotManager* manager) {

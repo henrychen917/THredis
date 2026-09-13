@@ -51,7 +51,7 @@ namespace tomo {
 // its unreachability proof is written against. net/conn.h re-exports it by including this file.
 inline constexpr uint32_t kRobWindow = 64;   // max in-flight ops per connection
 
-// COLD-PATH COUNTERS FOR ARM-ON-DEMAND. Three events, none of them on a hot
+// COLD-PATH COUNTERS FOR ARM-ON-DEMAND (DESIGN-RINGDIET.md). Three events, none of them on a hot
 // path: a connection being armed, its RYOW sidecar being allocated, and one write being committed
 // into the ring. They are the instrument the design is proved with -- "pure SET does zero ring
 // bookkeeping" is exactly write_ring_records staying at zero -- so they are always on rather than
@@ -72,8 +72,8 @@ struct ReadLocalArmStats {
 struct alignas(64) ReadLocalRobState {
     // SIZED TO THE ROB WINDOW, WHICH MAKES CAPACITY OVERFLOW UNREACHABLE. A ring entry is removed
     // by retirement, so every live entry names an op in [flush_id, dispatch_id) -- distinct ids in
-    // a window that is at most kRobWindow wide. Insertion prunes first, and the write being
-    // inserted holds one of those ids itself, so after the prune
+    // a window that is at most kRobWindow wide. Both insert sites prune immediately before testing
+    // capacity, and the write being inserted holds one of those ids itself, so after the prune
     // write_count <= in_flight - 1 <= kRobWindow - 1. Rob asserts kWriteRingCapacity >= Capacity,
     // which is the whole argument. Measured against the instrument that does not depend on it
     // (scratchpad/ringsize): a client pipelining 64 deep at 100% writes tops out at exactly 63
@@ -133,8 +133,8 @@ static_assert(ReadLocalRobState::kWriteRingCapacity <=
 // rounds to its 1280-byte class -- measured as +965 bytes of RSS per connection that owns one
 // (scratchpad/ringsize section 3) against the sixteen-slot sidecar's 296/320. It is NO LONGER paid
 // by every connection: arm-on-demand allocates it at the first write of an ARMED connection, so a
-// pure-write connection, a pure-read connection and an idle connection each carry none of it.
-// Locked all the same, so that a later field cannot quietly add another size
+// pure-write connection, a pure-read connection and an idle connection each carry none of it
+// (DESIGN-RINGDIET.md). Locked all the same, so that a later field cannot quietly add another size
 // class to every read/write connection without someone re-measuring that number.
 // The MGET latest-read fence used to live here and now lives in the Rob: it is a read-side fence
 // with nothing to do with the write ring, and keeping it here would have forced a pure-MGET
@@ -315,7 +315,7 @@ public:
     // until this id either completes locally or is irrevocably transferred to the owner path. It
     // lives on the Rob's own producer line rather than in the write-ring sidecar because it is a
     // READ-side fence -- a connection that only ever sends MGETs must not have to allocate 1216
-    // bytes of write ring to hold one id.
+    // bytes of write ring to hold one id (DESIGN-RINGDIET.md).
     void arm_current_local_mget_fence() {
         if (local_mget_fence_id_ != UINT64_MAX) std::abort();
         local_mget_fence_id_ = dispatch_id();
@@ -338,7 +338,7 @@ public:
 
     bool has_pending_read_local() const { return read_local_pending_slots_ != 0; }
     // Lane slots this connection holds right now: local reads published and not yet executed (or
-    // demoted). The parser's fair-share admission compares THIS, not in_flight(): a
+    // demoted). The parser's fair-share admission (P128.md) compares THIS, not in_flight(): a
     // reply that PHASE 2's bounded serve has not flushed yet holds no lane slot and must not
     // count against the connection's share (measured: it halved ops per rotation).
     uint32_t pending_read_local_count() const {
@@ -361,7 +361,7 @@ public:
     // Retires through the same clear-on-empty rule as the per-op form: when the drained chunk was
     // the whole pending set the summary restarts from zero (the contract stated in fcab80884; the
     // chunk form had dropped it, so the filter only ever grew in read-heavy streams and the first
-    // write of every batch paid the exact walk).
+    // write of every batch paid the exact walk — AUDIT-MARKDIET.md section 4).
     void complete_pending_read_local_mask(uint64_t bits) {
         if ((read_local_pending_slots_ & bits) != bits) std::abort();
         read_local_retire_pending_bit(bits);
@@ -471,7 +471,7 @@ public:
     // Every write starts conservative. After arity and routing are known, ordinary point writes
     // and bounded blind keysets may refine it; all other special/multi-key writes leave it broad.
     void mark_current_write() {
-        // ARM ON DEMAND, THE WRITE HALF. Until a local read has armed this
+        // ARM ON DEMAND, THE WRITE HALF (DESIGN-RINGDIET.md). Until a local read has armed this
         // connection the ring records NOTHING: no sidecar, no prune, no descriptor, no Staged tag
         // -- and so no resolve on the next frame either. The entire bookkeeping is one store of
         // this write's id, into a word on the producer's own cache line that dispatch_ has already
@@ -514,7 +514,19 @@ public:
             std::abort();
         // Once overflowed, every subsequently published write extends the conservative generation
         // until that whole run drains. Do not start tracking precise hashes again in its middle.
-        if (state.overflow) return false;
+        //
+        // THE SECOND TEST IS A KEPT FALLBACK, NOT A LIVE PATH. mark_current_write() pruned the ring
+        // to the ops still in flight one statement ago, and this frame holds a window position of
+        // its own, so write_count is at most Capacity-1 against a ring of Capacity slots (the
+        // static_assert in Rob). It is kept because "conservative" is the only safe answer if that
+        // reasoning is ever wrong, and deleting a correct fallback to celebrate a proof is how a
+        // proof gets to be wrong in silence. Conservative generations remain ordinary traffic by
+        // the OTHER door: any write that never refines -- a wide multi-key write, or a point write
+        // under an evicting maxmemory policy -- is one, and the ring's overflow machinery below
+        // serves them exactly as before.
+        if (state.overflow ||
+            state.write_count == ReadLocalRobState::kWriteRingCapacity)
+            return false;
         state.pending_hash = hash;
         state.pending_write = ReadLocalRobState::PendingWrite::Hash;
         return true;
@@ -535,7 +547,11 @@ public:
         if (state.pending_write != ReadLocalRobState::PendingWrite::Overflow ||
             state.pending_op_id != dispatch_id())
             std::abort();
-        if (state.overflow) return false;
+        // Same kept fallback as refine_current_write_hash: unreachable by the window argument,
+        // retained because conservative is the safe answer if the argument is ever wrong.
+        if (state.overflow ||
+            state.write_count == ReadLocalRobState::kWriteRingCapacity)
+            return false;
         state.pending_hash = filter;
         state.pending_write = ReadLocalRobState::PendingWrite::Keyset;
         return true;
@@ -557,7 +573,7 @@ public:
     template <typename KeysetTouchesHash>
     __attribute__((always_inline)) bool read_local_write_conflicts(
             uint64_t hash, KeysetTouchesHash&& keyset_touches_hash) {
-        // ARM ON DEMAND, THE READ HALF. ONE predictable test, on a word this
+        // ARM ON DEMAND, THE READ HALF (DESIGN-RINGDIET.md). ONE predictable test, on a word this
         // frame's acquire_read_local has already pulled into L1 with dispatch_, and nothing is
         // evaluated behind it: a connection in steady state (armed, no arming generation left in
         // flight) reads a zero and falls straight through to the unchanged probe below. The word
@@ -687,7 +703,7 @@ public:
     }
 
     // The RYOW write ring's sidecar. Called from the connection's own IO thread on the first
-    // write of an ARMED connection -- never at accept -- and directly by the
+    // write of an ARMED connection -- never at accept (DESIGN-RINGDIET.md) -- and directly by the
     // unit test, which drives the ROB without a server. Returns false only on allocation failure;
     // every caller has a safe unarmed fallback for that.
     bool prepare_read_local() {
@@ -781,8 +797,9 @@ private:
 
     // THE STRUCTURAL BOUND THE RING IS SIZED BY. A ring entry lives exactly while its op is in
     // flight, so the live entries name distinct ids inside a window at most Capacity wide, and both
-    // insertion prunes to that set first. The incoming op occupies its own window position,
-    // so there is always a free ring slot. Wide writes still start conservative generations.
+    // insert sites prune to that set immediately before testing capacity. With a slot per window
+    // position the capacity test can therefore never fire -- see refine_current_write_hash and
+    // read_local_resolve_pending_body, where the conservative fallback is kept anyway.
     static_assert(ReadLocalRobState::kWriteRingCapacity >= Capacity,
                   "the RYOW write ring must cover the whole ROB window");
     static_assert(ReadLocalRobState::kWriteRingCapacity <= 64,
@@ -805,7 +822,7 @@ private:
     static constexpr uintptr_t kReadLocalStateTagBits =
         kReadLocalStateInactive | kReadLocalStateStaged;
 
-    // ARM-ON-DEMAND STATE, one word on the producer line, zero in the state
+    // ARM-ON-DEMAND STATE (DESIGN-RINGDIET.md), one word on the producer line, zero in the state
     // every connection ends up in. Two non-zero values, and a connection passes through each of
     // them at most once:
     //   Unarmed   no local read has been seen. Writes record nothing but their newest id.
@@ -992,6 +1009,19 @@ private:
             return;
         }
 
+        // The commit-side half of the same kept fallback. read_local_prune ran one statement ago
+        // and the op being committed holds a window position that no ring entry can, so a full ring
+        // is unreachable; a connection that somehow reached it still becomes a conservative
+        // generation here and still fences every later read until that generation drains.
+        if (state.write_count == ReadLocalRobState::kWriteRingCapacity) {
+            state.overflow = true;
+            state.overflow_through = op_id;
+            state.write_head = 0;
+            state.write_count = 0;
+            state.write_keyset_slots = 0;
+            read_local_write_enter_overflow();
+            return;
+        }
         const uint32_t tail =
             (static_cast<uint32_t>(state.write_head) + state.write_count) &
             (ReadLocalRobState::kWriteRingCapacity - 1);

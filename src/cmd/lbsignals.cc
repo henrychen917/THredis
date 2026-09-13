@@ -325,8 +325,7 @@ void lbsignals_info_section(Server& srv, std::string& out) {
                srv.flip_client_weight_spread_before(), srv.flip_client_weight_spread_after(),
                srv.flip_bucket_bytes_spread_before(), srv.flip_bucket_bytes_spread_after());
     appendf_lb(out,
-               "tomokv_keylb_enabled:%u\r\n"
-               "tomokv_clientlb_enabled:%u\r\n"
+               "tomokv_lb_enabled:%u\r\n"
                "tomokv_keylb_stage:%u\r\n"
                "tomokv_keylb_ticks:%" PRIu64 "\r\n"
                "tomokv_keylb_bucket_moves:%" PRIu64 "\r\n"
@@ -335,7 +334,6 @@ void lbsignals_info_section(Server& srv, std::string& out) {
                "tomokv_keylb_client_cross_domain_moves:%" PRIu64 "\r\n"
                "tomokv_keylb_no_candidate:%" PRIu64 "\r\n",
                srv.key_lb_signals_enabled() ? 1u : 0u,
-               srv.client_lb_signals_enabled() ? 1u : 0u,
                static_cast<unsigned>(srv.lb_stage()),
                srv.lb_ticks(), srv.lb_bucket_moves(), srv.lb_client_moves(),
                srv.lb_bucket_cross_domain_moves(), srv.lb_client_cross_domain_moves(),

@@ -408,19 +408,6 @@ KvObj* hash_ttl_on_access(Shard& shard, Op& op, KvObj* object, bool notify) {
     // the capture completes.
     if (shard.store().snapshot_active()) return object;
     const int64_t now_ms = shard.now_ms();
-    if (!shard.store().read_retirement_available()) {
-        // Reaping the last field calls store_erase(), which retires the hash header. Leave an
-        // all-expired hash and its attention index intact when that would wait for QSBR. Partial
-        // field reaping needs no header retirement and still leaves handlers a live-field view.
-        const HashFieldTtl* ttls = ttl_table(object);
-        if (ttls) {
-            uint32_t due = 0;
-            ttls->for_each([&](Slice field, int64_t at) {
-                if (at <= now_ms && hash_ttl_field_exists(object, field)) due++;
-            });
-            if (due && due == hash_ttl_field_count(object)) return nullptr;
-        }
-    }
     const size_t before = kvobj_size(object);
     const uint32_t reaped = reap_due(object, now_ms);
     if (!reaped) return object;

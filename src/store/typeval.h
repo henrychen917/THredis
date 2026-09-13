@@ -26,18 +26,6 @@ struct CompactLimit {
     uint32_t max_value;
 };
 
-// Redis list-max-listpack-size is signed: negative values select 4/8/16/32/64 KiB,
-// values below -5 clamp to 64 KiB, zero allows one element, positives bound the count.
-// Count mode retains the reference's 8 KiB safety ceiling. The small representation keeps
-// its existing payload accounting, so the default -2 reproduces today's TypeLimits exactly.
-inline constexpr CompactLimit list_compact_limit(int32_t fill) {
-    if (fill < 0) {
-        const uint32_t level = fill < -5 ? 5 : static_cast<uint32_t>(-fill);
-        return {UINT32_MAX, uint32_t{2048} << level};
-    }
-    return {fill == 0 ? 1u : static_cast<uint32_t>(fill), 8192};
-}
-
 struct TypeLimits {
     CompactLimit hash{512, 64};
     CompactLimit list{std::numeric_limits<uint32_t>::max(), 8 * 1024};
