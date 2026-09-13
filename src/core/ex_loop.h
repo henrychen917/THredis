@@ -1998,8 +1998,9 @@ private:
 
     // Identical ready-mask drain and stack batch as the iofused coarse path.  Only the first batch
     // is split at its existing load-to-use seam; the caller's WB work runs synchronously there and
-    // every later batch remains the ordinary prefetch+execute unit.  ThreadCtx still owns the exact
-    // same pop/retire sequence, so no streams lane list or delayed-retirement context is involved.
+    // every later batch remains an executor-only unit. O6 warms A before the filler, then warms B
+    // during A's execution. ThreadCtx still owns the same pop/retire sequence; neither half is
+    // staged outside this stack batch.
     template <uint32_t BatchOps, bool IofusedPrivateQueue, typename Filler>
     uint32_t drain_tasks_with_filler(bool unmasked, Filler& filler, bool& filler_used) {
         Task batch[BatchOps];
@@ -2010,10 +2011,13 @@ private:
                 if (__builtin_expect(reorder_enabled_, false))
                     srv_->mode_schedule_stats(self_->id()).note_reorder(
                         held, ex_schedule_batch(batch, held));
-                prefetch_exec_batch(batch, held);
+                const bool split = split_exec_batch_enabled(held);
+                if (split) prefetch_overlap_batch(batch, (held + 1) / 2);
+                else       prefetch_exec_batch(batch, held);
                 filler();
                 filler_used = true;
-                exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
+                if (split) exec_batch_prefetched<IofusedPrivateQueue, true>(batch, held);
+                else       exec_batch_prefetched<IofusedPrivateQueue>(batch, held);
             } else {
                 exec_batch<IofusedPrivateQueue>(batch, held);
             }
@@ -2313,7 +2317,7 @@ private:
     // arms per-op timing for the next kSlowlogEscalateBatches batches instead, and the recurrence
     // is timed exactly. This is the documented divergence from redis, which times every command.
     //
-    template <bool IofusedPrivateQueue = false>
+    template <bool IofusedPrivateQueue = false, bool SplitBatch = false>
     __attribute__((noinline, cold))
     void exec_batch_timed(const Task* batch, uint32_t n) {
         Server::ClientWorkScope client_work(*srv_, self_->id());
@@ -2356,12 +2360,21 @@ private:
 
         const uint64_t started = now_ns();
         uint32_t executed = n;
-        for (uint32_t i = 0; i < n; i++) {
-            if (execute<IofusedPrivateQueue>(batch[i])) continue;
-            xshard_retries_.push_back(batch[i]);
-            for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
-            executed = i;
-            break;
+        if constexpr (SplitBatch) {
+            executed = exec_batch_split_commands<IofusedPrivateQueue>(batch, n);
+            if (executed != n) {
+                xshard_retries_.push_back(batch[executed]);
+                for (uint32_t j = executed + 1; j < n; j++)
+                    ordered_deferred_.push_back(batch[j]);
+            }
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                if (execute<IofusedPrivateQueue>(batch[i])) continue;
+                xshard_retries_.push_back(batch[i]);
+                for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                executed = i;
+                break;
+            }
         }
         flush_xshard_commits();
         const uint64_t elapsed = now_ns() - started;
@@ -2396,10 +2409,58 @@ private:
         }
     }
 
-    // Consume a bucket-prefetched homogeneous batch. The interwoven schedule calls this
-    // immediately after the prefetch loop; an interleaved schedule reaches it after independent-
-    // stream filler.
-    template <bool IofusedPrivateQueue = false>
+    // GCC 13.3 at release -O2 erases the nested bucket prefetch when this walk is inlined.
+    // Flatten this separate body before optimizing it, and retain the direct call so the hints
+    // survive. This costs a call per A/B pair and must be counted against O6's latency saving.
+    // Off keeps the shipped walk above. Keep both ownership guards identical: even a hint must
+    // not inspect a stale owner's mutable table. No store/slot pointer survives this call.
+    __attribute__((noinline, flatten))
+    void prefetch_overlap_batch(const Task* batch, uint32_t n) {
+        for (uint32_t i = 0; i < n; i++) {
+            if (!batch[i].client) continue;
+            const Op& op = batch[i].client->rob().at(batch[i].op_id);
+            const int32_t shard = batch[i].shard >= 0 ? batch[i].shard : op.shard;
+            if (shard >= 0 && !batch[i].scatter &&
+                srv_->worker_of_shard(shard) == self_->id() &&
+                !(op.spec->flags & (CmdFlags::CursorShard | CmdFlags::RandomShard)))
+                srv_->shard(shard).store().prefetch(op.hash);
+        }
+    }
+
+    // The only O6 selector is per batch: off reserves no scratch and executes no split loop.
+    // Ordinary batch timing includes B's prefetch under the existing two clock reads. Exact
+    // per-op escalation keeps the whole-batch path so a neighbour's prefetch is not charged to
+    // the timed command. A singleton has no second half. Both modes use the same split rule.
+    bool split_exec_batch_enabled(uint32_t n) const {
+        return srv_->cfg().overlap != 0 && n > 1 &&
+               (!slowlog_armed_ || !slowlog_state_.escalate_batches);
+    }
+
+    // A is already warm. Prefetch B[i] while executing A[i], then consume the warmed B. The
+    // extra task of an odd batch belongs to A: after n/2 pairs, the suffix loop executes that
+    // task and all of B without an odd-tail branch per op. Reuse the execution index; there is
+    // no second scheduling cursor, persistent pointer, or per-op indirect callback.
+    template <bool IofusedPrivateQueue>
+    uint32_t exec_batch_split_commands(const Task* batch, uint32_t n) {
+        const uint32_t half = n / 2;
+        const Task* const second = batch + (n + 1) / 2;
+        uint32_t i = 0;
+        for (; i < half; i++) {
+            // Resolve -> verify-owner -> prefetch at issue time, retaining no store/slot/object
+            // pointer across an earlier task's mutation. A failed execute in either half returns
+            // the first blocked index so the caller parks the entire suffix in original order.
+            prefetch_overlap_batch(second + i, 1);
+            if (!execute<IofusedPrivateQueue>(batch[i])) return i;
+        }
+        for (; i < n; i++)
+            if (!execute<IofusedPrivateQueue>(batch[i])) return i;
+        return n;
+    }
+
+    // Consume one batch under one completion/publication/reclamation boundary. With SplitBatch,
+    // only A has been prefetched; otherwise the whole batch is warm. An existing fused WB filler
+    // may precede this call, but O6 itself only overlaps work inside the executor stage.
+    template <bool IofusedPrivateQueue = false, bool SplitBatch = false>
     void exec_batch_prefetched(const Task* batch, uint32_t n) {
         if (!xshard_retries_.empty()) {
             for (uint32_t i = 0; i < n; i++) ordered_deferred_.push_back(batch[i]);
@@ -2415,7 +2476,15 @@ private:
             // not linked into this loop at all. The armed body is out of line in
             // exec_batch_timed().
             if (__builtin_expect(slowlog_armed_, false)) {
-                exec_batch_timed<IofusedPrivateQueue>(batch, n);
+                exec_batch_timed<IofusedPrivateQueue, SplitBatch>(batch, n);
+            } else if constexpr (SplitBatch) {
+                const uint32_t i = exec_batch_split_commands<IofusedPrivateQueue>(batch, n);
+                if (i != n) {
+                    // A blocker in either half parks the entire remaining suffix in original
+                    // order. Prefetching B grants no permission to execute past that blocker.
+                    xshard_retries_.push_back(batch[i]);
+                    for (uint32_t j = i + 1; j < n; j++) ordered_deferred_.push_back(batch[j]);
+                }
             } else {
                 for (uint32_t i = 0; i < n; i++) {
                     if (execute<IofusedPrivateQueue>(batch[i])) continue;
@@ -2469,8 +2538,8 @@ private:
         }
     }
 
-    // Coarse compatibility: prefetch the whole batch and consume it without an intervening
-    // micro-stage.
+    // Reorder once over the gathered batch before either half's prefetch. O6 changes only the
+    // load-to-use distance, never task order or the gather/notify/cleanup quanta.
     template <bool IofusedPrivateQueue = false, size_t BatchOps>
     void exec_batch(Task (&batch)[BatchOps], uint32_t n) {
         // Deferral first (skip wasted prefetch on the rare retry path), then the opt-in
@@ -2481,6 +2550,11 @@ private:
         }
         if (__builtin_expect(reorder_enabled_, false))
             srv_->mode_schedule_stats(self_->id()).note_reorder(n, ex_schedule_batch(batch, n));
+        if (__builtin_expect(split_exec_batch_enabled(n), false)) {
+            prefetch_overlap_batch(batch, (n + 1) / 2);
+            exec_batch_prefetched<IofusedPrivateQueue, true>(batch, n);
+            return;
+        }
         prefetch_exec_batch(batch, n);
         exec_batch_prefetched<IofusedPrivateQueue>(batch, n);
     }
