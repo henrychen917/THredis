@@ -7,7 +7,6 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include "read_local_settax.h"
 
 namespace tomo {
 
@@ -33,33 +32,13 @@ struct ReadLocalRetireSink {
     // call there would hand back part of the allocator call it exists to remove. Null means the
     // owner has no cache and every write allocates, which is the pre-cache behaviour.
     KvBlockCache* block_cache = nullptr;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    ReadLocalSetTaxStats* settax_stats = nullptr;
-#endif
 
     void retire(void* owner, void* payload, size_t auxiliary, ReclaimFn reclaim) const {
         defer(context, owner, payload, auxiliary, reclaim);
     }
-
-    void bind_settax_stats(ReadLocalSetTaxStats* stats) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        settax_stats = stats;
-#else
-        (void)stats;
-#endif
-    }
-    ReadLocalSetTaxStats* diagnostics() const {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        return settax_stats;
-#else
-        return nullptr;
-#endif
-    }
 };
 
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT != 3
 static_assert(sizeof(ReadLocalRetireSink) == 3 * sizeof(void*),
               "the shipped retire sink is context + defer + block cache and nothing else");
-#endif
 
 }  // namespace tomo

@@ -1576,9 +1576,6 @@ void add_read_local_stats(ReadLocalStats& total, const ReadLocalStats& local) {
     total.mget_generation_retries += local.mget_generation_retries;
     total.mget_fallback_generation += local.mget_fallback_generation;
     total.mget_fallback_lane_full += local.mget_fallback_lane_full;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    total.settax.add(local.settax);
-#endif
 }
 
 void collect_stat_totals(StatBaseline& out) {
@@ -2508,129 +2505,6 @@ void cmd_info(Shard&, Op& op) {
                 static_cast<unsigned long long>(read_local.mget_generation_retries),
                 static_cast<unsigned long long>(read_local.mget_fallback_generation),
                 static_cast<unsigned long long>(read_local.mget_fallback_lane_full));
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        // Temporary experiment telemetry is lifetime-scoped (unlike Redis compatibility stats,
-        // CONFIG RESETSTAT does not rebase it) so queue/pool gauges and their traffic stay coherent.
-        const ReadLocalSetTaxStats& settax = read_local.settax;
-        const uint64_t settax_overwrite_attempts = settax.overwrite_hits +
-            settax.reject_missing + settax.reject_encoding + settax.reject_ttl +
-            settax.reject_oversize + settax.reject_size_class + settax.reject_borrowed +
-            settax.reject_sequence_saturated + settax.overwrite_maxmemory_oom;
-        appendf(body,
-                "read_local_settax_variant:%u\r\n"
-                "read_local_settax_overwrite_attempts:%llu\r\n"
-                "read_local_settax_overwrite_hits:%llu\r\n"
-                "read_local_settax_reject_missing:%llu\r\n"
-                "read_local_settax_reject_encoding:%llu\r\n"
-                "read_local_settax_reject_ttl:%llu\r\n"
-                "read_local_settax_reject_oversize:%llu\r\n"
-                "read_local_settax_reject_size_class:%llu\r\n"
-                "read_local_settax_reject_borrowed:%llu\r\n"
-                "read_local_settax_reject_sequence_saturated:%llu\r\n"
-                "read_local_settax_overwrite_maxmemory_oom:%llu\r\n",
-                static_cast<unsigned>(TOMO_READ_LOCAL_SET_TAX_VARIANT),
-                static_cast<unsigned long long>(settax_overwrite_attempts),
-                static_cast<unsigned long long>(settax.overwrite_hits),
-                static_cast<unsigned long long>(settax.reject_missing),
-                static_cast<unsigned long long>(settax.reject_encoding),
-                static_cast<unsigned long long>(settax.reject_ttl),
-                static_cast<unsigned long long>(settax.reject_oversize),
-                static_cast<unsigned long long>(settax.reject_size_class),
-                static_cast<unsigned long long>(settax.reject_borrowed),
-                static_cast<unsigned long long>(settax.reject_sequence_saturated),
-                static_cast<unsigned long long>(settax.overwrite_maxmemory_oom));
-        appendf(body,
-                "read_local_settax_init_raw_calls:%llu\r\n"
-                "read_local_settax_init_int_calls:%llu\r\n"
-                "read_local_settax_init_extern_calls:%llu\r\n"
-                "read_local_settax_init_key_bytes:%llu\r\n"
-                "read_local_settax_init_value_bytes:%llu\r\n"
-                "read_local_settax_init_cell_prepare_calls:%llu\r\n"
-                "read_local_settax_fresh_allocation_attempts:%llu\r\n"
-                "read_local_settax_accounting_add_calls:%llu\r\n"
-                "read_local_settax_accounting_sub_calls:%llu\r\n"
-                "read_local_settax_accounting_bytes:%llu\r\n"
-                "read_local_settax_slot_replacements:%llu\r\n"
-                "read_local_settax_expire_erases:%llu\r\n",
-                static_cast<unsigned long long>(settax.init_raw_calls),
-                static_cast<unsigned long long>(settax.init_int_calls),
-                static_cast<unsigned long long>(settax.init_extern_calls),
-                static_cast<unsigned long long>(settax.init_key_bytes),
-                static_cast<unsigned long long>(settax.init_value_bytes),
-                static_cast<unsigned long long>(settax.init_cell_prepare_calls),
-                static_cast<unsigned long long>(settax.fresh_allocation_attempts),
-                static_cast<unsigned long long>(settax.accounting_add_calls),
-                static_cast<unsigned long long>(settax.accounting_sub_calls),
-                static_cast<unsigned long long>(settax.accounting_bytes),
-                static_cast<unsigned long long>(settax.slot_replacements),
-                static_cast<unsigned long long>(settax.expire_erases));
-        appendf(body,
-                "read_local_settax_recycle_acquire_attempts:%llu\r\n"
-                "read_local_settax_recycle_acquire_hits:%llu\r\n"
-                "read_local_settax_recycle_acquire_ineligible:%llu\r\n"
-                "read_local_settax_recycle_acquire_empty:%llu\r\n"
-                "read_local_settax_recycle_return_attempts:%llu\r\n"
-                "read_local_settax_recycle_return_accepted:%llu\r\n"
-                "read_local_settax_recycle_return_ineligible:%llu\r\n"
-                "read_local_settax_recycle_return_limited:%llu\r\n"
-                "read_local_settax_recycle_pool_nodes:%llu\r\n"
-                "read_local_settax_recycle_pool_max_owner_nodes:%llu\r\n"
-                "read_local_settax_recycle_capacity_evals:%llu\r\n"
-                "read_local_settax_recycle_candidate_attempts:%llu\r\n"
-                "read_local_settax_recycle_reject_not_string:%llu\r\n"
-                "read_local_settax_recycle_reject_encoding:%llu\r\n"
-                "read_local_settax_recycle_reject_borrowed:%llu\r\n"
-                "read_local_settax_recycle_atomic_pool_accepts:%llu\r\n",
-                static_cast<unsigned long long>(settax.recycle_acquire_attempts),
-                static_cast<unsigned long long>(settax.recycle_acquire_hits),
-                static_cast<unsigned long long>(settax.recycle_acquire_ineligible),
-                static_cast<unsigned long long>(settax.recycle_acquire_empty),
-                static_cast<unsigned long long>(settax.recycle_return_attempts),
-                static_cast<unsigned long long>(settax.recycle_return_accepted),
-                static_cast<unsigned long long>(settax.recycle_return_ineligible),
-                static_cast<unsigned long long>(settax.recycle_return_limited),
-                static_cast<unsigned long long>(settax.recycle_pool_nodes),
-                static_cast<unsigned long long>(settax.recycle_pool_max_owner_nodes),
-                static_cast<unsigned long long>(settax.recycle_capacity_evals),
-                static_cast<unsigned long long>(settax.recycle_candidate_attempts),
-                static_cast<unsigned long long>(settax.recycle_reject_not_string),
-                static_cast<unsigned long long>(settax.recycle_reject_encoding),
-                static_cast<unsigned long long>(settax.recycle_reject_borrowed),
-                static_cast<unsigned long long>(settax.recycle_atomic_pool_accepts));
-        appendf(body,
-                "read_local_settax_qsbr_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_object_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_table_deferrals:%llu\r\n"
-                "read_local_settax_qsbr_depth:%llu\r\n"
-                "read_local_settax_qsbr_max_owner_depth:%llu\r\n"
-                "read_local_settax_qsbr_depth_samples:%llu\r\n"
-                "read_local_settax_qsbr_depth_sum:%llu\r\n"
-                "read_local_settax_qsbr_seals:%llu\r\n"
-                "read_local_settax_qsbr_sealed_entries:%llu\r\n"
-                "read_local_settax_qsbr_grace_scans:%llu\r\n"
-                "read_local_settax_qsbr_participant_loads:%llu\r\n"
-                "read_local_settax_qsbr_zero_progress_scans:%llu\r\n"
-                "read_local_settax_qsbr_reclaims:%llu\r\n"
-                "read_local_settax_qsbr_forced_graces:%llu\r\n"
-                "read_local_settax_qsbr_forced_yields:%llu\r\n"
-                "read_local_settax_object_sequence_retries:%llu\r\n",
-                static_cast<unsigned long long>(settax.qsbr_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_object_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_table_deferrals),
-                static_cast<unsigned long long>(settax.qsbr_depth),
-                static_cast<unsigned long long>(settax.qsbr_max_owner_depth),
-                static_cast<unsigned long long>(settax.qsbr_depth_samples),
-                static_cast<unsigned long long>(settax.qsbr_depth_sum),
-                static_cast<unsigned long long>(settax.qsbr_seals),
-                static_cast<unsigned long long>(settax.qsbr_sealed_entries),
-                static_cast<unsigned long long>(settax.qsbr_grace_scans),
-                static_cast<unsigned long long>(settax.qsbr_participant_loads),
-                static_cast<unsigned long long>(settax.qsbr_zero_progress_scans),
-                static_cast<unsigned long long>(settax.qsbr_reclaims),
-                static_cast<unsigned long long>(settax.qsbr_forced_graces),
-                static_cast<unsigned long long>(settax.qsbr_forced_yields),
-                static_cast<unsigned long long>(settax.object_sequence_retries));
-#endif
     }
     if (info_section(op, "COMMANDSTATS", false)) {
         body += "# Commandstats\r\n";

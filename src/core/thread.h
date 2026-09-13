@@ -198,10 +198,6 @@ struct ReadLocalStats {
     // three at zero -- that is the design's first proof obligation, stated as a number.
     ReadLocalArmStats arm{};
 
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    // Keep temporary SET attribution off the remotely scanned quiescence-publication cache line.
-    alignas(64) ReadLocalSetTaxStats settax{};
-#endif
 
     uint64_t fallbacks() const {
         return fallback_multi + fallback_watch + fallback_context +

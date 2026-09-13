@@ -484,19 +484,9 @@
             if (block->allocation != allocation) std::abort();
             atomic_pending_->free_values[cls] = block->next;
             atomic_pending_->cached_value_bytes -= allocation;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            std::destroy_at(block);
-            return ::new (block) KvObj;
-#else
             return block;
-#endif
         }
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        void* memory = alloc_raw(allocation);
-        return memory ? ::new (memory) KvObj : nullptr;
-#else
         return alloc_raw(allocation);
-#endif
     }
 
     void atomic_discard_value(KvObj* value) {
@@ -1296,18 +1286,11 @@ private:
             live_[0]++;
             const size_t added_bytes = kvobj_size(replacement);
             obj_bytes_ += added_bytes;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            settax_stats().accounting_add_calls++;
-            settax_stats().accounting_bytes += added_bytes;
-#endif
             // The folded probe publishes without insert_into_read_local, so it owes the selected
             // tracker the same registration that path performs. Going through the flag alone would
             // register a PERSISTed key that merely RETAINS its slot, and would hand the sidecar
             // prototype an entry with no deadline payload.
             (void)track_expire(hash, replacement);
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-            if (replacement->expire_at_ms() < 0) settax_stats().expire_erases++;
-#endif
         };
         if (KvObj* object = exchange(0)) return object;
         if (rehashing()) {
@@ -1403,16 +1386,9 @@ private:
         if (cls >= AtomicPendingState::kPoolClasses ||
             allocation < sizeof(AtomicPendingState::FreeValue) ||
             atomic_pending_->cached_value_bytes + allocation > kValueCacheBytes) return false;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        void* memory = object;
-        std::destroy_at(object);
-        auto* block = ::new (memory) AtomicPendingState::FreeValue{
-            atomic_pending_->free_values[cls], allocation};
-#else
         auto* block = reinterpret_cast<AtomicPendingState::FreeValue*>(object);
         block->next = atomic_pending_->free_values[cls];
         block->allocation = allocation;
-#endif
         atomic_pending_->free_values[cls] = block;
         atomic_pending_->cached_value_bytes += allocation;
         return true;

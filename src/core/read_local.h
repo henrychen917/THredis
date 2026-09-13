@@ -22,7 +22,6 @@
 #include <sys/syscall.h>
 #endif
 #include "../store/read_local_reclaim.h"
-#include "../store/read_local_settax.h"
 
 namespace tomo {
 
@@ -264,9 +263,6 @@ public:
         // Every store this owner drives shares ONE cache: a single head array that stays hot in
         // L1 for every armed write, whatever shard the key lands on. See kv_block_cache.h.
         sink_.block_cache = &block_cache_;
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        sink_.bind_settax_stats(&owner_->read_local_stats().settax);
-#endif
         return true;
     }
 
@@ -304,17 +300,6 @@ public:
         entry.reclaim = reclaim;
         // The next drain (or rare capacity seal) performs the global epoch RMW after every unlink
         // in this suffix. Sharing that stamp avoids one globally contended RMW per retired object.
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats& stats = settax_stats();
-        stats.qsbr_deferrals++;
-        if (auxiliary) stats.qsbr_object_deferrals++;
-        else stats.qsbr_table_deferrals++;
-        stats.qsbr_depth = ring_.count;
-        stats.qsbr_max_owner_depth = std::max<uint64_t>(
-            stats.qsbr_max_owner_depth, ring_.count);
-        stats.qsbr_depth_samples++;
-        stats.qsbr_depth_sum += ring_.count;
-#endif
     }
 
     uint32_t drain_ready() {
@@ -323,11 +308,6 @@ public:
         // One participant scan per owner pass, not per retired allocation. Stamps are FIFO and
         // strictly below the returned floor only after every active tick has crossed them; parked
         // participants contribute infinity because they hold no foreign pointer.
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats& stats = settax_stats();
-        stats.qsbr_grace_scans++;
-        stats.qsbr_participant_loads += server_->nthreads();
-#endif
         // Ask only whether the OLDEST sealed stamp has been crossed. Nothing is releasable until it
         // has, so the scan may stop at the first participant still below it (and re-test that one
         // first next pass) instead of loading every participant's tick line each pass. The ring is
@@ -336,11 +316,6 @@ public:
             server_->read_local_grace_floor(ring_.head_stamp(), grace_hint_);
         const uint32_t drained = ring_.drain_below(
             grace_floor, [this](uint32_t slot) { reclaim_entry(entries_[slot]); });
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        stats.qsbr_reclaims += drained;
-        if (!drained) stats.qsbr_zero_progress_scans++;
-        stats.qsbr_depth = ring_.count;
-#endif
         return drained;
     }
 
@@ -356,11 +331,6 @@ public:
 #endif
         const uint32_t drained = ring_.drain_all(
             [this](uint32_t slot) { reclaim_entry(entries_[slot]); });
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats& stats = settax_stats();
-        stats.qsbr_reclaims += drained;
-        stats.qsbr_depth = 0;
-#endif
         // Shutdown returns the cache too: the store destructors that follow free the LIVE objects,
         // and these blocks are live to nobody.
         block_cache_.release_all();
@@ -406,11 +376,6 @@ private:
         // recorded once, not once per entry.
         [[maybe_unused]] const uint32_t sealed =
             ring_.seal(server_->advance_read_local_epoch());
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        ReadLocalSetTaxStats& stats = settax_stats();
-        stats.qsbr_seals++;
-        stats.qsbr_sealed_entries += sealed;
-#endif
     }
 
     void force_oldest_grace() {
@@ -418,29 +383,16 @@ private:
         // copy before owner mutation can reach here, so publishing its current epoch is the safe
         // point that prevents a full list from waiting on itself.
         seal_pending();
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-        settax_stats().qsbr_forced_graces++;
-#endif
         while (ring_.full()) {
             // Preserve a permanent/parked publication if shutdown cleanup reaches this path.
             owner_->refresh_read_local_quiescence(server_->read_local_epoch());
             if (!drain_ready()) {
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-                settax_stats().qsbr_forced_yields++;
-#endif
                 __builtin_ia32_pause();
                 ::sched_yield();
             }
         }
     }
 
-#if TOMO_READ_LOCAL_SET_TAX_VARIANT == 3
-    ReadLocalSetTaxStats& settax_stats() {
-        ReadLocalSetTaxStats* stats = sink_.diagnostics();
-        if (!stats) std::abort();
-        return *stats;
-    }
-#endif
 
 #ifdef TOMO_RL_CACHE_DEBUG
     // The retire ring is the owner's private QSBR list. Both laws -- one thread, each payload

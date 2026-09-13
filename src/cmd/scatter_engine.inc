@@ -2865,41 +2865,11 @@ ScatterTaskResult xshard_execute(const Task& task, Shard& shard, Op& op,
                         slot.kind = ValueKind::Inline;
                         continue;
                     }
-                    if constexpr (kReadLocalSetTaxVariant ==
-                                  ReadLocalSetTaxVariant::ObjectSequenceOverwrite) {
-                        if (object->encoding() == Enc::Raw) {
-                            const uint32_t length = kvobj_read_local_raw_length(object);
-                            slot.len = length;
-                            const uint32_t cutover =
-                                std::min<uint32_t>(shard.zc_min(), ValueSlot::kInline);
-                            if (length <= cutover) {
-                                kvobj_read_local_copy_raw(
-                                    object, object->read_local_flags(), length, slot.small);
-                                slot.kind = ValueKind::Inline;
-                            } else {
-                                const char* value = object->str_data();
-                                // Registration precedes the next owner command, whose overwrite
-                                // gate will force immutable replacement until IO releases this ptr.
-                                shard.store().borrow(value);
-                                slot.ptr = value;
-                                slot.shard = shard.id();
-                                slot.kind = ValueKind::Borrow;
-                            }
-                            continue;
-                        }
-                    }
                     KvObjRawReadBuffer raw;
                     const Slice value = kvobj_string_value(object, raw);
                     slot.len = value.n;
                     uint32_t cutover =
                         std::min<uint32_t>(shard.zc_min(), ValueSlot::kInline);
-                    if constexpr (kReadLocalSetTaxVariant ==
-                                  ReadLocalSetTaxVariant::SequenceOverwrite) {
-                        // A materializes Raw through atomic cells. Keep that owner-local copy in
-                        // the gather slot instead of publishing its stack address as a borrow.
-                        if (object->encoding() == Enc::Raw)
-                            cutover = ValueSlot::kInline;
-                    }
                     if (value.n <= cutover) {
                         if (value.n) std::memcpy(slot.small, value.p, value.n);
                         slot.kind = ValueKind::Inline;
