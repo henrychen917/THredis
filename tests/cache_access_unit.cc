@@ -197,7 +197,7 @@ struct CoreConcurrencyTest {
     }
 
     // The other hoisted transports carry borrow lifetimes and client ownership. Exercise every
-    // real drain with a callback that publishes a fresh tail, including an unnotified idle sweep.
+    // real drain with a callback that publishes a fresh tail, including the mask-independent sweep.
     // At the last callback head == tail; only the separate retired frontier may authorize teardown.
     static void control_channels() {
         auto owner = std::make_unique<ThreadCtx>();
@@ -211,8 +211,7 @@ struct CoreConcurrencyTest {
         auto exercise = [&](auto post, auto drain, auto id, auto quiesced) {
             for (bool unmasked : {false, true}) {
                 require(quiesced(), "control channel begins quiesced");
-                require(post(0, 0, unmasked) && post(0, 1, unmasked) &&
-                        post(1, 2, unmasked), "control-channel publication");
+                require(post(0, 0) && post(0, 1) && post(1, 2), "control-channel publication");
                 std::vector<uint32_t> seen;
                 auto take = [&](auto value) {
                     require(!quiesced(), "control callback must precede retirement");
@@ -220,10 +219,8 @@ struct CoreConcurrencyTest {
                     const uint32_t current = id(value);
                     seen.push_back(current);
                     if (current == 0)
-                        require(post(0, 3, unmasked), "control callback publishes fresh tail");
+                        require(post(0, 3), "control callback publishes fresh tail");
                 };
-                if (unmasked)
-                    require(drain(take, false) == 0, "control idle sweep has no notification");
                 require(drain(take, unmasked) == 4 &&
                         seen == std::vector<uint32_t>({0, 1, 3, 2}),
                         "control drain preserves producer FIFO and observes fresh tail");
@@ -232,9 +229,8 @@ struct CoreConcurrencyTest {
                         "control drain leaves no duplicate or hidden work");
             }
         };
-        exercise([&](uint32_t p, uint32_t i, bool quiet) {
-                     return quiet ? owner->client_in_[p].push(clients[i], sig)
-                                  : owner->post_client(p, clients[i], unopened, sig);
+        exercise([&](uint32_t p, uint32_t i) {
+                     return owner->post_client(p, clients[i], unopened, sig);
                  }, [&](auto take, bool unmasked) {
                      return unmasked ? owner->drain_clients_unmasked(take)
                                      : owner->drain_clients(take);
@@ -243,19 +239,17 @@ struct CoreConcurrencyTest {
                      require(found != clients.end(), "completion names the published client");
                      return static_cast<uint32_t>(found - clients.begin());
                  }, [&] { return owner->io_inbound_quiesced(); });
-        exercise([&](uint32_t p, uint32_t i, bool quiet) {
+        exercise([&](uint32_t p, uint32_t i) {
                      BorrowRelease release{static_cast<int32_t>(i), nullptr};
-                     return quiet ? owner->release_in_[p].push(release, sig)
-                                  : owner->post_release(p, release, unopened, sig);
+                     return owner->post_release(p, release, unopened, sig);
                  }, [&](auto take, bool unmasked) {
                      return unmasked ? owner->drain_releases_unmasked(take)
                                      : owner->drain_releases(take);
                  }, [](const BorrowRelease& release) { return uint32_t(release.shard); },
                  [&] { return owner->ex_inbound_quiesced(); });
-        exercise([&](uint32_t p, uint32_t i, bool quiet) {
+        exercise([&](uint32_t p, uint32_t i) {
                      ClientTransfer transfer{clients[i], nullptr, nullptr, i};
-                     return quiet ? owner->transfer_in_[p].push(transfer, sig)
-                                  : owner->post_client_transfer(p, transfer, unopened, sig);
+                     return owner->post_client_transfer(p, transfer, unopened, sig);
                  }, [&](auto take, bool unmasked) {
                      return unmasked ? owner->drain_client_transfers_unmasked(take)
                                      : owner->drain_client_transfers(take);
