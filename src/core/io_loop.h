@@ -200,6 +200,7 @@ public:
             return true;
         }
         if (!prepare_activation()) return false;
+        if (ifid_batch_.count || wb_batch_.count) std::abort();
         accept_quiescing_ = false;
         accept_cancel_submitted_ = tls_accept_cancel_submitted_ = false;
         self_->set_ring(&ring_);
@@ -256,6 +257,7 @@ public:
     void deactivate() {
         if (!active_role_) return;
         if (!self_->clients().empty() || !client_migrations_.empty()) std::abort();
+        if (!io_pipelines_quiesced()) std::abort();
         // Channel homes are members of the live IO set. A thread leaving that set retires its
         // owner-local indexes here; every new/surviving IO rebuilds the next epoch in RoleReady.
         pubsub_clear_home_indexes();
@@ -735,6 +737,13 @@ private:
                 }
             }
             self_->clear_blocked();
+        }
+        if constexpr (IoPipe) {
+            // O5 retains only receive nominations, not parsed Ops or owner reservations. On
+            // shutdown they can be discarded before the final corpse grace; FLIP must already
+            // have drained them before publishing the role edge.
+            if (self_->role() != Role::Ifid && !io_pipelines_quiesced()) std::abort();
+            ifid_batch_.clear();
         }
         if constexpr (Fused) {
             // The read loop is over for this tenure. Teardown may take longer than another
@@ -4560,6 +4569,12 @@ ordinary_shard_ready:
         if constexpr (HasUnix) work += flush_handoffs();
         work += service_client_migrations<kEp>() + drain_client_transfers<kEp>(true) +
                 flush_borrow_releases();
+        // A retained nomination may predate active-set removals or new arrivals. Consume it
+        // first, then take the sweep's fresh census: charging it as one of the census batches
+        // could omit a newly active connection and park with its only receive already reaped.
+        if (ifid_batch_.count)
+            work += pipeline_pass<HasUnix, HasTls, kEp, SplitLocal>(
+                true, natural_order, submitted);
         // The hot rotation visits one cap-bounded IFID batch. Before parking, run enough batches
         // to inspect the whole active set once, retaining this outer pass's selected order and the
         // unmasked completion drain.
@@ -4641,6 +4656,13 @@ ordinary_shard_ready:
 
     bool client_pipeline_referenced(const Client* client) const {
         if (client->ifid_pending()) return true;
+        // The split receive batch can cross a prologue. Its Client handles must outlive both
+        // corpse grace and client migration, even though it owns no ROB/storage pointer yet.
+        // These scans are cold lifetime checks, never per-command bookkeeping.
+        for (uint32_t i = 0; i < ifid_batch_.count; i++)
+            if (ifid_batch_.clients[i] == client) return true;
+        for (uint32_t i = 0; i < wb_batch_.count; i++)
+            if (wb_batch_.clients[i] == client) return true;
         if (active_wb_context_)
             for (uint32_t i = 0; i < active_wb_context_->count; i++)
                 if (active_wb_context_->clients[i] == client) return true;
@@ -4648,7 +4670,7 @@ ordinary_shard_ready:
     }
 
     bool io_pipelines_quiesced() const {
-        return active_wb_context_ == nullptr;
+        return !ifid_batch_.count && !wb_batch_.count && active_wb_context_ == nullptr;
     }
 
     // Targeted receive-buffer maintenance and the ordinary uncapped parser, shared by both
@@ -5551,14 +5573,24 @@ ordinary_shard_ready:
     uint32_t pipeline_pass(bool unmasked, bool natural_order, bool& submitted) {
         srv_->mode_schedule_stats(self_->id()).note_overlap(
             OverlapSchedule::SplitIo, !natural_order);
-        // One synchronous buffer per stream, exactly as measured. Cross-core queue publications
-        // and kernel SQEs own their data after their stage, so no ping/pong lifetime is required.
+        // O5: receive N+1 survives this call; the next turn parses it while the split owners
+        // execute N and this IO retires older replies. Reuse the existing 64-client IFID buffer
+        // (520 bytes), so staging adds no allocation, member, task copy, or per-op state. The
+        // retained handles name only Clients: no hash, owner sample, reservation, Op, or foreign
+        // store pointer crosses a control/QSBR boundary. Parsing still resolves every owner at
+        // dispatch, and its local-read captures are consumed before it publishes the epoch.
+        //
+        // Only split Pipeline=1 reaches this rotation; overlap=0 and the existing fused rotation
+        // remain the controls. The intra-turn WB/POST order and depth gate stay as measured:
+        // receive staging is one mechanism, with no earlier-notify or reply-coalescing bundle.
         IfidBatch& ifid = ifid_batch_;
         WbBatch& wb = wb_batch_;
-        if (ifid.count || wb.count) std::abort();
+        if (wb.count) std::abort();
         uint32_t work = 0;
         if (natural_order) {
-            work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
+            // Prime an empty pipeline immediately, including p1 and the first pass after
+            // parking. Never hold a batch for a minimum occupancy or residual-age threshold.
+            if (!ifid.count) work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
             work += collect_retire_work<HasUnix, kEp>(unmasked);
             work += ifid_parse_hash<HasTls, kEp, SplitLocal>(ifid);
             work += ifid_post(ifid);
@@ -5571,7 +5603,7 @@ ordinary_shard_ready:
                         work += wb_observe<HasUnix, kEp>(unmasked, wb);
                         break;
                     case IoPipeStage::IfidRx:
-                        work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
+                        if (!ifid.count) work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
                         break;
                     case IoPipeStage::WbPrefetch:
                         wb_prefetch(wb);
@@ -5593,6 +5625,18 @@ ordinary_shard_ready:
         }
         ifid.clear();
         wb.clear();
+        // Harvest AFTER the ordinary submit/reap, committing received bytes promptly while EX
+        // is running. Carry one bounded batch into the next call, without another syscall or
+        // another buffer. Selection alone is NOT progress: counting its size would spin on
+        // full ROBs, paused clients, and incomplete frames with no new input.
+        //
+        // An unmasked idle sweep consumes the staged batch and never refills it, so no receive
+        // debt can be slept past. Every placement transition also stops refill: ClientDrain can
+        // move a quiescent ROB with unparsed bytes, so re-nominating that paused client every
+        // turn would keep the migration lifetime fence closed forever. The next turn releases
+        // existing nominations before client/role transfer, even if the pause raced this cut.
+        if (!unmasked && !srv_->placement_transition_active())
+            work += ifid_rx<HasUnix, HasTls, kEp>(ifid);
         return work;
     }
 

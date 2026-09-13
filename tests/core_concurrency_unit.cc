@@ -39,7 +39,7 @@ struct CoreConcurrencyTest {
         uint32_t source = Fused ? 0 : 6;
         uint32_t destination = Fused ? 1 : 7;
         uint32_t io_id = Fused ? 7 : 0;
-        Fixture() {
+        explicit Fixture(uint32_t overlap = 0) {
             cpu_set_t cpus;
             CPU_ZERO(&cpus);
             require(sched_getaffinity(0, sizeof(cpus), &cpus) == 0, "affinity unavailable");
@@ -60,6 +60,7 @@ struct CoreConcurrencyTest {
             Config config;
             config.shards = 16;
             config.thread_mode = Fused ? ThreadMode::Fused : ThreadMode::Split;
+            config.overlap = overlap;
             config.flip_auto = 0;
             config.save.clear();
             require(server.init(config), "initialize in-memory fixture");
@@ -265,6 +266,172 @@ struct CoreConcurrencyTest {
         require(f.io.dead_ready_.empty(), "corpse reclaimed after channel grace");
     }
 
+    static void split_pipeline_lifetime() {
+        Fixture f(1);
+        auto* client = new Client(-1);
+        f.client(*client);
+        f.server.client_accepted();
+        f.io.ifid_batch_.clients[0] = client;
+        f.io.ifid_batch_.count = 1;
+        require(!f.io.io_pipelines_quiesced() && f.io.client_pipeline_referenced(client),
+                "staged receive blocks the IO drain acknowledgement");
+        std::string refusal;
+        require(!f.io.client_transfer_ready(client, 1, refusal) &&
+                    refusal == "connection is held by a generalized-thread pipeline batch",
+                "staged handle blocks transfer before the directory/protocol checks");
+        f.io.close_client(client);
+        require(client->dead(), "closed staged client entered corpse grace");
+        for (uint32_t i = 0; i < 4; i++) f.io.reap_dead();
+        require(f.io.dead_ready_.size() == 1 && f.io.dead_ready_.front() == client,
+                "staged handle survives more than two corpse prologues");
+        f.io.ifid_batch_.clear();
+        require(f.io.io_pipelines_quiesced(), "consuming the staged batch releases IO drain");
+        f.io.reap_dead();
+        require(f.io.dead_ready_.empty(), "consumed receive handle releases the corpse");
+    }
+
+    static void split_pipeline_turns(bool natural) {
+        static_assert(sizeof(IoLoop::IfidBatch) == 520,
+                      "O5 must reuse the existing receive buffer without footprint growth");
+        // Only Ring's eventfd mailbox is needed to exercise the real split rotation. All bytes
+        // are installed in Client buffers below; there is no listener, socket IO, or worker loop.
+        struct MailboxOnly {
+            bool previous = g_ring_epoll_mode;
+            MailboxOnly() { g_ring_epoll_mode = true; }
+            ~MailboxOnly() { g_ring_epoll_mode = previous; }
+        } mailbox_only;
+        Fixture f(1);
+        require(f.io.ring_.init(8), "initialize serverless IO mailbox");
+        f.io.self_->set_ring(&f.io.ring_);
+        for (auto& owner : f.loops) owner.self_->set_ring(&owner.ring_);
+        const std::string key = f.key(f.sid());
+        const std::string frame = "*2\r\n$4\r\nINCR\r\n$" + std::to_string(key.size()) +
+                                  "\r\n" + key + "\r\n";
+        std::vector<std::unique_ptr<Client>> clients;
+        // One more than the receive capacity proves that the second batch really survives a
+        // call with unparsed input. A synchronous/discarded tail must fail this witness.
+        for (uint32_t i = 0; i <= kIoPipeIfidBatchClients; i++) {
+            auto client = std::make_unique<Client>(-1);
+            f.client(*client);
+            client->set_id(i + 1);
+            std::memcpy(client->rbuf(), frame.data(), frame.size());
+            client->commit_read(frame.size());
+            client->set_recv_armed(true); // no kernel submission is needed by this fixture
+            f.io.mark_active(client.get());
+            clients.push_back(std::move(client));
+        }
+        bool submitted = false;
+        auto turn = [&](bool unmasked) {
+            return f.io.pipeline_pass<false, false, false>(unmasked, natural, submitted);
+        };
+        require(turn(false) != 0, "cold pipeline dispatches without an extra priming turn");
+        for (uint32_t i = 0; i < kIoPipeIfidBatchClients; i++)
+            require(clients[i]->rob().dispatch_id() == 1, "first batch dispatched once");
+        require(clients.back()->rob().dispatch_id() == 0 &&
+                    f.io.ifid_batch_.count == kIoPipeIfidBatchClients &&
+                    f.io.client_pipeline_referenced(clients.back().get()),
+                "next batch retains unparsed input across the call");
+        require(f.io.ntouched_ == 0, "no quiet notification debt crosses a control tail");
+        // A real prologue now runs with the staged handles still live.
+        f.io.reap_dead();
+        natural = !natural; // depth-gate order changes must consume the very same staged input
+        require(turn(false) != 0 && clients.back()->rob().dispatch_id() == 1,
+                "next turn dispatches the retained input across a depth-order change");
+        require(turn(false) == 0 && f.io.ifid_batch_.count != 0,
+                "nominations alone do not report progress or force an idle spin");
+
+        f.server.lb_epoch_.store(1);
+        f.server.lb_start_shard_drain();
+        require(f.server.lb_dispatch_paused(), "LB producer barrier armed");
+        (void)turn(false);
+        require(f.io.io_pipelines_quiesced() && f.io.ntouched_ == 0,
+                "LB consumes staging without refill or unpublished owner work");
+        f.server.lb_stage_.store(LbStage::Idle, std::memory_order_release);
+        (void)turn(false);
+        require(f.io.ifid_batch_.count != 0, "fresh staging rearms after LB");
+        f.server.lb_stage_.store(LbStage::ClientDrain, std::memory_order_release);
+        require(!f.server.lb_dispatch_paused() && f.server.placement_transition_active(),
+                "client drain is a placement transition without a shard dispatch pause");
+        (void)turn(false);
+        require(f.io.io_pipelines_quiesced(), "client drain cannot repeatedly re-pin its clients");
+        f.server.lb_stage_.store(LbStage::Idle, std::memory_order_release);
+        (void)turn(false);
+        require(f.io.ifid_batch_.count != 0, "fresh staging rearms after client drain");
+        f.server.flip_stage_.store(FlipStage::IoDrain, std::memory_order_release);
+        require(f.server.flip_dispatch_paused(), "FLIP producer barrier armed");
+        (void)turn(false);
+        require(f.io.io_pipelines_quiesced(), "FLIP consumes staging without refill");
+        f.server.flip_stage_.store(FlipStage::Idle, std::memory_order_release);
+
+        (void)turn(false);
+        require(f.io.ifid_batch_.count != 0, "fresh staging rearms before the idle audit");
+        require(f.io.pipeline_sweep<false, false, false>(natural, submitted) == 0 &&
+                    f.io.io_pipelines_quiesced(),
+                "idle audit leaves no staged batch to sleep past and no invented progress");
+        auto drain_tasks = [&] {
+            // Use the notified path, so silently dropping IFID.POST fails this count too.
+            return f.server.thread(f.source).drain_tasks([&](const Task& task) {
+                require(task.op_id == 0 && task.client->rob().dispatch_id() == 1,
+                        "staging conserves the original single-op dispatch per client");
+                task.client->rob().at(0).state.store(OpState::Done, std::memory_order_release);
+                require(task.client->rob().drain([](Op&) {}) == 1, "release fixture ROB");
+            });
+        };
+        // Refill while these clients still have outstanding tasks, then make the entire
+        // nomination stale by retiring them and replacing the active set with fresh arrivals.
+        (void)turn(false);
+        require(f.io.ifid_batch_.count != 0, "stale-census window armed before retiring tasks");
+        require(drain_tasks() == clients.size(), "no dropped or duplicate owner tasks");
+        for (auto& client : clients) client->set_in_active(false);
+        f.io.active_.v.clear();
+        for (uint32_t i = 0; i <= kIoPipeIfidBatchClients; i++) {
+            auto client = std::make_unique<Client>(-1);
+            f.client(*client);
+            client->set_id(clients.size() + 1);
+            std::memcpy(client->rbuf(), frame.data(), frame.size());
+            client->commit_read(frame.size());
+            client->set_recv_armed(true);
+            f.io.mark_active(client.get());
+            clients.push_back(std::move(client));
+        }
+        require(f.io.pipeline_sweep<false, false, false>(natural, submitted) != 0 &&
+                    f.io.io_pipelines_quiesced(), "fresh idle census progresses and drains staging");
+        for (size_t i = kIoPipeIfidBatchClients + 1; i < clients.size(); i++)
+            require(clients[i]->rob().dispatch_id() == 1, "idle census visits every fresh arrival");
+        require(drain_tasks() == kIoPipeIfidBatchClients + 1,
+                "stale nominations cannot consume the fresh idle census budget");
+
+        // Move a fully drained shard while a receive nomination survives. The nomination must
+        // hold neither an old owner nor an issued Op: routing belongs to the later parse pass.
+        (void)f.io.ifid_rx<false, false, false>(f.io.ifid_batch_);
+        require(f.io.ifid_batch_.count != 0 && f.io.ntouched_ == 0,
+                "ownership-change window retains receive state without notification debt");
+        Client* rerouted = f.io.ifid_batch_.clients[0];
+        require(rerouted->rob().quiesced() && rerouted->rob().dispatch_id() == 1 &&
+                    rerouted->rlen() + frame.size() <= rerouted->rcap(),
+                "reroute fixture has a drained ROB and room for a fresh frame");
+        std::memcpy(rerouted->rbuf() + rerouted->rlen(), frame.data(), frame.size());
+        rerouted->commit_read(frame.size());
+        f.move(f.sid(), false);
+        require(turn(true) != 0 && f.io.io_pipelines_quiesced() && f.io.ntouched_ == 0,
+                "staged receive dispatches after the owner change and drains fully");
+        uint32_t rerouted_tasks = 0;
+        for (uint32_t tid = 0; tid < f.server.nthreads(); tid++)
+            rerouted_tasks += f.server.thread(tid).drain_tasks([&](const Task& task) {
+                require(tid == f.destination && task.client == rerouted && task.op_id == 1,
+                        "only the new shard owner receives the staged command");
+                task.client->rob().at(1).state.store(OpState::Done, std::memory_order_release);
+                require(task.client->rob().drain([](Op&) {}) == 1, "release rerouted fixture ROB");
+            });
+        require(rerouted_tasks == 1, "owner change cannot drop or duplicate staged dispatch");
+        // The fixture owns these clients; do not leave lookup pointers into their destructors.
+        for (auto& client : clients) {
+            f.io.self_->release_wb_slot(client->wb_slot());
+            client->set_recv_armed(false);
+        }
+        f.io.active_.v.clear();
+    }
+
     inline static ExLoop* ack_loop = nullptr;
     inline static bool ack_entered = false;
     static void after_ack() {
@@ -420,8 +587,12 @@ int main(int argc, char** argv) {
     const std::string row = argv[1];
     if (row == "watch") T::watch_disconnect();
     else if (row == "scheduler") T::scheduler();
-    else if (row == "lifetime") T::lifetime();
-    else if (row == "drain") T::drain_ack();
+    else if (row == "lifetime") {
+        T::lifetime();
+        T::split_pipeline_lifetime();
+        T::split_pipeline_turns(false);
+        T::split_pipeline_turns(true);
+    } else if (row == "drain") T::drain_ack();
     else if (row == "route") T::route_order();
     else if (row == "snapshot") T::snapshot_forward();
     else if (row == "config") {
