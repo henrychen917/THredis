@@ -4947,8 +4947,24 @@ ordinary_shard_ready:
     // outer boundary.
     template <bool HasUnix, bool HasTls, bool kEp>
     uint32_t genthread_three_way_pass(WbPipelineBatch& batch, bool& gate_open) {
-        srv_->mode_schedule_stats(self_->id()).note_overlap(OverlapSchedule::Fused, gate_open);
         if (batch.count || active_wb_context_) std::abort();
+        if (srv_->read_local_enabled()) {
+            // 1s has an independent execution stream in its local lane. Parse feeds that lane
+            // and the owner inbox; O11 gives the lane the owner prefetch gap, then executes the
+            // owner batch. Retire AFTER both streams, including the AOF gate, so replies created
+            // here can submit at this rotation's SEND boundary. The old preselected WB batch
+            // could only send those replies on a later rotation. See fused_local_rotation.inc.
+            uint32_t work = genthread_ifid_batch<HasTls, kEp>();
+            bool gap_used = false;
+            work += fused_executor_->fused_local_read_pass(gap_used);
+            work += collect_retire_work<HasUnix, kEp, true>();
+            work += genthread_wb_batch<HasTls, kEp>();
+            srv_->mode_schedule_stats(self_->id()).note_overlap(
+                OverlapSchedule::Fused, gap_used);
+            gate_open = false;
+            return work;
+        }
+        srv_->mode_schedule_stats(self_->id()).note_overlap(OverlapSchedule::Fused, gate_open);
         LoopSignals& sig = self_->sig();
         uint32_t occupancy = 0;
         auto note_ops_since = [&](uint64_t before) {

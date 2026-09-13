@@ -222,7 +222,14 @@ def smoke(conn, port, knobs):
             keys = [f'feature-{attempt}-{i}' for i in range(len(clients))]
             for c, key in zip(clients, keys):
                 require(c.must('SET', key, '0') == b'OK', 'counter seed failed')
-            read_frames = [encode('GET', key) + encode('MGET', key, key) for key in keys]
+            # Local-aware 1s overlap needs simultaneous lane and owner work. STRLEN is an
+            # owner-only, precise read of a disjoint key; placing it before MGET's local fence
+            # leaves GETs available for the owner prefetch gap. Pure reads cannot witness it.
+            local_gap = (knobs['thread-mode'] == '1s' and knobs['read-local'] and
+                         knobs['overlap'])
+            owner_read = encode('STRLEN', bitmap) if local_gap else b''
+            read_frames = [encode('GET', key) + owner_read + encode('MGET', key, key)
+                           for key in keys]
             end = time.monotonic() + 1.1
             rounds = 0
             while rounds < 4 or time.monotonic() < end:
@@ -239,6 +246,8 @@ def smoke(conn, port, knobs):
                 for c in clients:
                     for _ in range(8):
                         require(c.read() == value, 'GET violated RYOW')
+                        if local_gap:
+                            require(c.read() == 65536, 'gap owner read/reply order failed')
                         require(c.read() == [value, value], 'MGET violated RYOW')
             # Several actual cross-owner groups, discovered from the live directory.
             located = conn.must('DEBUG', 'SHARDS', *keys)
